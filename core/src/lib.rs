@@ -188,16 +188,14 @@ impl Insets {
 #[derive(Clone, Debug)]
 pub struct LayoutStyle {
     pub taffy: TaffyStyle,
-    pub margin: Insets,
-    pub padding: Insets,
 }
 
 impl Default for LayoutStyle {
     fn default() -> Self {
+        let mut taffy = TaffyStyle::default();
+        taffy.display = taffy::Display::Block;
         Self {
-            taffy: TaffyStyle::default(),
-            margin: Insets::ZERO,
-            padding: Insets::ZERO,
+            taffy,
         }
     }
 }
@@ -271,11 +269,12 @@ pub enum RenderKind {
     Text(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct RenderNode {
     pub kind: RenderKind,
     pub layout: LayoutBox,
     pub style: VisualStyle,
+    pub on_click: Option<EventHandler>,
     pub children: Vec<RenderNode>,
 }
 
@@ -285,6 +284,7 @@ impl RenderNode {
             kind: RenderKind::Container,
             layout,
             style: VisualStyle::default(),
+            on_click: None,
             children: Vec::new(),
         }
     }
@@ -294,12 +294,18 @@ impl RenderNode {
             kind: RenderKind::Text(content.into()),
             layout,
             style: VisualStyle::default(),
+            on_click: None,
             children: Vec::new(),
         }
     }
 
     pub fn with_style(mut self, style: VisualStyle) -> Self {
         self.style = style;
+        self
+    }
+
+    pub fn on_click(mut self, handler: EventHandler) -> Self {
+        self.on_click = Some(handler);
         self
     }
 

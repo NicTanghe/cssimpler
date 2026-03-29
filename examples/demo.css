@@ -1,30 +1,50 @@
 #app {
+  display: flex;
   width: 960px;
   height: 540px;
+  padding: 32px;
+  justify-content: center;
+  align-items: center;
   background-color: #e2e8f0;
 }
 
 .card {
-  left: 160px;
-  top: 128px;
+  display: grid;
   width: 640px;
-  height: 220px;
+  padding: 32px;
+  gap: 16px 24px;
+  grid-template-columns: 1fr 160px;
+  grid-template-rows: 32px 24px 40px 24px;
   background-color: #0f172a;
   color: #ffffff;
 }
 
 .title {
-  left: 200px;
-  top: 172px;
-  width: 520px;
+  grid-column: 1 / 3;
+  grid-row: 1;
   height: 32px;
   color: #ffffff;
 }
 
 .subtitle {
-  left: 200px;
-  top: 228px;
-  width: 420px;
+  grid-column: 1;
+  grid-row: 2;
+  height: 24px;
+  color: #93c5fd;
+}
+
+.button {
+  grid-column: 1;
+  grid-row: 3;
+  width: 160px;
+  height: 40px;
+  background-color: #2563eb;
+  color: #ffffff;
+}
+
+.meta {
+  grid-column: 1 / 3;
+  grid-row: 4;
   height: 24px;
   color: #bfdbfe;
 }

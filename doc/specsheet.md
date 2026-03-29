@@ -28,7 +28,7 @@ Acceptance
 
 ## A2. Minimal runtime app
 Depends: A1  
-Status: todo  
+Status: done 
 
 - Basic window (via renderer backend)  
 - Single render loop  
@@ -63,7 +63,7 @@ Acceptance
 
 ## B1. Node system
 Depends: A3  
-Status: todo  
+Status: done  
 
 ```rust
 enum Node {
@@ -80,7 +80,7 @@ Acceptance
 
 ## B2. UI macro (`ui!`)
 Depends: B1  
-Status: todo  
+Status: done  
 
 ```rust
 ui! {
@@ -99,7 +99,7 @@ Acceptance
 
 ## B3. Event binding
 Depends: B1  
-Status: todo  
+Status: done  
 
 ```rust
 <button onclick={increment}>
@@ -116,7 +116,7 @@ Acceptance
 
 ## C1. CSS parsing
 Depends: A1  
-Status: todo  
+Status: done  
 
 Use:
 - lightningcss
@@ -129,7 +129,7 @@ Acceptance
 
 ## C2. Style representation
 Depends: C1  
-Status: todo  
+Status: done  
 
 ```rust
 struct Style {
@@ -146,7 +146,7 @@ Acceptance
 
 ## C3. Selector system
 Depends: C1  
-Status: todo  
+Status: done  
 
 Supported:
 - `.class`
@@ -161,7 +161,7 @@ Acceptance
 
 ## C4. Style resolution
 Depends: C2, C3  
-Status: todo  
+Status: done  
 
 ```rust
 fn resolve(node, stylesheet) -> Style
@@ -177,7 +177,7 @@ Acceptance
 
 ## D1. Layout mapping
 Depends: C2  
-Status: todo  
+Status: done  
 
 ```rust
 fn to_taffy(style: &LayoutStyle) -> taffy::Style
@@ -191,7 +191,7 @@ Acceptance
 
 ## D2. Layout computation
 Depends: D1  
-Status: todo  
+Status: done  
 
 ```rust
 taffy.compute_layout(root)
@@ -204,6 +204,8 @@ Acceptance
 ---
 
 ## D3. Layout output model
+Depends: D2  
+Status: done  
 
 ```rust
 struct LayoutBox {
@@ -340,7 +342,43 @@ Acceptance
 
 ---
 
-## G3. Optional optimization (later)
+## G3. Invalidation & partial refresh
+Depends: G2  
+Status: todo  
+
+Purpose:
+- Rerender on interaction, state mutation, or external data change
+- Refresh only the smallest safe affected subtree
+- Fall back to full rerender when the impact is unclear
+
+Triggers:
+- Hover / pointer enter / pointer leave
+- Click / input / focus changes
+- State updates
+- Data updates from outside the UI tree
+
+Invalidation classes:
+- `paint` - visual-only changes such as color, background, border, shadow
+- `layout` - changes that can affect size or position
+- `structure` - insert / remove / reorder nodes or change matching attributes / classes
+
+Rules:
+- Every change marks nodes as dirty
+- The engine computes the smallest safe invalidation root
+- `paint` changes should avoid layout work when possible
+- `layout` changes may recompute parent and sibling layout as needed
+- `structure` changes may expand to a larger subtree or full rerender
+- Correctness wins over partial refresh
+
+Acceptance  
+- Hover-only style changes repaint without rebuilding unrelated UI  
+- Local state changes rerender only the affected subtree when safe  
+- Layout-affecting changes update all impacted layout boxes  
+- Engine can always fall back to full rerender deterministically  
+
+---
+
+## G4. Optional optimization (later)
 Depends: G2  
 Status: todo  
 

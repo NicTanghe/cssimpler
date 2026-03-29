@@ -2,9 +2,9 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::time::{Duration, Instant};
 
-use cssimpler_core::{Color, LayoutBox, RenderKind, RenderNode};
+use cssimpler_core::{Color, EventHandler, LayoutBox, RenderKind, RenderNode};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
-use minifb::{Key, Window, WindowOptions};
+use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
 #[derive(Clone, Copy, Debug)]
 pub struct FrameInfo {
@@ -71,13 +71,25 @@ where
     let mut buffer = vec![pack_rgb(config.clear_color); config.width * config.height];
     let mut last_frame = Instant::now();
     let mut frame_index = 0_u64;
+    let mut previous_left_down = false;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
         let delta = now.saturating_duration_since(last_frame);
         last_frame = now;
 
-        let scene = render_scene(FrameInfo { frame_index, delta });
+        let frame = FrameInfo { frame_index, delta };
+        let mut scene = render_scene(frame);
+        let left_down = window.get_mouse_down(MouseButton::Left);
+        let click_started = left_down && !previous_left_down;
+
+        if click_started
+            && let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Clamp)
+            && dispatch_click(&scene, mouse_x, mouse_y)
+        {
+            scene = render_scene(frame);
+        }
+
         render_to_buffer(
             &scene,
             &mut buffer,
@@ -86,6 +98,7 @@ where
             config.clear_color,
         );
         window.update_with_buffer(&buffer, config.width, config.height)?;
+        previous_left_down = left_down;
         frame_index += 1;
     }
 
@@ -126,6 +139,40 @@ fn draw_node(node: &RenderNode, buffer: &mut [u32], width: usize, height: usize)
     for child in &node.children {
         draw_node(child, buffer, width, height);
     }
+}
+
+fn dispatch_click(scene: &[RenderNode], x: f32, y: f32) -> bool {
+    let Some(handler) = hit_test_scene(scene, x, y) else {
+        return false;
+    };
+
+    handler();
+    true
+}
+
+fn hit_test_scene(scene: &[RenderNode], x: f32, y: f32) -> Option<EventHandler> {
+    scene
+        .iter()
+        .rev()
+        .find_map(|node| hit_test_node(node, x, y))
+}
+
+fn hit_test_node(node: &RenderNode, x: f32, y: f32) -> Option<EventHandler> {
+    if !layout_contains(node.layout, x, y) {
+        return None;
+    }
+
+    for child in node.children.iter().rev() {
+        if let Some(handler) = hit_test_node(child, x, y) {
+            return Some(handler);
+        }
+    }
+
+    node.on_click
+}
+
+fn layout_contains(layout: LayoutBox, x: f32, y: f32) -> bool {
+    x >= layout.x && y >= layout.y && x < layout.x + layout.width && y < layout.y + layout.height
 }
 
 fn draw_rect(buffer: &mut [u32], width: usize, height: usize, layout: LayoutBox, color: Color) {
@@ -223,9 +270,26 @@ fn frame_time_to_fps(frame_time: Duration) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use cssimpler_core::{Color, LayoutBox, RenderNode, VisualStyle};
 
-    use crate::{pack_rgb, render_to_buffer};
+    use crate::{dispatch_click, pack_rgb, render_to_buffer};
+
+    static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static CLICK_TARGET: AtomicUsize = AtomicUsize::new(0);
+
+    fn increment_click_count() {
+        CLICK_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn mark_parent_clicked() {
+        CLICK_TARGET.store(1, Ordering::SeqCst);
+    }
+
+    fn mark_child_clicked() {
+        CLICK_TARGET.store(2, Ordering::SeqCst);
+    }
 
     #[test]
     fn offscreen_rendering_marks_the_expected_pixels() {
@@ -240,5 +304,34 @@ mod tests {
         render_to_buffer(&scene, &mut buffer, 20, 20, Color::WHITE);
 
         assert!(buffer.contains(&pack_rgb(Color::rgb(40, 120, 220))));
+    }
+
+    #[test]
+    fn dispatch_click_invokes_the_hit_handler() {
+        CLICK_COUNT.store(0, Ordering::SeqCst);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0))
+                .on_click(increment_click_count),
+        ];
+
+        assert!(dispatch_click(&scene, 12.0, 12.0));
+        assert_eq!(CLICK_COUNT.load(Ordering::SeqCst), 1);
+        assert!(!dispatch_click(&scene, 80.0, 80.0));
+    }
+
+    #[test]
+    fn dispatch_click_prefers_the_topmost_child() {
+        CLICK_TARGET.store(0, Ordering::SeqCst);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 80.0, 60.0))
+                .on_click(mark_parent_clicked)
+                .with_child(
+                    RenderNode::container(LayoutBox::new(12.0, 10.0, 30.0, 20.0))
+                        .on_click(mark_child_clicked),
+                ),
+        ];
+
+        assert!(dispatch_click(&scene, 20.0, 18.0));
+        assert_eq!(CLICK_TARGET.load(Ordering::SeqCst), 2);
     }
 }

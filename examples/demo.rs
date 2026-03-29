@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use cssimpler::core::RenderNode;
@@ -8,9 +9,12 @@ use cssimpler::ui;
 
 #[derive(Debug, Default)]
 struct DemoState {
+    click_count: u64,
     frame_index: u64,
     last_frame_ms: u128,
 }
+
+static CLICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> Result<()> {
     let config = WindowConfig::new("cssimpler", 960, 540);
@@ -24,6 +28,7 @@ fn main() -> Result<()> {
 }
 
 fn update(state: &mut DemoState, frame: FrameInfo) {
+    state.click_count = CLICK_COUNT.load(Ordering::Relaxed);
     state.frame_index = frame.frame_index;
     state.last_frame_ms = frame.delta.as_millis();
 }
@@ -38,14 +43,24 @@ fn build_ui(state: &DemoState) -> cssimpler::core::Node {
         <div id="app">
             <section class="card">
                 <h1 class="title">
-                    {"Rust-native UI"}
+                    {"Increment button demo"}
                 </h1>
                 <p class="subtitle">
+                    {format!("count {}", state.click_count)}
+                </p>
+                <button class="button" onclick={increment}>
+                    {"Increment"}
+                </button>
+                <p class="meta">
                     {format!("frame {}  dt={}ms", state.frame_index, state.last_frame_ms)}
                 </p>
             </section>
         </div>
     }
+}
+
+fn increment() {
+    CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 fn stylesheet() -> &'static Stylesheet {
