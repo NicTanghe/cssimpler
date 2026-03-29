@@ -68,7 +68,9 @@ where
     )?;
     window.set_target_fps(frame_time_to_fps(config.frame_time));
 
-    let mut buffer = vec![pack_rgb(config.clear_color); config.width * config.height];
+    let mut buffer_width = config.width.max(1);
+    let mut buffer_height = config.height.max(1);
+    let mut buffer = vec![pack_rgb(config.clear_color); buffer_width * buffer_height];
     let mut last_frame = Instant::now();
     let mut frame_index = 0_u64;
     let mut previous_left_down = false;
@@ -90,14 +92,23 @@ where
             scene = render_scene(frame);
         }
 
+        let (window_width, window_height) = window.get_size();
+        resize_buffer(
+            &mut buffer,
+            &mut buffer_width,
+            &mut buffer_height,
+            window_width,
+            window_height,
+            config.clear_color,
+        );
         render_to_buffer(
             &scene,
             &mut buffer,
-            config.width,
-            config.height,
+            buffer_width,
+            buffer_height,
             config.clear_color,
         );
-        window.update_with_buffer(&buffer, config.width, config.height)?;
+        window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
         previous_left_down = left_down;
         frame_index += 1;
     }
@@ -230,6 +241,26 @@ fn draw_text(
     }
 }
 
+fn resize_buffer(
+    buffer: &mut Vec<u32>,
+    width: &mut usize,
+    height: &mut usize,
+    next_width: usize,
+    next_height: usize,
+    clear_color: Color,
+) {
+    let next_width = next_width.max(1);
+    let next_height = next_height.max(1);
+
+    if *width == next_width && *height == next_height {
+        return;
+    }
+
+    *width = next_width;
+    *height = next_height;
+    buffer.resize(next_width * next_height, pack_rgb(clear_color));
+}
+
 fn blend_pixel(buffer: &mut [u32], width: usize, height: usize, x: i32, y: i32, color: Color) {
     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
         return;
@@ -274,7 +305,7 @@ mod tests {
 
     use cssimpler_core::{Color, LayoutBox, RenderNode, VisualStyle};
 
-    use crate::{dispatch_click, pack_rgb, render_to_buffer};
+    use crate::{dispatch_click, pack_rgb, render_to_buffer, resize_buffer};
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
     static CLICK_TARGET: AtomicUsize = AtomicUsize::new(0);
@@ -333,5 +364,25 @@ mod tests {
 
         assert!(dispatch_click(&scene, 20.0, 18.0));
         assert_eq!(CLICK_TARGET.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn resize_buffer_tracks_the_latest_window_size_without_scaling() {
+        let mut width = 320;
+        let mut height = 180;
+        let mut buffer = vec![0_u32; width * height];
+
+        resize_buffer(
+            &mut buffer,
+            &mut width,
+            &mut height,
+            640,
+            360,
+            Color::WHITE,
+        );
+
+        assert_eq!(width, 640);
+        assert_eq!(height, 360);
+        assert_eq!(buffer.len(), 640 * 360);
     }
 }
