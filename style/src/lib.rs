@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use cssimpler_core::Color;
+use cssimpler_core::{Color, ElementNode, LayoutBox, Node, RenderNode, VisualStyle};
 
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
@@ -135,6 +135,13 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
     Ok(stylesheet)
 }
 
+pub fn build_render_tree(root: &Node, stylesheet: &Stylesheet) -> RenderNode {
+    match root {
+        Node::Element(element) => element_to_render_node(element, stylesheet),
+        Node::Text(_) => panic!("render tree roots must be elements"),
+    }
+}
+
 fn parse_selector(selector: &str) -> Result<Selector, StyleError> {
     if selector.is_empty() || selector.chars().any(char::is_whitespace) {
         return Err(StyleError::UnsupportedSelector(selector.to_string()));
@@ -160,6 +167,76 @@ fn parse_declaration(property: &str, value: &str) -> Result<Declaration, StyleEr
         "width" => Ok(Declaration::Width(parse_length(value)?)),
         "height" => Ok(Declaration::Height(parse_length(value)?)),
         other => Err(StyleError::UnsupportedProperty(other.to_string())),
+    }
+}
+
+fn element_to_render_node(element: &ElementNode, stylesheet: &Stylesheet) -> RenderNode {
+    let computed = compute_style(element, stylesheet);
+    let layout = LayoutBox::new(
+        computed.x.unwrap_or(0.0),
+        computed.y.unwrap_or(0.0),
+        computed.width.unwrap_or(0.0),
+        computed.height.unwrap_or(0.0),
+    );
+    let visual = VisualStyle {
+        background: computed.background,
+        foreground: computed.foreground.unwrap_or(Color::BLACK),
+        ..VisualStyle::default()
+    };
+    let child_elements: Vec<_> = element
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            Node::Element(child) => Some(element_to_render_node(child, stylesheet)),
+            Node::Text(_) => None,
+        })
+        .collect();
+    let text = element_text(element);
+
+    if child_elements.is_empty() && !text.is_empty() {
+        RenderNode::text(layout, text).with_style(visual)
+    } else {
+        RenderNode::container(layout)
+            .with_style(visual)
+            .with_children(child_elements)
+    }
+}
+
+fn compute_style(element: &ElementNode, stylesheet: &Stylesheet) -> ComputedStyle {
+    let mut computed = ComputedStyle::default();
+    let element_ref = ElementRef {
+        tag: &element.tag,
+        id: element.id.as_deref(),
+        classes: &element.classes,
+    };
+
+    for rule in stylesheet.matching_rules(element_ref) {
+        for declaration in &rule.declarations {
+            computed.apply(*declaration);
+        }
+    }
+
+    computed
+}
+
+fn element_text(element: &ElementNode) -> String {
+    let mut content = String::new();
+
+    for child in &element.children {
+        collect_text(child, &mut content);
+    }
+
+    content
+}
+
+fn collect_text(node: &Node, buffer: &mut String) {
+    match node {
+        Node::Text(content) => buffer.push_str(content),
+        Node::Element(element) => {
+            for child in &element.children {
+                collect_text(child, buffer);
+            }
+        }
     }
 }
 
@@ -190,11 +267,37 @@ fn parse_length(value: &str) -> Result<f32, StyleError> {
         .map_err(|_| StyleError::InvalidLength(value.to_string()))
 }
 
+#[derive(Debug, Default)]
+struct ComputedStyle {
+    background: Option<Color>,
+    foreground: Option<Color>,
+    x: Option<f32>,
+    y: Option<f32>,
+    width: Option<f32>,
+    height: Option<f32>,
+}
+
+impl ComputedStyle {
+    fn apply(&mut self, declaration: Declaration) {
+        match declaration {
+            Declaration::Background(color) => self.background = Some(color),
+            Declaration::Foreground(color) => self.foreground = Some(color),
+            Declaration::X(value) => self.x = Some(value),
+            Declaration::Y(value) => self.y = Some(value),
+            Declaration::Width(value) => self.width = Some(value),
+            Declaration::Height(value) => self.height = Some(value),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use cssimpler_core::Color;
+    use cssimpler_core::{Color, Node};
 
-    use super::{Declaration, ElementRef, Selector, StyleRule, Stylesheet, parse_stylesheet};
+    use super::{
+        Declaration, ElementRef, Selector, StyleRule, Stylesheet, build_render_tree,
+        parse_stylesheet,
+    };
 
     #[test]
     fn selectors_match_supported_primitives() {
@@ -253,5 +356,28 @@ mod tests {
                 a: 255
             })
         ));
+    }
+
+    #[test]
+    fn render_tree_builder_resolves_styles_outside_the_app() {
+        let stylesheet = parse_stylesheet(
+            "#app { x: 0px; y: 0px; width: 100px; height: 80px; background: #ffffff; }
+             .title { x: 10px; y: 12px; width: 40px; height: 16px; color: #0f172a; }",
+        )
+        .expect("stylesheet should parse");
+        let tree = Node::element("div")
+            .with_id("app")
+            .with_child(
+                Node::element("h1")
+                    .with_class("title")
+                    .with_child(Node::text("hello"))
+                    .into(),
+            )
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        assert_eq!(scene.layout.width, 100.0);
+        assert_eq!(scene.children.len(), 1);
+        assert_eq!(scene.children[0].layout.x, 10.0);
     }
 }

@@ -14,12 +14,12 @@ Cargo workspace:
 - `core/` - DOM, style system, layout bridge (Taffy), event system
 - `renderer/` - rendering backend
 - `macro/` - `ui!` procedural macro (bootstrap)
-- `app/` - application entrypoint (state + render loop)
 - `style/` - stylesheet + selector primitives
+- `examples/` - demo applications and integration samples
 - `docs/` - specs and architecture notes
 
 Acceptance
-- `cargo run` launches app (pending validation)
+- `cargo run --example demo` launches the demo app
 - `core` has zero renderer dependencies
 - `renderer` does not know about parsing internals
 - `macro` outputs only `core` types
