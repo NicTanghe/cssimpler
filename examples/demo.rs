@@ -1,9 +1,10 @@
 use std::sync::OnceLock;
 
 use anyhow::Result;
-use cssimpler_core::{Node, RenderNode};
-use cssimpler_renderer::{FrameInfo, WindowConfig};
-use cssimpler_style::{Stylesheet, build_render_tree, parse_stylesheet};
+use cssimpler::core::RenderNode;
+use cssimpler::renderer::{FrameInfo, WindowConfig};
+use cssimpler::style::{Stylesheet, build_render_tree, parse_stylesheet};
+use cssimpler::ui;
 
 #[derive(Debug, Default)]
 struct DemoState {
@@ -32,30 +33,19 @@ fn render(state: &DemoState) -> Vec<RenderNode> {
     vec![build_render_tree(&ui, stylesheet())]
 }
 
-fn build_ui(state: &DemoState) -> Node {
-    Node::element("div")
-        .with_id("app")
-        .with_child(
-            Node::element("section")
-                .with_class("card")
-                .with_child(
-                    Node::element("h1")
-                        .with_class("title")
-                        .with_child(Node::text("Rust-native UI"))
-                        .into(),
-                )
-                .with_child(
-                    Node::element("p")
-                        .with_class("subtitle")
-                        .with_child(Node::text(format!(
-                            "frame {}  dt={}ms",
-                            state.frame_index, state.last_frame_ms
-                        )))
-                        .into(),
-                )
-                .into(),
-        )
-        .into()
+fn build_ui(state: &DemoState) -> cssimpler::core::Node {
+    ui! {
+        <div id="app">
+            <section class="card">
+                <h1 class="title">
+                    {"Rust-native UI"}
+                </h1>
+                <p class="subtitle">
+                    {format!("frame {}  dt={}ms", state.frame_index, state.last_frame_ms)}
+                </p>
+            </section>
+        </div>
+    }
 }
 
 fn stylesheet() -> &'static Stylesheet {

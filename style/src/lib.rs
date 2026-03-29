@@ -2,6 +2,15 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{Color, ElementNode, LayoutBox, Node, RenderNode, VisualStyle};
+use lightningcss::declaration::DeclarationBlock;
+use lightningcss::properties::Property;
+use lightningcss::properties::background::Background;
+use lightningcss::properties::size::Size;
+use lightningcss::rules::CssRule;
+use lightningcss::selector::{Component, Selector as LightningSelector};
+use lightningcss::stylesheet::{ParserOptions, StyleSheet};
+use lightningcss::values::color::CssColor;
+use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto};
 
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
@@ -42,8 +51,8 @@ impl StyleRule {
 pub enum Declaration {
     Background(Color),
     Foreground(Color),
-    X(f32),
-    Y(f32),
+    Left(f32),
+    Top(f32),
     Width(f32),
     Height(f32),
 }
@@ -77,25 +86,19 @@ pub struct ElementRef<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StyleError {
-    InvalidRule(String),
+    Parse(String),
+    UnsupportedRule(String),
     UnsupportedSelector(String),
-    UnsupportedProperty(String),
-    InvalidColor(String),
-    InvalidLength(String),
+    UnsupportedValue(String),
 }
 
 impl Display for StyleError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidRule(rule) => write!(f, "invalid CSS rule: {rule}"),
-            Self::UnsupportedSelector(selector) => {
-                write!(f, "unsupported selector: {selector}")
-            }
-            Self::UnsupportedProperty(property) => {
-                write!(f, "unsupported property: {property}")
-            }
-            Self::InvalidColor(value) => write!(f, "invalid color value: {value}"),
-            Self::InvalidLength(value) => write!(f, "invalid length value: {value}"),
+            Self::Parse(error) => write!(f, "failed to parse stylesheet: {error}"),
+            Self::UnsupportedRule(rule) => write!(f, "unsupported rule: {rule}"),
+            Self::UnsupportedSelector(selector) => write!(f, "unsupported selector: {selector}"),
+            Self::UnsupportedValue(value) => write!(f, "unsupported value: {value}"),
         }
     }
 }
@@ -103,33 +106,33 @@ impl Display for StyleError {
 impl Error for StyleError {}
 
 pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
+    let parsed = StyleSheet::parse(source, ParserOptions::default())
+        .map_err(|error| StyleError::Parse(error.to_string()))?;
     let mut stylesheet = Stylesheet::default();
 
-    for raw_block in source.split('}') {
-        let block = raw_block.trim();
-        if block.is_empty() {
-            continue;
+    for rule in &parsed.rules.0 {
+        let CssRule::Style(style_rule) = rule else {
+            return Err(StyleError::UnsupportedRule(
+                "only top-level style rules are supported".to_string(),
+            ));
+        };
+
+        if !style_rule.rules.0.is_empty() {
+            return Err(StyleError::UnsupportedRule(
+                "nested style rules are not supported".to_string(),
+            ));
         }
 
-        let (selector_text, body) = block
-            .split_once('{')
-            .ok_or_else(|| StyleError::InvalidRule(block.to_string()))?;
-        let selector = parse_selector(selector_text.trim())?;
-        let mut declarations = Vec::new();
-
-        for raw_declaration in body.split(';') {
-            let declaration = raw_declaration.trim();
-            if declaration.is_empty() {
-                continue;
-            }
-
-            let (property, value) = declaration
-                .split_once(':')
-                .ok_or_else(|| StyleError::InvalidRule(declaration.to_string()))?;
-            declarations.push(parse_declaration(property.trim(), value.trim())?);
+        let declarations = extract_declarations(&style_rule.declarations)?;
+        for selector in style_rule
+            .selectors
+            .0
+            .iter()
+            .map(extract_selector)
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            stylesheet.push(StyleRule::new(selector, declarations.clone()));
         }
-
-        stylesheet.push(StyleRule::new(selector, declarations));
     }
 
     Ok(stylesheet)
@@ -142,31 +145,101 @@ pub fn build_render_tree(root: &Node, stylesheet: &Stylesheet) -> RenderNode {
     }
 }
 
-fn parse_selector(selector: &str) -> Result<Selector, StyleError> {
-    if selector.is_empty() || selector.chars().any(char::is_whitespace) {
-        return Err(StyleError::UnsupportedSelector(selector.to_string()));
+fn extract_selector(selector: &LightningSelector<'_>) -> Result<Selector, StyleError> {
+    let mut resolved = None;
+
+    for component in selector.iter_raw_match_order() {
+        let candidate = match component {
+            Component::Class(name) => Selector::Class(name.0.to_string()),
+            Component::ID(name) => Selector::Id(name.0.to_string()),
+            Component::LocalName(name) => Selector::Tag(name.name.0.to_string()),
+            Component::ExplicitUniversalType => continue,
+            _ => {
+                return Err(StyleError::UnsupportedSelector(format!("{selector:?}")));
+            }
+        };
+
+        if resolved.replace(candidate).is_some() {
+            return Err(StyleError::UnsupportedSelector(format!("{selector:?}")));
+        }
     }
 
-    if let Some(value) = selector.strip_prefix('.') {
-        return Ok(Selector::Class(value.to_string()));
-    }
-
-    if let Some(value) = selector.strip_prefix('#') {
-        return Ok(Selector::Id(value.to_string()));
-    }
-
-    Ok(Selector::Tag(selector.to_string()))
+    resolved.ok_or_else(|| StyleError::UnsupportedSelector(format!("{selector:?}")))
 }
 
-fn parse_declaration(property: &str, value: &str) -> Result<Declaration, StyleError> {
+fn extract_declarations(block: &DeclarationBlock<'_>) -> Result<Vec<Declaration>, StyleError> {
+    let mut declarations = Vec::new();
+
+    for (property, _important) in block.iter() {
+        if let Some(declaration) = extract_property(property)? {
+            declarations.push(declaration);
+        }
+    }
+
+    Ok(declarations)
+}
+
+fn extract_property(property: &Property<'_>) -> Result<Option<Declaration>, StyleError> {
     match property {
-        "background" | "background-color" => Ok(Declaration::Background(parse_color(value)?)),
-        "color" => Ok(Declaration::Foreground(parse_color(value)?)),
-        "x" => Ok(Declaration::X(parse_length(value)?)),
-        "y" => Ok(Declaration::Y(parse_length(value)?)),
-        "width" => Ok(Declaration::Width(parse_length(value)?)),
-        "height" => Ok(Declaration::Height(parse_length(value)?)),
-        other => Err(StyleError::UnsupportedProperty(other.to_string())),
+        Property::BackgroundColor(color) => {
+            Ok(Some(Declaration::Background(color_from_css(color)?)))
+        }
+        Property::Background(backgrounds) => {
+            Ok(extract_background_declaration(backgrounds.first())?)
+        }
+        Property::Color(color) => Ok(Some(Declaration::Foreground(color_from_css(color)?))),
+        Property::Width(size) => Ok(Some(Declaration::Width(px_from_size(size)?))),
+        Property::Height(size) => Ok(Some(Declaration::Height(px_from_size(size)?))),
+        Property::Left(value) => Ok(Some(Declaration::Left(px_from_inset(value)?))),
+        Property::Top(value) => Ok(Some(Declaration::Top(px_from_inset(value)?))),
+        _ => Ok(None),
+    }
+}
+
+fn extract_background_declaration(
+    background: Option<&Background<'_>>,
+) -> Result<Option<Declaration>, StyleError> {
+    let Some(background) = background else {
+        return Ok(None);
+    };
+
+    Ok(Some(Declaration::Background(color_from_css(
+        &background.color,
+    )?)))
+}
+
+fn color_from_css(color: &CssColor) -> Result<Color, StyleError> {
+    let rgb = color
+        .to_rgb()
+        .map_err(|_| StyleError::UnsupportedValue(format!("{color:?}")))?;
+
+    match rgb {
+        CssColor::RGBA(rgba) => Ok(Color::rgba(rgba.red, rgba.green, rgba.blue, rgba.alpha)),
+        _ => Err(StyleError::UnsupportedValue(format!("{color:?}"))),
+    }
+}
+
+fn px_from_size(size: &Size) -> Result<f32, StyleError> {
+    match size {
+        Size::LengthPercentage(value) => px_from_length_percentage(value),
+        _ => Err(StyleError::UnsupportedValue(format!("{size:?}"))),
+    }
+}
+
+fn px_from_inset(value: &LengthPercentageOrAuto) -> Result<f32, StyleError> {
+    match value {
+        LengthPercentageOrAuto::LengthPercentage(value) => px_from_length_percentage(value),
+        LengthPercentageOrAuto::Auto => Err(StyleError::UnsupportedValue("auto".to_string())),
+    }
+}
+
+fn px_from_length_percentage(value: &LengthPercentage) -> Result<f32, StyleError> {
+    match value {
+        LengthPercentage::Dimension(length) => length
+            .to_px()
+            .map(|value| value as f32)
+            .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}"))),
+        _ => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
     }
 }
 
@@ -240,33 +313,6 @@ fn collect_text(node: &Node, buffer: &mut String) {
     }
 }
 
-fn parse_color(value: &str) -> Result<Color, StyleError> {
-    let value = value.trim();
-    let Some(hex) = value.strip_prefix('#') else {
-        return Err(StyleError::InvalidColor(value.to_string()));
-    };
-
-    if hex.len() != 6 {
-        return Err(StyleError::InvalidColor(value.to_string()));
-    }
-
-    let rgb =
-        u32::from_str_radix(hex, 16).map_err(|_| StyleError::InvalidColor(value.to_string()))?;
-
-    Ok(Color::rgb(
-        ((rgb >> 16) & 0xFF) as u8,
-        ((rgb >> 8) & 0xFF) as u8,
-        (rgb & 0xFF) as u8,
-    ))
-}
-
-fn parse_length(value: &str) -> Result<f32, StyleError> {
-    let normalized = value.trim().strip_suffix("px").unwrap_or(value.trim());
-    normalized
-        .parse::<f32>()
-        .map_err(|_| StyleError::InvalidLength(value.to_string()))
-}
-
 #[derive(Debug, Default)]
 struct ComputedStyle {
     background: Option<Color>,
@@ -282,8 +328,8 @@ impl ComputedStyle {
         match declaration {
             Declaration::Background(color) => self.background = Some(color),
             Declaration::Foreground(color) => self.foreground = Some(color),
-            Declaration::X(value) => self.x = Some(value),
-            Declaration::Y(value) => self.y = Some(value),
+            Declaration::Left(value) => self.x = Some(value),
+            Declaration::Top(value) => self.y = Some(value),
             Declaration::Width(value) => self.width = Some(value),
             Declaration::Height(value) => self.height = Some(value),
         }
@@ -341,28 +387,29 @@ mod tests {
     #[test]
     fn parser_supports_a_small_bootstrap_stylesheet() {
         let stylesheet = parse_stylesheet(
-            "#app { width: 960px; height: 540px; background: #e2e8f0; }
-             .card { x: 160px; y: 128px; width: 640px; height: 220px; background: #0f172a; color: #ffffff; }",
+            "#app { width: 960px; height: 540px; background-color: #e2e8f0; }
+             .card { left: 160px; top: 128px; width: 640px; height: 220px; background-color: #0f172a; color: #ffffff; }",
         )
         .expect("bootstrap stylesheet should parse");
 
         assert_eq!(stylesheet.rules.len(), 2);
-        assert!(matches!(
-            stylesheet.rules[0].declarations[2],
-            Declaration::Background(Color {
-                r: 226,
-                g: 232,
-                b: 240,
-                a: 255
-            })
-        ));
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::Background(Color::rgb(226, 232, 240)))
+        );
+        assert!(
+            stylesheet.rules[1]
+                .declarations
+                .contains(&Declaration::Left(160.0))
+        );
     }
 
     #[test]
     fn render_tree_builder_resolves_styles_outside_the_app() {
         let stylesheet = parse_stylesheet(
-            "#app { x: 0px; y: 0px; width: 100px; height: 80px; background: #ffffff; }
-             .title { x: 10px; y: 12px; width: 40px; height: 16px; color: #0f172a; }",
+            "#app { width: 100px; height: 80px; background-color: #ffffff; }
+             .title { left: 10px; top: 12px; width: 40px; height: 16px; color: #0f172a; }",
         )
         .expect("stylesheet should parse");
         let tree = Node::element("div")

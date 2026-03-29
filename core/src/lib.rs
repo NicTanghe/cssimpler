@@ -2,6 +2,10 @@ use taffy::Style as TaffyStyle;
 
 pub type EventHandler = fn();
 
+pub trait IntoNode {
+    fn into_node(self) -> Node;
+}
+
 #[derive(Clone, Debug)]
 pub enum Node {
     Element(ElementNode),
@@ -16,6 +20,10 @@ impl Node {
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text(text.into())
     }
+}
+
+pub fn into_node(value: impl IntoNode) -> Node {
+    value.into_node()
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +84,64 @@ impl From<ElementNode> for Node {
         Self::Element(value)
     }
 }
+
+impl IntoNode for Node {
+    fn into_node(self) -> Node {
+        self
+    }
+}
+
+impl IntoNode for ElementNode {
+    fn into_node(self) -> Node {
+        self.into()
+    }
+}
+
+impl IntoNode for String {
+    fn into_node(self) -> Node {
+        Node::Text(self)
+    }
+}
+
+impl IntoNode for &str {
+    fn into_node(self) -> Node {
+        Node::Text(self.to_string())
+    }
+}
+
+impl IntoNode for &String {
+    fn into_node(self) -> Node {
+        Node::Text(self.clone())
+    }
+}
+
+impl IntoNode for char {
+    fn into_node(self) -> Node {
+        Node::Text(self.to_string())
+    }
+}
+
+impl IntoNode for bool {
+    fn into_node(self) -> Node {
+        Node::Text(self.to_string())
+    }
+}
+
+macro_rules! impl_into_node_via_to_string {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl IntoNode for $ty {
+                fn into_node(self) -> Node {
+                    Node::Text(self.to_string())
+                }
+            }
+        )*
+    };
+}
+
+impl_into_node_via_to_string!(i8, i16, i32, i64, i128, isize);
+impl_into_node_via_to_string!(u8, u16, u32, u64, u128, usize);
+impl_into_node_via_to_string!(f32, f64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {

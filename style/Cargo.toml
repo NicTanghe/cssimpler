@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 cssimpler-core.workspace = true
+lightningcss.workspace = true
