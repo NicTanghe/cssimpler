@@ -1,0 +1,9 @@
+[package]
+name = "cssimpler-renderer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cssimpler-core.workspace = true
+font8x8.workspace = true
+minifb.workspace = true

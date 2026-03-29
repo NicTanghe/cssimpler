@@ -1,0 +1,7 @@
+[package]
+name = "cssimpler-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+taffy.workspace = true

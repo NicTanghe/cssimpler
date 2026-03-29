@@ -1,0 +1,32 @@
+#app {
+  x: 0px;
+  y: 0px;
+  width: 960px;
+  height: 540px;
+  background: #e2e8f0;
+}
+
+.card {
+  x: 160px;
+  y: 128px;
+  width: 640px;
+  height: 220px;
+  background: #0f172a;
+  color: #ffffff;
+}
+
+.title {
+  x: 200px;
+  y: 172px;
+  width: 520px;
+  height: 32px;
+  color: #ffffff;
+}
+
+.subtitle {
+  x: 200px;
+  y: 228px;
+  width: 420px;
+  height: 24px;
+  color: #bfdbfe;
+}

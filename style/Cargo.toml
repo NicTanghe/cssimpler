@@ -1,0 +1,7 @@
+[package]
+name = "cssimpler-style"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cssimpler-core.workspace = true

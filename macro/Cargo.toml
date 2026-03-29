@@ -1,0 +1,10 @@
+[package]
+name = "cssimpler-macro"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+cssimpler-core.workspace = true
