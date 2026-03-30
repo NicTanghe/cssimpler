@@ -81,9 +81,22 @@ where
         let delta = now.saturating_duration_since(last_frame);
         last_frame = now;
 
+        let left_down = window.get_mouse_down(MouseButton::Left);
+        let alt_dragging = should_suspend_updates(
+            left_down,
+            window.is_key_down(Key::LeftAlt),
+            window.is_key_down(Key::RightAlt),
+        );
+
+        if alt_dragging {
+            window.update();
+            previous_left_down = left_down;
+            frame_index += 1;
+            continue;
+        }
+
         let frame = FrameInfo { frame_index, delta };
         let mut scene = render_scene(frame);
-        let left_down = window.get_mouse_down(MouseButton::Left);
         let click_started = left_down && !previous_left_down;
 
         if click_started
@@ -169,6 +182,10 @@ fn render_nodes_match_visuals(left: &RenderNode, right: &RenderNode) -> bool {
         && left.style == right.style
         && left.content_inset == right.content_inset
         && scenes_match_visuals(&left.children, &right.children)
+}
+
+fn should_suspend_updates(left_down: bool, left_alt_down: bool, right_alt_down: bool) -> bool {
+    left_down && (left_alt_down || right_alt_down)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -868,7 +885,7 @@ mod tests {
 
     use crate::{
         dispatch_click, pack_rgb, render_to_buffer, resize_buffer, scenes_match_visuals,
-        should_present_scene,
+        should_present_scene, should_suspend_updates,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1076,5 +1093,13 @@ mod tests {
         ];
 
         assert!(should_present_scene(Some(&scene), &scene, true));
+    }
+
+    #[test]
+    fn alt_dragging_suspends_updates() {
+        assert!(should_suspend_updates(true, true, false));
+        assert!(should_suspend_updates(true, false, true));
+        assert!(!should_suspend_updates(true, false, false));
+        assert!(!should_suspend_updates(false, true, true));
     }
 }
