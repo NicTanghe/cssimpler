@@ -7,7 +7,7 @@ Rust-native UI system with HTML-like syntax, real CSS parsing, explicit renderin
 
 ## A1. Workspace layout
 Depends: -  
-Status: todo  
+Status: done  
 
 Cargo workspace:
 
@@ -42,7 +42,7 @@ Acceptance
 
 ## A3. Core / Renderer contract
 Depends: A1  
-Status: todo  
+Status: done  
 
 Core exposes:
 - `Node` (DOM)
@@ -225,7 +225,7 @@ Acceptance
 
 ## E1. Render tree construction
 Depends: D2, C4  
-Status: todo  
+Status: done  
 
 ```rust
 struct RenderNode {
@@ -243,7 +243,7 @@ Acceptance
 
 ## E2. Renderer backend
 Depends: E1  
-Status: todo  
+Status: done  
 
 - Rectangle rendering  
 - Text rendering  
@@ -258,7 +258,7 @@ Acceptance
 
 ### Shadows
 Depends: E2  
-Status: todo  
+Status: done  
 
 - `box-shadow` support  
 - Blur + offset  
@@ -270,7 +270,7 @@ Acceptance
 
 ### Borders & radius
 Depends: E2  
-Status: todo  
+Status: done  
 
 Acceptance  
 - Rounded corners respected  
@@ -279,7 +279,7 @@ Acceptance
 
 ### Clipping / overflow
 Depends: E2  
-Status: todo  
+Status: done  
 
 Acceptance  
 - Children clipped to parent bounds  
@@ -290,7 +290,7 @@ Acceptance
 
 ## F1. Hit testing
 Depends: D3  
-Status: todo  
+Status: done  
 
 - Map mouse → layout boxes  
 
@@ -301,7 +301,7 @@ Acceptance
 
 ## F2. Event dispatch
 Depends: F1, B3  
-Status: todo  
+Status: done  
 
 Flow:
 1. hit test  
@@ -318,7 +318,7 @@ Acceptance
 
 ## G1. Application model
 Depends: A2  
-Status: todo  
+Status: done  
 
 ```rust
 fn update(state: &mut State)
@@ -333,7 +333,7 @@ Acceptance
 
 ## G2. Full rerender
 Depends: G1  
-Status: todo  
+Status: done  
 
 - Rebuild UI tree every frame or on demand  
 
@@ -344,7 +344,7 @@ Acceptance
 
 ## G3. Invalidation & partial refresh
 Depends: G2  
-Status: todo  
+Status: done  
 
 Purpose:
 - Rerender on interaction, state mutation, or external data change

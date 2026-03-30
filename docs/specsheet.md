@@ -7,7 +7,7 @@ Rust-native UI system with HTML-like syntax, real CSS parsing, explicit renderin
 
 ## A1. Workspace layout
 Depends: -
-Status: in progress
+Status: done
 
 Cargo workspace:
 
@@ -23,6 +23,10 @@ Acceptance
 - `core` has zero renderer dependencies
 - `renderer` does not know about parsing internals
 - `macro` outputs only `core` types
+
+Status sync
+- `A1` through `G3` are implemented in the workspace
+- `G4` remains optional future optimization work
 
 ---
 

@@ -74,6 +74,7 @@ where
     let mut last_frame = Instant::now();
     let mut frame_index = 0_u64;
     let mut previous_left_down = false;
+    let mut previous_presented_scene: Option<Vec<RenderNode>> = None;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
@@ -93,6 +94,7 @@ where
         }
 
         let (window_width, window_height) = window.get_size();
+        let resized = buffer_width != window_width.max(1) || buffer_height != window_height.max(1);
         resize_buffer(
             &mut buffer,
             &mut buffer_width,
@@ -101,14 +103,20 @@ where
             window_height,
             config.clear_color,
         );
-        render_to_buffer(
-            &scene,
-            &mut buffer,
-            buffer_width,
-            buffer_height,
-            config.clear_color,
-        );
-        window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
+        if should_present_scene(previous_presented_scene.as_deref(), &scene, resized) {
+            render_to_buffer(
+                &scene,
+                &mut buffer,
+                buffer_width,
+                buffer_height,
+                config.clear_color,
+            );
+            window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
+            previous_presented_scene = Some(scene.clone());
+        } else {
+            window.update();
+        }
+
         previous_left_down = left_down;
         frame_index += 1;
     }
@@ -129,6 +137,38 @@ pub fn render_to_buffer(
     for node in scene {
         draw_node(node, buffer, width, height, clip);
     }
+}
+
+fn should_present_scene(
+    previous_scene: Option<&[RenderNode]>,
+    scene: &[RenderNode],
+    resized: bool,
+) -> bool {
+    if resized {
+        return true;
+    }
+
+    let Some(previous_scene) = previous_scene else {
+        return true;
+    };
+
+    !scenes_match_visuals(previous_scene, scene)
+}
+
+fn scenes_match_visuals(left: &[RenderNode], right: &[RenderNode]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| render_nodes_match_visuals(left, right))
+}
+
+fn render_nodes_match_visuals(left: &RenderNode, right: &RenderNode) -> bool {
+    left.kind == right.kind
+        && left.layout == right.layout
+        && left.style == right.style
+        && left.content_inset == right.content_inset
+        && scenes_match_visuals(&left.children, &right.children)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -826,7 +866,10 @@ mod tests {
         BoxShadow, Color, CornerRadius, LayoutBox, Overflow, RenderNode, VisualStyle,
     };
 
-    use crate::{dispatch_click, pack_rgb, render_to_buffer, resize_buffer};
+    use crate::{
+        dispatch_click, pack_rgb, render_to_buffer, resize_buffer, scenes_match_visuals,
+        should_present_scene,
+    };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
     static CLICK_TARGET: AtomicUsize = AtomicUsize::new(0);
@@ -841,6 +884,10 @@ mod tests {
 
     fn mark_child_clicked() {
         CLICK_TARGET.store(2, Ordering::SeqCst);
+    }
+
+    fn alternate_click_handler() {
+        CLICK_COUNT.fetch_add(10, Ordering::SeqCst);
     }
 
     #[test]
@@ -988,5 +1035,46 @@ mod tests {
         assert_eq!(width, 640);
         assert_eq!(height, 360);
         assert_eq!(buffer.len(), 640 * 360);
+    }
+
+    #[test]
+    fn visual_scene_comparison_ignores_click_handlers() {
+        let left = vec![
+            RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0)).on_click(increment_click_count),
+        ];
+        let right = vec![
+            RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0))
+                .on_click(alternate_click_handler),
+        ];
+
+        assert!(scenes_match_visuals(&left, &right));
+    }
+
+    #[test]
+    fn should_present_scene_when_visuals_change() {
+        let previous = vec![
+            RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(40, 120, 220)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let next = vec![
+            RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(220, 38, 38)),
+                ..VisualStyle::default()
+            }),
+        ];
+
+        assert!(should_present_scene(Some(&previous), &next, false));
+        assert!(!should_present_scene(Some(&previous), &previous, false));
+    }
+
+    #[test]
+    fn should_present_scene_when_buffer_is_resized() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0)),
+        ];
+
+        assert!(should_present_scene(Some(&scene), &scene, true));
     }
 }

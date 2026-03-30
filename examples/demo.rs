@@ -2,9 +2,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use cssimpler::core::RenderNode;
+use cssimpler::app::{App, Invalidation, RenderMode};
 use cssimpler::renderer::{FrameInfo, WindowConfig};
-use cssimpler::style::{Stylesheet, build_render_tree, parse_stylesheet};
+use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
 
 #[derive(Debug, Default)]
@@ -18,24 +18,17 @@ static CLICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> Result<()> {
     let config = WindowConfig::new("cssimpler", 960, 540);
-    let mut state = DemoState::default();
-
-    cssimpler_renderer::run(config, move |frame| {
-        update(&mut state, frame);
-        render(&state)
-    })
-    .map_err(Into::into)
+    App::new(DemoState::default(), stylesheet(), update, build_ui)
+        .with_render_mode(RenderMode::EveryFrame)
+        .run(config)
+        .map_err(Into::into)
 }
 
-fn update(state: &mut DemoState, frame: FrameInfo) {
+fn update(state: &mut DemoState, frame: FrameInfo) -> Invalidation {
     state.click_count = CLICK_COUNT.load(Ordering::Relaxed);
     state.frame_index = frame.frame_index;
     state.last_frame_ms = frame.delta.as_millis();
-}
-
-fn render(state: &DemoState) -> Vec<RenderNode> {
-    let ui = build_ui(state);
-    vec![build_render_tree(&ui, stylesheet())]
+    Invalidation::Paint
 }
 
 fn build_ui(state: &DemoState) -> cssimpler::core::Node {
