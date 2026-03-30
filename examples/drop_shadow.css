@@ -1,0 +1,98 @@
+#app {
+  display: flex;
+  width: 980px;
+  height: 640px;
+  justify-content: center;
+  align-items: center;
+  background-color: #efe7dc;
+}
+
+.hero-card {
+  display: flex;
+  flex-direction: column;
+  width: 620px;
+  gap: 18px;
+  padding: 28px;
+  background-color: #fffaf2;
+  color: #102a43;
+  border: 2px solid #d9c7af;
+  border-radius: 22px;
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.18);
+}
+
+.eyebrow {
+  color: #9a3412;
+}
+
+.title {
+  color: #102a43;
+}
+
+.copy {
+  color: #475569;
+}
+
+.preview-frame {
+  display: flex;
+  height: 92px;
+  padding: 16px;
+  border: 2px solid #d9c7af;
+  border-radius: 18px;
+  overflow: hidden;
+  background-color: #f7efe3;
+}
+
+.preview-strip {
+  display: flex;
+  gap: 14px;
+}
+
+.pill {
+  width: 118px;
+  height: 56px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  color: #102a43;
+  box-shadow: 0 12px 22px rgba(15, 23, 42, 0.12);
+}
+
+.pill-a {
+  background-color: #fde68a;
+}
+
+.pill-b {
+  background-color: #bfdbfe;
+}
+
+.pill-c {
+  background-color: #c7d2fe;
+}
+
+.pill-d {
+  background-color: #fecaca;
+}
+
+.action-row {
+  display: flex;
+  gap: 16px;
+}
+
+.ghost-button {
+  width: 220px;
+  height: 52px;
+  padding: 14px 18px;
+  border: 2px solid #d9c7af;
+  border-radius: 16px;
+  background-color: #f7efe3;
+  color: #102a43;
+}
+
+.primary-button {
+  width: 220px;
+  height: 52px;
+  padding: 14px 18px;
+  border-radius: 16px;
+  background-color: #c2410c;
+  color: #ffffff;
+  box-shadow: 0 14px 24px rgba(154, 52, 18, 0.28);
+}

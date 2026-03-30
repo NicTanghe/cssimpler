@@ -2,7 +2,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
-    Color, ElementNode, EventHandler, LayoutBox, LayoutStyle, Node, RenderNode, Style,
+    BoxShadow as CoreBoxShadow, Color, ElementNode, EventHandler, LayoutBox, LayoutStyle, Node,
+    RenderNode, Style,
 };
 use lightningcss::declaration::DeclarationBlock;
 use lightningcss::properties::Property;
@@ -12,6 +13,7 @@ use lightningcss::properties::align::{
     SelfPosition,
 };
 use lightningcss::properties::background::Background;
+use lightningcss::properties::border::{BorderSideWidth as CssBorderSideWidth, LineStyle as CssLineStyle};
 use lightningcss::properties::display::{Display as CssDisplay, DisplayInside, DisplayKeyword};
 use lightningcss::properties::flex::{
     FlexDirection as CssFlexDirection, FlexWrap as CssFlexWrap,
@@ -20,6 +22,7 @@ use lightningcss::properties::grid::{
     GridColumn as CssGridColumn, GridLine as CssGridLine, GridRow as CssGridRow, RepeatCount,
     TrackBreadth, TrackListItem, TrackSize, TrackSizing as CssTrackSizing,
 };
+use lightningcss::properties::overflow::OverflowKeyword as CssOverflowKeyword;
 use lightningcss::properties::position::Position as CssPosition;
 use lightningcss::properties::size::Size as CssSize;
 use lightningcss::rules::CssRule;
@@ -27,6 +30,8 @@ use lightningcss::selector::{Component, Selector as LightningSelector};
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 use lightningcss::values::color::CssColor;
 use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto};
+use lightningcss::values::size::Size2D;
+use taffy::Overflow as TaffyOverflow;
 use taffy::geometry::{Line, Size as TaffySize};
 use taffy::prelude::{
     AlignContent as TaffyAlignContent, AlignItems as TaffyAlignItems,
@@ -34,13 +39,21 @@ use taffy::prelude::{
     FlexDirection, FlexWrap, GridPlacement, GridTrackRepetition,
     JustifyContent as TaffyJustifyContent, LengthPercentage as TaffyLengthPercentage,
     LengthPercentageAuto as TaffyLengthPercentageAuto, MaxTrackSizingFunction,
-    MinTrackSizingFunction, NodeId, NonRepeatedTrackSizingFunction,
-    Position as TaffyPosition, Style as TaffyStyle, TaffyGridLine, TaffyGridSpan, TaffyTree,
-    TrackSizingFunction,
+    MinTrackSizingFunction, NodeId, NonRepeatedTrackSizingFunction, Position as TaffyPosition,
+    Style as TaffyStyle, TaffyGridLine, TaffyGridSpan, TaffyTree, TrackSizingFunction,
 };
 
 const GLYPH_WIDTH: f32 = 18.0;
 const GLYPH_HEIGHT: f32 = 20.0;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShadowDeclaration {
+    color: Option<Color>,
+    offset_x: f32,
+    offset_y: f32,
+    blur_radius: f32,
+    spread: f32,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
@@ -81,6 +94,18 @@ impl StyleRule {
 pub enum Declaration {
     Background(Color),
     Foreground(Color),
+    CornerTopLeft(f32),
+    CornerTopRight(f32),
+    CornerBottomRight(f32),
+    CornerBottomLeft(f32),
+    BorderTopWidth(f32),
+    BorderRightWidth(f32),
+    BorderBottomWidth(f32),
+    BorderLeftWidth(f32),
+    BorderColor(Option<Color>),
+    BoxShadows(Vec<ShadowDeclaration>),
+    OverflowX(TaffyOverflow, bool),
+    OverflowY(TaffyOverflow, bool),
     Display(TaffyDisplay),
     Position(TaffyPosition),
     InsetTop(TaffyLengthPercentageAuto),
@@ -253,15 +278,19 @@ pub fn build_render_tree(root: &Node, stylesheet: &Stylesheet) -> RenderNode {
     let layout_tree = build_layout_tree(&resolved, &mut taffy);
     let available_space = available_space_from_root(&layout_tree.style.layout.taffy);
     taffy
-        .compute_layout_with_measure(layout_tree.node_id, available_space, |_, _, _, context, _| {
-            context.map_or(
-                TaffySize {
-                    width: 0.0,
-                    height: 0.0,
-                },
-                |context| measure_text(&context.text),
-            )
-        })
+        .compute_layout_with_measure(
+            layout_tree.node_id,
+            available_space,
+            |known_dimensions, available_space, _, context, _| {
+                context.map_or(
+                    TaffySize {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    |context| measure_text(&context.text, known_dimensions, available_space),
+                )
+            },
+        )
         .expect("resolved layout should be valid for taffy");
 
     render_node_from_layout(&layout_tree, &taffy, 0.0, 0.0)
@@ -308,6 +337,65 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
                 .collect(),
         ),
         Property::Color(color) => Ok(vec![Declaration::Foreground(color_from_css(color)?)]),
+        Property::BorderRadius(radius, _) => extract_corner_radius_declarations(radius),
+        Property::BorderTopLeftRadius(radius, _) => {
+            Ok(vec![Declaration::CornerTopLeft(corner_radius_to_px(radius)?)])
+        }
+        Property::BorderTopRightRadius(radius, _) => {
+            Ok(vec![Declaration::CornerTopRight(corner_radius_to_px(radius)?)])
+        }
+        Property::BorderBottomRightRadius(radius, _) => {
+            Ok(vec![Declaration::CornerBottomRight(corner_radius_to_px(radius)?)])
+        }
+        Property::BorderBottomLeftRadius(radius, _) => {
+            Ok(vec![Declaration::CornerBottomLeft(corner_radius_to_px(radius)?)])
+        }
+        Property::Border(border) => extract_border_shorthand_declarations(border),
+        Property::BorderTop(border) => extract_border_side_declarations(border, BorderSide::Top),
+        Property::BorderRight(border) => {
+            extract_border_side_declarations(border, BorderSide::Right)
+        }
+        Property::BorderBottom(border) => {
+            extract_border_side_declarations(border, BorderSide::Bottom)
+        }
+        Property::BorderLeft(border) => extract_border_side_declarations(border, BorderSide::Left),
+        Property::BorderWidth(widths) => extract_border_width_declarations(widths),
+        Property::BorderTopWidth(value) => {
+            Ok(vec![Declaration::BorderTopWidth(border_width_to_px(value)?)])
+        }
+        Property::BorderRightWidth(value) => {
+            Ok(vec![Declaration::BorderRightWidth(border_width_to_px(value)?)])
+        }
+        Property::BorderBottomWidth(value) => {
+            Ok(vec![Declaration::BorderBottomWidth(border_width_to_px(value)?)])
+        }
+        Property::BorderLeftWidth(value) => {
+            Ok(vec![Declaration::BorderLeftWidth(border_width_to_px(value)?)])
+        }
+        Property::BorderColor(colors) => Ok(vec![Declaration::BorderColor(
+            color_from_css_optional(&colors.top)?,
+        )]),
+        Property::BorderTopColor(color) => {
+            Ok(vec![Declaration::BorderColor(color_from_css_optional(color)?)])
+        }
+        Property::BorderRightColor(color) => {
+            Ok(vec![Declaration::BorderColor(color_from_css_optional(color)?)])
+        }
+        Property::BorderBottomColor(color) => {
+            Ok(vec![Declaration::BorderColor(color_from_css_optional(color)?)])
+        }
+        Property::BorderLeftColor(color) => {
+            Ok(vec![Declaration::BorderColor(color_from_css_optional(color)?)])
+        }
+        Property::BoxShadow(shadows, _) => {
+            Ok(vec![Declaration::BoxShadows(box_shadow_declarations(shadows.as_slice())?)])
+        }
+        Property::Overflow(overflow) => Ok(vec![
+            overflow_x_declaration(overflow.x),
+            overflow_y_declaration(overflow.y),
+        ]),
+        Property::OverflowX(value) => Ok(vec![overflow_x_declaration(*value)]),
+        Property::OverflowY(value) => Ok(vec![overflow_y_declaration(*value)]),
         Property::Display(display) => Ok(vec![Declaration::Display(display_from_css(display)?)]),
         Property::Position(position) => {
             Ok(vec![Declaration::Position(position_from_css(position))])
@@ -429,6 +517,14 @@ fn extract_background_declaration(
     )?)))
 }
 
+#[derive(Clone, Copy)]
+enum BorderSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
 fn color_from_css(color: &CssColor) -> Result<Color, StyleError> {
     let rgb = color
         .to_rgb()
@@ -437,6 +533,215 @@ fn color_from_css(color: &CssColor) -> Result<Color, StyleError> {
     match rgb {
         CssColor::RGBA(rgba) => Ok(Color::rgba(rgba.red, rgba.green, rgba.blue, rgba.alpha)),
         _ => Err(StyleError::UnsupportedValue(format!("{color:?}"))),
+    }
+}
+
+fn color_from_css_optional(color: &CssColor) -> Result<Option<Color>, StyleError> {
+    match color {
+        CssColor::CurrentColor => Ok(None),
+        _ => color_from_css(color).map(Some),
+    }
+}
+
+fn extract_corner_radius_declarations(
+    radius: &lightningcss::properties::border_radius::BorderRadius,
+) -> Result<Vec<Declaration>, StyleError> {
+    Ok(vec![
+        Declaration::CornerTopLeft(corner_radius_to_px(&radius.top_left)?),
+        Declaration::CornerTopRight(corner_radius_to_px(&radius.top_right)?),
+        Declaration::CornerBottomRight(corner_radius_to_px(&radius.bottom_right)?),
+        Declaration::CornerBottomLeft(corner_radius_to_px(&radius.bottom_left)?),
+    ])
+}
+
+fn corner_radius_to_px(value: &Size2D<LengthPercentage>) -> Result<f32, StyleError> {
+    length_percentage_to_px(&value.0)
+}
+
+fn length_percentage_to_px(value: &LengthPercentage) -> Result<f32, StyleError> {
+    match value {
+        LengthPercentage::Dimension(length) => length
+            .to_px()
+            .map(|value| value as f32)
+            .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}"))),
+        _ => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
+    }
+}
+
+fn border_width_to_px(value: &CssBorderSideWidth) -> Result<f32, StyleError> {
+    match value {
+        CssBorderSideWidth::Thin => Ok(1.0),
+        CssBorderSideWidth::Medium => Ok(3.0),
+        CssBorderSideWidth::Thick => Ok(5.0),
+        CssBorderSideWidth::Length(length) => length
+            .to_px()
+            .map(|value| value as f32)
+            .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}"))),
+    }
+}
+
+fn extract_border_width_declarations(
+    widths: &lightningcss::properties::border::BorderWidth,
+) -> Result<Vec<Declaration>, StyleError> {
+    Ok(vec![
+        Declaration::BorderTopWidth(border_width_to_px(&widths.top)?),
+        Declaration::BorderRightWidth(border_width_to_px(&widths.right)?),
+        Declaration::BorderBottomWidth(border_width_to_px(&widths.bottom)?),
+        Declaration::BorderLeftWidth(border_width_to_px(&widths.left)?),
+    ])
+}
+
+fn extract_border_shorthand_declarations(
+    border: &lightningcss::properties::border::Border,
+) -> Result<Vec<Declaration>, StyleError> {
+    if matches!(border.style, CssLineStyle::None | CssLineStyle::Hidden) {
+        return Ok(vec![
+            Declaration::BorderTopWidth(0.0),
+            Declaration::BorderRightWidth(0.0),
+            Declaration::BorderBottomWidth(0.0),
+            Declaration::BorderLeftWidth(0.0),
+        ]);
+    }
+
+    let width = border_width_to_px(&border.width)?;
+    Ok(vec![
+        Declaration::BorderTopWidth(width),
+        Declaration::BorderRightWidth(width),
+        Declaration::BorderBottomWidth(width),
+        Declaration::BorderLeftWidth(width),
+        Declaration::BorderColor(color_from_css_optional(&border.color)?),
+    ])
+}
+
+fn extract_border_side_declarations<T>(
+    border: &T,
+    side: BorderSide,
+) -> Result<Vec<Declaration>, StyleError>
+where
+    T: BorderSideAccess,
+{
+    if matches!(border.line_style(), CssLineStyle::None | CssLineStyle::Hidden) {
+        return Ok(vec![border_width_declaration(side, 0.0)]);
+    }
+
+    Ok(vec![
+        border_width_declaration(side, border_width_to_px(border.width())?),
+        Declaration::BorderColor(color_from_css_optional(border.color())?),
+    ])
+}
+
+trait BorderSideAccess {
+    fn width(&self) -> &CssBorderSideWidth;
+    fn line_style(&self) -> CssLineStyle;
+    fn color(&self) -> &CssColor;
+}
+
+impl BorderSideAccess for lightningcss::properties::border::BorderTop {
+    fn width(&self) -> &CssBorderSideWidth {
+        &self.width
+    }
+
+    fn line_style(&self) -> CssLineStyle {
+        self.style
+    }
+
+    fn color(&self) -> &CssColor {
+        &self.color
+    }
+}
+
+impl BorderSideAccess for lightningcss::properties::border::BorderRight {
+    fn width(&self) -> &CssBorderSideWidth {
+        &self.width
+    }
+
+    fn line_style(&self) -> CssLineStyle {
+        self.style
+    }
+
+    fn color(&self) -> &CssColor {
+        &self.color
+    }
+}
+
+impl BorderSideAccess for lightningcss::properties::border::BorderBottom {
+    fn width(&self) -> &CssBorderSideWidth {
+        &self.width
+    }
+
+    fn line_style(&self) -> CssLineStyle {
+        self.style
+    }
+
+    fn color(&self) -> &CssColor {
+        &self.color
+    }
+}
+
+impl BorderSideAccess for lightningcss::properties::border::BorderLeft {
+    fn width(&self) -> &CssBorderSideWidth {
+        &self.width
+    }
+
+    fn line_style(&self) -> CssLineStyle {
+        self.style
+    }
+
+    fn color(&self) -> &CssColor {
+        &self.color
+    }
+}
+
+fn border_width_declaration(side: BorderSide, value: f32) -> Declaration {
+    match side {
+        BorderSide::Top => Declaration::BorderTopWidth(value),
+        BorderSide::Right => Declaration::BorderRightWidth(value),
+        BorderSide::Bottom => Declaration::BorderBottomWidth(value),
+        BorderSide::Left => Declaration::BorderLeftWidth(value),
+    }
+}
+
+fn box_shadow_declarations(
+    shadows: &[lightningcss::properties::box_shadow::BoxShadow],
+) -> Result<Vec<ShadowDeclaration>, StyleError> {
+    shadows
+        .iter()
+        .filter(|shadow| !shadow.inset)
+        .map(|shadow| {
+            Ok(ShadowDeclaration {
+                color: color_from_css_optional(&shadow.color)?,
+                offset_x: length_to_px(&shadow.x_offset)?,
+                offset_y: length_to_px(&shadow.y_offset)?,
+                blur_radius: length_to_px(&shadow.blur)?,
+                spread: length_to_px(&shadow.spread)?,
+            })
+        })
+        .collect()
+}
+
+fn length_to_px(value: &lightningcss::values::length::Length) -> Result<f32, StyleError> {
+    value
+        .to_px()
+        .map(|value| value as f32)
+        .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}")))
+}
+
+fn overflow_x_declaration(value: CssOverflowKeyword) -> Declaration {
+    let (overflow, clip) = overflow_from_css_keyword(value);
+    Declaration::OverflowX(overflow, clip)
+}
+
+fn overflow_y_declaration(value: CssOverflowKeyword) -> Declaration {
+    let (overflow, clip) = overflow_from_css_keyword(value);
+    Declaration::OverflowY(overflow, clip)
+}
+
+fn overflow_from_css_keyword(value: CssOverflowKeyword) -> (TaffyOverflow, bool) {
+    match value {
+        CssOverflowKeyword::Visible => (TaffyOverflow::Visible, false),
+        CssOverflowKeyword::Clip => (TaffyOverflow::Clip, true),
+        CssOverflowKeyword::Hidden => (TaffyOverflow::Hidden, true),
+        CssOverflowKeyword::Scroll | CssOverflowKeyword::Auto => (TaffyOverflow::Scroll, true),
     }
 }
 
@@ -793,6 +1098,49 @@ fn apply_declaration(style: &mut Style, position_explicit: &mut bool, declaratio
     match declaration {
         Declaration::Background(color) => style.visual.background = Some(*color),
         Declaration::Foreground(color) => style.visual.foreground = *color,
+        Declaration::CornerTopLeft(value) => style.visual.corner_radius.top_left = *value,
+        Declaration::CornerTopRight(value) => style.visual.corner_radius.top_right = *value,
+        Declaration::CornerBottomRight(value) => style.visual.corner_radius.bottom_right = *value,
+        Declaration::CornerBottomLeft(value) => style.visual.corner_radius.bottom_left = *value,
+        Declaration::BorderTopWidth(value) => {
+            style.visual.border.widths.top = *value;
+            style.layout.taffy.border.top = TaffyLengthPercentage::Length(*value);
+        }
+        Declaration::BorderRightWidth(value) => {
+            style.visual.border.widths.right = *value;
+            style.layout.taffy.border.right = TaffyLengthPercentage::Length(*value);
+        }
+        Declaration::BorderBottomWidth(value) => {
+            style.visual.border.widths.bottom = *value;
+            style.layout.taffy.border.bottom = TaffyLengthPercentage::Length(*value);
+        }
+        Declaration::BorderLeftWidth(value) => {
+            style.visual.border.widths.left = *value;
+            style.layout.taffy.border.left = TaffyLengthPercentage::Length(*value);
+        }
+        Declaration::BorderColor(color) => {
+            style.visual.border.color = color.unwrap_or(style.visual.foreground);
+        }
+        Declaration::BoxShadows(shadows) => {
+            style.visual.shadows = shadows
+                .iter()
+                .map(|shadow| CoreBoxShadow {
+                    color: shadow.color.unwrap_or(style.visual.foreground),
+                    offset_x: shadow.offset_x,
+                    offset_y: shadow.offset_y,
+                    blur_radius: shadow.blur_radius,
+                    spread: shadow.spread,
+                })
+                .collect();
+        }
+        Declaration::OverflowX(value, clip) => {
+            style.layout.taffy.overflow.x = *value;
+            style.visual.overflow.clip_x = *clip;
+        }
+        Declaration::OverflowY(value, clip) => {
+            style.layout.taffy.overflow.y = *value;
+            style.visual.overflow.clip_y = *clip;
+        }
         Declaration::Display(display) => style.layout.taffy.display = *display,
         Declaration::Position(position) => {
             style.layout.taffy.position = *position;
@@ -939,16 +1287,20 @@ fn render_node_from_layout(
         .iter()
         .map(|child| render_node_from_layout(child, taffy, x, y))
         .collect();
+    let content_inset = content_inset_from_taffy(&tree.style.layout.taffy);
 
     if child_nodes.is_empty() && !tree.text.is_empty() {
-        let mut node = RenderNode::text(layout_box, tree.text.clone()).with_style(tree.style.visual);
+        let mut node = RenderNode::text(layout_box, tree.text.clone())
+            .with_style(tree.style.visual.clone())
+            .with_content_inset(content_inset);
         if let Some(handler) = tree.on_click {
             node = node.on_click(handler);
         }
         node
     } else {
         let mut node = RenderNode::container(layout_box)
-            .with_style(tree.style.visual)
+            .with_style(tree.style.visual.clone())
+            .with_content_inset(content_inset)
             .with_children(child_nodes);
         if let Some(handler) = tree.on_click {
             node = node.on_click(handler);
@@ -978,7 +1330,11 @@ fn collect_text(node: &Node, buffer: &mut String) {
     }
 }
 
-fn measure_text(text: &str) -> TaffySize<f32> {
+fn measure_text(
+    text: &str,
+    known_dimensions: TaffySize<Option<f32>>,
+    available_space: TaffySize<AvailableSpace>,
+) -> TaffySize<f32> {
     if text.is_empty() {
         return TaffySize {
             width: 0.0,
@@ -986,12 +1342,103 @@ fn measure_text(text: &str) -> TaffySize<f32> {
         };
     }
 
-    let line_count = text.lines().count();
-    let max_columns = text.lines().map(|line| line.chars().count()).max().unwrap_or(0);
+    let wrap_width = known_dimensions.width.or_else(|| match available_space.width {
+        AvailableSpace::Definite(width) => Some(width.max(GLYPH_WIDTH)),
+        AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
+    });
+    let lines = wrap_text(text, wrap_width);
+    let line_count = lines.len();
+    let max_columns = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
 
     TaffySize {
-        width: max_columns as f32 * GLYPH_WIDTH,
-        height: line_count as f32 * GLYPH_HEIGHT,
+        width: known_dimensions
+            .width
+            .unwrap_or(max_columns as f32 * GLYPH_WIDTH),
+        height: known_dimensions
+            .height
+            .unwrap_or(line_count as f32 * GLYPH_HEIGHT),
+    }
+}
+
+fn wrap_text(text: &str, wrap_width: Option<f32>) -> Vec<String> {
+    let max_columns = wrap_width
+        .map(|width| (width / GLYPH_WIDTH).floor().max(1.0) as usize);
+    let Some(max_columns) = max_columns else {
+        return text.lines().map(|line| line.to_string()).collect();
+    };
+
+    let mut wrapped = Vec::new();
+    for source_line in text.lines() {
+        wrap_line(source_line, max_columns, &mut wrapped);
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
+}
+
+fn wrap_line(line: &str, max_columns: usize, wrapped: &mut Vec<String>) {
+    if line.is_empty() {
+        wrapped.push(String::new());
+        return;
+    }
+
+    let mut current = String::new();
+    for word in line.split_whitespace() {
+        let word_len = word.chars().count();
+        let spacing = usize::from(!current.is_empty());
+
+        if word_len > max_columns {
+            if !current.is_empty() {
+                wrapped.push(std::mem::take(&mut current));
+            }
+            push_broken_word(word, max_columns, wrapped);
+            continue;
+        }
+
+        if current.chars().count() + spacing + word_len > max_columns {
+            wrapped.push(std::mem::take(&mut current));
+        }
+
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+
+    if !current.is_empty() {
+        wrapped.push(current);
+    }
+}
+
+fn push_broken_word(word: &str, max_columns: usize, wrapped: &mut Vec<String>) {
+    let mut segment = String::new();
+    for character in word.chars() {
+        if segment.chars().count() == max_columns {
+            wrapped.push(std::mem::take(&mut segment));
+        }
+        segment.push(character);
+    }
+    if !segment.is_empty() {
+        wrapped.push(segment);
+    }
+}
+
+fn content_inset_from_taffy(style: &TaffyStyle) -> cssimpler_core::Insets {
+    cssimpler_core::Insets {
+        top: resolved_length(style.padding.top) + resolved_length(style.border.top),
+        right: resolved_length(style.padding.right) + resolved_length(style.border.right),
+        bottom: resolved_length(style.padding.bottom) + resolved_length(style.border.bottom),
+        left: resolved_length(style.padding.left) + resolved_length(style.border.left),
+    }
+}
+
+fn resolved_length(value: TaffyLengthPercentage) -> f32 {
+    match value {
+        TaffyLengthPercentage::Length(value) => value,
+        TaffyLengthPercentage::Percent(_) => 0.0,
     }
 }
 

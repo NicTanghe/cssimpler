@@ -162,6 +162,10 @@ impl Color {
     pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self { r, g, b, a }
     }
+
+    pub const fn with_alpha(self, a: u8) -> Self {
+        Self { a, ..self }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -182,6 +186,10 @@ impl Insets {
             bottom: value,
             left: value,
         }
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.top == 0.0 && self.right == 0.0 && self.bottom == 0.0 && self.left == 0.0
     }
 }
 
@@ -222,10 +230,59 @@ impl CornerRadius {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BorderStyle {
+    pub color: Color,
+    pub widths: Insets,
+}
+
+impl Default for BorderStyle {
+    fn default() -> Self {
+        Self {
+            color: Color::BLACK,
+            widths: Insets::ZERO,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxShadow {
+    pub color: Color,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur_radius: f32,
+    pub spread: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Overflow {
+    pub clip_x: bool,
+    pub clip_y: bool,
+}
+
+impl Overflow {
+    pub const VISIBLE: Self = Self {
+        clip_x: false,
+        clip_y: false,
+    };
+
+    pub const CLIP: Self = Self {
+        clip_x: true,
+        clip_y: true,
+    };
+
+    pub fn clips_any_axis(self) -> bool {
+        self.clip_x || self.clip_y
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VisualStyle {
     pub background: Option<Color>,
     pub foreground: Color,
     pub corner_radius: CornerRadius,
+    pub border: BorderStyle,
+    pub shadows: Vec<BoxShadow>,
+    pub overflow: Overflow,
 }
 
 impl Default for VisualStyle {
@@ -234,6 +291,9 @@ impl Default for VisualStyle {
             background: None,
             foreground: Color::BLACK,
             corner_radius: CornerRadius::ZERO,
+            border: BorderStyle::default(),
+            shadows: Vec::new(),
+            overflow: Overflow::VISIBLE,
         }
     }
 }
@@ -274,6 +334,7 @@ pub struct RenderNode {
     pub kind: RenderKind,
     pub layout: LayoutBox,
     pub style: VisualStyle,
+    pub content_inset: Insets,
     pub on_click: Option<EventHandler>,
     pub children: Vec<RenderNode>,
 }
@@ -284,6 +345,7 @@ impl RenderNode {
             kind: RenderKind::Container,
             layout,
             style: VisualStyle::default(),
+            content_inset: Insets::ZERO,
             on_click: None,
             children: Vec::new(),
         }
@@ -294,6 +356,7 @@ impl RenderNode {
             kind: RenderKind::Text(content.into()),
             layout,
             style: VisualStyle::default(),
+            content_inset: Insets::ZERO,
             on_click: None,
             children: Vec::new(),
         }
@@ -301,6 +364,11 @@ impl RenderNode {
 
     pub fn with_style(mut self, style: VisualStyle) -> Self {
         self.style = style;
+        self
+    }
+
+    pub fn with_content_inset(mut self, content_inset: Insets) -> Self {
+        self.content_inset = content_inset;
         self
     }
 

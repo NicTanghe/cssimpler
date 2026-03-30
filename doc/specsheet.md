@@ -414,7 +414,9 @@ Acceptance
 7. F1 + F2 (click handling)  
 8. E3 (shadows, visuals)  
 9. G1 + G2 (full loop)  
-10. Polish: selectors, styling depth, performance  
+10. G3 
+11. g4 
+Polish: selectors, styling depth, performance  
 
 ---
 
