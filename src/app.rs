@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use crate::core::{Node, RenderNode};
-use crate::renderer::{self, FrameInfo, WindowConfig};
+use crate::renderer::{self, FrameInfo, SceneProvider, WindowConfig};
 use crate::style::{Stylesheet, build_render_tree};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -201,6 +201,15 @@ where
     }
 
     pub fn frame(&mut self, frame: FrameInfo) -> Vec<RenderNode> {
+        self.advance(frame);
+        self.scene().to_vec()
+    }
+
+    pub fn run(self, config: WindowConfig) -> renderer::Result<()> {
+        renderer::run_with_scene_provider(config, self)
+    }
+
+    fn advance(&mut self, frame: FrameInfo) {
         let update = &mut self.update;
         let state = &mut self.state;
         let refresh = update(state, frame).into();
@@ -209,15 +218,6 @@ where
         if self.needs_rerender() {
             self.rebuild_scene();
         }
-
-        self.cached_scene
-            .as_ref()
-            .cloned()
-            .expect("app scene should be cached after the first frame")
-    }
-
-    pub fn run(mut self, config: WindowConfig) -> renderer::Result<()> {
-        renderer::run(config, move |frame| self.frame(frame))
     }
 
     fn needs_rerender(&self) -> bool {
@@ -231,6 +231,27 @@ where
         let tree = view(&self.state);
         self.cached_scene = Some(vec![build_render_tree(&tree, self.stylesheet)]);
         self.pending_refresh = Refresh::clean();
+    }
+
+    fn scene(&self) -> &[RenderNode] {
+        self.cached_scene
+            .as_deref()
+            .expect("app scene should be cached after the first frame")
+    }
+}
+
+impl<'a, State, Update, View, Signal> SceneProvider for App<'a, State, Update, View, Signal>
+where
+    Update: FnMut(&mut State, FrameInfo) -> Signal,
+    View: FnMut(&State) -> Node,
+    Signal: Into<Refresh>,
+{
+    fn update(&mut self, frame: FrameInfo) {
+        self.advance(frame);
+    }
+
+    fn scene(&self) -> &[RenderNode] {
+        App::scene(self)
     }
 }
 
@@ -289,6 +310,15 @@ where
     }
 
     pub fn frame(&mut self, frame: FrameInfo) -> Vec<RenderNode> {
+        self.advance(frame);
+        self.scene().to_vec()
+    }
+
+    pub fn run(self, config: WindowConfig) -> renderer::Result<()> {
+        renderer::run_with_scene_provider(config, self)
+    }
+
+    fn advance(&mut self, frame: FrameInfo) {
         let update = &mut self.update;
         let state = &mut self.state;
         let refresh = update(state, frame).into();
@@ -297,15 +327,6 @@ where
         if self.needs_rerender() {
             self.refresh_scene();
         }
-
-        self.cached_scene
-            .as_ref()
-            .cloned()
-            .expect("fragment app scene should be cached after the first frame")
-    }
-
-    pub fn run(mut self, config: WindowConfig) -> renderer::Result<()> {
-        renderer::run(config, move |frame| self.frame(frame))
     }
 
     fn needs_rerender(&self) -> bool {
@@ -377,6 +398,26 @@ where
 
         true
     }
+
+    fn scene(&self) -> &[RenderNode] {
+        self.cached_scene
+            .as_deref()
+            .expect("fragment app scene should be cached after the first frame")
+    }
+}
+
+impl<'a, State, Update, Signal> SceneProvider for FragmentApp<'a, State, Update, Signal>
+where
+    Update: FnMut(&mut State, FrameInfo) -> Signal,
+    Signal: Into<Refresh>,
+{
+    fn update(&mut self, frame: FrameInfo) {
+        self.advance(frame);
+    }
+
+    fn scene(&self) -> &[RenderNode] {
+        FragmentApp::scene(self)
+    }
 }
 
 pub fn run<State, Update, View, Signal>(
@@ -411,7 +452,7 @@ mod tests {
     use super::{
         App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode,
     };
-    use crate::renderer::FrameInfo;
+    use crate::renderer::{FrameInfo, SceneProvider};
     use crate::style::Stylesheet;
 
     #[test]
@@ -647,6 +688,54 @@ mod tests {
         assert_eq!(
             text_nodes(&refreshed),
             vec!["left 9".to_string(), "right 9".to_string()]
+        );
+    }
+
+    #[test]
+    fn app_scene_provider_exposes_the_cached_scene_without_cloning_through_frame() {
+        let stylesheet = Stylesheet::default();
+        let mut app = App::new(
+            4_u32,
+            &stylesheet,
+            |_state, _frame| Invalidation::Clean,
+            |state| {
+                ui! {
+                    <div id="app">
+                        <p>{format!("count {}", state)}</p>
+                    </div>
+                }
+            },
+        );
+
+        SceneProvider::update(&mut app, frame(0));
+
+        assert_eq!(
+            text_nodes(SceneProvider::scene(&app)),
+            vec!["count 4".to_string()]
+        );
+    }
+
+    #[test]
+    fn fragment_scene_provider_exposes_the_cached_scene_without_cloning_through_frame() {
+        let stylesheet = Stylesheet::default();
+        let mut app = FragmentApp::new(
+            9_u32,
+            &stylesheet,
+            |_state, _frame| Refresh::clean(),
+            [Fragment::new("stats", |state: &u32| {
+                ui! {
+                    <section id="stats">
+                        <p>{format!("value {}", state)}</p>
+                    </section>
+                }
+            })],
+        );
+
+        SceneProvider::update(&mut app, frame(0));
+
+        assert_eq!(
+            text_nodes(SceneProvider::scene(&app)),
+            vec!["value 9".to_string()]
         );
     }
 

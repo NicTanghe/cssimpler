@@ -61,9 +61,57 @@ impl From<minifb::Error> for RendererError {
 
 pub type Result<T> = std::result::Result<T, RendererError>;
 
-pub fn run<F>(config: WindowConfig, mut render_scene: F) -> Result<()>
+pub trait SceneProvider {
+    fn update(&mut self, frame: FrameInfo);
+
+    fn scene(&self) -> &[RenderNode];
+
+    fn capture_scene(&mut self) -> Vec<RenderNode> {
+        self.scene().to_vec()
+    }
+}
+
+struct ClosureSceneProvider<F> {
+    render_scene: F,
+    scene: Vec<RenderNode>,
+}
+
+impl<F> ClosureSceneProvider<F> {
+    fn new(render_scene: F) -> Self {
+        Self {
+            render_scene,
+            scene: Vec::new(),
+        }
+    }
+}
+
+impl<F> SceneProvider for ClosureSceneProvider<F>
 where
     F: FnMut(FrameInfo) -> Vec<RenderNode>,
+{
+    fn update(&mut self, frame: FrameInfo) {
+        self.scene = (self.render_scene)(frame);
+    }
+
+    fn scene(&self) -> &[RenderNode] {
+        &self.scene
+    }
+
+    fn capture_scene(&mut self) -> Vec<RenderNode> {
+        std::mem::take(&mut self.scene)
+    }
+}
+
+pub fn run<F>(config: WindowConfig, render_scene: F) -> Result<()>
+where
+    F: FnMut(FrameInfo) -> Vec<RenderNode>,
+{
+    run_with_scene_provider(config, ClosureSceneProvider::new(render_scene))
+}
+
+pub fn run_with_scene_provider<P>(config: WindowConfig, mut scene_provider: P) -> Result<()>
+where
+    P: SceneProvider,
 {
     let mut window = Window::new(
         &config.title,
@@ -100,16 +148,24 @@ where
         }
 
         let frame = FrameInfo { frame_index, delta };
-        let mut scene = render_scene(frame);
+        scene_provider.update(frame);
         let click_started = left_down && !previous_left_down;
 
-        if click_started
-            && let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Clamp)
-            && dispatch_click(&scene, mouse_x, mouse_y)
-        {
-            scene = render_scene(frame);
+        let click_triggered_rerender = if click_started {
+            if let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Clamp) {
+                dispatch_click(scene_provider.scene(), mouse_x, mouse_y)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if click_triggered_rerender {
+            scene_provider.update(frame);
         }
 
+        let scene = scene_provider.scene();
         let (window_width, window_height) = window.get_size();
         let resized = buffer_width != window_width.max(1) || buffer_height != window_height.max(1);
         resize_buffer(
@@ -148,7 +204,7 @@ where
                 );
             }
             window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
-            previous_presented_scene = Some(scene);
+            previous_presented_scene = Some(scene_provider.capture_scene());
         } else {
             window.update();
         }
