@@ -25,8 +25,8 @@ Acceptance
 - `macro` outputs only `core` types
 
 Status sync
-- `A1` through `G3` are implemented in the workspace
-- `G4` remains optional future optimization work
+- `A1` through `G4` are implemented in the workspace
+- `G4` currently uses renderer-side dirty-region diffing and partial repaint while preserving the public API
 
 ---
 

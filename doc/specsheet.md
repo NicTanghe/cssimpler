@@ -380,7 +380,7 @@ Acceptance
 
 ## G4. Optional optimization (later)
 Depends: G2  
-Status: todo  
+Status: done  
 
 - diffing  
 - partial updates  

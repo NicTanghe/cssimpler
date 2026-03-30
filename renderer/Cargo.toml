@@ -7,3 +7,6 @@ edition.workspace = true
 cssimpler-core.workspace = true
 font8x8.workspace = true
 minifb.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.9", features = ["winuser"] }

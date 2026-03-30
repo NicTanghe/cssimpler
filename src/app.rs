@@ -197,14 +197,14 @@ where
     }
 
     pub fn invalidate(&mut self, refresh: impl Into<Refresh>) {
-        self.pending_refresh = self.pending_refresh.clone().merge(refresh.into());
+        self.pending_refresh = std::mem::take(&mut self.pending_refresh).merge(refresh.into());
     }
 
     pub fn frame(&mut self, frame: FrameInfo) -> Vec<RenderNode> {
         let update = &mut self.update;
         let state = &mut self.state;
         let refresh = update(state, frame).into();
-        self.pending_refresh = self.pending_refresh.clone().merge(refresh);
+        self.pending_refresh = std::mem::take(&mut self.pending_refresh).merge(refresh);
 
         if self.needs_rerender() {
             self.rebuild_scene();
@@ -285,14 +285,14 @@ where
     }
 
     pub fn invalidate(&mut self, refresh: impl Into<Refresh>) {
-        self.pending_refresh = self.pending_refresh.clone().merge(refresh.into());
+        self.pending_refresh = std::mem::take(&mut self.pending_refresh).merge(refresh.into());
     }
 
     pub fn frame(&mut self, frame: FrameInfo) -> Vec<RenderNode> {
         let update = &mut self.update;
         let state = &mut self.state;
         let refresh = update(state, frame).into();
-        self.pending_refresh = self.pending_refresh.clone().merge(refresh);
+        self.pending_refresh = std::mem::take(&mut self.pending_refresh).merge(refresh);
 
         if self.needs_rerender() {
             self.refresh_scene();

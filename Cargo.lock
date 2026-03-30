@@ -216,6 +216,7 @@ dependencies = [
  "cssimpler-core",
  "font8x8",
  "minifb",
+ "winapi",
 ]
 
 [[package]]

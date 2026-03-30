@@ -1,11 +1,16 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use cssimpler_core::{Color, CornerRadius, EventHandler, Insets, LayoutBox, RenderKind, RenderNode};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
+#[cfg(windows)]
+use winapi::um::winuser::{GetAsyncKeyState, VK_LBUTTON, VK_LWIN, VK_RWIN};
 
+const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 8;
+const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.5;
 #[derive(Clone, Copy, Debug)]
 pub struct FrameInfo {
     pub frame_index: u64,
@@ -82,16 +87,15 @@ where
         last_frame = now;
 
         let left_down = window.get_mouse_down(MouseButton::Left);
-        let alt_dragging = should_suspend_updates(
+        let suspend_updates_for_system_drag = should_suspend_updates(
             left_down,
-            window.is_key_down(Key::LeftAlt),
-            window.is_key_down(Key::RightAlt),
+            window.is_key_down(Key::LeftSuper),
+            window.is_key_down(Key::RightSuper),
         );
 
-        if alt_dragging {
-            window.update();
-            previous_left_down = left_down;
-            frame_index += 1;
+        if suspend_updates_for_system_drag {
+            freeze_during_native_window_drag(&mut window);
+            previous_left_down = false;
             continue;
         }
 
@@ -117,15 +121,34 @@ where
             config.clear_color,
         );
         if should_present_scene(previous_presented_scene.as_deref(), &scene, resized) {
-            render_to_buffer(
-                &scene,
-                &mut buffer,
-                buffer_width,
-                buffer_height,
-                config.clear_color,
-            );
+            if resized {
+                render_to_buffer(
+                    &scene,
+                    &mut buffer,
+                    buffer_width,
+                    buffer_height,
+                    config.clear_color,
+                );
+            } else if let Some(previous_scene) = previous_presented_scene.as_deref() {
+                render_scene_update(
+                    previous_scene,
+                    &scene,
+                    &mut buffer,
+                    buffer_width,
+                    buffer_height,
+                    config.clear_color,
+                );
+            } else {
+                render_to_buffer(
+                    &scene,
+                    &mut buffer,
+                    buffer_width,
+                    buffer_height,
+                    config.clear_color,
+                );
+            }
             window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
-            previous_presented_scene = Some(scene.clone());
+            previous_presented_scene = Some(scene);
         } else {
             window.update();
         }
@@ -148,7 +171,38 @@ pub fn render_to_buffer(
     let clip = ClipRect::full(width as f32, height as f32);
 
     for node in scene {
-        draw_node(node, buffer, width, height, clip);
+        draw_node(node, buffer, width, height, clip, CullMode::Layout);
+    }
+}
+
+fn render_scene_update(
+    previous_scene: &[RenderNode],
+    scene: &[RenderNode],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+) {
+    let mut dirty_regions = dirty_regions_between_scenes(previous_scene, scene);
+    if dirty_regions.is_empty() {
+        return;
+    }
+
+    coalesce_dirty_regions(&mut dirty_regions);
+    if should_full_redraw(&dirty_regions, width, height) {
+        render_to_buffer(scene, buffer, width, height, clear_color);
+        return;
+    }
+
+    let full_clip = ClipRect::full(width as f32, height as f32);
+    for dirty_region in dirty_regions {
+        let Some(dirty_region) = dirty_region.intersect(full_clip) else {
+            continue;
+        };
+        clear_clip(buffer, width, height, dirty_region, clear_color);
+        for node in scene {
+            draw_node(node, buffer, width, height, dirty_region, CullMode::Subtree);
+        }
     }
 }
 
@@ -177,15 +231,50 @@ fn scenes_match_visuals(left: &[RenderNode], right: &[RenderNode]) -> bool {
 }
 
 fn render_nodes_match_visuals(left: &RenderNode, right: &RenderNode) -> bool {
+    render_nodes_match_own_visuals(left, right)
+        && scenes_match_visuals(&left.children, &right.children)
+}
+
+fn render_nodes_match_own_visuals(left: &RenderNode, right: &RenderNode) -> bool {
     left.kind == right.kind
         && left.layout == right.layout
         && left.style == right.style
         && left.content_inset == right.content_inset
-        && scenes_match_visuals(&left.children, &right.children)
 }
 
-fn should_suspend_updates(left_down: bool, left_alt_down: bool, right_alt_down: bool) -> bool {
-    left_down && (left_alt_down || right_alt_down)
+fn should_suspend_updates(left_down: bool, left_super_down: bool, right_super_down: bool) -> bool {
+    left_down && (left_super_down || right_super_down)
+}
+
+fn freeze_during_native_window_drag(window: &mut Window) {
+    #[cfg(windows)]
+    {
+        while system_drag_is_active() {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        window.update();
+        return;
+    }
+
+    #[cfg(not(windows))]
+    window.update();
+}
+
+#[cfg(windows)]
+fn system_drag_is_active() -> bool {
+    key_is_down(VK_LBUTTON) && (key_is_down(VK_LWIN) || key_is_down(VK_RWIN))
+}
+
+#[cfg(windows)]
+fn key_is_down(virtual_key: i32) -> bool {
+    unsafe { (GetAsyncKeyState(virtual_key) as u16 & 0x8000) != 0 }
+}
+
+#[derive(Clone, Copy)]
+enum CullMode {
+    Layout,
+    Subtree,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -230,13 +319,41 @@ impl ClipRect {
         x >= self.x0 && y >= self.y0 && x < self.x1 && y < self.y1
     }
 
+    fn union(self, other: Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+
+    fn overlaps_or_touches(self, other: Self) -> bool {
+        self.x0 <= other.x1 && self.x1 >= other.x0 && self.y0 <= other.y1 && self.y1 >= other.y0
+    }
+
+    fn area(self) -> f32 {
+        if self.is_empty() {
+            0.0
+        } else {
+            (self.x1 - self.x0) * (self.y1 - self.y0)
+        }
+    }
+
     fn is_empty(self) -> bool {
         self.x0 >= self.x1 || self.y0 >= self.y1
     }
 }
 
-fn draw_node(node: &RenderNode, buffer: &mut [u32], width: usize, height: usize, clip: ClipRect) {
-    if clip.is_empty() || !clip.intersect(layout_clip(node.layout)).is_some() {
+fn draw_node(
+    node: &RenderNode,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clip: ClipRect,
+    cull_mode: CullMode,
+) {
+    if clip.is_empty() || !node_intersects_clip(node, clip, cull_mode) {
         return;
     }
 
@@ -281,7 +398,16 @@ fn draw_node(node: &RenderNode, buffer: &mut [u32], width: usize, height: usize,
     };
 
     for child in &node.children {
-        draw_node(child, buffer, width, height, child_clip);
+        draw_node(child, buffer, width, height, child_clip, cull_mode);
+    }
+}
+
+fn node_intersects_clip(node: &RenderNode, clip: ClipRect, cull_mode: CullMode) -> bool {
+    match cull_mode {
+        CullMode::Layout => clip.intersect(layout_clip(node.layout)).is_some(),
+        CullMode::Subtree => subtree_visual_bounds(node)
+            .and_then(|bounds| clip.intersect(bounds))
+            .is_some(),
     }
 }
 
@@ -520,6 +646,170 @@ fn draw_text(
     }
 }
 
+fn dirty_regions_between_scenes(previous_scene: &[RenderNode], scene: &[RenderNode]) -> Vec<ClipRect> {
+    let mut dirty_regions = Vec::new();
+    collect_scene_dirty_regions(previous_scene, scene, &mut dirty_regions);
+    dirty_regions
+}
+
+fn collect_scene_dirty_regions(
+    previous_scene: &[RenderNode],
+    scene: &[RenderNode],
+    dirty_regions: &mut Vec<ClipRect>,
+) {
+    let count = previous_scene.len().max(scene.len());
+
+    for index in 0..count {
+        match (previous_scene.get(index), scene.get(index)) {
+            (Some(previous), Some(current)) => {
+                collect_node_dirty_regions(previous, current, dirty_regions);
+            }
+            (Some(previous), None) => push_subtree_dirty_region(previous, dirty_regions),
+            (None, Some(current)) => push_subtree_dirty_region(current, dirty_regions),
+            (None, None) => {}
+        }
+    }
+}
+
+fn collect_node_dirty_regions(
+    previous: &RenderNode,
+    current: &RenderNode,
+    dirty_regions: &mut Vec<ClipRect>,
+) {
+    if render_nodes_match_visuals(previous, current) {
+        return;
+    }
+
+    if !render_nodes_match_own_visuals(previous, current) {
+        push_dirty_region(union_optional_bounds(
+            subtree_visual_bounds(previous),
+            subtree_visual_bounds(current),
+        ), dirty_regions);
+        return;
+    }
+
+    collect_scene_dirty_regions(&previous.children, &current.children, dirty_regions);
+}
+
+fn push_subtree_dirty_region(node: &RenderNode, dirty_regions: &mut Vec<ClipRect>) {
+    push_dirty_region(subtree_visual_bounds(node), dirty_regions);
+}
+
+fn push_dirty_region(region: Option<ClipRect>, dirty_regions: &mut Vec<ClipRect>) {
+    if let Some(region) = region
+        && !region.is_empty()
+    {
+        dirty_regions.push(region);
+    }
+}
+
+fn coalesce_dirty_regions(dirty_regions: &mut Vec<ClipRect>) {
+    let mut index = 0;
+    while index < dirty_regions.len() {
+        let mut merged = false;
+        let mut other_index = index + 1;
+        while other_index < dirty_regions.len() {
+            if dirty_regions[index].overlaps_or_touches(dirty_regions[other_index]) {
+                dirty_regions[index] = dirty_regions[index].union(dirty_regions[other_index]);
+                dirty_regions.swap_remove(other_index);
+                merged = true;
+            } else {
+                other_index += 1;
+            }
+        }
+
+        if !merged {
+            index += 1;
+        }
+    }
+}
+
+fn should_full_redraw(dirty_regions: &[ClipRect], width: usize, height: usize) -> bool {
+    if dirty_regions.len() > MAX_INCREMENTAL_DIRTY_REGIONS {
+        return true;
+    }
+
+    let full_clip = ClipRect::full(width as f32, height as f32);
+    let dirty_area: f32 = dirty_regions
+        .iter()
+        .filter_map(|region| region.intersect(full_clip))
+        .map(ClipRect::area)
+        .sum();
+
+    dirty_area > full_clip.area() * MAX_INCREMENTAL_DIRTY_AREA_RATIO
+}
+
+fn subtree_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
+    let mut bounds = node_visual_bounds(node);
+    let parent_clip = non_empty_layout_clip(node.layout);
+
+    for child in &node.children {
+        let Some(mut child_bounds) = subtree_visual_bounds(child) else {
+            continue;
+        };
+
+        if node.style.overflow.clips_any_axis() {
+            let Some(clip) = parent_clip else {
+                continue;
+            };
+            let Some(clipped_bounds) = child_bounds.intersect(clip) else {
+                continue;
+            };
+            child_bounds = clipped_bounds;
+        }
+
+        bounds = union_optional_bounds(bounds, Some(child_bounds));
+    }
+
+    bounds
+}
+
+fn node_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
+    let mut bounds = non_empty_layout_clip(node.layout);
+
+    for shadow in &node.style.shadows {
+        bounds = union_optional_bounds(bounds, shadow_bounds(node.layout, *shadow));
+    }
+
+    bounds
+}
+
+fn shadow_bounds(layout: LayoutBox, shadow: cssimpler_core::BoxShadow) -> Option<ClipRect> {
+    let shadow_layout = offset_layout(
+        expand_layout(layout, shadow.spread),
+        shadow.offset_x,
+        shadow.offset_y,
+    );
+    non_empty_layout_clip(expand_layout(shadow_layout, shadow.blur_radius.max(0.0)))
+}
+
+fn non_empty_layout_clip(layout: LayoutBox) -> Option<ClipRect> {
+    let clip = layout_clip(layout);
+    (!clip.is_empty()).then_some(clip)
+}
+
+fn union_optional_bounds(left: Option<ClipRect>, right: Option<ClipRect>) -> Option<ClipRect> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.union(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn clear_clip(buffer: &mut [u32], width: usize, height: usize, clip: ClipRect, clear_color: Color) {
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(clip, width, height) else {
+        return;
+    };
+    let clear = pack_rgb(clear_color);
+
+    for y in y0..y1 {
+        let start = y as usize * width + x0 as usize;
+        let end = y as usize * width + x1 as usize;
+        buffer[start..end].fill(clear);
+    }
+}
+
 fn resize_buffer(
     buffer: &mut Vec<u32>,
     width: &mut usize,
@@ -560,6 +850,15 @@ fn pixel_bounds(
     let y0 = layout.y.max(clip.y0).floor().max(0.0) as i32;
     let x1 = (layout.x + layout.width).min(clip.x1).ceil().min(width as f32) as i32;
     let y1 = (layout.y + layout.height).min(clip.y1).ceil().min(height as f32) as i32;
+    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+}
+
+fn clip_pixel_bounds(clip: ClipRect, width: usize, height: usize) -> Option<(i32, i32, i32, i32)> {
+    let clip = clip.intersect(ClipRect::full(width as f32, height as f32))?;
+    let x0 = clip.x0.floor().max(0.0) as i32;
+    let y0 = clip.y0.floor().max(0.0) as i32;
+    let x1 = clip.x1.ceil().min(width as f32) as i32;
+    let y1 = clip.y1.ceil().min(height as f32) as i32;
     (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
 }
 
@@ -797,52 +1096,69 @@ fn wrap_line(line: &str, max_columns: usize, wrapped: &mut Vec<String>) {
     }
 
     let mut current = String::new();
+    let mut current_len = 0;
     for word in line.split_whitespace() {
         let word_len = word.chars().count();
-        let spacing = usize::from(!current.is_empty());
+        let spacing = usize::from(current_len != 0);
 
         if word_len > max_columns {
-            if !current.is_empty() {
+            if current_len != 0 {
                 wrapped.push(std::mem::take(&mut current));
+                current_len = 0;
             }
             push_broken_word(word, max_columns, wrapped);
             continue;
         }
 
-        if current.chars().count() + spacing + word_len > max_columns {
+        if current_len + spacing + word_len > max_columns {
             wrapped.push(std::mem::take(&mut current));
+            current_len = 0;
         }
 
-        if !current.is_empty() {
+        if current_len != 0 {
             current.push(' ');
+            current_len += 1;
         }
         current.push_str(word);
+        current_len += word_len;
     }
 
-    if !current.is_empty() {
+    if current_len != 0 {
         wrapped.push(current);
     }
 }
 
 fn push_broken_word(word: &str, max_columns: usize, wrapped: &mut Vec<String>) {
     let mut segment = String::new();
+    let mut segment_len = 0;
     for character in word.chars() {
-        if segment.chars().count() == max_columns {
+        if segment_len == max_columns {
             wrapped.push(std::mem::take(&mut segment));
+            segment_len = 0;
         }
         segment.push(character);
+        segment_len += 1;
     }
-    if !segment.is_empty() {
+    if segment_len != 0 {
         wrapped.push(segment);
     }
 }
 
 fn blend_pixel(buffer: &mut [u32], width: usize, height: usize, x: i32, y: i32, color: Color) {
+    if color.a == 0 {
+        return;
+    }
+
     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
         return;
     }
 
     let index = y as usize * width + x as usize;
+    if color.a == 255 {
+        buffer[index] = pack_rgb(color);
+        return;
+    }
+
     let destination = unpack_rgb(buffer[index]);
     let alpha = color.a as f32 / 255.0;
     let inverse_alpha = 1.0 - alpha;
@@ -884,8 +1200,8 @@ mod tests {
     };
 
     use crate::{
-        dispatch_click, pack_rgb, render_to_buffer, resize_buffer, scenes_match_visuals,
-        should_present_scene, should_suspend_updates,
+        dispatch_click, pack_rgb, render_scene_update, render_to_buffer, resize_buffer,
+        scenes_match_visuals, should_present_scene, should_suspend_updates,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1096,10 +1412,74 @@ mod tests {
     }
 
     #[test]
-    fn alt_dragging_suspends_updates() {
+    fn super_dragging_suspends_updates() {
         assert!(should_suspend_updates(true, true, false));
         assert!(should_suspend_updates(true, false, true));
+        assert!(should_suspend_updates(true, true, true));
+        assert!(!should_suspend_updates(false, true, false));
         assert!(!should_suspend_updates(true, false, false));
-        assert!(!should_suspend_updates(false, true, true));
+    }
+
+    #[test]
+    fn incremental_render_matches_full_render_when_a_node_moves() {
+        let previous = vec![
+            RenderNode::container(LayoutBox::new(2.0, 2.0, 4.0, 4.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(40, 120, 220)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let next = vec![
+            RenderNode::container(LayoutBox::new(10.0, 2.0, 4.0, 4.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(40, 120, 220)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut incremental = vec![0_u32; 20 * 20];
+        let mut full = vec![0_u32; 20 * 20];
+
+        render_to_buffer(&previous, &mut incremental, 20, 20, Color::WHITE);
+        render_scene_update(&previous, &next, &mut incremental, 20, 20, Color::WHITE);
+        render_to_buffer(&next, &mut full, 20, 20, Color::WHITE);
+
+        assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn incremental_render_clears_shadow_pixels_and_redraws_the_background() {
+        let background = RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_style(
+            VisualStyle {
+                background: Some(Color::rgb(226, 232, 240)),
+                ..VisualStyle::default()
+            },
+        );
+        let previous = vec![
+            background.clone(),
+            RenderNode::container(LayoutBox::new(6.0, 6.0, 4.0, 4.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(15, 23, 42)),
+                shadows: vec![BoxShadow {
+                    color: Color::rgba(15, 23, 42, 140),
+                    offset_x: 3.0,
+                    offset_y: 3.0,
+                    blur_radius: 2.0,
+                    spread: 0.0,
+                }],
+                ..VisualStyle::default()
+            }),
+        ];
+        let next = vec![
+            background,
+            RenderNode::container(LayoutBox::new(6.0, 6.0, 4.0, 4.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(15, 23, 42)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut incremental = vec![0_u32; 20 * 20];
+        let mut full = vec![0_u32; 20 * 20];
+
+        render_to_buffer(&previous, &mut incremental, 20, 20, Color::WHITE);
+        render_scene_update(&previous, &next, &mut incremental, 20, 20, Color::WHITE);
+        render_to_buffer(&next, &mut full, 20, 20, Color::WHITE);
+
+        assert_eq!(incremental, full);
     }
 }

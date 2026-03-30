@@ -1386,42 +1386,50 @@ fn wrap_line(line: &str, max_columns: usize, wrapped: &mut Vec<String>) {
     }
 
     let mut current = String::new();
+    let mut current_len = 0;
     for word in line.split_whitespace() {
         let word_len = word.chars().count();
-        let spacing = usize::from(!current.is_empty());
+        let spacing = usize::from(current_len != 0);
 
         if word_len > max_columns {
-            if !current.is_empty() {
+            if current_len != 0 {
                 wrapped.push(std::mem::take(&mut current));
+                current_len = 0;
             }
             push_broken_word(word, max_columns, wrapped);
             continue;
         }
 
-        if current.chars().count() + spacing + word_len > max_columns {
+        if current_len + spacing + word_len > max_columns {
             wrapped.push(std::mem::take(&mut current));
+            current_len = 0;
         }
 
-        if !current.is_empty() {
+        if current_len != 0 {
             current.push(' ');
+            current_len += 1;
         }
         current.push_str(word);
+        current_len += word_len;
     }
 
-    if !current.is_empty() {
+    if current_len != 0 {
         wrapped.push(current);
     }
 }
 
 fn push_broken_word(word: &str, max_columns: usize, wrapped: &mut Vec<String>) {
     let mut segment = String::new();
+    let mut segment_len = 0;
     for character in word.chars() {
-        if segment.chars().count() == max_columns {
+        if segment_len == max_columns {
             wrapped.push(std::mem::take(&mut segment));
+            segment_len = 0;
         }
         segment.push(character);
+        segment_len += 1;
     }
-    if !segment.is_empty() {
+    if segment_len != 0 {
         wrapped.push(segment);
     }
 }
