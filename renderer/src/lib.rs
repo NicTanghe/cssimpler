@@ -3,7 +3,12 @@ use std::fmt::{Display, Formatter};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cssimpler_core::{Color, CornerRadius, EventHandler, Insets, LayoutBox, RenderKind, RenderNode};
+use cssimpler_core::{
+    AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, CornerRadius,
+    EllipseRadius, EventHandler, GradientDirection, GradientHorizontal, GradientPoint,
+    GradientStop, GradientVertical, Insets, LayoutBox, LengthPercentageValue, LinearGradient,
+    LinearRgba, RadialGradient, RadialShape, RenderKind, RenderNode, ShapeExtent,
+};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 #[cfg(windows)]
@@ -530,17 +535,18 @@ fn draw_background_and_border(
         );
     }
 
+    let fill_layout = if node.style.border.widths.is_zero() {
+        node.layout
+    } else {
+        inset_layout(node.layout, node.style.border.widths)
+    };
+    let fill_radius = if node.style.border.widths.is_zero() {
+        node.style.corner_radius
+    } else {
+        inset_corner_radius(node.style.corner_radius, node.style.border.widths)
+    };
+
     if let Some(background) = node.style.background {
-        let fill_layout = if node.style.border.widths.is_zero() {
-            node.layout
-        } else {
-            inset_layout(node.layout, node.style.border.widths)
-        };
-        let fill_radius = if node.style.border.widths.is_zero() {
-            node.style.corner_radius
-        } else {
-            inset_corner_radius(node.style.corner_radius, node.style.border.widths)
-        };
         draw_rounded_rect(
             buffer,
             width,
@@ -550,6 +556,10 @@ fn draw_background_and_border(
             background,
             clip,
         );
+    }
+
+    for layer in node.style.background_layers.iter().rev() {
+        draw_background_layer(buffer, width, height, fill_layout, fill_radius, layer, clip);
     }
 }
 
@@ -562,8 +572,11 @@ fn draw_shadow(
     shadow: cssimpler_core::BoxShadow,
     clip: ClipRect,
 ) {
-    let base_layout =
-        offset_layout(expand_layout(layout, shadow.spread), shadow.offset_x, shadow.offset_y);
+    let base_layout = offset_layout(
+        expand_layout(layout, shadow.spread),
+        shadow.offset_x,
+        shadow.offset_y,
+    );
     let base_radius = expand_corner_radius(radius, shadow.spread);
     let blur_radius = shadow.blur_radius.max(0.0);
 
@@ -589,7 +602,14 @@ fn draw_shadow(
         for x in x0..x1 {
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
-            let alpha = shadow_alpha(px, py, base_layout, base_radius, blur_radius, shadow.color.a);
+            let alpha = shadow_alpha(
+                px,
+                py,
+                base_layout,
+                base_radius,
+                blur_radius,
+                shadow.color.a,
+            );
             if alpha == 0 {
                 continue;
             }
@@ -619,6 +639,478 @@ fn draw_rounded_rect(
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedGradientStop {
+    color: LinearRgba,
+    position: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedRadialShape {
+    radius_x: f32,
+    radius_y: f32,
+}
+
+fn draw_background_layer(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    layer: &BackgroundLayer,
+    clip: ClipRect,
+) {
+    match layer {
+        BackgroundLayer::LinearGradient(gradient) => {
+            draw_linear_gradient(buffer, width, height, layout, radius, gradient, clip);
+        }
+        BackgroundLayer::RadialGradient(gradient) => {
+            draw_radial_gradient(buffer, width, height, layout, radius, gradient, clip);
+        }
+        BackgroundLayer::ConicGradient(gradient) => {
+            draw_conic_gradient(buffer, width, height, layout, radius, gradient, clip);
+        }
+    }
+}
+
+fn draw_linear_gradient(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    gradient: &LinearGradient,
+    clip: ClipRect,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
+        return;
+    };
+
+    let Some(first_stop) = gradient.stops.first() else {
+        return;
+    };
+    let direction = gradient_direction_vector(gradient.direction, layout);
+    let center_x = layout.x + layout.width * 0.5;
+    let center_y = layout.y + layout.height * 0.5;
+    let (min_projection, max_projection) =
+        gradient_projection_bounds(layout, center_x, center_y, direction);
+    let projection_span = max_projection - min_projection;
+
+    if projection_span.abs() <= f32::EPSILON {
+        draw_rounded_rect(
+            buffer,
+            width,
+            height,
+            layout,
+            radius,
+            first_stop.color,
+            clip,
+        );
+        return;
+    }
+
+    let stops = resolve_length_stops(&gradient.stops, projection_span, min_projection);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            if !point_in_rounded_rect(px, py, layout, radius) {
+                continue;
+            }
+
+            let projection = ((px - center_x) * direction.0) + ((py - center_y) * direction.1);
+            let color =
+                Color::from_linear_rgba(sample_gradient(&stops, projection, gradient.repeating));
+            blend_pixel(buffer, width, height, x, y, color);
+        }
+    }
+}
+
+fn draw_radial_gradient(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    gradient: &RadialGradient,
+    clip: ClipRect,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
+        return;
+    };
+
+    let Some(first_stop) = gradient.stops.first() else {
+        return;
+    };
+
+    let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
+    let resolved_shape = resolve_radial_shape(gradient.shape, layout, center_x, center_y);
+    if resolved_shape.radius_x <= f32::EPSILON || resolved_shape.radius_y <= f32::EPSILON {
+        draw_rounded_rect(
+            buffer,
+            width,
+            height,
+            layout,
+            radius,
+            first_stop.color,
+            clip,
+        );
+        return;
+    }
+
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            if !point_in_rounded_rect(px, py, layout, radius) {
+                continue;
+            }
+
+            let dx = px - center_x;
+            let dy = py - center_y;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let ray_length = radial_ray_length(dx, dy, resolved_shape);
+            let stops = resolve_length_stops(&gradient.stops, ray_length, 0.0);
+            let color =
+                Color::from_linear_rgba(sample_gradient(&stops, distance, gradient.repeating));
+            blend_pixel(buffer, width, height, x, y, color);
+        }
+    }
+}
+
+fn draw_conic_gradient(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    gradient: &ConicGradient,
+    clip: ClipRect,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
+        return;
+    };
+
+    let Some(_first_stop) = gradient.stops.first() else {
+        return;
+    };
+
+    let stops = resolve_angle_stops(&gradient.stops);
+    let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
+
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            if !point_in_rounded_rect(px, py, layout, radius) {
+                continue;
+            }
+
+            let dx = px - center_x;
+            let dy = py - center_y;
+            let angle = if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
+                0.0
+            } else {
+                dx.atan2(-dy).to_degrees().rem_euclid(360.0)
+            };
+            let position = (angle - gradient.angle).rem_euclid(360.0);
+            let color =
+                Color::from_linear_rgba(sample_gradient(&stops, position, gradient.repeating));
+            blend_pixel(buffer, width, height, x, y, color);
+        }
+    }
+}
+
+fn gradient_direction_vector(direction: GradientDirection, layout: LayoutBox) -> (f32, f32) {
+    match direction {
+        GradientDirection::Angle(degrees) => {
+            let radians = degrees.to_radians();
+            (radians.sin(), -radians.cos())
+        }
+        GradientDirection::Horizontal(GradientHorizontal::Left) => (-1.0, 0.0),
+        GradientDirection::Horizontal(GradientHorizontal::Right) => (1.0, 0.0),
+        GradientDirection::Vertical(GradientVertical::Top) => (0.0, -1.0),
+        GradientDirection::Vertical(GradientVertical::Bottom) => (0.0, 1.0),
+        GradientDirection::Corner {
+            horizontal,
+            vertical,
+        } => {
+            let dx = match horizontal {
+                GradientHorizontal::Left => -layout.width.max(1.0),
+                GradientHorizontal::Right => layout.width.max(1.0),
+            };
+            let dy = match vertical {
+                GradientVertical::Top => -layout.height.max(1.0),
+                GradientVertical::Bottom => layout.height.max(1.0),
+            };
+            normalize_vector(dx, dy)
+        }
+    }
+}
+
+fn normalize_vector(x: f32, y: f32) -> (f32, f32) {
+    let length = (x * x + y * y).sqrt();
+    if length <= f32::EPSILON {
+        (0.0, 1.0)
+    } else {
+        (x / length, y / length)
+    }
+}
+
+fn gradient_projection_bounds(
+    layout: LayoutBox,
+    center_x: f32,
+    center_y: f32,
+    direction: (f32, f32),
+) -> (f32, f32) {
+    let corners = [
+        (layout.x, layout.y),
+        (layout.x + layout.width, layout.y),
+        (layout.x, layout.y + layout.height),
+        (layout.x + layout.width, layout.y + layout.height),
+    ];
+    let mut min_projection = f32::INFINITY;
+    let mut max_projection = f32::NEG_INFINITY;
+
+    for (x, y) in corners {
+        let projection = ((x - center_x) * direction.0) + ((y - center_y) * direction.1);
+        min_projection = min_projection.min(projection);
+        max_projection = max_projection.max(projection);
+    }
+
+    (min_projection, max_projection)
+}
+
+fn resolve_gradient_point(point: GradientPoint, layout: LayoutBox) -> (f32, f32) {
+    (
+        layout.x + point.x.resolve(layout.width),
+        layout.y + point.y.resolve(layout.height),
+    )
+}
+
+fn resolve_length_stops(
+    stops: &[GradientStop<LengthPercentageValue>],
+    total: f32,
+    origin: f32,
+) -> Vec<ResolvedGradientStop> {
+    let mut resolved: Vec<_> = stops
+        .iter()
+        .map(|stop| ResolvedGradientStop {
+            color: stop.color.to_linear_rgba(),
+            position: origin + stop.position.resolve(total),
+        })
+        .collect();
+    clamp_resolved_stop_positions(&mut resolved);
+    resolved
+}
+
+fn resolve_angle_stops(stops: &[GradientStop<AnglePercentageValue>]) -> Vec<ResolvedGradientStop> {
+    let mut resolved: Vec<_> = stops
+        .iter()
+        .map(|stop| ResolvedGradientStop {
+            color: stop.color.to_linear_rgba(),
+            position: stop.position.resolve_degrees(),
+        })
+        .collect();
+    clamp_resolved_stop_positions(&mut resolved);
+    resolved
+}
+
+fn clamp_resolved_stop_positions(stops: &mut [ResolvedGradientStop]) {
+    let mut last_position = f32::NEG_INFINITY;
+    for stop in stops {
+        if stop.position < last_position {
+            stop.position = last_position;
+        } else {
+            last_position = stop.position;
+        }
+    }
+}
+
+fn resolve_radial_shape(
+    shape: RadialShape,
+    layout: LayoutBox,
+    center_x: f32,
+    center_y: f32,
+) -> ResolvedRadialShape {
+    match shape {
+        RadialShape::Circle(radius) => {
+            let radius = match radius {
+                CircleRadius::Explicit(radius) => radius.max(0.0),
+                CircleRadius::Extent(extent) => {
+                    resolve_circle_extent(extent, layout, center_x, center_y)
+                }
+            };
+            ResolvedRadialShape {
+                radius_x: radius,
+                radius_y: radius,
+            }
+        }
+        RadialShape::Ellipse(radius) => match radius {
+            EllipseRadius::Explicit { x, y } => ResolvedRadialShape {
+                radius_x: x.resolve(layout.width).max(0.0),
+                radius_y: y.resolve(layout.height).max(0.0),
+            },
+            EllipseRadius::Extent(extent) => {
+                resolve_ellipse_extent(extent, layout, center_x, center_y)
+            }
+        },
+    }
+}
+
+fn resolve_circle_extent(
+    extent: ShapeExtent,
+    layout: LayoutBox,
+    center_x: f32,
+    center_y: f32,
+) -> f32 {
+    let (left, right, top, bottom) = side_distances(layout, center_x, center_y);
+    let corners = corner_offsets(left, right, top, bottom);
+
+    match extent {
+        ShapeExtent::ClosestSide => left.min(right).min(top).min(bottom),
+        ShapeExtent::FarthestSide => left.max(right).max(top).max(bottom),
+        ShapeExtent::ClosestCorner => corners
+            .iter()
+            .map(|(dx, dy)| (dx * dx + dy * dy).sqrt())
+            .fold(f32::INFINITY, f32::min),
+        ShapeExtent::FarthestCorner => corners
+            .iter()
+            .map(|(dx, dy)| (dx * dx + dy * dy).sqrt())
+            .fold(0.0, f32::max),
+    }
+}
+
+fn resolve_ellipse_extent(
+    extent: ShapeExtent,
+    layout: LayoutBox,
+    center_x: f32,
+    center_y: f32,
+) -> ResolvedRadialShape {
+    let (left, right, top, bottom) = side_distances(layout, center_x, center_y);
+    let corners = corner_offsets(left, right, top, bottom);
+
+    match extent {
+        ShapeExtent::ClosestSide => ResolvedRadialShape {
+            radius_x: left.min(right),
+            radius_y: top.min(bottom),
+        },
+        ShapeExtent::FarthestSide => ResolvedRadialShape {
+            radius_x: left.max(right),
+            radius_y: top.max(bottom),
+        },
+        ShapeExtent::ClosestCorner => {
+            scale_ellipse_to_corner(left.min(right), top.min(bottom), &corners, false)
+        }
+        ShapeExtent::FarthestCorner => {
+            scale_ellipse_to_corner(left.max(right), top.max(bottom), &corners, true)
+        }
+    }
+}
+
+fn scale_ellipse_to_corner(
+    base_radius_x: f32,
+    base_radius_y: f32,
+    corners: &[(f32, f32); 4],
+    farthest: bool,
+) -> ResolvedRadialShape {
+    if base_radius_x <= f32::EPSILON || base_radius_y <= f32::EPSILON {
+        return ResolvedRadialShape {
+            radius_x: 0.0,
+            radius_y: 0.0,
+        };
+    }
+
+    let mut scale = if farthest { 0.0 } else { f32::INFINITY };
+    for &(dx, dy) in corners {
+        let factor = ((dx / base_radius_x).powi(2) + (dy / base_radius_y).powi(2)).sqrt();
+        if farthest {
+            scale = scale.max(factor);
+        } else {
+            scale = scale.min(factor);
+        }
+    }
+
+    ResolvedRadialShape {
+        radius_x: base_radius_x * scale,
+        radius_y: base_radius_y * scale,
+    }
+}
+
+fn side_distances(layout: LayoutBox, center_x: f32, center_y: f32) -> (f32, f32, f32, f32) {
+    (
+        (center_x - layout.x).abs(),
+        (layout.x + layout.width - center_x).abs(),
+        (center_y - layout.y).abs(),
+        (layout.y + layout.height - center_y).abs(),
+    )
+}
+
+fn corner_offsets(left: f32, right: f32, top: f32, bottom: f32) -> [(f32, f32); 4] {
+    [(left, top), (right, top), (left, bottom), (right, bottom)]
+}
+
+fn radial_ray_length(dx: f32, dy: f32, shape: ResolvedRadialShape) -> f32 {
+    if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
+        return 0.0;
+    }
+
+    let radius_x = shape.radius_x.max(f32::EPSILON);
+    let radius_y = shape.radius_y.max(f32::EPSILON);
+    let denominator =
+        ((dx * dx) / (radius_x * radius_x) + (dy * dy) / (radius_y * radius_y)).sqrt();
+    if denominator <= f32::EPSILON {
+        0.0
+    } else {
+        (dx * dx + dy * dy).sqrt() / denominator
+    }
+}
+
+fn normalize_gradient_t(t: f32, stops: &[ResolvedGradientStop], repeating: bool) -> f32 {
+    let start = stops.first().map(|stop| stop.position).unwrap_or(0.0);
+    let end = stops.last().map(|stop| stop.position).unwrap_or(start);
+    if !repeating {
+        return t;
+    }
+
+    let period = end - start;
+    if period.abs() <= f32::EPSILON {
+        start
+    } else {
+        start + (t - start).rem_euclid(period)
+    }
+}
+
+fn sample_gradient(stops: &[ResolvedGradientStop], position: f32, repeating: bool) -> LinearRgba {
+    sample_gradient_color(stops, normalize_gradient_t(position, stops, repeating))
+}
+
+fn sample_gradient_color(stops: &[ResolvedGradientStop], t: f32) -> LinearRgba {
+    let Some(first) = stops.first().copied() else {
+        return LinearRgba::TRANSPARENT;
+    };
+    if t <= first.position {
+        return first.color;
+    }
+
+    for pair in stops.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        if t > end.position {
+            continue;
+        }
+
+        let span = end.position - start.position;
+        if span.abs() <= f32::EPSILON {
+            return end.color;
+        }
+
+        return start.color.lerp(end.color, (t - start.position) / span);
+    }
+
+    stops.last().map(|stop| stop.color).unwrap_or(first.color)
 }
 
 fn draw_rounded_ring(
@@ -702,7 +1194,10 @@ fn draw_text(
     }
 }
 
-fn dirty_regions_between_scenes(previous_scene: &[RenderNode], scene: &[RenderNode]) -> Vec<ClipRect> {
+fn dirty_regions_between_scenes(
+    previous_scene: &[RenderNode],
+    scene: &[RenderNode],
+) -> Vec<ClipRect> {
     let mut dirty_regions = Vec::new();
     collect_scene_dirty_regions(previous_scene, scene, &mut dirty_regions);
     dirty_regions
@@ -737,10 +1232,13 @@ fn collect_node_dirty_regions(
     }
 
     if !render_nodes_match_own_visuals(previous, current) {
-        push_dirty_region(union_optional_bounds(
-            subtree_visual_bounds(previous),
-            subtree_visual_bounds(current),
-        ), dirty_regions);
+        push_dirty_region(
+            union_optional_bounds(
+                subtree_visual_bounds(previous),
+                subtree_visual_bounds(current),
+            ),
+            dirty_regions,
+        );
         return;
     }
 
@@ -904,8 +1402,14 @@ fn pixel_bounds(
     let clip = clip.intersect(ClipRect::full(width as f32, height as f32))?;
     let x0 = layout.x.max(clip.x0).floor().max(0.0) as i32;
     let y0 = layout.y.max(clip.y0).floor().max(0.0) as i32;
-    let x1 = (layout.x + layout.width).min(clip.x1).ceil().min(width as f32) as i32;
-    let y1 = (layout.y + layout.height).min(clip.y1).ceil().min(height as f32) as i32;
+    let x1 = (layout.x + layout.width)
+        .min(clip.x1)
+        .ceil()
+        .min(width as f32) as i32;
+    let y1 = (layout.y + layout.height)
+        .min(clip.y1)
+        .ceil()
+        .min(height as f32) as i32;
     (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
 }
 
@@ -1215,14 +1719,16 @@ fn blend_pixel(buffer: &mut [u32], width: usize, height: usize, x: i32, y: i32, 
         return;
     }
 
-    let destination = unpack_rgb(buffer[index]);
-    let alpha = color.a as f32 / 255.0;
+    let source = color.to_linear_rgba();
+    let destination = unpack_rgb(buffer[index]).to_linear_rgba();
+    let alpha = source.a;
     let inverse_alpha = 1.0 - alpha;
-    let blended = Color::rgb(
-        (color.r as f32 * alpha + destination.r as f32 * inverse_alpha).round() as u8,
-        (color.g as f32 * alpha + destination.g as f32 * inverse_alpha).round() as u8,
-        (color.b as f32 * alpha + destination.b as f32 * inverse_alpha).round() as u8,
-    );
+    let blended = Color::from_linear_rgba(LinearRgba {
+        r: source.r * alpha + destination.r * inverse_alpha,
+        g: source.g * alpha + destination.g * inverse_alpha,
+        b: source.b * alpha + destination.b * inverse_alpha,
+        a: 1.0,
+    });
 
     buffer[index] = pack_rgb(blended);
 }
@@ -1252,12 +1758,15 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use cssimpler_core::{
-        BoxShadow, Color, CornerRadius, LayoutBox, Overflow, RenderNode, VisualStyle,
+        AnglePercentageValue, BackgroundLayer, BoxShadow, CircleRadius, Color, ConicGradient,
+        CornerRadius, GradientDirection, GradientHorizontal, GradientPoint, GradientStop,
+        LayoutBox, LengthPercentageValue, LinearGradient, Overflow, RadialGradient, RadialShape,
+        RenderNode, VisualStyle,
     };
 
     use crate::{
-        dispatch_click, pack_rgb, render_scene_update, render_to_buffer, resize_buffer,
-        scenes_match_visuals, should_present_scene, should_suspend_updates,
+        blend_pixel, dispatch_click, pack_rgb, render_scene_update, render_to_buffer,
+        resize_buffer, scenes_match_visuals, should_present_scene, should_suspend_updates,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1312,6 +1821,194 @@ mod tests {
     }
 
     #[test]
+    fn linear_gradients_interpolate_in_linear_color_space() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 3.0, 1.0)).with_style(VisualStyle {
+                background_layers: vec![BackgroundLayer::LinearGradient(LinearGradient {
+                    direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                    repeating: false,
+                    stops: vec![
+                        GradientStop {
+                            color: Color::BLACK,
+                            position: LengthPercentageValue::from_fraction(0.0),
+                        },
+                        GradientStop {
+                            color: Color::WHITE,
+                            position: LengthPercentageValue::from_fraction(1.0),
+                        },
+                    ],
+                })],
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 3];
+
+        render_to_buffer(&scene, &mut buffer, 3, 1, Color::BLACK);
+
+        assert_eq!(buffer[1], pack_rgb(Color::rgb(188, 188, 188)));
+    }
+
+    #[test]
+    fn layered_backgrounds_draw_the_first_layer_on_top() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 3.0, 1.0)).with_style(VisualStyle {
+                background_layers: vec![
+                    BackgroundLayer::LinearGradient(LinearGradient {
+                        direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                        repeating: false,
+                        stops: vec![
+                            GradientStop {
+                                color: Color::rgb(220, 38, 38),
+                                position: LengthPercentageValue::from_fraction(0.0),
+                            },
+                            GradientStop {
+                                color: Color::rgb(220, 38, 38),
+                                position: LengthPercentageValue::from_fraction(1.0),
+                            },
+                        ],
+                    }),
+                    BackgroundLayer::LinearGradient(LinearGradient {
+                        direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                        repeating: false,
+                        stops: vec![
+                            GradientStop {
+                                color: Color::rgb(37, 99, 235),
+                                position: LengthPercentageValue::from_fraction(0.0),
+                            },
+                            GradientStop {
+                                color: Color::rgb(37, 99, 235),
+                                position: LengthPercentageValue::from_fraction(1.0),
+                            },
+                        ],
+                    }),
+                ],
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 3];
+
+        render_to_buffer(&scene, &mut buffer, 3, 1, Color::BLACK);
+
+        assert_eq!(buffer[1], pack_rgb(Color::rgb(220, 38, 38)));
+    }
+
+    #[test]
+    fn linear_gradients_support_length_based_stop_positions() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 5.0, 1.0)).with_style(VisualStyle {
+                background_layers: vec![BackgroundLayer::LinearGradient(LinearGradient {
+                    direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                    repeating: false,
+                    stops: vec![
+                        GradientStop {
+                            color: Color::BLACK,
+                            position: LengthPercentageValue::from_px(0.0),
+                        },
+                        GradientStop {
+                            color: Color::WHITE,
+                            position: LengthPercentageValue::from_px(2.0),
+                        },
+                    ],
+                })],
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 5];
+
+        render_to_buffer(&scene, &mut buffer, 5, 1, Color::BLACK);
+
+        assert_ne!(buffer[1], pack_rgb(Color::WHITE));
+        assert_eq!(buffer[2], pack_rgb(Color::WHITE));
+        assert_eq!(buffer[4], pack_rgb(Color::WHITE));
+    }
+
+    #[test]
+    fn radial_gradients_render_from_the_center_outward() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 5.0, 5.0)).with_style(VisualStyle {
+                background_layers: vec![BackgroundLayer::RadialGradient(RadialGradient {
+                    shape: RadialShape::Circle(CircleRadius::Explicit(2.0)),
+                    center: GradientPoint::CENTER,
+                    repeating: false,
+                    stops: vec![
+                        GradientStop {
+                            color: Color::BLACK,
+                            position: LengthPercentageValue::from_px(0.0),
+                        },
+                        GradientStop {
+                            color: Color::WHITE,
+                            position: LengthPercentageValue::from_px(2.0),
+                        },
+                    ],
+                })],
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 25];
+
+        render_to_buffer(&scene, &mut buffer, 5, 5, Color::BLACK);
+
+        assert_eq!(buffer[2 * 5 + 2], pack_rgb(Color::BLACK));
+        assert_eq!(buffer[2 * 5 + 4], pack_rgb(Color::WHITE));
+    }
+
+    #[test]
+    fn conic_gradients_support_multiple_angle_sectors() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 5.0, 5.0)).with_style(VisualStyle {
+                background_layers: vec![BackgroundLayer::ConicGradient(ConicGradient {
+                    angle: 0.0,
+                    center: GradientPoint::CENTER,
+                    repeating: false,
+                    stops: vec![
+                        GradientStop {
+                            color: Color::rgb(255, 0, 0),
+                            position: AnglePercentageValue::from_degrees(0.0),
+                        },
+                        GradientStop {
+                            color: Color::rgb(255, 0, 0),
+                            position: AnglePercentageValue::from_degrees(90.0),
+                        },
+                        GradientStop {
+                            color: Color::rgb(0, 255, 0),
+                            position: AnglePercentageValue::from_degrees(90.0),
+                        },
+                        GradientStop {
+                            color: Color::rgb(0, 255, 0),
+                            position: AnglePercentageValue::from_degrees(180.0),
+                        },
+                        GradientStop {
+                            color: Color::rgb(0, 0, 255),
+                            position: AnglePercentageValue::from_degrees(180.0),
+                        },
+                        GradientStop {
+                            color: Color::rgb(0, 0, 255),
+                            position: AnglePercentageValue::from_degrees(270.0),
+                        },
+                        GradientStop {
+                            color: Color::rgb(255, 255, 255),
+                            position: AnglePercentageValue::from_degrees(270.0),
+                        },
+                        GradientStop {
+                            color: Color::rgb(255, 255, 255),
+                            position: AnglePercentageValue::from_turns(1.0),
+                        },
+                    ],
+                })],
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 25];
+
+        render_to_buffer(&scene, &mut buffer, 5, 5, Color::BLACK);
+
+        assert_eq!(buffer[4], pack_rgb(Color::rgb(255, 0, 0)));
+        assert_eq!(buffer[4 * 5 + 4], pack_rgb(Color::rgb(0, 255, 0)));
+        assert_eq!(buffer[4 * 5], pack_rgb(Color::rgb(0, 0, 255)));
+        assert_eq!(buffer[0], pack_rgb(Color::rgb(255, 255, 255)));
+    }
+
+    #[test]
     fn overflow_clip_hides_child_pixels_outside_parent_bounds() {
         let scene = vec![
             RenderNode::container(LayoutBox::new(4.0, 4.0, 6.0, 6.0))
@@ -1355,6 +2052,15 @@ mod tests {
         render_to_buffer(&scene, &mut buffer, 20, 20, Color::WHITE);
 
         assert_ne!(buffer[13 * 20 + 13], pack_rgb(Color::WHITE));
+    }
+
+    #[test]
+    fn alpha_blending_uses_linear_color_space() {
+        let mut buffer = vec![pack_rgb(Color::BLACK)];
+
+        blend_pixel(&mut buffer, 1, 1, 0, 0, Color::rgba(255, 255, 255, 128));
+
+        assert_eq!(buffer[0], pack_rgb(Color::rgb(188, 188, 188)));
     }
 
     #[test]
@@ -1412,14 +2118,7 @@ mod tests {
         let mut height = 180;
         let mut buffer = vec![0_u32; width * height];
 
-        resize_buffer(
-            &mut buffer,
-            &mut width,
-            &mut height,
-            640,
-            360,
-            Color::WHITE,
-        );
+        resize_buffer(&mut buffer, &mut width, &mut height, 640, 360, Color::WHITE);
 
         assert_eq!(width, 640);
         assert_eq!(height, 360);
@@ -1429,7 +2128,8 @@ mod tests {
     #[test]
     fn visual_scene_comparison_ignores_click_handlers() {
         let left = vec![
-            RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0)).on_click(increment_click_count),
+            RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0))
+                .on_click(increment_click_count),
         ];
         let right = vec![
             RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0))
@@ -1460,9 +2160,7 @@ mod tests {
 
     #[test]
     fn should_present_scene_when_buffer_is_resized() {
-        let scene = vec![
-            RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0)),
-        ];
+        let scene = vec![RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0))];
 
         assert!(should_present_scene(Some(&scene), &scene, true));
     }
@@ -1502,12 +2200,11 @@ mod tests {
 
     #[test]
     fn incremental_render_clears_shadow_pixels_and_redraws_the_background() {
-        let background = RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_style(
-            VisualStyle {
+        let background =
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_style(VisualStyle {
                 background: Some(Color::rgb(226, 232, 240)),
                 ..VisualStyle::default()
-            },
-        );
+            });
         let previous = vec![
             background.clone(),
             RenderNode::container(LayoutBox::new(6.0, 6.0, 4.0, 4.0)).with_style(VisualStyle {

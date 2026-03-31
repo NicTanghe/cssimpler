@@ -271,12 +271,7 @@ where
     Update: FnMut(&mut State, FrameInfo) -> Signal,
     Signal: Into<Refresh>,
 {
-    pub fn new<I>(
-        state: State,
-        stylesheet: &'a Stylesheet,
-        update: Update,
-        fragments: I,
-    ) -> Self
+    pub fn new<I>(state: State, stylesheet: &'a Stylesheet, update: Update, fragments: I) -> Self
     where
         I: IntoIterator<Item = Fragment<'a, State>>,
     {
@@ -381,7 +376,11 @@ where
 
         let mut replacements = Vec::with_capacity(ids.len());
         for id in ids {
-            let Some(index) = self.fragments.iter().position(|fragment| fragment.id() == id) else {
+            let Some(index) = self
+                .fragments
+                .iter()
+                .position(|fragment| fragment.id() == id)
+            else {
                 return false;
             };
             let node = self.fragments[index].render(&self.state);
@@ -449,9 +448,7 @@ mod tests {
     use crate::core::{RenderKind, RenderNode};
     use crate::ui;
 
-    use super::{
-        App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode,
-    };
+    use super::{App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode};
     use crate::renderer::{FrameInfo, SceneProvider};
     use crate::style::Stylesheet;
 

@@ -166,6 +166,249 @@ impl Color {
     pub const fn with_alpha(self, a: u8) -> Self {
         Self { a, ..self }
     }
+
+    pub fn to_linear_rgba(self) -> LinearRgba {
+        LinearRgba {
+            r: srgb_channel_to_linear(self.r),
+            g: srgb_channel_to_linear(self.g),
+            b: srgb_channel_to_linear(self.b),
+            a: self.a as f32 / 255.0,
+        }
+    }
+
+    pub fn from_linear_rgba(color: LinearRgba) -> Self {
+        Self {
+            r: linear_channel_to_srgb(color.r),
+            g: linear_channel_to_srgb(color.g),
+            b: linear_channel_to_srgb(color.b),
+            a: (color.a.clamp(0.0, 1.0) * 255.0).round() as u8,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinearRgba {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+impl LinearRgba {
+    pub const TRANSPARENT: Self = Self {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 0.0,
+    };
+
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self {
+            r: self.r + (other.r - self.r) * t,
+            g: self.g + (other.g - self.g) * t,
+            b: self.b + (other.b - self.b) * t,
+            a: self.a + (other.a - self.a) * t,
+        }
+    }
+}
+
+fn srgb_channel_to_linear(channel: u8) -> f32 {
+    let value = channel as f32 / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_channel_to_srgb(value: f32) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    let srgb = if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (srgb * 255.0).round() as u8
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LengthPercentageValue {
+    pub px: f32,
+    pub fraction: f32,
+}
+
+impl LengthPercentageValue {
+    pub const ZERO: Self = Self {
+        px: 0.0,
+        fraction: 0.0,
+    };
+
+    pub const fn from_px(px: f32) -> Self {
+        Self { px, fraction: 0.0 }
+    }
+
+    pub const fn from_fraction(fraction: f32) -> Self {
+        Self { px: 0.0, fraction }
+    }
+
+    pub fn resolve(self, total: f32) -> f32 {
+        self.px + self.fraction * total
+    }
+
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self {
+            px: self.px + (other.px - self.px) * t,
+            fraction: self.fraction + (other.fraction - self.fraction) * t,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AnglePercentageValue {
+    pub degrees: f32,
+    pub turns: f32,
+}
+
+impl AnglePercentageValue {
+    pub const ZERO: Self = Self {
+        degrees: 0.0,
+        turns: 0.0,
+    };
+
+    pub const fn from_degrees(degrees: f32) -> Self {
+        Self {
+            degrees,
+            turns: 0.0,
+        }
+    }
+
+    pub const fn from_turns(turns: f32) -> Self {
+        Self {
+            degrees: 0.0,
+            turns,
+        }
+    }
+
+    pub fn resolve_degrees(self) -> f32 {
+        self.degrees + self.turns * 360.0
+    }
+
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self {
+            degrees: self.degrees + (other.degrees - self.degrees) * t,
+            turns: self.turns + (other.turns - self.turns) * t,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradientPoint {
+    pub x: LengthPercentageValue,
+    pub y: LengthPercentageValue,
+}
+
+impl GradientPoint {
+    pub const CENTER: Self = Self {
+        x: LengthPercentageValue::from_fraction(0.5),
+        y: LengthPercentageValue::from_fraction(0.5),
+    };
+}
+
+impl Default for GradientPoint {
+    fn default() -> Self {
+        Self::CENTER
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradientHorizontal {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradientVertical {
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientDirection {
+    Angle(f32),
+    Horizontal(GradientHorizontal),
+    Vertical(GradientVertical),
+    Corner {
+        horizontal: GradientHorizontal,
+        vertical: GradientVertical,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradientStop<P> {
+    pub color: Color,
+    pub position: P,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeExtent {
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CircleRadius {
+    Explicit(f32),
+    Extent(ShapeExtent),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EllipseRadius {
+    Explicit {
+        x: LengthPercentageValue,
+        y: LengthPercentageValue,
+    },
+    Extent(ShapeExtent),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RadialShape {
+    Circle(CircleRadius),
+    Ellipse(EllipseRadius),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinearGradient {
+    pub direction: GradientDirection,
+    pub repeating: bool,
+    pub stops: Vec<GradientStop<LengthPercentageValue>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RadialGradient {
+    pub shape: RadialShape,
+    pub center: GradientPoint,
+    pub repeating: bool,
+    pub stops: Vec<GradientStop<LengthPercentageValue>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConicGradient {
+    pub angle: f32,
+    pub center: GradientPoint,
+    pub repeating: bool,
+    pub stops: Vec<GradientStop<AnglePercentageValue>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum BackgroundLayer {
+    LinearGradient(LinearGradient),
+    RadialGradient(RadialGradient),
+    ConicGradient(ConicGradient),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -202,9 +445,7 @@ impl Default for LayoutStyle {
     fn default() -> Self {
         let mut taffy = TaffyStyle::default();
         taffy.display = taffy::Display::Block;
-        Self {
-            taffy,
-        }
+        Self { taffy }
     }
 }
 
@@ -278,6 +519,7 @@ impl Overflow {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisualStyle {
     pub background: Option<Color>,
+    pub background_layers: Vec<BackgroundLayer>,
     pub foreground: Color,
     pub corner_radius: CornerRadius,
     pub border: BorderStyle,
@@ -289,6 +531,7 @@ impl Default for VisualStyle {
     fn default() -> Self {
         Self {
             background: None,
+            background_layers: Vec::new(),
             foreground: Color::BLACK,
             corner_radius: CornerRadius::ZERO,
             border: BorderStyle::default(),
