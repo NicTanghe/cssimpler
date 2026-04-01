@@ -26,6 +26,17 @@ impl Invalidation {
     }
 }
 
+impl From<crate::style::StyleInvalidation> for Invalidation {
+    fn from(value: crate::style::StyleInvalidation) -> Self {
+        match value {
+            crate::style::StyleInvalidation::Clean => Self::Clean,
+            crate::style::StyleInvalidation::Paint => Self::Paint,
+            crate::style::StyleInvalidation::Layout => Self::Layout,
+            crate::style::StyleInvalidation::Structure => Self::Structure,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RefreshTarget {
     #[default]
@@ -270,9 +281,23 @@ where
             return false;
         }
 
+        let refresh = self.interaction_refresh(&self.interaction, &interaction);
         self.interaction = interaction;
-        self.invalidate(Invalidation::Paint);
-        true
+        let needs_rerender = refresh.needs_rerender();
+        self.invalidate(refresh);
+        needs_rerender
+    }
+
+    fn interaction_refresh(
+        &self,
+        previous: &ElementInteractionState,
+        next: &ElementInteractionState,
+    ) -> Refresh {
+        let invalidation: Invalidation = self
+            .stylesheet
+            .interaction_invalidation(previous, next)
+            .into();
+        invalidation.into()
     }
 }
 
@@ -492,8 +517,9 @@ where
 
         let refresh = self.interaction_refresh(&self.interaction, &interaction);
         self.interaction = interaction;
+        let needs_rerender = refresh.needs_rerender();
         self.invalidate(refresh);
-        true
+        needs_rerender
     }
 
     fn interaction_refresh(
@@ -501,13 +527,21 @@ where
         previous: &ElementInteractionState,
         next: &ElementInteractionState,
     ) -> Refresh {
+        let invalidation: Invalidation = self
+            .stylesheet
+            .interaction_invalidation(previous, next)
+            .into();
+        if !invalidation.needs_rerender() {
+            return Refresh::clean();
+        }
+
         let mut fragment_ids = Vec::new();
         for root in interaction_roots(previous)
             .into_iter()
             .chain(interaction_roots(next))
         {
             let Some(fragment) = self.fragments.get(root) else {
-                return Refresh::full(Invalidation::Paint);
+                return Refresh::full(invalidation);
             };
             push_unique_id(&mut fragment_ids, fragment.id().to_string());
         }
@@ -515,7 +549,7 @@ where
         if fragment_ids.is_empty() {
             Refresh::clean()
         } else {
-            Refresh::fragments(fragment_ids, Invalidation::Paint)
+            Refresh::fragments(fragment_ids, invalidation)
         }
     }
 }
@@ -990,6 +1024,183 @@ mod tests {
         assert_eq!(
             scene[1].style.foreground,
             crate::core::Color::rgb(37, 99, 235)
+        );
+    }
+
+    #[test]
+    fn app_skips_interaction_rerenders_without_interactive_rules() {
+        let stylesheet =
+            parse_stylesheet(".button { color: #111111; }").expect("stylesheet should parse");
+        let render_calls = Cell::new(0_u32);
+        let mut app = App::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Invalidation::Clean,
+            |_state| {
+                render_calls.set(render_calls.get() + 1);
+                ui! {
+                    <button class="button">{"hover me"}</button>
+                }
+            },
+        );
+
+        app.frame(frame(0));
+        assert!(!SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(0)),
+                active: None,
+            },
+        ));
+        app.frame(frame(1));
+
+        assert_eq!(render_calls.get(), 1);
+        assert_eq!(app.pending_refresh, Refresh::clean());
+    }
+
+    #[test]
+    fn fragment_app_skips_interaction_rerenders_without_interactive_rules() {
+        let stylesheet =
+            parse_stylesheet(".button { color: #111111; }").expect("stylesheet should parse");
+        let render_calls = Cell::new(0_u32);
+        let mut app = FragmentApp::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Refresh::clean(),
+            [Fragment::new("button", |_state: &()| {
+                render_calls.set(render_calls.get() + 1);
+                ui! {
+                    <button class="button">{"hover me"}</button>
+                }
+            })],
+        );
+
+        app.frame(frame(0));
+        assert!(!SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(0)),
+                active: None,
+            },
+        ));
+        app.frame(frame(1));
+
+        assert_eq!(render_calls.get(), 1);
+        assert_eq!(app.pending_refresh, Refresh::clean());
+    }
+
+    #[test]
+    fn app_promotes_interaction_refresh_to_layout_when_needed() {
+        let stylesheet =
+            parse_stylesheet(".button:hover { width: 120px; }").expect("stylesheet should parse");
+        let mut app = App::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Invalidation::Clean,
+            |_state| {
+                ui! {
+                    <button class="button">{"hover me"}</button>
+                }
+            },
+        );
+
+        app.frame(frame(0));
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(0)),
+                active: None,
+            },
+        ));
+
+        assert_eq!(app.pending_refresh, Refresh::full(Invalidation::Layout));
+    }
+
+    #[test]
+    fn fragment_app_descendant_hover_rules_rerender_only_the_affected_root() {
+        let stylesheet = parse_stylesheet(".button:hover .hover-text { color: #2563eb; }")
+            .expect("interactive stylesheet should parse");
+        let left_calls = Cell::new(0_u32);
+        let right_calls = Cell::new(0_u32);
+        let mut app = FragmentApp::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Refresh::clean(),
+            [
+                Fragment::new("left", |_state: &()| {
+                    left_calls.set(left_calls.get() + 1);
+                    ui! {
+                        <div class="button">
+                            <span class="hover-text">{"left"}</span>
+                        </div>
+                    }
+                }),
+                Fragment::new("right", |_state: &()| {
+                    right_calls.set(right_calls.get() + 1);
+                    ui! {
+                        <div class="button">
+                            <span class="hover-text">{"right"}</span>
+                        </div>
+                    }
+                }),
+            ],
+        );
+
+        app.frame(frame(0));
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(1).with_child(0)),
+                active: None,
+            },
+        ));
+
+        assert_eq!(
+            app.pending_refresh,
+            Refresh::fragment("right", Invalidation::Paint)
+        );
+
+        let scene = app.frame(frame(1));
+
+        assert_eq!(left_calls.get(), 1);
+        assert_eq!(right_calls.get(), 2);
+        assert_eq!(
+            scene[0].children[0].style.foreground,
+            crate::core::Color::BLACK
+        );
+        assert_eq!(
+            scene[1].children[0].style.foreground,
+            crate::core::Color::rgb(37, 99, 235)
+        );
+    }
+
+    #[test]
+    fn fragment_app_promotes_interaction_refresh_to_layout_when_needed() {
+        let stylesheet =
+            parse_stylesheet(".button:hover { width: 120px; }").expect("stylesheet should parse");
+        let mut app = FragmentApp::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Refresh::clean(),
+            [Fragment::new("right", |_state: &()| {
+                ui! {
+                    <button class="button">{"right"}</button>
+                }
+            })],
+        );
+
+        app.frame(frame(0));
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(0)),
+                active: None,
+            },
+        ));
+
+        assert_eq!(
+            app.pending_refresh,
+            Refresh::fragment("right", Invalidation::Layout)
         );
     }
 

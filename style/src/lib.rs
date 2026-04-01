@@ -38,6 +38,7 @@ use taffy::prelude::{
 
 mod attributes;
 mod fonts;
+mod invalidation;
 mod selectors;
 mod visual;
 
@@ -49,6 +50,7 @@ use self::fonts::{
 use self::selectors::extract_selector;
 
 pub use attributes::{AttributeTextSource, parse_attribute_text_source};
+pub use invalidation::StyleInvalidation;
 pub use selectors::{
     AncestorSelector, CompoundSelector, ElementRef, Selector, SelectorCombinator, SimpleSelector,
 };

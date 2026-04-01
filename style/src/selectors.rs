@@ -8,6 +8,29 @@ use lightningcss::selector::{
 
 use crate::StyleError;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InteractionDependencies {
+    pub hover: bool,
+    pub active: bool,
+}
+
+impl InteractionDependencies {
+    pub(crate) const fn is_empty(self) -> bool {
+        !self.hover && !self.active
+    }
+
+    pub(crate) const fn intersects(self, other: Self) -> bool {
+        (self.hover && other.hover) || (self.active && other.active)
+    }
+
+    const fn merge(self, other: Self) -> Self {
+        Self {
+            hover: self.hover || other.hover,
+            active: self.active || other.active,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SimpleSelector {
     Class(String),
@@ -20,6 +43,23 @@ pub enum SimpleSelector {
 }
 
 impl SimpleSelector {
+    pub(crate) const fn interaction_dependencies(&self) -> InteractionDependencies {
+        match self {
+            Self::Hover => InteractionDependencies {
+                hover: true,
+                active: false,
+            },
+            Self::Active => InteractionDependencies {
+                hover: false,
+                active: true,
+            },
+            _ => InteractionDependencies {
+                hover: false,
+                active: false,
+            },
+        }
+    }
+
     pub fn matches(&self, element: ElementRef<'_>) -> bool {
         self.matches_with_interaction(
             element,
@@ -82,6 +122,13 @@ impl CompoundSelector {
         self.simple_selectors
             .iter()
             .all(|selector| selector.matches_with_interaction(element, element_path, interaction))
+    }
+
+    pub(crate) fn interaction_dependencies(&self) -> InteractionDependencies {
+        self.simple_selectors.iter().fold(
+            InteractionDependencies::default(),
+            |dependencies, selector| dependencies.merge(selector.interaction_dependencies()),
+        )
     }
 }
 
@@ -226,6 +273,15 @@ impl Selector {
         }
 
         true
+    }
+
+    pub(crate) fn interaction_dependencies(&self) -> InteractionDependencies {
+        self.ancestors.iter().fold(
+            self.rightmost.interaction_dependencies(),
+            |dependencies, ancestor| {
+                dependencies.merge(ancestor.compound.interaction_dependencies())
+            },
+        )
     }
 }
 
