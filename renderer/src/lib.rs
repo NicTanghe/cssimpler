@@ -2186,6 +2186,63 @@ mod tests {
     }
 
     #[test]
+    fn gallery_style_conic_gradient_changes_when_the_interpolation_mode_changes() {
+        fn render_conic(interpolation: GradientInterpolation) -> Vec<u32> {
+            let scene = vec![
+                RenderNode::container(LayoutBox::new(0.0, 0.0, 96.0, 96.0)).with_style(
+                    VisualStyle {
+                        background_layers: vec![BackgroundLayer::ConicGradient(ConicGradient {
+                            angle: 220.0,
+                            center: GradientPoint {
+                                x: LengthPercentageValue::from_fraction(0.64),
+                                y: LengthPercentageValue::from_fraction(0.56),
+                            },
+                            interpolation,
+                            repeating: false,
+                            stops: vec![
+                                GradientStop {
+                                    color: Color::rgb(56, 189, 248),
+                                    position: AnglePercentageValue::from_degrees(0.0),
+                                },
+                                GradientStop {
+                                    color: Color::rgb(45, 212, 191),
+                                    position: AnglePercentageValue::from_degrees(100.0),
+                                },
+                                GradientStop {
+                                    color: Color::rgb(245, 158, 11),
+                                    position: AnglePercentageValue::from_degrees(220.0),
+                                },
+                                GradientStop {
+                                    color: Color::rgb(244, 114, 182),
+                                    position: AnglePercentageValue::from_degrees(300.0),
+                                },
+                                GradientStop {
+                                    color: Color::rgb(56, 189, 248),
+                                    position: AnglePercentageValue::from_degrees(360.0),
+                                },
+                            ],
+                        })],
+                        ..VisualStyle::default()
+                    },
+                ),
+            ];
+            let mut buffer = vec![0_u32; 96 * 96];
+            render_to_buffer(&scene, &mut buffer, 96, 96, Color::BLACK);
+            buffer
+        }
+
+        let oklab = render_conic(GradientInterpolation::Oklab);
+        let linear = render_conic(GradientInterpolation::LinearSrgb);
+        let different_pixels = oklab
+            .iter()
+            .zip(&linear)
+            .filter(|(left, right)| left != right)
+            .count();
+
+        assert!(different_pixels > 0);
+    }
+
+    #[test]
     fn overflow_clip_hides_child_pixels_outside_parent_bounds() {
         let scene = vec![
             RenderNode::container(LayoutBox::new(4.0, 4.0, 6.0, 6.0))

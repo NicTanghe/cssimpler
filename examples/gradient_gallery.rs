@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation};
 use cssimpler::core::{
-    BackgroundLayer, ElementInteractionState, GradientInterpolation, LayoutBox, Node, RenderNode,
+    BackgroundLayer, ElementInteractionState, GradientInterpolation, Node, RenderNode,
 };
 use cssimpler::renderer::{FrameInfo, SceneProvider, ViewportSize, WindowConfig};
 use cssimpler::style::{Stylesheet, parse_stylesheet};
@@ -29,8 +29,6 @@ type GalleryApp = App<
 struct GradientGalleryProvider {
     app: GalleryApp,
     scene: Vec<RenderNode>,
-    last_button_layout: Option<LayoutBox>,
-    last_interaction: ElementInteractionState,
 }
 
 impl GradientGalleryProvider {
@@ -43,8 +41,6 @@ impl GradientGalleryProvider {
                 build_ui as fn(&GalleryState) -> Node,
             ),
             scene: Vec::new(),
-            last_button_layout: None,
-            last_interaction: ElementInteractionState::default(),
         }
     }
 }
@@ -61,11 +57,6 @@ impl SceneProvider for GradientGalleryProvider {
     fn capture_scene(&mut self) -> Vec<RenderNode> {
         let mut scene = <GalleryApp as SceneProvider>::capture_scene(&mut self.app);
         apply_gradient_interpolation(&mut scene, self.app.state().interpolation);
-        log_button_layout_change(
-            &scene,
-            self.app.state().interpolation,
-            &mut self.last_button_layout,
-        );
         self.scene = scene.clone();
         scene
     }
@@ -75,13 +66,6 @@ impl SceneProvider for GradientGalleryProvider {
     }
 
     fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
-        if interaction != self.last_interaction {
-            eprintln!(
-                "[gradient_gallery] interaction hovered={:?} active={:?}",
-                interaction.hovered, interaction.active
-            );
-            self.last_interaction = interaction.clone();
-        }
         <GalleryApp as SceneProvider>::set_element_interaction(&mut self.app, interaction)
     }
 }
@@ -99,11 +83,6 @@ fn update(state: &mut GalleryState, _frame: FrameInfo) -> Invalidation {
     }
 
     if actions & ACTION_TOGGLE_INTERPOLATION != 0 {
-        eprintln!(
-            "[gradient_gallery] applying toggle {} -> {}",
-            current_mode_label(state.interpolation),
-            next_mode_label(state.interpolation)
-        );
         state.interpolation = next_interpolation(state.interpolation);
     }
 
@@ -207,7 +186,6 @@ fn build_mode_switch(state: &GalleryState) -> Node {
 }
 
 fn toggle_interpolation() {
-    eprintln!("[gradient_gallery] toggle_interpolation handler fired");
     ACTIONS.fetch_or(ACTION_TOGGLE_INTERPOLATION, Ordering::Relaxed);
 }
 
@@ -245,55 +223,6 @@ fn apply_node_gradient_interpolation(node: &mut RenderNode, interpolation: Gradi
     }
 
     apply_gradient_interpolation(&mut node.children, interpolation);
-}
-
-fn log_button_layout_change(
-    scene: &[RenderNode],
-    interpolation: GradientInterpolation,
-    last_button_layout: &mut Option<LayoutBox>,
-) {
-    let button_layout = find_clickable_layout(scene);
-    if button_layout == *last_button_layout {
-        return;
-    }
-
-    *last_button_layout = button_layout;
-    if let Some(layout) = button_layout {
-        eprintln!(
-            "[gradient_gallery] mode-toggle bounds mode={} x={} y={} w={} h={}",
-            current_mode_label(interpolation),
-            layout.x,
-            layout.y,
-            layout.width,
-            layout.height
-        );
-    } else {
-        eprintln!("[gradient_gallery] mode-toggle bounds not found");
-    }
-}
-
-fn find_clickable_layout(nodes: &[RenderNode]) -> Option<LayoutBox> {
-    for node in nodes {
-        if let Some(layout) = find_clickable_layout_in_node(node) {
-            return Some(layout);
-        }
-    }
-
-    None
-}
-
-fn find_clickable_layout_in_node(node: &RenderNode) -> Option<LayoutBox> {
-    if node.on_click.is_some() {
-        return Some(node.layout);
-    }
-
-    for child in &node.children {
-        if let Some(layout) = find_clickable_layout_in_node(child) {
-            return Some(layout);
-        }
-    }
-
-    None
 }
 
 fn stylesheet() -> &'static Stylesheet {
