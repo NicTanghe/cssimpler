@@ -281,6 +281,27 @@ pub fn to_taffy(style: &LayoutStyle) -> TaffyStyle {
 }
 
 pub fn build_render_tree(root: &Node, stylesheet: &Stylesheet) -> RenderNode {
+    build_render_tree_with_available_space(root, stylesheet, None)
+}
+
+pub fn build_render_tree_in_viewport(
+    root: &Node,
+    stylesheet: &Stylesheet,
+    viewport_width: usize,
+    viewport_height: usize,
+) -> RenderNode {
+    let viewport = TaffySize {
+        width: AvailableSpace::Definite(viewport_width.max(1) as f32),
+        height: AvailableSpace::Definite(viewport_height.max(1) as f32),
+    };
+    build_render_tree_with_available_space(root, stylesheet, Some(viewport))
+}
+
+fn build_render_tree_with_available_space(
+    root: &Node,
+    stylesheet: &Stylesheet,
+    available_space_override: Option<TaffySize<AvailableSpace>>,
+) -> RenderNode {
     let Node::Element(root_element) = root else {
         panic!("render tree roots must be elements");
     };
@@ -288,7 +309,8 @@ pub fn build_render_tree(root: &Node, stylesheet: &Stylesheet) -> RenderNode {
     let resolved = resolve_element_tree(root_element, stylesheet, None);
     let mut taffy = TaffyTree::<LeafMeasureContext>::new();
     let layout_tree = build_layout_tree(&resolved, &mut taffy);
-    let available_space = available_space_from_root(&layout_tree.style.layout.taffy);
+    let available_space = available_space_override
+        .unwrap_or_else(|| available_space_from_root(&layout_tree.style.layout.taffy));
     taffy
         .compute_layout_with_measure(
             layout_tree.node_id,
@@ -1114,7 +1136,7 @@ mod tests {
 
     use super::{
         Declaration, ElementRef, Selector, StyleRule, Stylesheet, build_render_tree,
-        parse_stylesheet, resolve_style, to_taffy,
+        build_render_tree_in_viewport, parse_stylesheet, resolve_style, to_taffy,
     };
 
     #[test]
@@ -1551,5 +1573,35 @@ mod tests {
         assert!(scrollbars.shows_vertical());
         assert_eq!(scrollbars.metrics.reserved_width, 12.0);
         assert!(scrollbars.metrics.max_offset_y > 0.0);
+    }
+
+    #[test]
+    fn viewport_layout_supports_percentage_sized_roots() {
+        let stylesheet = parse_stylesheet(
+            "#app {
+                display: flex;
+                width: 100%;
+                height: 100%;
+                padding: 12px;
+                background-color: #ffffff;
+            }
+            .panel {
+                flex-grow: 1;
+                height: 40px;
+                background-color: #0f172a;
+            }",
+        )
+        .expect("viewport stylesheet should parse");
+        let tree = Node::element("div")
+            .with_id("app")
+            .with_child(Node::element("section").with_class("panel").into())
+            .into();
+        let scene = build_render_tree_in_viewport(&tree, &stylesheet, 640, 360);
+
+        assert_eq!(scene.layout.width, 640.0);
+        assert_eq!(scene.layout.height, 360.0);
+        assert_eq!(scene.children[0].layout.x, 12.0);
+        assert_eq!(scene.children[0].layout.y, 12.0);
+        assert_eq!(scene.children[0].layout.width, 616.0);
     }
 }

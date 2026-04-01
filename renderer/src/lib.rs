@@ -1,6 +1,5 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::thread;
 use std::time::{Duration, Instant};
 
 mod fonts;
@@ -13,8 +12,6 @@ use cssimpler_core::{
     LinearRgba, RadialGradient, RadialShape, RenderKind, RenderNode, ShapeExtent,
 };
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
-#[cfg(windows)]
-use winapi::um::winuser::{GetAsyncKeyState, VK_LBUTTON, VK_LWIN, VK_RWIN};
 
 const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 8;
 const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.5;
@@ -22,6 +19,27 @@ const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.5;
 pub struct FrameInfo {
     pub frame_index: u64,
     pub delta: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewportSize {
+    pub width: usize,
+    pub height: usize,
+}
+
+impl ViewportSize {
+    pub const fn new(width: usize, height: usize) -> Self {
+        Self {
+            width: if width == 0 { 1 } else { width },
+            height: if height == 0 { 1 } else { height },
+        }
+    }
+}
+
+impl Default for ViewportSize {
+    fn default() -> Self {
+        Self::new(1, 1)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +93,10 @@ pub trait SceneProvider {
 
     fn scene(&self) -> &[RenderNode];
 
+    fn set_viewport(&mut self, viewport: ViewportSize) {
+        let _ = viewport;
+    }
+
     fn capture_scene(&mut self) -> Vec<RenderNode> {
         self.scene().to_vec()
     }
@@ -90,6 +112,22 @@ impl<F> ClosureSceneProvider<F> {
         Self {
             render_scene,
             scene: Vec::new(),
+        }
+    }
+}
+
+struct ViewportClosureSceneProvider<F> {
+    render_scene: F,
+    scene: Vec<RenderNode>,
+    viewport: ViewportSize,
+}
+
+impl<F> ViewportClosureSceneProvider<F> {
+    fn new(render_scene: F) -> Self {
+        Self {
+            render_scene,
+            scene: Vec::new(),
+            viewport: ViewportSize::default(),
         }
     }
 }
@@ -111,11 +149,39 @@ where
     }
 }
 
+impl<F> SceneProvider for ViewportClosureSceneProvider<F>
+where
+    F: FnMut(FrameInfo, ViewportSize) -> Vec<RenderNode>,
+{
+    fn update(&mut self, frame: FrameInfo) {
+        self.scene = (self.render_scene)(frame, self.viewport);
+    }
+
+    fn scene(&self) -> &[RenderNode] {
+        &self.scene
+    }
+
+    fn set_viewport(&mut self, viewport: ViewportSize) {
+        self.viewport = viewport;
+    }
+
+    fn capture_scene(&mut self) -> Vec<RenderNode> {
+        std::mem::take(&mut self.scene)
+    }
+}
+
 pub fn run<F>(config: WindowConfig, render_scene: F) -> Result<()>
 where
     F: FnMut(FrameInfo) -> Vec<RenderNode>,
 {
     run_with_scene_provider(config, ClosureSceneProvider::new(render_scene))
+}
+
+pub fn run_with_viewport<F>(config: WindowConfig, render_scene: F) -> Result<()>
+where
+    F: FnMut(FrameInfo, ViewportSize) -> Vec<RenderNode>,
+{
+    run_with_scene_provider(config, ViewportClosureSceneProvider::new(render_scene))
 }
 
 pub fn run_with_scene_provider<P>(config: WindowConfig, mut scene_provider: P) -> Result<()>
@@ -126,7 +192,7 @@ where
         &config.title,
         config.width,
         config.height,
-        WindowOptions::default(),
+        window_options(),
     )?;
     window.set_target_fps(frame_time_to_fps(config.frame_time));
 
@@ -137,6 +203,7 @@ where
     let mut frame_index = 0_u64;
     let mut previous_left_down = false;
     let mut previous_middle_down = false;
+    let mut suppress_left_pointer_until_release = false;
     let mut previous_presented_scene: Option<Vec<RenderNode>> = None;
     let mut previous_presented_indicator: Option<scrollbar::AutoScrollIndicator> = None;
     let mut scrollbar_controller = scrollbar::ScrollbarController::default();
@@ -148,25 +215,29 @@ where
 
         let left_down = window.get_mouse_down(MouseButton::Left);
         let middle_down = window.get_mouse_down(MouseButton::Middle);
-        let suspend_updates_for_system_drag = should_suspend_updates(
+        let suppress_pointer_for_system_drag = should_suspend_updates(
             left_down,
             window.is_key_down(Key::LeftSuper),
             window.is_key_down(Key::RightSuper),
         );
-
-        if suspend_updates_for_system_drag {
-            freeze_during_native_window_drag(&mut window);
-            previous_left_down = false;
-            previous_middle_down = false;
-            continue;
+        if suppress_pointer_for_system_drag {
+            suppress_left_pointer_until_release = true;
+        } else if !left_down {
+            suppress_left_pointer_until_release = false;
         }
 
+        let interactive_left_down =
+            left_down && !suppress_pointer_for_system_drag && !suppress_left_pointer_until_release;
+
+        let (window_width, window_height) = window.get_size();
+        let viewport = ViewportSize::new(window_width, window_height);
+        scene_provider.set_viewport(viewport);
         let frame = FrameInfo { frame_index, delta };
         scene_provider.update(frame);
         let mut scene = scene_provider.capture_scene();
         scrollbar_controller.apply_to_scene(&mut scene);
         let mouse_position = window.get_mouse_pos(MouseMode::Clamp);
-        let click_started = left_down && !previous_left_down;
+        let click_started = interactive_left_down && !previous_left_down;
         let middle_click_started = middle_down && !previous_middle_down;
         let auto_scroll_canceled_click =
             click_started && scrollbar_controller.cancel_middle_button_auto_scroll();
@@ -184,7 +255,7 @@ where
         let scrollbar_consumed_click = scrollbar_controller.handle_pointer(
             &mut scene,
             mouse_position,
-            left_down,
+            interactive_left_down,
             click_started,
         );
 
@@ -203,19 +274,23 @@ where
             scene_provider.update(frame);
             scene = scene_provider.capture_scene();
             scrollbar_controller.apply_to_scene(&mut scene);
-            scrollbar_controller.handle_pointer(&mut scene, mouse_position, left_down, false);
+            scrollbar_controller.handle_pointer(
+                &mut scene,
+                mouse_position,
+                interactive_left_down,
+                false,
+            );
         }
 
         let auto_scroll_indicator = scrollbar_controller.auto_scroll_indicator();
 
-        let (window_width, window_height) = window.get_size();
-        let resized = buffer_width != window_width.max(1) || buffer_height != window_height.max(1);
+        let resized = buffer_width != viewport.width || buffer_height != viewport.height;
         resize_buffer(
             &mut buffer,
             &mut buffer_width,
             &mut buffer_height,
-            window_width,
-            window_height,
+            viewport.width,
+            viewport.height,
             config.clear_color,
         );
         if should_present_frame(
@@ -267,12 +342,19 @@ where
             window.update();
         }
 
-        previous_left_down = left_down;
+        previous_left_down = interactive_left_down;
         previous_middle_down = middle_down;
         frame_index += 1;
     }
 
     Ok(())
+}
+
+fn window_options() -> WindowOptions {
+    WindowOptions {
+        resize: true,
+        ..WindowOptions::default()
+    }
 }
 
 pub fn render_to_buffer(
@@ -406,31 +488,6 @@ fn render_nodes_match_own_visuals(left: &RenderNode, right: &RenderNode) -> bool
 
 fn should_suspend_updates(left_down: bool, left_super_down: bool, right_super_down: bool) -> bool {
     left_down && (left_super_down || right_super_down)
-}
-
-fn freeze_during_native_window_drag(window: &mut Window) {
-    #[cfg(windows)]
-    {
-        while system_drag_is_active() {
-            thread::sleep(Duration::from_millis(1));
-        }
-
-        window.update();
-        return;
-    }
-
-    #[cfg(not(windows))]
-    window.update();
-}
-
-#[cfg(windows)]
-fn system_drag_is_active() -> bool {
-    key_is_down(VK_LBUTTON) && (key_is_down(VK_LWIN) || key_is_down(VK_RWIN))
-}
-
-#[cfg(windows)]
-fn key_is_down(virtual_key: i32) -> bool {
-    unsafe { (GetAsyncKeyState(virtual_key) as u16 & 0x8000) != 0 }
 }
 
 #[derive(Clone, Copy)]
@@ -1754,7 +1811,7 @@ mod tests {
     use crate::{
         WindowConfig, blend_pixel, dispatch_click, pack_rgb, render_scene_update, render_to_buffer,
         resize_buffer, scenes_match_visuals, should_present_frame, should_present_scene,
-        should_suspend_updates,
+        should_suspend_updates, window_options,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -2111,6 +2168,11 @@ mod tests {
         assert_eq!(width, 640);
         assert_eq!(height, 360);
         assert_eq!(buffer.len(), 640 * 360);
+    }
+
+    #[test]
+    fn window_options_enable_native_resizing() {
+        assert!(window_options().resize);
     }
 
     #[test]

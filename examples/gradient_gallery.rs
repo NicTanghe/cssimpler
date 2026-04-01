@@ -3,17 +3,23 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use cssimpler::core::RenderNode;
 use cssimpler::renderer::WindowConfig;
-use cssimpler::style::{Stylesheet, build_render_tree, parse_stylesheet};
+use cssimpler::style::{Stylesheet, build_render_tree_in_viewport, parse_stylesheet};
 use cssimpler::ui;
 
 fn main() -> Result<()> {
     let config = WindowConfig::new("cssimpler / gradient gallery", 1280, 840);
-    cssimpler_renderer::run(config, |_| render()).map_err(Into::into)
+    cssimpler_renderer::run_with_viewport(config, |_, viewport| render(viewport.width, viewport.height))
+        .map_err(Into::into)
 }
 
-fn render() -> Vec<RenderNode> {
+fn render(viewport_width: usize, viewport_height: usize) -> Vec<RenderNode> {
     let ui = build_ui();
-    vec![build_render_tree(&ui, stylesheet())]
+    vec![build_render_tree_in_viewport(
+        &ui,
+        stylesheet(),
+        viewport_width,
+        viewport_height,
+    )]
 }
 
 fn build_ui() -> cssimpler::core::Node {

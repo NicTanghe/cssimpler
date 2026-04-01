@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
 use crate::core::{Node, RenderNode};
-use crate::renderer::{self, FrameInfo, SceneProvider, WindowConfig};
-use crate::style::{Stylesheet, build_render_tree};
+use crate::renderer::{self, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
+use crate::style::{Stylesheet, build_render_tree, build_render_tree_in_viewport};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Invalidation {
@@ -158,6 +158,7 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     stylesheet: &'a Stylesheet,
     update: Update,
     view: View,
+    viewport: Option<ViewportSize>,
     render_mode: RenderMode,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
@@ -176,6 +177,7 @@ where
             stylesheet,
             update,
             view,
+            viewport: None,
             render_mode: RenderMode::OnInvalidation,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
@@ -194,6 +196,13 @@ where
 
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    pub fn set_viewport(&mut self, viewport: ViewportSize) {
+        if self.viewport != Some(viewport) {
+            self.viewport = Some(viewport);
+            self.invalidate(Invalidation::Layout);
+        }
     }
 
     pub fn invalidate(&mut self, refresh: impl Into<Refresh>) {
@@ -229,7 +238,12 @@ where
     fn rebuild_scene(&mut self) {
         let view = &mut self.view;
         let tree = view(&self.state);
-        self.cached_scene = Some(vec![build_render_tree(&tree, self.stylesheet)]);
+        let scene = if let Some(viewport) = self.viewport {
+            build_render_tree_in_viewport(&tree, self.stylesheet, viewport.width, viewport.height)
+        } else {
+            build_render_tree(&tree, self.stylesheet)
+        };
+        self.cached_scene = Some(vec![scene]);
         self.pending_refresh = Refresh::clean();
     }
 
@@ -246,6 +260,10 @@ where
     View: FnMut(&State) -> Node,
     Signal: Into<Refresh>,
 {
+    fn set_viewport(&mut self, viewport: ViewportSize) {
+        App::set_viewport(self, viewport);
+    }
+
     fn update(&mut self, frame: FrameInfo) {
         self.advance(frame);
     }
@@ -260,6 +278,7 @@ pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     stylesheet: &'a Stylesheet,
     update: Update,
     fragments: Vec<Fragment<'a, State>>,
+    viewport: Option<ViewportSize>,
     render_mode: RenderMode,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
@@ -280,6 +299,7 @@ where
             stylesheet,
             update,
             fragments: fragments.into_iter().collect(),
+            viewport: None,
             render_mode: RenderMode::OnInvalidation,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
@@ -298,6 +318,13 @@ where
 
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    pub fn set_viewport(&mut self, viewport: ViewportSize) {
+        if self.viewport != Some(viewport) {
+            self.viewport = Some(viewport);
+            self.invalidate(Invalidation::Layout);
+        }
     }
 
     pub fn invalidate(&mut self, refresh: impl Into<Refresh>) {
@@ -361,7 +388,7 @@ where
         let scene = self
             .fragments
             .iter()
-            .map(|fragment| build_render_tree(&fragment.render(&self.state), self.stylesheet))
+            .map(|fragment| self.render_fragment(fragment))
             .collect();
         self.cached_scene = Some(scene);
     }
@@ -384,7 +411,7 @@ where
                 return false;
             };
             let node = self.fragments[index].render(&self.state);
-            replacements.push((index, build_render_tree(&node, self.stylesheet)));
+            replacements.push((index, self.render_node(&node)));
         }
 
         let scene = self
@@ -396,6 +423,19 @@ where
         }
 
         true
+    }
+
+    fn render_fragment(&self, fragment: &Fragment<'a, State>) -> RenderNode {
+        let node = fragment.render(&self.state);
+        self.render_node(&node)
+    }
+
+    fn render_node(&self, node: &Node) -> RenderNode {
+        if let Some(viewport) = self.viewport {
+            build_render_tree_in_viewport(node, self.stylesheet, viewport.width, viewport.height)
+        } else {
+            build_render_tree(node, self.stylesheet)
+        }
     }
 
     fn scene(&self) -> &[RenderNode] {
@@ -410,6 +450,10 @@ where
     Update: FnMut(&mut State, FrameInfo) -> Signal,
     Signal: Into<Refresh>,
 {
+    fn set_viewport(&mut self, viewport: ViewportSize) {
+        FragmentApp::set_viewport(self, viewport);
+    }
+
     fn update(&mut self, frame: FrameInfo) {
         self.advance(frame);
     }
@@ -449,8 +493,8 @@ mod tests {
     use crate::ui;
 
     use super::{App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode};
-    use crate::renderer::{FrameInfo, SceneProvider};
-    use crate::style::Stylesheet;
+    use crate::renderer::{FrameInfo, SceneProvider, ViewportSize};
+    use crate::style::{Stylesheet, parse_stylesheet};
 
     #[test]
     fn initial_frame_builds_the_scene() {
@@ -734,6 +778,38 @@ mod tests {
             text_nodes(SceneProvider::scene(&app)),
             vec!["value 9".to_string()]
         );
+    }
+
+    #[test]
+    fn viewport_changes_trigger_a_layout_rerender() {
+        let stylesheet =
+            parse_stylesheet("#app { width: 100%; height: 100%; background-color: #ffffff; }")
+                .expect("viewport stylesheet should parse");
+        let render_calls = Cell::new(0_u32);
+        let mut app = App::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Invalidation::Clean,
+            |_state| {
+                render_calls.set(render_calls.get() + 1);
+                ui! {
+                    <div id="app"></div>
+                }
+            },
+        );
+
+        app.set_viewport(ViewportSize::new(320, 180));
+        let first = app.frame(frame(0));
+        let second = app.frame(frame(1));
+        app.set_viewport(ViewportSize::new(640, 360));
+        let third = app.frame(frame(2));
+
+        assert_eq!(render_calls.get(), 2);
+        assert_eq!(first[0].layout.width, 320.0);
+        assert_eq!(first[0].layout.height, 180.0);
+        assert_eq!(second[0].layout.width, 320.0);
+        assert_eq!(third[0].layout.width, 640.0);
+        assert_eq!(third[0].layout.height, 360.0);
     }
 
     fn frame(frame_index: u64) -> FrameInfo {
