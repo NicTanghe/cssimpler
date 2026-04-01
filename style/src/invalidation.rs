@@ -69,6 +69,9 @@ fn changed_interaction(
 fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
     match declaration {
         Declaration::CustomProperty { .. } => StyleInvalidation::Clean,
+        Declaration::VariableDependentProperty { property_name, .. } => {
+            variable_property_invalidation(property_name)
+        }
         Declaration::Background(_)
         | Declaration::BackgroundLayers(_)
         | Declaration::Foreground(_)
@@ -126,6 +129,29 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::GridRowStart(_)
         | Declaration::GridRowEnd(_) => StyleInvalidation::Layout,
         Declaration::Display(_) => StyleInvalidation::Structure,
+    }
+}
+
+fn variable_property_invalidation(property_name: &str) -> StyleInvalidation {
+    match property_name {
+        "background"
+        | "background-color"
+        | "background-image"
+        | "color"
+        | "border-color"
+        | "border-top-color"
+        | "border-right-color"
+        | "border-bottom-color"
+        | "border-left-color"
+        | "box-shadow"
+        | "scrollbar-color"
+        | "border-radius"
+        | "border-top-left-radius"
+        | "border-top-right-radius"
+        | "border-bottom-right-radius"
+        | "border-bottom-left-radius" => StyleInvalidation::Paint,
+        "display" => StyleInvalidation::Structure,
+        _ => StyleInvalidation::Layout,
     }
 }
 

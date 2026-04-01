@@ -41,6 +41,7 @@ mod custom_properties;
 mod fonts;
 mod invalidation;
 mod selectors;
+mod variable_resolution;
 mod visual;
 
 use self::attributes::reject_unsupported_attr_usage;
@@ -111,7 +112,14 @@ impl StyleRule {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Declaration {
-    CustomProperty { name: String, value: String },
+    CustomProperty {
+        name: String,
+        value: String,
+    },
+    VariableDependentProperty {
+        property_name: String,
+        value_css: String,
+    },
     Background(Color),
     BackgroundLayers(Vec<BackgroundLayerDeclaration>),
     Foreground(Color),
@@ -297,7 +305,19 @@ fn resolve_style_with_inherited_text(
         stylesheet.matching_rules_with_context(element_ref, ancestors, element_path, interaction)
     {
         for declaration in &rule.declarations {
-            apply_declaration(&mut resolved, &mut position_explicit, declaration);
+            if matches!(declaration, Declaration::CustomProperty { .. }) {
+                apply_declaration(&mut resolved, &mut position_explicit, declaration);
+            }
+        }
+    }
+
+    for rule in
+        stylesheet.matching_rules_with_context(element_ref, ancestors, element_path, interaction)
+    {
+        for declaration in &rule.declarations {
+            if !matches!(declaration, Declaration::CustomProperty { .. }) {
+                apply_declaration(&mut resolved, &mut position_explicit, declaration);
+            }
         }
     }
 
@@ -446,6 +466,10 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
     reject_unsupported_attr_usage(property)?;
 
     if let Some(declarations) = custom_properties::extract_property(property) {
+        return declarations;
+    }
+
+    if let Some(declarations) = variable_resolution::extract_property(property) {
         return declarations;
     }
 
@@ -930,6 +954,16 @@ fn grid_placement_from_css(line: &CssGridLine<'_>) -> Result<GridPlacement, Styl
 
 fn apply_declaration(style: &mut Style, position_explicit: &mut bool, declaration: &Declaration) {
     if custom_properties::apply_declaration(style, declaration) {
+        return;
+    }
+
+    if let Some(declarations) =
+        variable_resolution::resolve_declaration(declaration, &style.custom_properties)
+    {
+        let declarations = declarations.unwrap_or_else(|error| panic!("{error}"));
+        for declaration in declarations {
+            apply_declaration(style, position_explicit, &declaration);
+        }
         return;
     }
 
