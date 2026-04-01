@@ -36,16 +36,19 @@ use taffy::prelude::{
     TrackSizingFunction,
 };
 
+mod attributes;
 mod fonts;
 mod selectors;
 mod visual;
 
+use self::attributes::reject_unsupported_attr_usage;
 use self::fonts::{
     FontSizeDeclaration, FontWeightDeclaration, LineHeightDeclaration, apply_font_declaration,
     extract_property as extract_font_property,
 };
 use self::selectors::extract_selector;
 
+pub use attributes::{AttributeTextSource, parse_attribute_text_source};
 pub use selectors::{ElementRef, Selector};
 pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 
@@ -319,6 +322,8 @@ fn extract_declarations(block: &DeclarationBlock<'_>) -> Result<Vec<Declaration>
 }
 
 fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleError> {
+    reject_unsupported_attr_usage(property)?;
+
     if let Some(declarations) = extract_font_property(property) {
         return declarations;
     }

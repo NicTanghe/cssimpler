@@ -631,7 +631,7 @@ Acceptance
 
 ## J3. Attribute selectors and attribute value lookup
 Depends: J1, J2, C1, C3  
-Status: planned  
+Status: done  
 
 Purpose:
 - Make stored attributes usable from CSS and other style-time features
