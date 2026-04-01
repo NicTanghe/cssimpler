@@ -43,6 +43,14 @@ impl Default for ViewportSize {
     }
 }
 
+fn drawable_viewport_size(width: usize, height: usize) -> Option<ViewportSize> {
+    if width == 0 || height == 0 {
+        None
+    } else {
+        Some(ViewportSize::new(width, height))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
     pub title: String,
@@ -232,7 +240,14 @@ where
             left_down && !suppress_pointer_for_system_drag && !suppress_left_pointer_until_release;
 
         let (window_width, window_height) = window.get_size();
-        let viewport = ViewportSize::new(window_width, window_height);
+        let Some(viewport) = drawable_viewport_size(window_width, window_height) else {
+            let _ = scrollbar_controller.cancel_middle_button_auto_scroll();
+            suppress_left_pointer_until_release = false;
+            previous_left_down = false;
+            previous_middle_down = false;
+            window.update();
+            continue;
+        };
         scene_provider.set_viewport(viewport);
         let frame = FrameInfo { frame_index, delta };
         scene_provider.update(frame);
@@ -1935,7 +1950,8 @@ mod tests {
     };
 
     use crate::{
-        WindowConfig, blend_pixel, dispatch_click, hit_test_element_path, pack_rgb,
+        ViewportSize, WindowConfig, blend_pixel, dispatch_click, drawable_viewport_size,
+        hit_test_element_path, pack_rgb,
         render_scene_update, render_to_buffer, resize_buffer, scenes_match_visuals,
         should_present_frame, should_present_scene, should_suspend_updates, window_options,
     };
@@ -2461,6 +2477,17 @@ mod tests {
         assert!(should_suspend_updates(true, true, true));
         assert!(!should_suspend_updates(false, true, false));
         assert!(!should_suspend_updates(true, false, false));
+    }
+
+    #[test]
+    fn drawable_viewport_size_skips_minimized_windows() {
+        assert_eq!(drawable_viewport_size(0, 0), None);
+        assert_eq!(drawable_viewport_size(0, 720), None);
+        assert_eq!(drawable_viewport_size(1280, 0), None);
+        assert_eq!(
+            drawable_viewport_size(1280, 720),
+            Some(ViewportSize::new(1280, 720))
+        );
     }
 
     #[test]
