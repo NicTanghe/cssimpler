@@ -68,7 +68,12 @@ fn changed_interaction(
 
 fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
     match declaration {
-        Declaration::CustomProperty { .. } => StyleInvalidation::Clean,
+        Declaration::Content(_) => StyleInvalidation::Structure,
+        Declaration::CustomProperty { .. }
+        | Declaration::TransitionProperties(_)
+        | Declaration::TransitionDurations(_)
+        | Declaration::TransitionDelays(_)
+        | Declaration::TransitionTimingFunctions(_) => StyleInvalidation::Clean,
         Declaration::VariableDependentProperty { property_name, .. } => {
             variable_property_invalidation(property_name)
         }

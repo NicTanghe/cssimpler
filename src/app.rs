@@ -1,5 +1,9 @@
-use std::marker::PhantomData;
+mod scene_transition;
 
+use std::marker::PhantomData;
+use std::time::Duration;
+
+use self::scene_transition::SceneTransition;
 use crate::core::{ElementInteractionState, Node, RenderNode};
 use crate::renderer::{self, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
 use crate::style::{
@@ -177,6 +181,7 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     render_mode: RenderMode,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
+    scene_transition: Option<SceneTransition>,
     signal: PhantomData<Signal>,
 }
 
@@ -197,6 +202,7 @@ where
             render_mode: RenderMode::OnInvalidation,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
+            scene_transition: None,
             signal: PhantomData,
         }
     }
@@ -239,9 +245,15 @@ where
         let state = &mut self.state;
         let refresh = update(state, frame).into();
         self.pending_refresh = std::mem::take(&mut self.pending_refresh).merge(refresh);
+        let mut rebuilt = false;
 
         if self.needs_rerender() {
             self.rebuild_scene();
+            rebuilt = true;
+        }
+
+        if !rebuilt {
+            self.advance_scene_transition(frame.delta);
         }
     }
 
@@ -254,7 +266,7 @@ where
     fn rebuild_scene(&mut self) {
         let view = &mut self.view;
         let tree = view(&self.state);
-        let scene = if let Some(viewport) = self.viewport {
+        let scene = vec![if let Some(viewport) = self.viewport {
             build_render_tree_in_viewport_with_interaction_at_root(
                 &tree,
                 self.stylesheet,
@@ -265,8 +277,8 @@ where
             )
         } else {
             build_render_tree_with_interaction_at_root(&tree, self.stylesheet, &self.interaction, 0)
-        };
-        self.cached_scene = Some(vec![scene]);
+        }];
+        self.replace_scene(scene);
         self.pending_refresh = Refresh::clean();
     }
 
@@ -274,6 +286,29 @@ where
         self.cached_scene
             .as_deref()
             .expect("app scene should be cached after the first frame")
+    }
+
+    fn replace_scene(&mut self, scene: Vec<RenderNode>) {
+        if let Some(previous) = self.cached_scene.clone()
+            && let Some(transition) = SceneTransition::new(previous, scene.clone())
+        {
+            self.cached_scene = Some(transition.sample());
+            self.scene_transition = Some(transition);
+            return;
+        }
+
+        self.cached_scene = Some(scene);
+        self.scene_transition = None;
+    }
+
+    fn advance_scene_transition(&mut self, delta: Duration) {
+        let Some(transition) = self.scene_transition.as_mut() else {
+            return;
+        };
+        self.cached_scene = Some(transition.advance(delta));
+        if !transition.is_active() {
+            self.scene_transition = None;
+        }
     }
 
     fn set_interaction_state(&mut self, interaction: ElementInteractionState) -> bool {
@@ -334,6 +369,7 @@ pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     render_mode: RenderMode,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
+    scene_transition: Option<SceneTransition>,
     signal: PhantomData<Signal>,
 }
 
@@ -356,6 +392,7 @@ where
             render_mode: RenderMode::OnInvalidation,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
+            scene_transition: None,
             signal: PhantomData,
         }
     }
@@ -398,9 +435,15 @@ where
         let state = &mut self.state;
         let refresh = update(state, frame).into();
         self.pending_refresh = std::mem::take(&mut self.pending_refresh).merge(refresh);
+        let mut rebuilt = false;
 
         if self.needs_rerender() {
             self.refresh_scene();
+            rebuilt = true;
+        }
+
+        if !rebuilt {
+            self.advance_scene_transition(frame.delta);
         }
     }
 
@@ -444,11 +487,11 @@ where
             .enumerate()
             .map(|(index, fragment)| self.render_fragment(index, fragment))
             .collect();
-        self.cached_scene = Some(scene);
+        self.replace_scene(scene);
     }
 
     fn refresh_fragments(&mut self, ids: &[String]) -> bool {
-        let Some(existing_scene) = self.cached_scene.as_ref() else {
+        let Some(existing_scene) = self.cached_scene.clone() else {
             return false;
         };
         if existing_scene.len() != self.fragments.len() {
@@ -468,13 +511,12 @@ where
             replacements.push((index, self.render_node(&node, index)));
         }
 
-        let scene = self
-            .cached_scene
-            .as_mut()
-            .expect("cached scene existence was checked above");
+        let mut scene = existing_scene;
         for (index, node) in replacements {
             scene[index] = node;
         }
+
+        self.replace_scene(scene);
 
         true
     }
@@ -508,6 +550,29 @@ where
         self.cached_scene
             .as_deref()
             .expect("fragment app scene should be cached after the first frame")
+    }
+
+    fn replace_scene(&mut self, scene: Vec<RenderNode>) {
+        if let Some(previous) = self.cached_scene.clone()
+            && let Some(transition) = SceneTransition::new(previous, scene.clone())
+        {
+            self.cached_scene = Some(transition.sample());
+            self.scene_transition = Some(transition);
+            return;
+        }
+
+        self.cached_scene = Some(scene);
+        self.scene_transition = None;
+    }
+
+    fn advance_scene_transition(&mut self, delta: Duration) {
+        let Some(transition) = self.scene_transition.as_mut() else {
+            return;
+        };
+        self.cached_scene = Some(transition.advance(delta));
+        if !transition.is_active() {
+            self.scene_transition = None;
+        }
     }
 
     fn set_interaction_state(&mut self, interaction: ElementInteractionState) -> bool {
@@ -620,7 +685,7 @@ mod tests {
     use std::cell::Cell;
     use std::time::Duration;
 
-    use crate::core::{ElementInteractionState, ElementPath, RenderKind, RenderNode};
+    use crate::core::{Color, ElementInteractionState, ElementPath, Node, RenderKind, RenderNode};
     use crate::ui;
 
     use super::{App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode};
@@ -1202,6 +1267,89 @@ mod tests {
             app.pending_refresh,
             Refresh::fragment("right", Invalidation::Layout)
         );
+    }
+
+    #[test]
+    fn app_advances_color_transitions_without_rebuilding_every_frame() {
+        let stylesheet = parse_stylesheet(
+            ".button { color: #111111; transition: color 32ms linear; }
+             .button.hot { color: #2563eb; }",
+        )
+        .expect("transition stylesheet should parse");
+        let render_calls = Cell::new(0_u32);
+        let mut app = App::new(
+            false,
+            &stylesheet,
+            |state, frame| {
+                if frame.frame_index == 1 {
+                    *state = true;
+                    Invalidation::Paint
+                } else {
+                    Invalidation::Clean
+                }
+            },
+            |state| {
+                render_calls.set(render_calls.get() + 1);
+                let mut button = Node::element("button").with_class("button");
+                if *state {
+                    button = button.with_class("hot");
+                }
+                button.with_child(Node::text("hover me")).into()
+            },
+        );
+
+        let first = app.frame(frame(0));
+        let second = app.frame(frame(1));
+        let third = app.frame(frame(2));
+        let fourth = app.frame(frame(3));
+
+        assert_eq!(render_calls.get(), 2);
+        assert_eq!(first[0].style.foreground, Color::rgb(17, 17, 17));
+        assert_eq!(second[0].style.foreground, Color::rgb(17, 17, 17));
+        assert_ne!(third[0].style.foreground, Color::rgb(17, 17, 17));
+        assert_ne!(third[0].style.foreground, Color::rgb(37, 99, 235));
+        assert_eq!(fourth[0].style.foreground, Color::rgb(37, 99, 235));
+    }
+
+    #[test]
+    fn app_advances_layout_transitions_without_rebuilding_every_frame() {
+        let stylesheet = parse_stylesheet(
+            ".button { width: 80px; transition: width 32ms linear; }
+             .button.hot { width: 160px; }",
+        )
+        .expect("layout transition stylesheet should parse");
+        let render_calls = Cell::new(0_u32);
+        let mut app = App::new(
+            false,
+            &stylesheet,
+            |state, frame| {
+                if frame.frame_index == 1 {
+                    *state = true;
+                    Invalidation::Layout
+                } else {
+                    Invalidation::Clean
+                }
+            },
+            |state| {
+                render_calls.set(render_calls.get() + 1);
+                let mut button = Node::element("button").with_class("button");
+                if *state {
+                    button = button.with_class("hot");
+                }
+                button.with_child(Node::text("hover me")).into()
+            },
+        );
+
+        let first = app.frame(frame(0));
+        let second = app.frame(frame(1));
+        let third = app.frame(frame(2));
+        let fourth = app.frame(frame(3));
+
+        assert_eq!(render_calls.get(), 2);
+        assert_eq!(first[0].layout.width, 80.0);
+        assert_eq!(second[0].layout.width, 80.0);
+        assert!((third[0].layout.width - 120.0).abs() < 0.01);
+        assert_eq!(fourth[0].layout.width, 160.0);
     }
 
     fn frame(frame_index: u64) -> FrameInfo {

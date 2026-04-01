@@ -2,9 +2,9 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
-    Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandler,
-    LayoutBox, LayoutStyle, Node, OverflowMode, RenderNode, ScrollbarWidth, Style,
-    fonts::{TextStyle, TextTransform, layout_text_block},
+    Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, LayoutStyle,
+    OverflowMode, ScrollbarWidth, Style, TransitionPropertyName, TransitionTimingFunction,
+    fonts::{TextStyle, TextTransform},
 };
 use lightningcss::declaration::DeclarationBlock;
 use lightningcss::properties::Property;
@@ -25,14 +25,14 @@ use lightningcss::properties::size::Size as CssSize;
 use lightningcss::rules::CssRule;
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto};
-use taffy::geometry::{Line, Size as TaffySize};
+use taffy::geometry::Line;
 use taffy::prelude::{
     AlignContent as TaffyAlignContent, AlignItems as TaffyAlignItems, AlignSelf as TaffyAlignSelf,
-    AvailableSpace, Dimension, Display as TaffyDisplay, FlexDirection, FlexWrap, GridPlacement,
+    Dimension, Display as TaffyDisplay, FlexDirection, FlexWrap, GridPlacement,
     GridTrackRepetition, JustifyContent as TaffyJustifyContent,
     LengthPercentage as TaffyLengthPercentage, LengthPercentageAuto as TaffyLengthPercentageAuto,
-    MaxTrackSizingFunction, MinTrackSizingFunction, NodeId, NonRepeatedTrackSizingFunction,
-    Position as TaffyPosition, Style as TaffyStyle, TaffyGridLine, TaffyGridSpan, TaffyTree,
+    MaxTrackSizingFunction, MinTrackSizingFunction, NonRepeatedTrackSizingFunction,
+    Position as TaffyPosition, Style as TaffyStyle, TaffyGridLine, TaffyGridSpan,
     TrackSizingFunction,
 };
 
@@ -40,21 +40,31 @@ mod attributes;
 mod custom_properties;
 mod fonts;
 mod invalidation;
+mod render_tree;
 mod selectors;
+mod transitions;
 mod variable_resolution;
 mod visual;
 
-use self::attributes::reject_unsupported_attr_usage;
+use self::attributes::{parse_content_text_source, reject_unsupported_attr_usage};
 use self::fonts::{
     FontSizeDeclaration, FontWeightDeclaration, LineHeightDeclaration, apply_font_declaration,
     extract_property as extract_font_property,
 };
 use self::selectors::extract_selector;
+pub use render_tree::{
+    build_render_tree, build_render_tree_in_viewport, build_render_tree_in_viewport_with_interaction,
+    build_render_tree_in_viewport_with_interaction_at_root, build_render_tree_with_interaction,
+    build_render_tree_with_interaction_at_root,
+};
+#[cfg(test)]
+pub(crate) use render_tree::resolve_element_tree;
 
 pub use attributes::{AttributeTextSource, parse_attribute_text_source};
 pub use invalidation::StyleInvalidation;
 pub use selectors::{
-    AncestorSelector, CompoundSelector, ElementRef, Selector, SelectorCombinator, SimpleSelector,
+    AncestorSelector, CompoundSelector, ElementRef, PseudoElementKind, Selector,
+    SelectorCombinator, SimpleSelector,
 };
 pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 
@@ -84,12 +94,30 @@ impl Stylesheet {
         element_path: &'a ElementPath,
         interaction: &'a ElementInteractionState,
     ) -> impl Iterator<Item = &'a StyleRule> {
+        self.matching_rules_with_context_and_pseudo(
+            element,
+            ancestors,
+            element_path,
+            interaction,
+            None,
+        )
+    }
+
+    pub fn matching_rules_with_context_and_pseudo<'a>(
+        &'a self,
+        element: ElementRef<'a>,
+        ancestors: &'a [ElementRef<'a>],
+        element_path: &'a ElementPath,
+        interaction: &'a ElementInteractionState,
+        pseudo_element: Option<PseudoElementKind>,
+    ) -> impl Iterator<Item = &'a StyleRule> {
         self.rules.iter().filter(move |rule| {
-            rule.selector.matches_with_ancestors_and_interaction(
+            rule.selector.matches_with_ancestors_interaction_and_pseudo(
                 element,
                 ancestors,
                 element_path,
                 interaction,
+                pseudo_element,
             )
         })
     }
@@ -112,6 +140,7 @@ impl StyleRule {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Declaration {
+    Content(Option<AttributeTextSource>),
     CustomProperty {
         name: String,
         value: String,
@@ -120,6 +149,10 @@ pub enum Declaration {
         property_name: String,
         value_css: String,
     },
+    TransitionProperties(Vec<TransitionPropertyName>),
+    TransitionDurations(Vec<f32>),
+    TransitionDelays(Vec<f32>),
+    TransitionTimingFunctions(Vec<TransitionTimingFunction>),
     Background(Color),
     BackgroundLayers(Vec<BackgroundLayerDeclaration>),
     Foreground(Color),
@@ -206,29 +239,6 @@ impl Display for StyleError {
 
 impl Error for StyleError {}
 
-#[derive(Clone, Debug)]
-struct ResolvedElement {
-    style: Style,
-    text: String,
-    on_click: Option<EventHandler>,
-    children: Vec<ResolvedElement>,
-}
-
-#[derive(Clone, Debug)]
-struct LayoutTree {
-    node_id: NodeId,
-    style: Style,
-    text: String,
-    on_click: Option<EventHandler>,
-    children: Vec<LayoutTree>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct LeafMeasureContext {
-    text: String,
-    text_style: TextStyle,
-}
-
 pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
     let parsed = StyleSheet::parse(source, ParserOptions::default())
         .map_err(|error| StyleError::Parse(error.to_string()))?;
@@ -277,27 +287,30 @@ pub fn resolve_style_with_interaction(
     interaction: &ElementInteractionState,
     element_path: &ElementPath,
 ) -> Style {
-    resolve_style_with_inherited_text(
+    resolve_style_target(
         element,
         stylesheet,
+        element.style.clone(),
         None,
         None,
         &[],
         interaction,
         element_path,
+        None,
     )
 }
 
-fn resolve_style_with_inherited_text(
+fn resolve_style_target(
     element: &ElementNode,
     stylesheet: &Stylesheet,
+    mut resolved: Style,
     inherited_text: Option<&TextStyle>,
     inherited_custom_properties: Option<&CustomProperties>,
     ancestors: &[ElementRef<'_>],
     interaction: &ElementInteractionState,
     element_path: &ElementPath,
+    pseudo_element: Option<PseudoElementKind>,
 ) -> Style {
-    let mut resolved = element.style.clone();
     if let Some(inherited_text) = inherited_text {
         resolved.visual.text = inherited_text.clone();
     }
@@ -308,7 +321,13 @@ fn resolve_style_with_inherited_text(
     let element_ref = ElementRef::from(element);
 
     for rule in
-        stylesheet.matching_rules_with_context(element_ref, ancestors, element_path, interaction)
+        stylesheet.matching_rules_with_context_and_pseudo(
+            element_ref,
+            ancestors,
+            element_path,
+            interaction,
+            pseudo_element,
+        )
     {
         for declaration in &rule.declarations {
             if matches!(declaration, Declaration::CustomProperty { .. }) {
@@ -318,7 +337,13 @@ fn resolve_style_with_inherited_text(
     }
 
     for rule in
-        stylesheet.matching_rules_with_context(element_ref, ancestors, element_path, interaction)
+        stylesheet.matching_rules_with_context_and_pseudo(
+            element_ref,
+            ancestors,
+            element_path,
+            interaction,
+            pseudo_element,
+        )
     {
         for declaration in &rule.declarations {
             if !matches!(declaration, Declaration::CustomProperty { .. }) {
@@ -332,130 +357,6 @@ fn resolve_style_with_inherited_text(
 
 pub fn to_taffy(style: &LayoutStyle) -> TaffyStyle {
     style.taffy.clone()
-}
-
-pub fn build_render_tree(root: &Node, stylesheet: &Stylesheet) -> RenderNode {
-    build_render_tree_with_interaction(root, stylesheet, &ElementInteractionState::default())
-}
-
-pub fn build_render_tree_with_interaction(
-    root: &Node,
-    stylesheet: &Stylesheet,
-    interaction: &ElementInteractionState,
-) -> RenderNode {
-    build_render_tree_with_interaction_at_root(root, stylesheet, interaction, 0)
-}
-
-pub fn build_render_tree_with_interaction_at_root(
-    root: &Node,
-    stylesheet: &Stylesheet,
-    interaction: &ElementInteractionState,
-    root_index: usize,
-) -> RenderNode {
-    build_render_tree_with_available_space(root, stylesheet, None, interaction, root_index)
-}
-
-pub fn build_render_tree_in_viewport(
-    root: &Node,
-    stylesheet: &Stylesheet,
-    viewport_width: usize,
-    viewport_height: usize,
-) -> RenderNode {
-    build_render_tree_in_viewport_with_interaction(
-        root,
-        stylesheet,
-        viewport_width,
-        viewport_height,
-        &ElementInteractionState::default(),
-    )
-}
-
-pub fn build_render_tree_in_viewport_with_interaction(
-    root: &Node,
-    stylesheet: &Stylesheet,
-    viewport_width: usize,
-    viewport_height: usize,
-    interaction: &ElementInteractionState,
-) -> RenderNode {
-    build_render_tree_in_viewport_with_interaction_at_root(
-        root,
-        stylesheet,
-        viewport_width,
-        viewport_height,
-        interaction,
-        0,
-    )
-}
-
-pub fn build_render_tree_in_viewport_with_interaction_at_root(
-    root: &Node,
-    stylesheet: &Stylesheet,
-    viewport_width: usize,
-    viewport_height: usize,
-    interaction: &ElementInteractionState,
-    root_index: usize,
-) -> RenderNode {
-    let viewport = TaffySize {
-        width: AvailableSpace::Definite(viewport_width.max(1) as f32),
-        height: AvailableSpace::Definite(viewport_height.max(1) as f32),
-    };
-    build_render_tree_with_available_space(
-        root,
-        stylesheet,
-        Some(viewport),
-        interaction,
-        root_index,
-    )
-}
-
-fn build_render_tree_with_available_space(
-    root: &Node,
-    stylesheet: &Stylesheet,
-    available_space_override: Option<TaffySize<AvailableSpace>>,
-    interaction: &ElementInteractionState,
-    root_index: usize,
-) -> RenderNode {
-    let Node::Element(root_element) = root else {
-        panic!("render tree roots must be elements");
-    };
-
-    let resolved = resolve_element_tree(
-        root_element,
-        stylesheet,
-        None,
-        None,
-        &[],
-        interaction,
-        &ElementPath::root(root_index),
-    );
-    let mut taffy = TaffyTree::<LeafMeasureContext>::new();
-    let layout_tree = build_layout_tree(&resolved, &mut taffy);
-    let available_space = available_space_override
-        .unwrap_or_else(|| available_space_from_root(&layout_tree.style.layout.taffy));
-    taffy
-        .compute_layout_with_measure(
-            layout_tree.node_id,
-            available_space,
-            |known_dimensions, available_space, _, context, _| {
-                context.map_or(
-                    TaffySize {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                    |context| {
-                        measure_text(
-                            &context.text,
-                            &context.text_style,
-                            known_dimensions,
-                            available_space,
-                        )
-                    },
-                )
-            },
-        )
-        .expect("resolved layout should be valid for taffy");
-
-    render_node_from_layout(&layout_tree, &taffy, 0.0, 0.0)
 }
 
 fn extract_declarations(block: &DeclarationBlock<'_>) -> Result<Vec<Declaration>, StyleError> {
@@ -487,7 +388,14 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
         return declarations;
     }
 
+    if let Some(declarations) = transitions::extract_property(property) {
+        return declarations;
+    }
+
     match property {
+        Property::Custom(custom) if custom.name.as_ref() == "content" => Ok(vec![
+            Declaration::Content(parse_content_text_source(&custom.value)?),
+        ]),
         Property::Overflow(overflow) => Ok(vec![
             overflow_x_declaration(overflow.x),
             overflow_y_declaration(overflow.y),
@@ -604,6 +512,13 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
             Ok(vec![Declaration::GridRowEnd(grid_placement_from_css(end)?)])
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+fn attribute_text_source_to_core(source: AttributeTextSource) -> cssimpler_core::GeneratedTextSource {
+    match source {
+        AttributeTextSource::Literal(value) => cssimpler_core::GeneratedTextSource::Literal(value),
+        AttributeTextSource::Attribute(name) => cssimpler_core::GeneratedTextSource::Attribute(name),
     }
 }
 
@@ -987,7 +902,14 @@ fn apply_declaration(style: &mut Style, position_explicit: &mut bool, declaratio
         return;
     }
 
+    if transitions::apply_declaration(style, declaration) {
+        return;
+    }
+
     match declaration {
+        Declaration::Content(value) => {
+            style.generated_text = value.clone().map(attribute_text_source_to_core);
+        }
         Declaration::OverflowX(mode) => {
             style.layout.taffy.overflow.x = visual::taffy_overflow_from_mode(*mode);
             style.visual.overflow.x = *mode;
@@ -1064,215 +986,6 @@ fn apply_declaration(style: &mut Style, position_explicit: &mut bool, declaratio
     }
 }
 
-fn resolve_element_tree(
-    element: &ElementNode,
-    stylesheet: &Stylesheet,
-    inherited_text: Option<&TextStyle>,
-    inherited_custom_properties: Option<&CustomProperties>,
-    ancestors: &[ElementRef<'_>],
-    interaction: &ElementInteractionState,
-    element_path: &ElementPath,
-) -> ResolvedElement {
-    let style = resolve_style_with_inherited_text(
-        element,
-        stylesheet,
-        inherited_text,
-        inherited_custom_properties,
-        ancestors,
-        interaction,
-        element_path,
-    );
-    let mut child_ancestors = Vec::with_capacity(ancestors.len() + 1);
-    child_ancestors.push(ElementRef::from(element));
-    child_ancestors.extend_from_slice(ancestors);
-    let mut child_index = 0;
-
-    ResolvedElement {
-        style: style.clone(),
-        text: element_text(element),
-        on_click: element.on_click,
-        children: element
-            .children
-            .iter()
-            .filter_map(|child| match child {
-                Node::Element(child) => {
-                    let child_path = element_path.with_child(child_index);
-                    child_index += 1;
-                    Some(resolve_element_tree(
-                        child,
-                        stylesheet,
-                        Some(&style.visual.text),
-                        Some(&style.custom_properties),
-                        &child_ancestors,
-                        interaction,
-                        &child_path,
-                    ))
-                }
-                Node::Text(_) => None,
-            })
-            .collect(),
-    }
-}
-
-fn build_layout_tree(
-    resolved: &ResolvedElement,
-    taffy: &mut TaffyTree<LeafMeasureContext>,
-) -> LayoutTree {
-    let children: Vec<_> = resolved
-        .children
-        .iter()
-        .map(|child| build_layout_tree(child, taffy))
-        .collect();
-    let child_ids: Vec<_> = children.iter().map(|child| child.node_id).collect();
-    let node_id = if child_ids.is_empty() {
-        taffy
-            .new_leaf_with_context(
-                to_taffy(&resolved.style.layout),
-                LeafMeasureContext {
-                    text: resolved.text.clone(),
-                    text_style: resolved.style.visual.text.clone(),
-                },
-            )
-            .expect("leaf style should be accepted by taffy")
-    } else {
-        taffy
-            .new_with_children(to_taffy(&resolved.style.layout), &child_ids)
-            .expect("container style should be accepted by taffy")
-    };
-
-    LayoutTree {
-        node_id,
-        style: resolved.style.clone(),
-        text: resolved.text.clone(),
-        on_click: resolved.on_click,
-        children,
-    }
-}
-
-fn available_space_from_root(style: &TaffyStyle) -> TaffySize<AvailableSpace> {
-    TaffySize {
-        width: available_space_from_dimension(style.size.width),
-        height: available_space_from_dimension(style.size.height),
-    }
-}
-
-fn available_space_from_dimension(dimension: Dimension) -> AvailableSpace {
-    match dimension {
-        Dimension::Length(value) => AvailableSpace::Definite(value),
-        _ => AvailableSpace::MaxContent,
-    }
-}
-
-fn render_node_from_layout(
-    tree: &LayoutTree,
-    taffy: &TaffyTree<LeafMeasureContext>,
-    parent_x: f32,
-    parent_y: f32,
-) -> RenderNode {
-    let layout = taffy
-        .layout(tree.node_id)
-        .expect("computed layouts should be readable");
-    let x = parent_x + layout.location.x;
-    let y = parent_y + layout.location.y;
-    let layout_box = LayoutBox::new(x, y, layout.size.width, layout.size.height);
-    let child_nodes: Vec<_> = tree
-        .children
-        .iter()
-        .map(|child| render_node_from_layout(child, taffy, x, y))
-        .collect();
-    let content_inset = content_inset_from_taffy(&tree.style.layout.taffy);
-    let scrollbars = visual::scrollbars_from_layout(&tree.style, layout);
-
-    if child_nodes.is_empty() && !tree.text.is_empty() {
-        let mut node = RenderNode::text(layout_box, tree.text.clone())
-            .with_style(tree.style.visual.clone())
-            .with_content_inset(content_inset);
-        if let Some(scrollbars) = scrollbars {
-            node = node.with_scrollbars(scrollbars);
-        }
-        if let Some(handler) = tree.on_click {
-            node = node.on_click(handler);
-        }
-        node
-    } else {
-        let mut node = RenderNode::container(layout_box)
-            .with_style(tree.style.visual.clone())
-            .with_content_inset(content_inset)
-            .with_children(child_nodes);
-        if let Some(scrollbars) = scrollbars {
-            node = node.with_scrollbars(scrollbars);
-        }
-        if let Some(handler) = tree.on_click {
-            node = node.on_click(handler);
-        }
-        node
-    }
-}
-
-fn element_text(element: &ElementNode) -> String {
-    let mut content = String::new();
-
-    for child in &element.children {
-        collect_text(child, &mut content);
-    }
-
-    content
-}
-
-fn collect_text(node: &Node, buffer: &mut String) {
-    match node {
-        Node::Text(content) => buffer.push_str(content),
-        Node::Element(element) => {
-            for child in &element.children {
-                collect_text(child, buffer);
-            }
-        }
-    }
-}
-
-fn measure_text(
-    text: &str,
-    text_style: &TextStyle,
-    known_dimensions: TaffySize<Option<f32>>,
-    available_space: TaffySize<AvailableSpace>,
-) -> TaffySize<f32> {
-    if text.is_empty() {
-        return TaffySize {
-            width: 0.0,
-            height: 0.0,
-        };
-    }
-
-    let wrap_width = known_dimensions
-        .width
-        .or_else(|| match available_space.width {
-            AvailableSpace::Definite(width) => Some(width.max(1.0)),
-            AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
-        });
-    let layout = layout_text_block(text, text_style, wrap_width);
-
-    TaffySize {
-        width: known_dimensions.width.unwrap_or(layout.width),
-        height: known_dimensions.height.unwrap_or(layout.height),
-    }
-}
-
-fn content_inset_from_taffy(style: &TaffyStyle) -> cssimpler_core::Insets {
-    cssimpler_core::Insets {
-        top: resolved_length(style.padding.top) + resolved_length(style.border.top),
-        right: resolved_length(style.padding.right) + resolved_length(style.border.right),
-        bottom: resolved_length(style.padding.bottom) + resolved_length(style.border.bottom),
-        left: resolved_length(style.padding.left) + resolved_length(style.border.left),
-    }
-}
-
-fn resolved_length(value: TaffyLengthPercentage) -> f32 {
-    match value {
-        TaffyLengthPercentage::Length(value) => value,
-        TaffyLengthPercentage::Percent(_) => 0.0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1281,7 +994,7 @@ mod tests {
         AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient,
         GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
         LengthPercentageValue, LinearGradient, Node, RadialShape, ScrollbarWidth, ShapeExtent,
-        fonts::TextTransform,
+        TransitionPropertyName, TransitionTimingFunction, fonts::TextTransform,
     };
     use taffy::prelude::{
         AlignItems as TaffyAlignItems, Dimension, Display as TaffyDisplay,
@@ -1468,6 +1181,34 @@ mod tests {
     }
 
     #[test]
+    fn parser_supports_transition_shorthand_metadata() {
+        let stylesheet = parse_stylesheet(
+            ".button { transition: color 180ms linear, width 320ms ease-in-out; }",
+        )
+        .expect("transition stylesheet should parse");
+
+        assert!(
+            stylesheet.rules[0].declarations.contains(&Declaration::TransitionProperties(vec![
+                TransitionPropertyName::Property("color".to_string()),
+                TransitionPropertyName::Property("width".to_string()),
+            ]))
+        );
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TransitionDurations(vec![0.18, 0.32]))
+        );
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TransitionTimingFunctions(vec![
+                    TransitionTimingFunction::Linear,
+                    TransitionTimingFunction::EaseInOut,
+                ]))
+        );
+    }
+
+    #[test]
     fn unsupported_filter_functions_fail_clearly() {
         let error = parse_stylesheet(".badge { filter: blur(2px); }")
             .expect_err("unsupported filter should fail clearly");
@@ -1522,6 +1263,24 @@ mod tests {
             Color::rgb(37, 99, 235)
         );
         assert_eq!(scene.children[1].children[0].style.background, None);
+    }
+
+    #[test]
+    fn generated_content_pseudo_elements_render_before_and_after_text() {
+        let stylesheet = parse_stylesheet(
+            ".badge::before { content: \"[\"; color: #2563eb; }
+             .badge::after { content: attr(data-label); color: #f97316; }",
+        )
+        .expect("generated content stylesheet should parse");
+        let tree = Node::element("div")
+            .with_class("badge")
+            .with_attribute("data-label", "done")
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        assert_eq!(text_nodes(&scene), vec!["[".to_string(), "done".to_string()]);
+        assert_eq!(scene.children[0].style.foreground, Color::rgb(37, 99, 235));
+        assert_eq!(scene.children[1].style.foreground, Color::rgb(249, 115, 22));
     }
 
     #[test]
@@ -1966,5 +1725,21 @@ mod tests {
         assert_eq!(scene.children[0].layout.x, 12.0);
         assert_eq!(scene.children[0].layout.y, 12.0);
         assert_eq!(scene.children[0].layout.width, 616.0);
+    }
+
+    fn text_nodes(node: &cssimpler_core::RenderNode) -> Vec<String> {
+        let mut text = Vec::new();
+        collect_text_nodes(node, &mut text);
+        text
+    }
+
+    fn collect_text_nodes(node: &cssimpler_core::RenderNode, text: &mut Vec<String>) {
+        if let cssimpler_core::RenderKind::Text(content) = &node.kind {
+            text.push(content.clone());
+        }
+
+        for child in &node.children {
+            collect_text_nodes(child, text);
+        }
     }
 }

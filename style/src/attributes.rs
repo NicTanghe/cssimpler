@@ -52,12 +52,44 @@ pub fn parse_attribute_text_source(
     }
 }
 
+pub fn parse_content_text_source(
+    tokens: &TokenList<'_>,
+) -> Result<Option<AttributeTextSource>, StyleError> {
+    let tokens = non_whitespace_tokens(tokens);
+    let [token] = tokens.as_slice() else {
+        return Err(unsupported_attribute_text_source(&tokens));
+    };
+
+    match token {
+        TokenOrValue::Token(token) => {
+            let serialized = token
+                .to_css_string(PrinterOptions::default())
+                .map_err(|_| unsupported_attribute_text_source(&tokens))?;
+            if serialized.eq_ignore_ascii_case("none") {
+                return Ok(None);
+            }
+            let Some(literal) = serialized
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .or_else(|| {
+                    serialized
+                        .strip_prefix('\'')
+                        .and_then(|value| value.strip_suffix('\''))
+                })
+            else {
+                return Err(unsupported_attribute_text_source(&tokens));
+            };
+
+            Ok(Some(AttributeTextSource::Literal(literal.to_string())))
+        }
+        TokenOrValue::Function(function) => parse_attr_function(function).map(Some),
+        _ => Err(unsupported_attribute_text_source(&tokens)),
+    }
+}
+
 pub fn reject_unsupported_attr_usage(property: &Property<'_>) -> Result<(), StyleError> {
     let property_name = match property {
         Property::Unparsed(unparsed) => Some((unparsed.property_id.name(), &unparsed.value)),
-        Property::Custom(custom) if custom.name.as_ref() == "content" => {
-            Some((custom.name.as_ref(), &custom.value))
-        }
         _ => None,
     };
 

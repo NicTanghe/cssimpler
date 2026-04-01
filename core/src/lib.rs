@@ -2,8 +2,10 @@ pub mod color;
 pub mod custom_properties;
 pub mod dom;
 pub mod fonts;
+pub mod generated_content;
 pub mod interaction;
 pub mod scrollbar;
+pub mod transitions;
 
 use crate::fonts::TextStyle;
 use taffy::Style as TaffyStyle;
@@ -11,10 +13,14 @@ use taffy::Style as TaffyStyle;
 pub use color::{Color, GradientInterpolation, LinearRgba};
 pub use custom_properties::CustomProperties;
 pub use dom::{ElementNode, EventHandler, IntoNode, Node, into_node};
+pub use generated_content::GeneratedTextSource;
 pub use interaction::{ElementInteractionState, ElementPath};
 pub use scrollbar::{
     OverflowMode, ScrollbarAxisState, ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics,
     ScrollbarStyle, ScrollbarWidth,
+};
+pub use transitions::{
+    TransitionEntry, TransitionPropertyName, TransitionStyle, TransitionTimingFunction,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -363,6 +369,8 @@ pub struct Style {
     pub custom_properties: CustomProperties,
     pub layout: LayoutStyle,
     pub visual: VisualStyle,
+    pub generated_text: Option<GeneratedTextSource>,
+    pub transitions: TransitionStyle,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -395,6 +403,8 @@ pub struct RenderNode {
     pub kind: RenderKind,
     pub layout: LayoutBox,
     pub style: VisualStyle,
+    pub transitions: TransitionStyle,
+    pub element_path: Option<ElementPath>,
     pub content_inset: Insets,
     pub scrollbars: Option<ScrollbarData>,
     pub on_click: Option<EventHandler>,
@@ -407,6 +417,8 @@ impl RenderNode {
             kind: RenderKind::Container,
             layout,
             style: VisualStyle::default(),
+            transitions: TransitionStyle::default(),
+            element_path: None,
             content_inset: Insets::ZERO,
             scrollbars: None,
             on_click: None,
@@ -419,6 +431,8 @@ impl RenderNode {
             kind: RenderKind::Text(content.into()),
             layout,
             style: VisualStyle::default(),
+            transitions: TransitionStyle::default(),
+            element_path: None,
             content_inset: Insets::ZERO,
             scrollbars: None,
             on_click: None,
@@ -428,6 +442,16 @@ impl RenderNode {
 
     pub fn with_style(mut self, style: VisualStyle) -> Self {
         self.style = style;
+        self
+    }
+
+    pub fn with_transitions(mut self, transitions: TransitionStyle) -> Self {
+        self.transitions = transitions;
+        self
+    }
+
+    pub fn with_element_path(mut self, element_path: ElementPath) -> Self {
+        self.element_path = Some(element_path);
         self
     }
 

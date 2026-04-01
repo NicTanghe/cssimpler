@@ -760,7 +760,7 @@ fn hit_test_element_path_node(
         }
     }
 
-    Some(path.clone())
+    node.element_path.clone().or_else(|| Some(path.clone()))
 }
 
 fn settle_element_interaction<P>(

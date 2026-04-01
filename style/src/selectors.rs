@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use cssimpler_core::{ElementInteractionState, ElementNode, ElementPath};
 use cssparser::ToCss;
 use lightningcss::selector::{
-    Combinator as LightningCombinator, Component, PseudoClass, Selector as LightningSelector,
+    Combinator as LightningCombinator, Component, PseudoClass,
+    PseudoElement as LightningPseudoElement, Selector as LightningSelector,
 };
 
 use crate::StyleError;
@@ -12,6 +13,12 @@ use crate::StyleError;
 pub(crate) struct InteractionDependencies {
     pub hover: bool,
     pub active: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PseudoElementKind {
+    Before,
+    After,
 }
 
 impl InteractionDependencies {
@@ -157,6 +164,7 @@ impl AncestorSelector {
 pub struct Selector {
     pub rightmost: CompoundSelector,
     pub ancestors: Vec<AncestorSelector>,
+    pub pseudo_element: Option<PseudoElementKind>,
 }
 
 impl Selector {
@@ -187,13 +195,19 @@ impl Selector {
         Self {
             rightmost: CompoundSelector::new(simple_selectors),
             ancestors: Vec::new(),
+            pseudo_element: None,
         }
     }
 
-    pub fn complex(rightmost: CompoundSelector, ancestors: Vec<AncestorSelector>) -> Self {
+    pub fn complex(
+        rightmost: CompoundSelector,
+        ancestors: Vec<AncestorSelector>,
+        pseudo_element: Option<PseudoElementKind>,
+    ) -> Self {
         Self {
             rightmost,
             ancestors,
+            pseudo_element,
         }
     }
 
@@ -210,11 +224,12 @@ impl Selector {
         for _ in ancestors {
             path = path.with_child(0);
         }
-        self.matches_with_ancestors_and_interaction(
+        self.matches_with_ancestors_interaction_and_pseudo(
             element,
             ancestors,
             &path,
             &ElementInteractionState::default(),
+            None,
         )
     }
 
@@ -225,6 +240,27 @@ impl Selector {
         element_path: &ElementPath,
         interaction: &ElementInteractionState,
     ) -> bool {
+        self.matches_with_ancestors_interaction_and_pseudo(
+            element,
+            ancestors,
+            element_path,
+            interaction,
+            None,
+        )
+    }
+
+    pub fn matches_with_ancestors_interaction_and_pseudo(
+        &self,
+        element: ElementRef<'_>,
+        ancestors: &[ElementRef<'_>],
+        element_path: &ElementPath,
+        interaction: &ElementInteractionState,
+        pseudo_element: Option<PseudoElementKind>,
+    ) -> bool {
+        if self.pseudo_element != pseudo_element {
+            return false;
+        }
+
         if !self
             .rightmost
             .matches_with_interaction(element, element_path, interaction)
@@ -312,13 +348,33 @@ impl<'a> From<&'a ElementNode> for ElementRef<'a> {
 
 pub fn extract_selector(selector: &LightningSelector<'_>) -> Result<Selector, StyleError> {
     let components = selector.iter_raw_match_order().as_slice();
-    let compound_selectors = components
-        .split(|component| component.is_combinator())
+    let compounds = components
+        .split(|component| {
+            matches!(
+                component,
+                Component::Combinator(combinator)
+                    if *combinator != LightningCombinator::PseudoElement
+            )
+        })
         .map(|compound| extract_compound_selector(selector, compound))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut pseudo_element = None;
+    let mut compound_selectors = Vec::with_capacity(compounds.len());
+    for (index, (compound, compound_pseudo)) in compounds.into_iter().enumerate() {
+        if index > 0 && compound_pseudo.is_some() {
+            return Err(unsupported_selector(selector));
+        }
+        if let Some(compound_pseudo) = compound_pseudo {
+            if pseudo_element.replace(compound_pseudo).is_some() {
+                return Err(unsupported_selector(selector));
+            }
+        }
+        compound_selectors.push(compound);
+    }
     let combinators = components
         .iter()
         .filter_map(|component| match component {
+            Component::Combinator(LightningCombinator::PseudoElement) => None,
             Component::Combinator(combinator) => Some(*combinator),
             _ => None,
         })
@@ -340,16 +396,27 @@ pub fn extract_selector(selector: &LightningSelector<'_>) -> Result<Selector, St
             .zip(combinators)
             .map(|(compound, combinator)| AncestorSelector::new(combinator, compound))
             .collect(),
+        pseudo_element,
     ))
 }
 
 fn extract_compound_selector(
     selector: &LightningSelector<'_>,
     compound: &[Component<'_>],
-) -> Result<CompoundSelector, StyleError> {
+) -> Result<(CompoundSelector, Option<PseudoElementKind>), StyleError> {
+    let mut pseudo_element = None;
     let simple_selectors = compound
         .iter()
-        .map(|component| extract_simple_selector(selector, component))
+        .map(|component| {
+            extract_simple_selector(selector, component).map(|(simple_selector, component_pseudo)| {
+                if let Some(component_pseudo) = component_pseudo {
+                    if pseudo_element.replace(component_pseudo).is_some() {
+                        return Err(unsupported_selector(selector));
+                    }
+                }
+                Ok(simple_selector)
+            })?
+        })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
@@ -359,31 +426,47 @@ fn extract_compound_selector(
         return Err(unsupported_selector(selector));
     }
 
-    Ok(CompoundSelector::new(simple_selectors))
+    Ok((CompoundSelector::new(simple_selectors), pseudo_element))
 }
 
 fn extract_simple_selector(
     selector: &LightningSelector<'_>,
     component: &Component<'_>,
-) -> Result<Option<SimpleSelector>, StyleError> {
+) -> Result<(Option<SimpleSelector>, Option<PseudoElementKind>), StyleError> {
     match component {
-        Component::Class(name) => Ok(Some(SimpleSelector::Class(name.0.to_string()))),
-        Component::ID(name) => Ok(Some(SimpleSelector::Id(name.0.to_string()))),
-        Component::LocalName(name) => Ok(Some(SimpleSelector::Tag(name.name.0.to_string()))),
-        Component::AttributeInNoNamespaceExists { local_name, .. } => Ok(Some(
-            extract_attribute_selector(component, selector, local_name.as_ref(), None)?,
+        Component::Class(name) => Ok((Some(SimpleSelector::Class(name.0.to_string())), None)),
+        Component::ID(name) => Ok((Some(SimpleSelector::Id(name.0.to_string())), None)),
+        Component::LocalName(name) => Ok((Some(SimpleSelector::Tag(name.name.0.to_string())), None)),
+        Component::AttributeInNoNamespaceExists { local_name, .. } => Ok((
+            Some(extract_attribute_selector(
+                component,
+                selector,
+                local_name.as_ref(),
+                None,
+            )?),
+            None,
         )),
         Component::AttributeInNoNamespace {
             local_name, value, ..
-        } => Ok(Some(extract_attribute_selector(
-            component,
-            selector,
-            local_name.as_ref(),
-            Some(value.as_ref()),
-        )?)),
-        Component::NonTSPseudoClass(PseudoClass::Hover) => Ok(Some(SimpleSelector::Hover)),
-        Component::NonTSPseudoClass(PseudoClass::Active) => Ok(Some(SimpleSelector::Active)),
-        Component::ExplicitUniversalType => Ok(None),
+        } => Ok((
+            Some(extract_attribute_selector(
+                component,
+                selector,
+                local_name.as_ref(),
+                Some(value.as_ref()),
+            )?),
+            None,
+        )),
+        Component::NonTSPseudoClass(PseudoClass::Hover) => Ok((Some(SimpleSelector::Hover), None)),
+        Component::NonTSPseudoClass(PseudoClass::Active) => Ok((Some(SimpleSelector::Active), None)),
+        Component::PseudoElement(LightningPseudoElement::Before) => {
+            Ok((None, Some(PseudoElementKind::Before)))
+        }
+        Component::PseudoElement(LightningPseudoElement::After) => {
+            Ok((None, Some(PseudoElementKind::After)))
+        }
+        Component::Combinator(LightningCombinator::PseudoElement) => Ok((None, None)),
+        Component::ExplicitUniversalType => Ok((None, None)),
         _ => Err(unsupported_selector(selector)),
     }
 }
@@ -470,8 +553,8 @@ mod tests {
     use crate::{StyleError, parse_stylesheet, resolve_style, resolve_style_with_interaction};
 
     use super::{
-        AncestorSelector, CompoundSelector, ElementRef, Selector, SelectorCombinator,
-        SimpleSelector,
+        AncestorSelector, CompoundSelector, ElementRef, PseudoElementKind, Selector,
+        SelectorCombinator, SimpleSelector,
     };
 
     #[test]
@@ -550,6 +633,7 @@ mod tests {
                 SelectorCombinator::Descendant,
                 CompoundSelector::new(vec![SimpleSelector::Class("button".to_string())]),
             )],
+            None,
         );
         let child = Selector::complex(
             CompoundSelector::new(vec![SimpleSelector::Class("hover-text".to_string())]),
@@ -557,6 +641,7 @@ mod tests {
                 SelectorCombinator::Child,
                 CompoundSelector::new(vec![SimpleSelector::Class("button".to_string())]),
             )],
+            None,
         );
 
         assert!(descendant.matches_with_ancestors(element, &[button, root]));
@@ -669,6 +754,7 @@ mod tests {
                         SimpleSelector::Class("primary".to_string()),
                     ]),
                 )],
+                None,
             )
         );
     }
@@ -692,6 +778,34 @@ mod tests {
                 SimpleSelector::Class("button".to_string()),
                 SimpleSelector::Active,
             ])
+        );
+    }
+
+    #[test]
+    fn parser_supports_before_and_after_pseudo_elements() {
+        let stylesheet = parse_stylesheet(
+            ".button::before { color: #2563eb; } .button:hover::after { width: 40px; }",
+        )
+        .expect("generated content pseudo elements should parse");
+
+        assert_eq!(
+            stylesheet.rules[0].selector,
+            Selector::complex(
+                CompoundSelector::new(vec![SimpleSelector::Class("button".to_string())]),
+                Vec::new(),
+                Some(PseudoElementKind::Before),
+            )
+        );
+        assert_eq!(
+            stylesheet.rules[1].selector,
+            Selector::complex(
+                CompoundSelector::new(vec![
+                    SimpleSelector::Class("button".to_string()),
+                    SimpleSelector::Hover,
+                ]),
+                Vec::new(),
+                Some(PseudoElementKind::After),
+            )
         );
     }
 
