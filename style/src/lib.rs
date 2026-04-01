@@ -2,8 +2,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
-    Color, ElementInteractionState, ElementNode, ElementPath, EventHandler, LayoutBox, LayoutStyle,
-    Node, OverflowMode, RenderNode, ScrollbarWidth, Style,
+    Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandler,
+    LayoutBox, LayoutStyle, Node, OverflowMode, RenderNode, ScrollbarWidth, Style,
     fonts::{TextStyle, layout_text_block},
 };
 use lightningcss::declaration::DeclarationBlock;
@@ -37,6 +37,7 @@ use taffy::prelude::{
 };
 
 mod attributes;
+mod custom_properties;
 mod fonts;
 mod invalidation;
 mod selectors;
@@ -110,6 +111,7 @@ impl StyleRule {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Declaration {
+    CustomProperty { name: String, value: String },
     Background(Color),
     BackgroundLayers(Vec<BackgroundLayerDeclaration>),
     Foreground(Color),
@@ -261,13 +263,22 @@ pub fn resolve_style_with_interaction(
     interaction: &ElementInteractionState,
     element_path: &ElementPath,
 ) -> Style {
-    resolve_style_with_inherited_text(element, stylesheet, None, &[], interaction, element_path)
+    resolve_style_with_inherited_text(
+        element,
+        stylesheet,
+        None,
+        None,
+        &[],
+        interaction,
+        element_path,
+    )
 }
 
 fn resolve_style_with_inherited_text(
     element: &ElementNode,
     stylesheet: &Stylesheet,
     inherited_text: Option<&TextStyle>,
+    inherited_custom_properties: Option<&CustomProperties>,
     ancestors: &[ElementRef<'_>],
     interaction: &ElementInteractionState,
     element_path: &ElementPath,
@@ -275,6 +286,9 @@ fn resolve_style_with_inherited_text(
     let mut resolved = element.style.clone();
     if let Some(inherited_text) = inherited_text {
         resolved.visual.text = inherited_text.clone();
+    }
+    if let Some(inherited_custom_properties) = inherited_custom_properties {
+        custom_properties::inherit(&mut resolved, inherited_custom_properties);
     }
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
     let element_ref = ElementRef::from(element);
@@ -383,6 +397,7 @@ fn build_render_tree_with_available_space(
         root_element,
         stylesheet,
         None,
+        None,
         &[],
         interaction,
         &ElementPath::root(root_index),
@@ -429,6 +444,10 @@ fn extract_declarations(block: &DeclarationBlock<'_>) -> Result<Vec<Declaration>
 
 fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleError> {
     reject_unsupported_attr_usage(property)?;
+
+    if let Some(declarations) = custom_properties::extract_property(property) {
+        return declarations;
+    }
 
     if let Some(declarations) = extract_font_property(property) {
         return declarations;
@@ -910,6 +929,10 @@ fn grid_placement_from_css(line: &CssGridLine<'_>) -> Result<GridPlacement, Styl
 }
 
 fn apply_declaration(style: &mut Style, position_explicit: &mut bool, declaration: &Declaration) {
+    if custom_properties::apply_declaration(style, declaration) {
+        return;
+    }
+
     if apply_font_declaration(style, declaration) {
         return;
     }
@@ -999,6 +1022,7 @@ fn resolve_element_tree(
     element: &ElementNode,
     stylesheet: &Stylesheet,
     inherited_text: Option<&TextStyle>,
+    inherited_custom_properties: Option<&CustomProperties>,
     ancestors: &[ElementRef<'_>],
     interaction: &ElementInteractionState,
     element_path: &ElementPath,
@@ -1007,6 +1031,7 @@ fn resolve_element_tree(
         element,
         stylesheet,
         inherited_text,
+        inherited_custom_properties,
         ancestors,
         interaction,
         element_path,
@@ -1031,6 +1056,7 @@ fn resolve_element_tree(
                         child,
                         stylesheet,
                         Some(&style.visual.text),
+                        Some(&style.custom_properties),
                         &child_ancestors,
                         interaction,
                         &child_path,
@@ -1219,7 +1245,8 @@ mod tests {
 
     use super::{
         Declaration, ElementRef, Selector, StyleRule, Stylesheet, build_render_tree,
-        build_render_tree_in_viewport, parse_stylesheet, resolve_style, to_taffy,
+        build_render_tree_in_viewport, parse_stylesheet, resolve_element_tree, resolve_style,
+        to_taffy,
     };
 
     #[test]
@@ -1339,6 +1366,60 @@ mod tests {
                     Some(Color::rgb(17, 34, 51)),
                     Some(Color::rgb(221, 238, 255)),
                 ))
+        );
+    }
+
+    #[test]
+    fn resolved_children_inherit_custom_properties_from_ancestors() {
+        let stylesheet = parse_stylesheet(
+            ".button { --animation-color: #2563eb; }
+             .label { --animation-offset: 12px; }
+             .label.active { --animation-color: #22c55e; }",
+        )
+        .expect("custom property stylesheet should parse");
+        let root = Node::element("div")
+            .with_class("button")
+            .with_child(Node::element("span").with_class("label").into())
+            .with_child(
+                Node::element("span")
+                    .with_class("label")
+                    .with_class("active")
+                    .into(),
+            );
+        let resolved = resolve_element_tree(
+            &root,
+            &stylesheet,
+            None,
+            None,
+            &[],
+            &cssimpler_core::ElementInteractionState::default(),
+            &cssimpler_core::ElementPath::root(0),
+        );
+
+        assert_eq!(
+            resolved.style.custom_properties.get("--animation-color"),
+            Some("#2563eb")
+        );
+        assert_eq!(
+            resolved.children[0]
+                .style
+                .custom_properties
+                .get("--animation-color"),
+            Some("#2563eb")
+        );
+        assert_eq!(
+            resolved.children[0]
+                .style
+                .custom_properties
+                .get("--animation-offset"),
+            Some("12px")
+        );
+        assert_eq!(
+            resolved.children[1]
+                .style
+                .custom_properties
+                .get("--animation-color"),
+            Some("#22c55e")
         );
     }
 

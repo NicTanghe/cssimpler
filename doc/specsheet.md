@@ -696,7 +696,7 @@ Acceptance
 
 ## K3. State-aware style resolution and invalidation
 Depends: K1, K2, C4, G3  
-Status: planned  
+Status: done 
 
 Purpose:
 - Let interactive selector matches feed normal style resolution and repaint rules

@@ -68,6 +68,7 @@ fn changed_interaction(
 
 fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
     match declaration {
+        Declaration::CustomProperty { .. } => StyleInvalidation::Clean,
         Declaration::Background(_)
         | Declaration::BackgroundLayers(_)
         | Declaration::Foreground(_)

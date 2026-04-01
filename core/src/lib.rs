@@ -1,4 +1,5 @@
 pub mod color;
+pub mod custom_properties;
 pub mod dom;
 pub mod fonts;
 pub mod interaction;
@@ -8,6 +9,7 @@ use crate::fonts::TextStyle;
 use taffy::Style as TaffyStyle;
 
 pub use color::{Color, GradientInterpolation, LinearRgba};
+pub use custom_properties::CustomProperties;
 pub use dom::{ElementNode, EventHandler, IntoNode, Node, into_node};
 pub use interaction::{ElementInteractionState, ElementPath};
 pub use scrollbar::{
@@ -337,6 +339,7 @@ impl Default for VisualStyle {
 
 #[derive(Clone, Debug, Default)]
 pub struct Style {
+    pub custom_properties: CustomProperties,
     pub layout: LayoutStyle,
     pub visual: VisualStyle,
 }
