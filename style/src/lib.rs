@@ -140,6 +140,10 @@ pub enum Declaration {
     BorderLeftWidth(f32),
     BorderColor(Option<Color>),
     BoxShadows(Vec<ShadowDeclaration>),
+    TextShadows(Vec<ShadowDeclaration>),
+    FilterDropShadows(Vec<ShadowDeclaration>),
+    TextStrokeWidth(f32),
+    TextStrokeColor(Option<Color>),
     OverflowX(OverflowMode),
     OverflowY(OverflowMode),
     ScrollbarWidth(ScrollbarWidth),
@@ -1287,9 +1291,9 @@ mod tests {
     };
 
     use super::{
-        Declaration, ElementRef, Selector, StyleRule, Stylesheet, build_render_tree,
-        build_render_tree_in_viewport, parse_stylesheet, resolve_element_tree, resolve_style,
-        to_taffy,
+        Declaration, ElementRef, Selector, ShadowDeclaration, StyleError, StyleRule, Stylesheet,
+        build_render_tree, build_render_tree_in_viewport, parse_stylesheet, resolve_element_tree,
+        resolve_style, to_taffy,
     };
 
     #[test]
@@ -1416,6 +1420,63 @@ mod tests {
         let spaced_scene = build_render_tree(&tree, &stylesheet);
 
         assert!((spaced_scene.layout.width - (baseline_scene.layout.width + 6.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn parser_supports_text_effect_controls() {
+        let stylesheet = parse_stylesheet(
+            ".label {
+                -webkit-text-stroke: 2px #ff6600;
+                text-shadow: 1px 2px 3px rgba(15, 23, 42, 0.5);
+                filter: drop-shadow(4px 5px 6px #112233);
+            }",
+        )
+        .expect("text effect stylesheet should parse");
+
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TextStrokeWidth(2.0))
+        );
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TextStrokeColor(Some(Color::rgb(255, 102, 0))))
+        );
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TextShadows(vec![ShadowDeclaration {
+                    color: Some(Color::rgba(15, 23, 42, 128)),
+                    offset_x: 1.0,
+                    offset_y: 2.0,
+                    blur_radius: 3.0,
+                    spread: 0.0,
+                }]))
+        );
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::FilterDropShadows(vec![ShadowDeclaration {
+                    color: Some(Color::rgb(17, 34, 51)),
+                    offset_x: 4.0,
+                    offset_y: 5.0,
+                    blur_radius: 6.0,
+                    spread: 0.0,
+                }]))
+        );
+    }
+
+    #[test]
+    fn unsupported_filter_functions_fail_clearly() {
+        let error = parse_stylesheet(".badge { filter: blur(2px); }")
+            .expect_err("unsupported filter should fail clearly");
+
+        assert!(matches!(
+            error,
+            StyleError::UnsupportedValue(message)
+                if message.contains("only drop-shadow() is supported")
+        ));
     }
 
     #[test]

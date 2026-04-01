@@ -85,6 +85,10 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::BorderLeftWidth(_)
         | Declaration::BorderColor(_)
         | Declaration::BoxShadows(_)
+        | Declaration::TextShadows(_)
+        | Declaration::FilterDropShadows(_)
+        | Declaration::TextStrokeWidth(_)
+        | Declaration::TextStrokeColor(_)
         | Declaration::ScrollbarColors(_, _) => StyleInvalidation::Paint,
         Declaration::FontFamilies(_)
         | Declaration::FontSize(_)
@@ -146,6 +150,11 @@ fn variable_property_invalidation(property_name: &str) -> StyleInvalidation {
         | "border-bottom-color"
         | "border-left-color"
         | "box-shadow"
+        | "text-shadow"
+        | "filter"
+        | "-webkit-text-stroke"
+        | "-webkit-text-stroke-width"
+        | "-webkit-text-stroke-color"
         | "scrollbar-color"
         | "border-radius"
         | "border-top-left-radius"

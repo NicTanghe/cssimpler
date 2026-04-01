@@ -282,6 +282,21 @@ pub struct BoxShadow {
     pub spread: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ShadowEffect {
+    pub color: Option<Color>,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur_radius: f32,
+    pub spread: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TextStrokeStyle {
+    pub width: f32,
+    pub color: Option<Color>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Overflow {
     pub x: OverflowMode,
@@ -314,6 +329,9 @@ pub struct VisualStyle {
     pub background_layers: Vec<BackgroundLayer>,
     pub foreground: Color,
     pub text: TextStyle,
+    pub text_stroke: TextStrokeStyle,
+    pub text_shadows: Vec<ShadowEffect>,
+    pub filter_drop_shadows: Vec<ShadowEffect>,
     pub corner_radius: CornerRadius,
     pub border: BorderStyle,
     pub shadows: Vec<BoxShadow>,
@@ -328,6 +346,9 @@ impl Default for VisualStyle {
             background_layers: Vec::new(),
             foreground: Color::BLACK,
             text: TextStyle::default(),
+            text_stroke: TextStrokeStyle::default(),
+            text_shadows: Vec::new(),
+            filter_drop_shadows: Vec::new(),
             corner_radius: CornerRadius::ZERO,
             border: BorderStyle::default(),
             shadows: Vec::new(),

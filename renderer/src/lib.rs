@@ -627,6 +627,21 @@ fn draw_node(
         );
     }
 
+    if !matches!(node.kind, RenderKind::Text(_)) {
+        for shadow in &node.style.filter_drop_shadows {
+            draw_shadow_effect(
+                buffer,
+                width,
+                height,
+                node.layout,
+                node.style.corner_radius,
+                *shadow,
+                node.style.foreground,
+                clip,
+            );
+        }
+    }
+
     draw_background_and_border(node, buffer, width, height, clip);
 
     if let RenderKind::Text(content) = &node.kind {
@@ -638,8 +653,7 @@ fn draw_node(
             height,
             text_layout,
             content,
-            &node.style.text,
-            node.style.foreground,
+            &node.style,
             text_clip,
         );
     }
@@ -916,6 +930,33 @@ fn draw_shadow(
             blend_pixel(buffer, width, height, x, y, shadow.color.with_alpha(alpha));
         }
     }
+}
+
+fn draw_shadow_effect(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    shadow: cssimpler_core::ShadowEffect,
+    fallback_color: Color,
+    clip: ClipRect,
+) {
+    draw_shadow(
+        buffer,
+        width,
+        height,
+        layout,
+        radius,
+        cssimpler_core::BoxShadow {
+            color: shadow.color.unwrap_or(fallback_color),
+            offset_x: shadow.offset_x,
+            offset_y: shadow.offset_y,
+            blur_radius: shadow.blur_radius,
+            spread: shadow.spread,
+        },
+        clip,
+    );
 }
 
 fn draw_rounded_rect(
@@ -1494,8 +1535,31 @@ fn subtree_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
 fn node_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
     let mut bounds = non_empty_layout_clip(node.layout);
 
+    if matches!(node.kind, RenderKind::Text(_)) && node.style.text_stroke.width > 0.0 {
+        bounds = union_optional_bounds(
+            bounds,
+            text_stroke_bounds(node.layout, node.style.text_stroke),
+        );
+    }
+
     for shadow in &node.style.shadows {
         bounds = union_optional_bounds(bounds, shadow_bounds(node.layout, *shadow));
+    }
+
+    match &node.kind {
+        RenderKind::Text(_) => {
+            for shadow in &node.style.text_shadows {
+                bounds = union_optional_bounds(bounds, shadow_effect_bounds(node.layout, *shadow));
+            }
+            for shadow in &node.style.filter_drop_shadows {
+                bounds = union_optional_bounds(bounds, shadow_effect_bounds(node.layout, *shadow));
+            }
+        }
+        RenderKind::Container => {
+            for shadow in &node.style.filter_drop_shadows {
+                bounds = union_optional_bounds(bounds, shadow_effect_bounds(node.layout, *shadow));
+            }
+        }
     }
 
     bounds
@@ -1508,6 +1572,33 @@ fn shadow_bounds(layout: LayoutBox, shadow: cssimpler_core::BoxShadow) -> Option
         shadow.offset_y,
     );
     non_empty_layout_clip(expand_layout(shadow_layout, shadow.blur_radius.max(0.0)))
+}
+
+fn shadow_effect_bounds(
+    layout: LayoutBox,
+    shadow: cssimpler_core::ShadowEffect,
+) -> Option<ClipRect> {
+    shadow_bounds(
+        layout,
+        cssimpler_core::BoxShadow {
+            color: shadow.color.unwrap_or(Color::BLACK),
+            offset_x: shadow.offset_x,
+            offset_y: shadow.offset_y,
+            blur_radius: shadow.blur_radius,
+            spread: shadow.spread,
+        },
+    )
+}
+
+fn text_stroke_bounds(
+    layout: LayoutBox,
+    stroke: cssimpler_core::TextStrokeStyle,
+) -> Option<ClipRect> {
+    if stroke.width <= 0.0 {
+        return None;
+    }
+
+    non_empty_layout_clip(expand_layout(layout, stroke.width.ceil().max(0.0)))
 }
 
 fn non_empty_layout_clip(layout: LayoutBox) -> Option<ClipRect> {
@@ -1869,7 +1960,7 @@ mod tests {
         AnglePercentageValue, BackgroundLayer, BoxShadow, CircleRadius, Color, ConicGradient,
         CornerRadius, ElementPath, GradientDirection, GradientHorizontal, GradientInterpolation,
         GradientPoint, GradientStop, LayoutBox, LengthPercentageValue, LinearGradient, Overflow,
-        RadialGradient, RadialShape, RenderNode, VisualStyle,
+        RadialGradient, RadialShape, RenderNode, ShadowEffect, TextStrokeStyle, VisualStyle,
     };
 
     use crate::{
@@ -2358,6 +2449,118 @@ mod tests {
         render_to_buffer(&literal_scene, &mut literal_buffer, 320, 120, Color::WHITE);
 
         assert_eq!(transformed_buffer, literal_buffer);
+    }
+
+    #[test]
+    fn text_stroke_renders_outline_pixels_without_extra_nodes() {
+        let stroked_scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 320.0, 120.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(245, 247, 250)),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::text(LayoutBox::new(20.0, 28.0, 280.0, 56.0), "Outline")
+                        .with_style(VisualStyle {
+                            foreground: Color::rgb(17, 37, 61),
+                            text: TextStyle::default(),
+                            text_stroke: TextStrokeStyle {
+                                width: 2.0,
+                                color: Some(Color::rgb(245, 158, 11)),
+                            },
+                            ..VisualStyle::default()
+                        }),
+                ),
+        ];
+        let baseline_outline_scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 320.0, 120.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(245, 247, 250)),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::text(LayoutBox::new(20.0, 28.0, 280.0, 56.0), "Outline")
+                        .with_style(VisualStyle {
+                            foreground: Color::rgb(17, 37, 61),
+                            text: TextStyle::default(),
+                            ..VisualStyle::default()
+                        }),
+                ),
+        ];
+        let mut baseline_buffer = vec![0_u32; 320 * 120];
+        let mut stroked_buffer = vec![0_u32; 320 * 120];
+
+        render_to_buffer(
+            &baseline_outline_scene,
+            &mut baseline_buffer,
+            320,
+            120,
+            Color::WHITE,
+        );
+        render_to_buffer(&stroked_scene, &mut stroked_buffer, 320, 120, Color::WHITE);
+
+        let different_pixels = baseline_buffer
+            .iter()
+            .zip(&stroked_buffer)
+            .filter(|(left, right)| left != right)
+            .count();
+
+        assert!(different_pixels > 0);
+        assert!(stroked_buffer.contains(&pack_rgb(Color::rgb(245, 158, 11))));
+    }
+
+    #[test]
+    fn text_shadow_renders_glow_outside_text_bounds() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 320.0, 120.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(245, 247, 250)),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::text(LayoutBox::new(40.0, 36.0, 180.0, 40.0), "Glow").with_style(
+                        VisualStyle {
+                            foreground: Color::rgb(17, 37, 61),
+                            text: TextStyle::default(),
+                            text_shadows: vec![ShadowEffect {
+                                color: Some(Color::rgba(37, 99, 235, 180)),
+                                offset_x: 0.0,
+                                offset_y: 0.0,
+                                blur_radius: 4.0,
+                                spread: 2.0,
+                            }],
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 320 * 120];
+
+        render_to_buffer(&scene, &mut buffer, 320, 120, Color::WHITE);
+
+        assert_ne!(buffer[34 * 320 + 36], pack_rgb(Color::WHITE));
+    }
+
+    #[test]
+    fn filter_drop_shadow_renders_for_supported_container_layers() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(48.0, 32.0, 72.0, 44.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(241, 245, 249)),
+                filter_drop_shadows: vec![ShadowEffect {
+                    color: Some(Color::rgba(15, 23, 42, 180)),
+                    offset_x: 8.0,
+                    offset_y: 10.0,
+                    blur_radius: 6.0,
+                    spread: 0.0,
+                }],
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 200 * 140];
+
+        render_to_buffer(&scene, &mut buffer, 200, 140, Color::WHITE);
+
+        assert_ne!(buffer[86 * 200 + 126], pack_rgb(Color::WHITE));
     }
 
     #[test]

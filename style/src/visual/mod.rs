@@ -22,6 +22,10 @@ pub(crate) fn extract_property(
         return Some(declarations);
     }
 
+    if let Some(declarations) = shadow::extract_unparsed_property(property) {
+        return Some(declarations);
+    }
+
     match property {
         Property::BackgroundColor(color) => Some(color::background_color_declaration(color)),
         Property::Background(backgrounds) => Some(gradient::background_declarations(backgrounds)),
@@ -64,6 +68,8 @@ pub(crate) fn extract_property(
         Property::BoxShadow(shadows, _) => {
             Some(shadow::box_shadow_declarations(shadows.as_slice()))
         }
+        Property::TextShadow(shadows) => Some(shadow::text_shadow_declarations(shadows.as_slice())),
+        Property::Filter(filters, _) => Some(shadow::filter_drop_shadow_declarations(filters)),
         _ => None,
     }
 }
@@ -120,6 +126,22 @@ pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) ->
         }
         Declaration::BoxShadows(shadows) => {
             shadow::apply_box_shadows(style, shadows);
+            true
+        }
+        Declaration::TextShadows(shadows) => {
+            shadow::apply_text_shadows(style, shadows);
+            true
+        }
+        Declaration::FilterDropShadows(shadows) => {
+            shadow::apply_filter_drop_shadows(style, shadows);
+            true
+        }
+        Declaration::TextStrokeWidth(width) => {
+            shadow::apply_text_stroke_width(style, *width);
+            true
+        }
+        Declaration::TextStrokeColor(color) => {
+            shadow::apply_text_stroke_color(style, *color);
             true
         }
         Declaration::ScrollbarWidth(width) => {

@@ -90,14 +90,6 @@ fn resolve_variable_dependent_property(
         ));
     }
 
-    if matches!(resolved_property, Property::Unparsed(_)) {
-        return Err(unresolved_property_error(
-            property_name,
-            value_css,
-            "the substituted value is not supported for this property",
-        ));
-    }
-
     let declarations = super::extract_property(&resolved_property)?;
 
     if declarations.is_empty() {
@@ -443,6 +435,25 @@ mod tests {
         assert_eq!(
             resolved.layout.taffy.inset.left,
             TaffyLengthPercentageAuto::Length(12.0)
+        );
+    }
+
+    #[test]
+    fn variable_backed_text_stroke_resolves_before_paint() {
+        let stylesheet = parse_stylesheet(
+            ".headline {
+                --stroke: 2px #ff6600;
+                -webkit-text-stroke: var(--stroke);
+            }",
+        )
+        .expect("variable-backed text stroke stylesheet should parse");
+        let element = Node::element("div").with_class("headline");
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.visual.text_stroke.width, 2.0);
+        assert_eq!(
+            resolved.visual.text_stroke.color,
+            Some(Color::rgb(255, 102, 0))
         );
     }
 
