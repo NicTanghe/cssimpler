@@ -504,6 +504,12 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
         Property::Left(value) => Ok(vec![Declaration::InsetLeft(
             length_percentage_auto_to_taffy(value)?,
         )]),
+        Property::Inset(inset) => Ok(vec![
+            Declaration::InsetTop(length_percentage_auto_to_taffy(&inset.top)?),
+            Declaration::InsetRight(length_percentage_auto_to_taffy(&inset.right)?),
+            Declaration::InsetBottom(length_percentage_auto_to_taffy(&inset.bottom)?),
+            Declaration::InsetLeft(length_percentage_auto_to_taffy(&inset.left)?),
+        ]),
         Property::Width(size) => Ok(vec![Declaration::Width(dimension_from_css_size(size)?)]),
         Property::Height(size) => Ok(vec![Declaration::Height(dimension_from_css_size(size)?)]),
         Property::Margin(margin) => Ok(vec![
@@ -1274,7 +1280,7 @@ mod tests {
         AlignItems as TaffyAlignItems, Dimension, Display as TaffyDisplay,
         FlexDirection as TaffyFlexDirection, JustifyContent as TaffyJustifyContent,
         LengthPercentage as TaffyLengthPercentage,
-        LengthPercentageAuto as TaffyLengthPercentageAuto,
+        LengthPercentageAuto as TaffyLengthPercentageAuto, Position as TaffyPosition,
     };
 
     use super::{
@@ -1329,6 +1335,32 @@ mod tests {
                 .contains(&Declaration::InsetLeft(TaffyLengthPercentageAuto::Length(
                     160.0
                 ),))
+        );
+    }
+
+    #[test]
+    fn inset_shorthand_expands_through_existing_absolute_position_pipeline() {
+        let stylesheet =
+            parse_stylesheet(".card { inset: 0; }").expect("inset shorthand should parse");
+        let element = Node::element("div").with_class("card");
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.layout.taffy.position, TaffyPosition::Absolute);
+        assert_eq!(
+            resolved.layout.taffy.inset.top,
+            TaffyLengthPercentageAuto::Length(0.0)
+        );
+        assert_eq!(
+            resolved.layout.taffy.inset.right,
+            TaffyLengthPercentageAuto::Length(0.0)
+        );
+        assert_eq!(
+            resolved.layout.taffy.inset.bottom,
+            TaffyLengthPercentageAuto::Length(0.0)
+        );
+        assert_eq!(
+            resolved.layout.taffy.inset.left,
+            TaffyLengthPercentageAuto::Length(0.0)
         );
     }
 

@@ -339,6 +339,9 @@ fn unresolved_property_error(property_name: &str, value_css: &str, reason: &str)
 #[cfg(test)]
 mod tests {
     use cssimpler_core::{Color, Node};
+    use taffy::prelude::{
+        LengthPercentageAuto as TaffyLengthPercentageAuto, Position as TaffyPosition,
+    };
 
     use crate::{Declaration, build_render_tree, parse_stylesheet, resolve_style};
 
@@ -410,6 +413,37 @@ mod tests {
 
         assert_eq!(resolved.visual.border.widths.right, 6.0);
         assert_eq!(resolved.visual.border.color, Color::rgb(221, 238, 255));
+    }
+
+    #[test]
+    fn variable_backed_inset_shorthand_resolves_before_layout() {
+        let stylesheet = parse_stylesheet(
+            ".badge {
+                --offset: 12px;
+                inset: var(--offset);
+            }",
+        )
+        .expect("variable-backed inset stylesheet should parse");
+        let element = Node::element("div").with_class("badge");
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.layout.taffy.position, TaffyPosition::Absolute);
+        assert_eq!(
+            resolved.layout.taffy.inset.top,
+            TaffyLengthPercentageAuto::Length(12.0)
+        );
+        assert_eq!(
+            resolved.layout.taffy.inset.right,
+            TaffyLengthPercentageAuto::Length(12.0)
+        );
+        assert_eq!(
+            resolved.layout.taffy.inset.bottom,
+            TaffyLengthPercentageAuto::Length(12.0)
+        );
+        assert_eq!(
+            resolved.layout.taffy.inset.left,
+            TaffyLengthPercentageAuto::Length(12.0)
+        );
     }
 
     #[test]
