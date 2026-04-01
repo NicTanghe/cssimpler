@@ -7,3 +7,4 @@ edition.workspace = true
 cssimpler-core.workspace = true
 lightningcss.workspace = true
 taffy.workspace = true
+cssparser.workspace = true

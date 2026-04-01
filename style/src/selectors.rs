@@ -1,14 +1,15 @@
 use std::collections::BTreeMap;
 
 use cssimpler_core::ElementNode;
-use lightningcss::printer::PrinterOptions;
-use lightningcss::selector::{Component, Selector as LightningSelector};
-use lightningcss::traits::ToCss;
+use cssparser::ToCss;
+use lightningcss::selector::{
+    Combinator as LightningCombinator, Component, Selector as LightningSelector,
+};
 
 use crate::StyleError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Selector {
+pub enum SimpleSelector {
     Class(String),
     Id(String),
     Tag(String),
@@ -16,7 +17,7 @@ pub enum Selector {
     AttributeEquals { name: String, value: String },
 }
 
-impl Selector {
+impl SimpleSelector {
     pub fn matches(&self, element: ElementRef<'_>) -> bool {
         match self {
             Self::Class(expected) => element
@@ -30,6 +31,133 @@ impl Selector {
                 element.attribute(name) == Some(value.as_str())
             }
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompoundSelector {
+    pub simple_selectors: Vec<SimpleSelector>,
+}
+
+impl CompoundSelector {
+    pub fn new(simple_selectors: Vec<SimpleSelector>) -> Self {
+        assert!(
+            !simple_selectors.is_empty(),
+            "compound selectors require at least one simple selector"
+        );
+        Self { simple_selectors }
+    }
+
+    pub fn matches(&self, element: ElementRef<'_>) -> bool {
+        self.simple_selectors
+            .iter()
+            .all(|selector| selector.matches(element))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectorCombinator {
+    Descendant,
+    Child,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AncestorSelector {
+    pub combinator: SelectorCombinator,
+    pub compound: CompoundSelector,
+}
+
+impl AncestorSelector {
+    pub fn new(combinator: SelectorCombinator, compound: CompoundSelector) -> Self {
+        Self {
+            combinator,
+            compound,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Selector {
+    pub rightmost: CompoundSelector,
+    pub ancestors: Vec<AncestorSelector>,
+}
+
+impl Selector {
+    pub fn class(name: impl Into<String>) -> Self {
+        Self::compound(vec![SimpleSelector::Class(name.into())])
+    }
+
+    pub fn id(name: impl Into<String>) -> Self {
+        Self::compound(vec![SimpleSelector::Id(name.into())])
+    }
+
+    pub fn tag(name: impl Into<String>) -> Self {
+        Self::compound(vec![SimpleSelector::Tag(name.into())])
+    }
+
+    pub fn attribute_exists(name: impl Into<String>) -> Self {
+        Self::compound(vec![SimpleSelector::AttributeExists(name.into())])
+    }
+
+    pub fn attribute_equals(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::compound(vec![SimpleSelector::AttributeEquals {
+            name: name.into(),
+            value: value.into(),
+        }])
+    }
+
+    pub fn compound(simple_selectors: Vec<SimpleSelector>) -> Self {
+        Self {
+            rightmost: CompoundSelector::new(simple_selectors),
+            ancestors: Vec::new(),
+        }
+    }
+
+    pub fn complex(rightmost: CompoundSelector, ancestors: Vec<AncestorSelector>) -> Self {
+        Self {
+            rightmost,
+            ancestors,
+        }
+    }
+
+    pub fn matches(&self, element: ElementRef<'_>) -> bool {
+        self.matches_with_ancestors(element, &[])
+    }
+
+    pub fn matches_with_ancestors(
+        &self,
+        element: ElementRef<'_>,
+        ancestors: &[ElementRef<'_>],
+    ) -> bool {
+        if !self.rightmost.matches(element) {
+            return false;
+        }
+
+        let mut ancestor_index = 0;
+        for selector in &self.ancestors {
+            match selector.combinator {
+                SelectorCombinator::Child => {
+                    let Some(parent) = ancestors.get(ancestor_index) else {
+                        return false;
+                    };
+                    if !selector.compound.matches(*parent) {
+                        return false;
+                    }
+                    ancestor_index += 1;
+                }
+                SelectorCombinator::Descendant => {
+                    let Some(offset) = ancestors[ancestor_index..]
+                        .iter()
+                        .position(|ancestor| selector.compound.matches(*ancestor))
+                    else {
+                        return false;
+                    };
+                    ancestor_index += offset + 1;
+                }
+            }
+        }
+
+        true
     }
 }
 
@@ -59,62 +187,120 @@ impl<'a> From<&'a ElementNode> for ElementRef<'a> {
 }
 
 pub fn extract_selector(selector: &LightningSelector<'_>) -> Result<Selector, StyleError> {
-    let mut resolved = None;
+    let components = selector.iter_raw_match_order().as_slice();
+    let compound_selectors = components
+        .split(|component| component.is_combinator())
+        .map(|compound| extract_compound_selector(selector, compound))
+        .collect::<Result<Vec<_>, _>>()?;
+    let combinators = components
+        .iter()
+        .filter_map(|component| match component {
+            Component::Combinator(combinator) => Some(*combinator),
+            _ => None,
+        })
+        .map(|combinator| extract_combinator(selector, combinator))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    for component in selector.iter_raw_match_order() {
-        let candidate = match component {
-            Component::Class(name) => Selector::Class(name.0.to_string()),
-            Component::ID(name) => Selector::Id(name.0.to_string()),
-            Component::LocalName(name) => Selector::Tag(name.name.0.to_string()),
-            Component::AttributeInNoNamespaceExists { local_name, .. } => {
-                extract_attribute_selector(selector, local_name.as_ref(), None)?
-            }
-            Component::AttributeInNoNamespace {
-                local_name, value, ..
-            } => extract_attribute_selector(selector, local_name.as_ref(), Some(value.as_ref()))?,
-            Component::ExplicitUniversalType => continue,
-            _ => {
-                return Err(StyleError::UnsupportedSelector(format!("{selector:?}")));
-            }
-        };
-
-        if resolved.replace(candidate).is_some() {
-            return Err(StyleError::UnsupportedSelector(format!("{selector:?}")));
-        }
+    let Some((rightmost, ancestors)) = compound_selectors.split_first() else {
+        return Err(unsupported_selector(selector));
+    };
+    if ancestors.len() != combinators.len() {
+        return Err(unsupported_selector(selector));
     }
 
-    resolved.ok_or_else(|| StyleError::UnsupportedSelector(format!("{selector:?}")))
+    Ok(Selector::complex(
+        rightmost.clone(),
+        ancestors
+            .iter()
+            .cloned()
+            .zip(combinators)
+            .map(|(compound, combinator)| AncestorSelector::new(combinator, compound))
+            .collect(),
+    ))
+}
+
+fn extract_compound_selector(
+    selector: &LightningSelector<'_>,
+    compound: &[Component<'_>],
+) -> Result<CompoundSelector, StyleError> {
+    let simple_selectors = compound
+        .iter()
+        .map(|component| extract_simple_selector(selector, component))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    if simple_selectors.is_empty() {
+        return Err(unsupported_selector(selector));
+    }
+
+    Ok(CompoundSelector::new(simple_selectors))
+}
+
+fn extract_simple_selector(
+    selector: &LightningSelector<'_>,
+    component: &Component<'_>,
+) -> Result<Option<SimpleSelector>, StyleError> {
+    match component {
+        Component::Class(name) => Ok(Some(SimpleSelector::Class(name.0.to_string()))),
+        Component::ID(name) => Ok(Some(SimpleSelector::Id(name.0.to_string()))),
+        Component::LocalName(name) => Ok(Some(SimpleSelector::Tag(name.name.0.to_string()))),
+        Component::AttributeInNoNamespaceExists { local_name, .. } => Ok(Some(
+            extract_attribute_selector(component, selector, local_name.as_ref(), None)?,
+        )),
+        Component::AttributeInNoNamespace {
+            local_name, value, ..
+        } => Ok(Some(extract_attribute_selector(
+            component,
+            selector,
+            local_name.as_ref(),
+            Some(value.as_ref()),
+        )?)),
+        Component::ExplicitUniversalType => Ok(None),
+        _ => Err(unsupported_selector(selector)),
+    }
+}
+
+fn extract_combinator(
+    selector: &LightningSelector<'_>,
+    combinator: LightningCombinator,
+) -> Result<SelectorCombinator, StyleError> {
+    match combinator {
+        LightningCombinator::Descendant => Ok(SelectorCombinator::Descendant),
+        LightningCombinator::Child => Ok(SelectorCombinator::Child),
+        _ => Err(unsupported_selector(selector)),
+    }
 }
 
 fn extract_attribute_selector(
+    component: &Component<'_>,
     selector: &LightningSelector<'_>,
     name: &str,
     value: Option<&str>,
-) -> Result<Selector, StyleError> {
-    let serialized = selector
-        .to_css_string(PrinterOptions::default())
-        .map_err(|_| StyleError::UnsupportedSelector(format!("{selector:?}")))?;
+) -> Result<SimpleSelector, StyleError> {
+    let serialized = component.to_css_string();
     let Some(inner) = serialized
         .trim()
         .strip_prefix('[')
         .and_then(|selector| selector.strip_suffix(']'))
     else {
-        return Err(StyleError::UnsupportedSelector(format!("{selector:?}")));
+        return Err(unsupported_selector(selector));
     };
     let Some(suffix) = inner.trim().strip_prefix(name) else {
-        return Err(StyleError::UnsupportedSelector(format!("{selector:?}")));
+        return Err(unsupported_selector(selector));
     };
     let suffix = suffix.trim_start();
 
     match value {
-        None if suffix.is_empty() => Ok(Selector::AttributeExists(name.to_string())),
+        None if suffix.is_empty() => Ok(SimpleSelector::AttributeExists(name.to_string())),
         Some(value) if is_supported_attribute_equals_selector(suffix) => {
-            Ok(Selector::AttributeEquals {
+            Ok(SimpleSelector::AttributeEquals {
                 name: name.to_string(),
                 value: value.to_string(),
             })
         }
-        _ => Err(StyleError::UnsupportedSelector(format!("{selector:?}"))),
+        _ => Err(unsupported_selector(selector)),
     }
 }
 
@@ -141,6 +327,10 @@ fn is_identifier_like(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
+fn unsupported_selector(selector: &LightningSelector<'_>) -> StyleError {
+    StyleError::UnsupportedSelector(format!("{selector:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -149,7 +339,10 @@ mod tests {
 
     use crate::{StyleError, parse_stylesheet, resolve_style};
 
-    use super::{ElementRef, Selector};
+    use super::{
+        AncestorSelector, CompoundSelector, ElementRef, Selector, SelectorCombinator,
+        SimpleSelector,
+    };
 
     #[test]
     fn selectors_match_supported_primitives() {
@@ -162,10 +355,83 @@ mod tests {
             attributes: &attributes,
         };
 
-        assert!(Selector::Class("card".to_string()).matches(element));
-        assert!(Selector::Id("hero".to_string()).matches(element));
-        assert!(Selector::Tag("div".to_string()).matches(element));
-        assert!(!Selector::Class("ghost".to_string()).matches(element));
+        assert!(SimpleSelector::Class("card".to_string()).matches(element));
+        assert!(SimpleSelector::Id("hero".to_string()).matches(element));
+        assert!(SimpleSelector::Tag("div".to_string()).matches(element));
+        assert!(!SimpleSelector::Class("ghost".to_string()).matches(element));
+    }
+
+    #[test]
+    fn compound_selectors_require_all_simple_selectors() {
+        let classes = vec!["button".to_string(), "primary".to_string()];
+        let attributes = BTreeMap::new();
+        let element = ElementRef {
+            tag: "button",
+            id: None,
+            classes: &classes,
+            attributes: &attributes,
+        };
+
+        assert!(
+            Selector::compound(vec![
+                SimpleSelector::Tag("button".to_string()),
+                SimpleSelector::Class("button".to_string()),
+                SimpleSelector::Class("primary".to_string()),
+            ])
+            .matches(element)
+        );
+        assert!(
+            !Selector::compound(vec![
+                SimpleSelector::Tag("button".to_string()),
+                SimpleSelector::Class("ghost".to_string()),
+            ])
+            .matches(element)
+        );
+    }
+
+    #[test]
+    fn combinator_selectors_match_against_ancestor_context() {
+        let root_classes = vec!["panel".to_string()];
+        let button_classes = vec!["button".to_string()];
+        let text_classes = vec!["hover-text".to_string()];
+        let attributes = BTreeMap::new();
+        let element = ElementRef {
+            tag: "span",
+            id: None,
+            classes: &text_classes,
+            attributes: &attributes,
+        };
+        let button = ElementRef {
+            tag: "button",
+            id: None,
+            classes: &button_classes,
+            attributes: &attributes,
+        };
+        let root = ElementRef {
+            tag: "div",
+            id: None,
+            classes: &root_classes,
+            attributes: &attributes,
+        };
+
+        let descendant = Selector::complex(
+            CompoundSelector::new(vec![SimpleSelector::Class("hover-text".to_string())]),
+            vec![AncestorSelector::new(
+                SelectorCombinator::Descendant,
+                CompoundSelector::new(vec![SimpleSelector::Class("button".to_string())]),
+            )],
+        );
+        let child = Selector::complex(
+            CompoundSelector::new(vec![SimpleSelector::Class("hover-text".to_string())]),
+            vec![AncestorSelector::new(
+                SelectorCombinator::Child,
+                CompoundSelector::new(vec![SimpleSelector::Class("button".to_string())]),
+            )],
+        );
+
+        assert!(descendant.matches_with_ancestors(element, &[button, root]));
+        assert!(child.matches_with_ancestors(element, &[button, root]));
+        assert!(!child.matches_with_ancestors(element, &[root, button]));
     }
 
     #[test]
@@ -175,16 +441,16 @@ mod tests {
             .with_attribute("aria-hidden", "true");
         let element_ref = ElementRef::from(&element);
 
-        assert!(Selector::AttributeExists("data-text".to_string()).matches(element_ref));
+        assert!(SimpleSelector::AttributeExists("data-text".to_string()).matches(element_ref));
         assert!(
-            Selector::AttributeEquals {
+            SimpleSelector::AttributeEquals {
                 name: "aria-hidden".to_string(),
                 value: "true".to_string(),
             }
             .matches(element_ref)
         );
         assert!(
-            !Selector::AttributeEquals {
+            !SimpleSelector::AttributeEquals {
                 name: "aria-hidden".to_string(),
                 value: "false".to_string(),
             }
@@ -217,14 +483,33 @@ mod tests {
         assert_eq!(stylesheet.rules.len(), 2);
         assert_eq!(
             stylesheet.rules[0].selector,
-            Selector::AttributeExists("data-text".to_string())
+            Selector::attribute_exists("data-text")
         );
         assert_eq!(
             stylesheet.rules[1].selector,
-            Selector::AttributeEquals {
-                name: "aria-hidden".to_string(),
-                value: "true".to_string(),
-            }
+            Selector::attribute_equals("aria-hidden", "true")
+        );
+    }
+
+    #[test]
+    fn parser_supports_compound_and_combinator_selectors() {
+        let stylesheet = parse_stylesheet("button.button.primary > .hover-text { width: 120px; }")
+            .expect("compound selectors should parse");
+
+        assert_eq!(stylesheet.rules.len(), 1);
+        assert_eq!(
+            stylesheet.rules[0].selector,
+            Selector::complex(
+                CompoundSelector::new(vec![SimpleSelector::Class("hover-text".to_string())]),
+                vec![AncestorSelector::new(
+                    SelectorCombinator::Child,
+                    CompoundSelector::new(vec![
+                        SimpleSelector::Tag("button".to_string()),
+                        SimpleSelector::Class("button".to_string()),
+                        SimpleSelector::Class("primary".to_string()),
+                    ]),
+                )],
+            )
         );
     }
 
@@ -250,6 +535,14 @@ mod tests {
     fn parser_rejects_unsupported_attribute_selector_operators() {
         let error = parse_stylesheet("[data-text^=\"ui\"] { width: 120px; }")
             .expect_err("prefix attribute selectors should be rejected");
+
+        assert!(matches!(error, StyleError::UnsupportedSelector(_)));
+    }
+
+    #[test]
+    fn parser_rejects_unsupported_combinators() {
+        let error = parse_stylesheet(".button + .hover-text { width: 120px; }")
+            .expect_err("sibling selectors should be rejected");
 
         assert!(matches!(error, StyleError::UnsupportedSelector(_)));
     }

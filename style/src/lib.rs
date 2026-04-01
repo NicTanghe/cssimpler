@@ -49,7 +49,9 @@ use self::fonts::{
 use self::selectors::extract_selector;
 
 pub use attributes::{AttributeTextSource, parse_attribute_text_source};
-pub use selectors::{ElementRef, Selector};
+pub use selectors::{
+    AncestorSelector, CompoundSelector, ElementRef, Selector, SelectorCombinator, SimpleSelector,
+};
 pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 
 #[derive(Clone, Debug, Default)]
@@ -66,9 +68,17 @@ impl Stylesheet {
         &'a self,
         element: ElementRef<'a>,
     ) -> impl Iterator<Item = &'a StyleRule> {
+        self.matching_rules_with_ancestors(element, &[])
+    }
+
+    pub fn matching_rules_with_ancestors(
+        &self,
+        element: ElementRef<'_>,
+        ancestors: &[ElementRef<'_>],
+    ) -> impl Iterator<Item = &StyleRule> {
         self.rules
             .iter()
-            .filter(move |rule| rule.selector.matches(element))
+            .filter(move |rule| rule.selector.matches_with_ancestors(element, ancestors))
     }
 }
 
@@ -226,13 +236,14 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
 }
 
 pub fn resolve_style(element: &ElementNode, stylesheet: &Stylesheet) -> Style {
-    resolve_style_with_inherited_text(element, stylesheet, None)
+    resolve_style_with_inherited_text(element, stylesheet, None, &[])
 }
 
 fn resolve_style_with_inherited_text(
     element: &ElementNode,
     stylesheet: &Stylesheet,
     inherited_text: Option<&TextStyle>,
+    ancestors: &[ElementRef<'_>],
 ) -> Style {
     let mut resolved = element.style.clone();
     if let Some(inherited_text) = inherited_text {
@@ -241,7 +252,7 @@ fn resolve_style_with_inherited_text(
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
     let element_ref = ElementRef::from(element);
 
-    for rule in stylesheet.matching_rules(element_ref) {
+    for rule in stylesheet.matching_rules_with_ancestors(element_ref, ancestors) {
         for declaration in &rule.declarations {
             apply_declaration(&mut resolved, &mut position_explicit, declaration);
         }
@@ -280,7 +291,7 @@ fn build_render_tree_with_available_space(
         panic!("render tree roots must be elements");
     };
 
-    let resolved = resolve_element_tree(root_element, stylesheet, None);
+    let resolved = resolve_element_tree(root_element, stylesheet, None, &[]);
     let mut taffy = TaffyTree::<LeafMeasureContext>::new();
     let layout_tree = build_layout_tree(&resolved, &mut taffy);
     let available_space = available_space_override
@@ -893,8 +904,12 @@ fn resolve_element_tree(
     element: &ElementNode,
     stylesheet: &Stylesheet,
     inherited_text: Option<&TextStyle>,
+    ancestors: &[ElementRef<'_>],
 ) -> ResolvedElement {
-    let style = resolve_style_with_inherited_text(element, stylesheet, inherited_text);
+    let style = resolve_style_with_inherited_text(element, stylesheet, inherited_text, ancestors);
+    let mut child_ancestors = Vec::with_capacity(ancestors.len() + 1);
+    child_ancestors.push(ElementRef::from(element));
+    child_ancestors.extend_from_slice(ancestors);
 
     ResolvedElement {
         style: style.clone(),
@@ -908,6 +923,7 @@ fn resolve_element_tree(
                     child,
                     stylesheet,
                     Some(&style.visual.text),
+                    &child_ancestors,
                 )),
                 Node::Text(_) => None,
             })
@@ -1101,11 +1117,11 @@ mod tests {
         let attributes = BTreeMap::new();
         let mut stylesheet = Stylesheet::default();
         stylesheet.push(StyleRule::new(
-            Selector::Class("card".to_string()),
+            Selector::class("card"),
             vec![Declaration::Width(Dimension::Length(300.0))],
         ));
         stylesheet.push(StyleRule::new(
-            Selector::Tag("p".to_string()),
+            Selector::tag("p"),
             vec![Declaration::Height(Dimension::Length(40.0))],
         ));
 
@@ -1150,15 +1166,43 @@ mod tests {
             .expect("tag selector stylesheet should parse");
 
         assert_eq!(stylesheet.rules.len(), 1);
-        assert_eq!(
-            stylesheet.rules[0].selector,
-            Selector::Tag("button".to_string())
-        );
+        assert_eq!(stylesheet.rules[0].selector, Selector::tag("button"));
         assert!(
             stylesheet.rules[0]
                 .declarations
                 .contains(&Declaration::Width(Dimension::Length(120.0)))
         );
+    }
+
+    #[test]
+    fn combinator_selectors_participate_in_render_tree_style_resolution() {
+        let stylesheet = parse_stylesheet(
+            ".button .hover-text { color: #2563eb; }
+             .button > .hover-text { background-color: #0f172a; }",
+        )
+        .expect("combinator selectors should parse");
+        let tree = Node::element("button")
+            .with_class("button")
+            .with_child(Node::element("span").with_class("hover-text").into())
+            .with_child(
+                Node::element("div")
+                    .with_class("wrapper")
+                    .with_child(Node::element("span").with_class("hover-text").into())
+                    .into(),
+            )
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        assert_eq!(scene.children[0].style.foreground, Color::rgb(37, 99, 235));
+        assert_eq!(
+            scene.children[0].style.background,
+            Some(Color::rgb(15, 23, 42))
+        );
+        assert_eq!(
+            scene.children[1].children[0].style.foreground,
+            Color::rgb(37, 99, 235)
+        );
+        assert_eq!(scene.children[1].children[0].style.background, None);
     }
 
     #[test]

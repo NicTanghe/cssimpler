@@ -252,6 +252,7 @@ name = "cssimpler-style"
 version = "0.1.0"
 dependencies = [
  "cssimpler-core",
+ "cssparser",
  "lightningcss",
  "taffy",
 ]

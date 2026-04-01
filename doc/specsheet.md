@@ -652,7 +652,7 @@ Acceptance
 
 ## K1. Compound and combinator selectors
 Depends: C1, C3  
-Status: planned  
+Status: done  
 
 Purpose:
 - Support common component CSS without requiring every relationship to be flattened into extra classes
