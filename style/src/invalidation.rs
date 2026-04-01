@@ -91,6 +91,8 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::FontWeight(_)
         | Declaration::FontStyle(_)
         | Declaration::LineHeight(_)
+        | Declaration::LetterSpacing(_)
+        | Declaration::TextTransform(_)
         | Declaration::OverflowX(_)
         | Declaration::OverflowY(_)
         | Declaration::ScrollbarWidth(_)

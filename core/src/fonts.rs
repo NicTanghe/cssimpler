@@ -68,6 +68,15 @@ impl LineHeight {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextTransform {
+    #[default]
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
     pub families: Vec<FontFamily>,
@@ -75,6 +84,8 @@ pub struct TextStyle {
     pub weight: u16,
     pub style: FontStyle,
     pub line_height: LineHeight,
+    pub letter_spacing_px: f32,
+    pub text_transform: TextTransform,
 }
 
 impl Default for TextStyle {
@@ -85,6 +96,8 @@ impl Default for TextStyle {
             weight: DEFAULT_FONT_WEIGHT,
             style: FontStyle::Normal,
             line_height: LineHeight::Normal,
+            letter_spacing_px: 0.0,
+            text_transform: TextTransform::None,
         }
     }
 }
@@ -97,6 +110,10 @@ impl TextStyle {
 
     pub fn resolved_line_height_px(&self) -> f32 {
         self.line_height.resolve_px(self.size_px.max(1.0))
+    }
+
+    pub fn transformed_text(&self, text: &str) -> String {
+        transform_text(text, self.text_transform)
     }
 }
 
@@ -365,11 +382,17 @@ pub fn layout_text_block(text: &str, style: &TextStyle, wrap_width: Option<f32>)
         };
     }
 
+    let transformed_text = style.transformed_text(text);
     let backend = resolve_font(style)
         .map(MeasurementBackend::Real)
         .unwrap_or_else(|| MeasurementBackend::Bitmap(BitmapFontMetrics::from_style(style)));
     let line_height = backend.line_height();
-    let lines = wrap_text_lines(text, wrap_width, &backend);
+    let lines = wrap_text_lines(
+        &transformed_text,
+        wrap_width,
+        &backend,
+        style.letter_spacing_px,
+    );
     let width = lines.iter().map(|line| line.width).fold(0.0_f32, f32::max);
     let height = lines.len() as f32 * line_height;
 
@@ -394,11 +417,13 @@ impl MeasurementBackend {
         }
     }
 
-    fn measure_text_width(&self, text: &str) -> f32 {
-        match self {
+    fn measure_text_width(&self, text: &str, letter_spacing_px: f32) -> f32 {
+        let base_width = match self {
             Self::Real(font) => font.measure_text_width(text),
             Self::Bitmap(metrics) => metrics.measure_text_width(text),
-        }
+        };
+
+        base_width + letter_spacing_adjustment(text, letter_spacing_px)
     }
 }
 
@@ -429,6 +454,7 @@ fn wrap_text_lines(
     text: &str,
     wrap_width: Option<f32>,
     backend: &MeasurementBackend,
+    letter_spacing_px: f32,
 ) -> Vec<TextLineLayout> {
     let max_width = wrap_width.filter(|width| *width > 0.0);
     let Some(max_width) = max_width else {
@@ -436,7 +462,7 @@ fn wrap_text_lines(
         for source_line in text.lines() {
             lines.push(TextLineLayout {
                 text: source_line.to_string(),
-                width: backend.measure_text_width(source_line),
+                width: backend.measure_text_width(source_line, letter_spacing_px),
             });
         }
         if lines.is_empty() {
@@ -450,7 +476,13 @@ fn wrap_text_lines(
 
     let mut wrapped = Vec::new();
     for source_line in text.lines() {
-        wrap_source_line(source_line, max_width, backend, &mut wrapped);
+        wrap_source_line(
+            source_line,
+            max_width,
+            backend,
+            letter_spacing_px,
+            &mut wrapped,
+        );
     }
 
     if wrapped.is_empty() {
@@ -467,6 +499,7 @@ fn wrap_source_line(
     line: &str,
     max_width: f32,
     backend: &MeasurementBackend,
+    letter_spacing_px: f32,
     wrapped: &mut Vec<TextLineLayout>,
 ) {
     if line.is_empty() {
@@ -481,34 +514,34 @@ fn wrap_source_line(
 
     for word in line.split_whitespace() {
         if current.is_empty() {
-            if backend.measure_text_width(word) <= max_width {
+            if backend.measure_text_width(word, letter_spacing_px) <= max_width {
                 current.push_str(word);
             } else {
-                wrap_long_word(word, max_width, backend, wrapped);
+                wrap_long_word(word, max_width, backend, letter_spacing_px, wrapped);
             }
             continue;
         }
 
         let candidate = format!("{current} {word}");
-        if backend.measure_text_width(&candidate) <= max_width {
+        if backend.measure_text_width(&candidate, letter_spacing_px) <= max_width {
             current = candidate;
         } else {
-            let width = backend.measure_text_width(&current);
+            let width = backend.measure_text_width(&current, letter_spacing_px);
             wrapped.push(TextLineLayout {
                 text: std::mem::take(&mut current),
                 width,
             });
 
-            if backend.measure_text_width(word) <= max_width {
+            if backend.measure_text_width(word, letter_spacing_px) <= max_width {
                 current.push_str(word);
             } else {
-                wrap_long_word(word, max_width, backend, wrapped);
+                wrap_long_word(word, max_width, backend, letter_spacing_px, wrapped);
             }
         }
     }
 
     if !current.is_empty() {
-        let width = backend.measure_text_width(&current);
+        let width = backend.measure_text_width(&current, letter_spacing_px);
         wrapped.push(TextLineLayout {
             text: current,
             width,
@@ -520,18 +553,21 @@ fn wrap_long_word(
     word: &str,
     max_width: f32,
     backend: &MeasurementBackend,
+    letter_spacing_px: f32,
     wrapped: &mut Vec<TextLineLayout>,
 ) {
     let mut segment = String::new();
 
     for character in word.chars() {
         let candidate = format!("{segment}{character}");
-        if segment.is_empty() || backend.measure_text_width(&candidate) <= max_width {
+        if segment.is_empty()
+            || backend.measure_text_width(&candidate, letter_spacing_px) <= max_width
+        {
             segment.push(character);
             continue;
         }
 
-        let width = backend.measure_text_width(&segment);
+        let width = backend.measure_text_width(&segment, letter_spacing_px);
         wrapped.push(TextLineLayout {
             text: std::mem::take(&mut segment),
             width,
@@ -540,7 +576,7 @@ fn wrap_long_word(
     }
 
     if !segment.is_empty() {
-        let width = backend.measure_text_width(&segment);
+        let width = backend.measure_text_width(&segment, letter_spacing_px);
         wrapped.push(TextLineLayout {
             text: segment,
             width,
@@ -548,13 +584,54 @@ fn wrap_long_word(
     }
 }
 
+fn letter_spacing_adjustment(text: &str, letter_spacing_px: f32) -> f32 {
+    if letter_spacing_px == 0.0 {
+        return 0.0;
+    }
+
+    let gaps = text.chars().count().saturating_sub(1) as f32;
+    gaps * letter_spacing_px
+}
+
+fn transform_text(text: &str, text_transform: TextTransform) -> String {
+    match text_transform {
+        TextTransform::None => text.to_string(),
+        TextTransform::Uppercase => text.chars().flat_map(char::to_uppercase).collect(),
+        TextTransform::Lowercase => text.chars().flat_map(char::to_lowercase).collect(),
+        TextTransform::Capitalize => capitalize_text(text),
+    }
+}
+
+fn capitalize_text(text: &str) -> String {
+    let mut transformed = String::with_capacity(text.len());
+    let mut capitalize_next = true;
+
+    for character in text.chars() {
+        if capitalize_next && character.is_alphabetic() {
+            transformed.extend(character.to_uppercase());
+            capitalize_next = false;
+            continue;
+        }
+
+        transformed.push(character);
+
+        if character.is_alphanumeric() || character == '\'' {
+            capitalize_next = false;
+        } else {
+            capitalize_next = true;
+        }
+    }
+
+    transformed
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::{
-        FontFamily, GenericFontFamily, LineHeight, TextStyle, layout_text_block, query_families,
-        register_font_file,
+        FontFamily, GenericFontFamily, LineHeight, TextStyle, TextTransform, layout_text_block,
+        query_families, register_font_file,
     };
 
     fn bundled_font_family() -> String {
@@ -635,5 +712,45 @@ mod tests {
 
         assert_ne!(baseline_single_line.width, bundled_single_line.width);
         assert_ne!(baseline_wrapped.lines.len(), bundled_wrapped.lines.len());
+    }
+
+    #[test]
+    fn uppercase_transform_changes_measured_content() {
+        let baseline = TextStyle::default();
+        let uppercase = TextStyle {
+            text_transform: TextTransform::Uppercase,
+            ..TextStyle::default()
+        };
+
+        let baseline_layout = layout_text_block("Straße", &baseline, None);
+        let uppercase_layout = layout_text_block("Straße", &uppercase, None);
+
+        assert_eq!(uppercase_layout.lines[0].text, "STRASSE");
+        assert!(uppercase_layout.width > baseline_layout.width);
+    }
+
+    #[test]
+    fn capitalize_transform_updates_each_word_in_layout_output() {
+        let style = TextStyle {
+            text_transform: TextTransform::Capitalize,
+            ..TextStyle::default()
+        };
+        let layout = layout_text_block("hello-world from cssimpler", &style, None);
+
+        assert_eq!(layout.lines[0].text, "Hello-World From Cssimpler");
+    }
+
+    #[test]
+    fn letter_spacing_increases_measured_width() {
+        let baseline = TextStyle::default();
+        let spaced = TextStyle {
+            letter_spacing_px: 2.0,
+            ..TextStyle::default()
+        };
+
+        let baseline_layout = layout_text_block("ABCD", &baseline, None);
+        let spaced_layout = layout_text_block("ABCD", &spaced, None);
+
+        assert!((spaced_layout.width - (baseline_layout.width + 6.0)).abs() < 0.01);
     }
 }

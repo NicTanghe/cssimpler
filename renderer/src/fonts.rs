@@ -20,7 +20,17 @@ pub(crate) fn draw_text(
     let wrapped = layout_text_block(text, text_style, Some(layout.width.max(1.0)));
 
     if let Some(font) = resolve_font(text_style) {
-        draw_resolved_font_text(buffer, width, height, layout, &wrapped, &font, color, clip);
+        draw_resolved_font_text(
+            buffer,
+            width,
+            height,
+            layout,
+            &wrapped,
+            &font,
+            text_style.letter_spacing_px,
+            color,
+            clip,
+        );
     } else {
         draw_bitmap_fallback_text(
             buffer, width, height, layout, &wrapped, text_style, color, clip,
@@ -35,6 +45,7 @@ fn draw_resolved_font_text(
     layout: LayoutBox,
     wrapped: &cssimpler_core::fonts::TextLayout,
     font: &cssimpler_core::fonts::ResolvedFont,
+    letter_spacing_px: f32,
     color: Color,
     clip: ClipRect,
 ) {
@@ -46,8 +57,9 @@ fn draw_resolved_font_text(
         let mut caret_x = start_x;
         let baseline_y = start_y + scaled_font.ascent() + line_index as f32 * font.line_height_px();
         let mut previous = None;
+        let mut characters = line.text.chars().peekable();
 
-        for character in line.text.chars() {
+        while let Some(character) = characters.next() {
             let glyph_id = scaled_font.glyph_id(character);
             if let Some(previous) = previous {
                 caret_x += scaled_font.kern(previous, glyph_id);
@@ -84,6 +96,9 @@ fn draw_resolved_font_text(
             }
 
             caret_x += scaled_font.h_advance(glyph_id);
+            if characters.peek().is_some() {
+                caret_x += letter_spacing_px;
+            }
             previous = Some(glyph_id);
         }
     }
@@ -100,17 +115,20 @@ fn draw_bitmap_fallback_text(
     clip: ClipRect,
 ) {
     let scale = ((text_style.size_px.max(1.0) / 8.0).round() as i32).max(1);
-    let start_x = layout.x.round() as i32;
-    let start_y = layout.y.round() as i32;
+    let start_x = layout.x;
+    let start_y = layout.y;
     let line_step = wrapped
         .line_height
         .max(BITMAP_LINE_HEIGHT_PX * (scale as f32 / 2.0));
 
     for (line_index, line) in wrapped.lines.iter().enumerate() {
         let mut cursor_x = start_x;
-        let cursor_y = start_y + (line_index as f32 * line_step).round() as i32;
+        let cursor_y = start_y + line_index as f32 * line_step;
+        let mut characters = line.text.chars().peekable();
 
-        for character in line.text.chars() {
+        while let Some(character) = characters.next() {
+            let glyph_origin_x = cursor_x.round() as i32;
+            let glyph_origin_y = cursor_y.round() as i32;
             if let Some(glyph) = BASIC_FONTS.get(character) {
                 for (row_index, row) in glyph.iter().enumerate() {
                     for column in 0..8 {
@@ -120,8 +138,8 @@ fn draw_bitmap_fallback_text(
 
                         for y_step in 0..scale {
                             for x_step in 0..scale {
-                                let x = cursor_x + (column * scale) + x_step;
-                                let y = cursor_y + (row_index as i32 * scale) + y_step;
+                                let x = glyph_origin_x + (column * scale) + x_step;
+                                let y = glyph_origin_y + (row_index as i32 * scale) + y_step;
                                 if !clip.contains(x as f32 + 0.5, y as f32 + 0.5) {
                                     continue;
                                 }
@@ -132,7 +150,10 @@ fn draw_bitmap_fallback_text(
                 }
             }
 
-            cursor_x += 9 * scale;
+            cursor_x += 9.0 * scale as f32;
+            if characters.peek().is_some() {
+                cursor_x += text_style.letter_spacing_px;
+            }
         }
     }
 }

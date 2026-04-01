@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use cssimpler_core::{
     Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandler,
     LayoutBox, LayoutStyle, Node, OverflowMode, RenderNode, ScrollbarWidth, Style,
-    fonts::{TextStyle, layout_text_block},
+    fonts::{TextStyle, TextTransform, layout_text_block},
 };
 use lightningcss::declaration::DeclarationBlock;
 use lightningcss::properties::Property;
@@ -128,6 +128,8 @@ pub enum Declaration {
     FontWeight(FontWeightDeclaration),
     FontStyle(cssimpler_core::fonts::FontStyle),
     LineHeight(LineHeightDeclaration),
+    LetterSpacing(f32),
+    TextTransform(TextTransform),
     CornerTopLeft(f32),
     CornerTopRight(f32),
     CornerBottomRight(f32),
@@ -1275,6 +1277,7 @@ mod tests {
         AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient,
         GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
         LengthPercentageValue, LinearGradient, Node, RadialShape, ScrollbarWidth, ShapeExtent,
+        fonts::TextTransform,
     };
     use taffy::prelude::{
         AlignItems as TaffyAlignItems, Dimension, Display as TaffyDisplay,
@@ -1362,6 +1365,57 @@ mod tests {
             resolved.layout.taffy.inset.left,
             TaffyLengthPercentageAuto::Length(0.0)
         );
+    }
+
+    #[test]
+    fn parser_supports_text_presentation_controls() {
+        let stylesheet =
+            parse_stylesheet(".label { letter-spacing: 2px; text-transform: uppercase; }")
+                .expect("text presentation stylesheet should parse");
+
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::LetterSpacing(2.0))
+        );
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TextTransform(TextTransform::Uppercase))
+        );
+    }
+
+    #[test]
+    fn text_transform_stylesheet_matches_pretransformed_layout() {
+        let stylesheet = parse_stylesheet(".label { text-transform: uppercase; }")
+            .expect("text-transform stylesheet should parse");
+        let transformed_tree = Node::element("span")
+            .with_class("label")
+            .with_child(Node::text("Straße"))
+            .into();
+        let literal_tree = Node::element("span")
+            .with_child(Node::text("STRASSE"))
+            .into();
+
+        let transformed_scene = build_render_tree(&transformed_tree, &stylesheet);
+        let literal_scene = build_render_tree(&literal_tree, &Stylesheet::default());
+
+        assert!((transformed_scene.layout.width - literal_scene.layout.width).abs() < 0.01);
+        assert_eq!(transformed_scene.layout.height, literal_scene.layout.height);
+    }
+
+    #[test]
+    fn letter_spacing_stylesheet_changes_measured_width() {
+        let stylesheet = parse_stylesheet(".label { letter-spacing: 2px; }")
+            .expect("letter-spacing stylesheet should parse");
+        let tree = Node::element("span")
+            .with_class("label")
+            .with_child(Node::text("ABCD"))
+            .into();
+        let baseline_scene = build_render_tree(&tree, &Stylesheet::default());
+        let spaced_scene = build_render_tree(&tree, &stylesheet);
+
+        assert!((spaced_scene.layout.width - (baseline_scene.layout.width + 6.0)).abs() < 0.01);
     }
 
     #[test]

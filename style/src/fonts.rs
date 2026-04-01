@@ -1,6 +1,7 @@
 use cssimpler_core::Style;
 use cssimpler_core::fonts::{
     FontFamily, FontStyle, GenericFontFamily, LineHeight as CoreLineHeight,
+    TextTransform as CoreTextTransform,
 };
 use lightningcss::printer::PrinterOptions;
 use lightningcss::properties::Property;
@@ -10,8 +11,11 @@ use lightningcss::properties::font::{
     GenericFontFamily as CssGenericFontFamily, LineHeight as CssLineHeight,
     RelativeFontSize as CssRelativeFontSize,
 };
+use lightningcss::properties::text::{
+    Spacing, TextTransform as CssTextTransform, TextTransformCase as CssTextTransformCase,
+};
 use lightningcss::traits::ToCss;
-use lightningcss::values::length::LengthPercentage;
+use lightningcss::values::length::{Length, LengthPercentage};
 
 use crate::{Declaration, StyleError};
 
@@ -80,6 +84,12 @@ pub(crate) fn extract_property(
         Property::LineHeight(value) => {
             Some(line_height_from_css(value).map(|value| vec![Declaration::LineHeight(value)]))
         }
+        Property::LetterSpacing(value) => Some(
+            letter_spacing_from_css(value).map(|value| vec![Declaration::LetterSpacing(value)]),
+        ),
+        Property::TextTransform(value) => Some(
+            text_transform_from_css(value).map(|value| vec![Declaration::TextTransform(value)]),
+        ),
         _ => None,
     }
 }
@@ -104,6 +114,14 @@ pub(crate) fn apply_font_declaration(style: &mut Style, declaration: &Declaratio
         }
         Declaration::LineHeight(value) => {
             style.visual.text.line_height = value.clone();
+            true
+        }
+        Declaration::LetterSpacing(value) => {
+            style.visual.text.letter_spacing_px = *value;
+            true
+        }
+        Declaration::TextTransform(value) => {
+            style.visual.text.text_transform = *value;
             true
         }
         _ => false,
@@ -235,9 +253,42 @@ fn line_height_from_css(value: &CssLineHeight) -> Result<LineHeightDeclaration, 
     }
 }
 
+fn letter_spacing_from_css(value: &Spacing) -> Result<f32, StyleError> {
+    match value {
+        Spacing::Normal => Ok(0.0),
+        Spacing::Length(length) => length_to_px(length),
+    }
+}
+
+fn text_transform_from_css(value: &CssTextTransform) -> Result<CoreTextTransform, StyleError> {
+    if !value.other.is_empty() {
+        return Err(StyleError::UnsupportedValue(
+            value
+                .to_css_string(PrinterOptions::default())
+                .unwrap_or_else(|_| format!("{value:?}")),
+        ));
+    }
+
+    Ok(match value.case {
+        CssTextTransformCase::None => CoreTextTransform::None,
+        CssTextTransformCase::Uppercase => CoreTextTransform::Uppercase,
+        CssTextTransformCase::Lowercase => CoreTextTransform::Lowercase,
+        CssTextTransformCase::Capitalize => CoreTextTransform::Capitalize,
+    })
+}
+
+fn length_to_px(value: &Length) -> Result<f32, StyleError> {
+    value
+        .to_px()
+        .map(|value| value as f32)
+        .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}")))
+}
+
 #[cfg(test)]
 mod tests {
-    use cssimpler_core::fonts::{FontFamily, GenericFontFamily, LineHeight, TextStyle};
+    use cssimpler_core::fonts::{
+        FontFamily, GenericFontFamily, LineHeight, TextStyle, TextTransform,
+    };
 
     use super::{FontSizeDeclaration, FontWeightDeclaration, apply_font_declaration};
     use crate::Declaration;
@@ -291,5 +342,29 @@ mod tests {
         ));
 
         assert_eq!(style.visual.text, TextStyle::default().with_family(family));
+    }
+
+    #[test]
+    fn letter_spacing_assignment_updates_the_text_style() {
+        let mut style = cssimpler_core::Style::default();
+
+        assert!(apply_font_declaration(
+            &mut style,
+            &Declaration::LetterSpacing(2.5),
+        ));
+
+        assert_eq!(style.visual.text.letter_spacing_px, 2.5);
+    }
+
+    #[test]
+    fn text_transform_assignment_updates_the_text_style() {
+        let mut style = cssimpler_core::Style::default();
+
+        assert!(apply_font_declaration(
+            &mut style,
+            &Declaration::TextTransform(TextTransform::Uppercase),
+        ));
+
+        assert_eq!(style.visual.text.text_transform, TextTransform::Uppercase);
     }
 }

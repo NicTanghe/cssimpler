@@ -1864,7 +1864,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use cssimpler_core::fonts::{FontFamily, TextStyle, register_font_file};
+    use cssimpler_core::fonts::{FontFamily, TextStyle, TextTransform, register_font_file};
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, BoxShadow, CircleRadius, Color, ConicGradient,
         CornerRadius, ElementPath, GradientDirection, GradientHorizontal, GradientInterpolation,
@@ -1909,7 +1909,7 @@ mod tests {
             .expect("bundled powerline font should expose at least one family name")
     }
 
-    fn text_scene(style: TextStyle) -> Vec<RenderNode> {
+    fn text_scene_with_content(style: TextStyle, content: &str) -> Vec<RenderNode> {
         vec![
             RenderNode::container(LayoutBox::new(0.0, 0.0, 320.0, 120.0))
                 .with_style(VisualStyle {
@@ -1917,17 +1917,19 @@ mod tests {
                     ..VisualStyle::default()
                 })
                 .with_child(
-                    RenderNode::text(
-                        LayoutBox::new(20.0, 28.0, 280.0, 56.0),
-                        "WWW iii 0123456789",
-                    )
-                    .with_style(VisualStyle {
-                        foreground: Color::rgb(17, 37, 61),
-                        text: style,
-                        ..VisualStyle::default()
-                    }),
+                    RenderNode::text(LayoutBox::new(20.0, 28.0, 280.0, 56.0), content).with_style(
+                        VisualStyle {
+                            foreground: Color::rgb(17, 37, 61),
+                            text: style,
+                            ..VisualStyle::default()
+                        },
+                    ),
                 ),
         ]
+    }
+
+    fn text_scene(style: TextStyle) -> Vec<RenderNode> {
+        text_scene_with_content(style, "WWW iii 0123456789")
     }
 
     #[test]
@@ -2331,6 +2333,31 @@ mod tests {
 
         assert_ne!(baseline_buffer, bundled_buffer);
         assert!(different_pixels > 100);
+    }
+
+    #[test]
+    fn text_transform_renders_the_same_pixels_as_pretransformed_content() {
+        let transformed_scene = text_scene_with_content(
+            TextStyle {
+                text_transform: TextTransform::Uppercase,
+                ..TextStyle::default()
+            },
+            "Straße",
+        );
+        let literal_scene = text_scene_with_content(TextStyle::default(), "STRASSE");
+        let mut transformed_buffer = vec![0_u32; 320 * 120];
+        let mut literal_buffer = vec![0_u32; 320 * 120];
+
+        render_to_buffer(
+            &transformed_scene,
+            &mut transformed_buffer,
+            320,
+            120,
+            Color::WHITE,
+        );
+        render_to_buffer(&literal_scene, &mut literal_buffer, 320, 120, Color::WHITE);
+
+        assert_eq!(transformed_buffer, literal_buffer);
     }
 
     #[test]
