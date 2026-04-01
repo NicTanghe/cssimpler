@@ -1,3 +1,4 @@
+pub mod color;
 pub mod dom;
 pub mod fonts;
 pub mod interaction;
@@ -6,101 +7,13 @@ pub mod scrollbar;
 use crate::fonts::TextStyle;
 use taffy::Style as TaffyStyle;
 
+pub use color::{Color, GradientInterpolation, LinearRgba};
 pub use dom::{ElementNode, EventHandler, IntoNode, Node, into_node};
 pub use interaction::{ElementInteractionState, ElementPath};
 pub use scrollbar::{
     OverflowMode, ScrollbarAxisState, ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics,
     ScrollbarStyle, ScrollbarWidth,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Color {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-    pub a: u8,
-}
-
-impl Color {
-    pub const WHITE: Self = Self::rgb(255, 255, 255);
-    pub const BLACK: Self = Self::rgb(0, 0, 0);
-
-    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b, a: 255 }
-    }
-
-    pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Self { r, g, b, a }
-    }
-
-    pub const fn with_alpha(self, a: u8) -> Self {
-        Self { a, ..self }
-    }
-
-    pub fn to_linear_rgba(self) -> LinearRgba {
-        LinearRgba {
-            r: srgb_channel_to_linear(self.r),
-            g: srgb_channel_to_linear(self.g),
-            b: srgb_channel_to_linear(self.b),
-            a: self.a as f32 / 255.0,
-        }
-    }
-
-    pub fn from_linear_rgba(color: LinearRgba) -> Self {
-        Self {
-            r: linear_channel_to_srgb(color.r),
-            g: linear_channel_to_srgb(color.g),
-            b: linear_channel_to_srgb(color.b),
-            a: (color.a.clamp(0.0, 1.0) * 255.0).round() as u8,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LinearRgba {
-    pub r: f32,
-    pub g: f32,
-    pub b: f32,
-    pub a: f32,
-}
-
-impl LinearRgba {
-    pub const TRANSPARENT: Self = Self {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: 0.0,
-    };
-
-    pub fn lerp(self, other: Self, t: f32) -> Self {
-        let t = t.clamp(0.0, 1.0);
-        Self {
-            r: self.r + (other.r - self.r) * t,
-            g: self.g + (other.g - self.g) * t,
-            b: self.b + (other.b - self.b) * t,
-            a: self.a + (other.a - self.a) * t,
-        }
-    }
-}
-
-fn srgb_channel_to_linear(channel: u8) -> f32 {
-    let value = channel as f32 / 255.0;
-    if value <= 0.04045 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn linear_channel_to_srgb(value: f32) -> u8 {
-    let value = value.clamp(0.0, 1.0);
-    let srgb = if value <= 0.003_130_8 {
-        value * 12.92
-    } else {
-        1.055 * value.powf(1.0 / 2.4) - 0.055
-    };
-    (srgb * 255.0).round() as u8
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LengthPercentageValue {
@@ -254,6 +167,7 @@ pub enum RadialShape {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinearGradient {
     pub direction: GradientDirection,
+    pub interpolation: GradientInterpolation,
     pub repeating: bool,
     pub stops: Vec<GradientStop<LengthPercentageValue>>,
 }
@@ -262,6 +176,7 @@ pub struct LinearGradient {
 pub struct RadialGradient {
     pub shape: RadialShape,
     pub center: GradientPoint,
+    pub interpolation: GradientInterpolation,
     pub repeating: bool,
     pub stops: Vec<GradientStop<LengthPercentageValue>>,
 }
@@ -270,6 +185,7 @@ pub struct RadialGradient {
 pub struct ConicGradient {
     pub angle: f32,
     pub center: GradientPoint,
+    pub interpolation: GradientInterpolation,
     pub repeating: bool,
     pub stops: Vec<GradientStop<AnglePercentageValue>>,
 }

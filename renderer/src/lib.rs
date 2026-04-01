@@ -2,15 +2,16 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::time::{Duration, Instant};
 
+mod color;
 mod fonts;
 mod scrollbar;
 
+use crate::color::{resolve_angle_stops, resolve_length_stops, sample_gradient};
 use cssimpler_core::{
-    AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, CornerRadius,
-    ElementInteractionState, ElementPath, EllipseRadius, EventHandler, GradientDirection,
-    GradientHorizontal, GradientPoint, GradientStop, GradientVertical, Insets, LayoutBox,
-    LengthPercentageValue, LinearGradient, LinearRgba, RadialGradient, RadialShape, RenderKind,
-    RenderNode, ShapeExtent,
+    BackgroundLayer, CircleRadius, Color, ConicGradient, CornerRadius, ElementInteractionState,
+    ElementPath, EllipseRadius, EventHandler, GradientDirection, GradientHorizontal, GradientPoint,
+    GradientVertical, Insets, LayoutBox, LinearGradient, LinearRgba, RadialGradient, RadialShape,
+    RenderKind, RenderNode, ShapeExtent,
 };
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
@@ -940,12 +941,6 @@ fn draw_rounded_rect(
 }
 
 #[derive(Clone, Copy)]
-struct ResolvedGradientStop {
-    color: LinearRgba,
-    position: f32,
-}
-
-#[derive(Clone, Copy)]
 struct ResolvedRadialShape {
     radius_x: f32,
     radius_y: f32,
@@ -1019,8 +1014,12 @@ fn draw_linear_gradient(
             }
 
             let projection = ((px - center_x) * direction.0) + ((py - center_y) * direction.1);
-            let color =
-                Color::from_linear_rgba(sample_gradient(&stops, projection, gradient.repeating));
+            let color = Color::from_linear_rgba(sample_gradient(
+                &stops,
+                projection,
+                gradient.repeating,
+                gradient.interpolation,
+            ));
             blend_pixel(buffer, width, height, x, y, color);
         }
     }
@@ -1071,8 +1070,12 @@ fn draw_radial_gradient(
             let distance = (dx * dx + dy * dy).sqrt();
             let ray_length = radial_ray_length(dx, dy, resolved_shape);
             let stops = resolve_length_stops(&gradient.stops, ray_length, 0.0);
-            let color =
-                Color::from_linear_rgba(sample_gradient(&stops, distance, gradient.repeating));
+            let color = Color::from_linear_rgba(sample_gradient(
+                &stops,
+                distance,
+                gradient.repeating,
+                gradient.interpolation,
+            ));
             blend_pixel(buffer, width, height, x, y, color);
         }
     }
@@ -1114,8 +1117,12 @@ fn draw_conic_gradient(
                 dx.atan2(-dy).to_degrees().rem_euclid(360.0)
             };
             let position = (angle - gradient.angle).rem_euclid(360.0);
-            let color =
-                Color::from_linear_rgba(sample_gradient(&stops, position, gradient.repeating));
+            let color = Color::from_linear_rgba(sample_gradient(
+                &stops,
+                position,
+                gradient.repeating,
+                gradient.interpolation,
+            ));
             blend_pixel(buffer, width, height, x, y, color);
         }
     }
@@ -1186,45 +1193,6 @@ fn resolve_gradient_point(point: GradientPoint, layout: LayoutBox) -> (f32, f32)
         layout.x + point.x.resolve(layout.width),
         layout.y + point.y.resolve(layout.height),
     )
-}
-
-fn resolve_length_stops(
-    stops: &[GradientStop<LengthPercentageValue>],
-    total: f32,
-    origin: f32,
-) -> Vec<ResolvedGradientStop> {
-    let mut resolved: Vec<_> = stops
-        .iter()
-        .map(|stop| ResolvedGradientStop {
-            color: stop.color.to_linear_rgba(),
-            position: origin + stop.position.resolve(total),
-        })
-        .collect();
-    clamp_resolved_stop_positions(&mut resolved);
-    resolved
-}
-
-fn resolve_angle_stops(stops: &[GradientStop<AnglePercentageValue>]) -> Vec<ResolvedGradientStop> {
-    let mut resolved: Vec<_> = stops
-        .iter()
-        .map(|stop| ResolvedGradientStop {
-            color: stop.color.to_linear_rgba(),
-            position: stop.position.resolve_degrees(),
-        })
-        .collect();
-    clamp_resolved_stop_positions(&mut resolved);
-    resolved
-}
-
-fn clamp_resolved_stop_positions(stops: &mut [ResolvedGradientStop]) {
-    let mut last_position = f32::NEG_INFINITY;
-    for stop in stops {
-        if stop.position < last_position {
-            stop.position = last_position;
-        } else {
-            last_position = stop.position;
-        }
-    }
 }
 
 fn resolve_radial_shape(
@@ -1364,51 +1332,6 @@ fn radial_ray_length(dx: f32, dy: f32, shape: ResolvedRadialShape) -> f32 {
     } else {
         (dx * dx + dy * dy).sqrt() / denominator
     }
-}
-
-fn normalize_gradient_t(t: f32, stops: &[ResolvedGradientStop], repeating: bool) -> f32 {
-    let start = stops.first().map(|stop| stop.position).unwrap_or(0.0);
-    let end = stops.last().map(|stop| stop.position).unwrap_or(start);
-    if !repeating {
-        return t;
-    }
-
-    let period = end - start;
-    if period.abs() <= f32::EPSILON {
-        start
-    } else {
-        start + (t - start).rem_euclid(period)
-    }
-}
-
-fn sample_gradient(stops: &[ResolvedGradientStop], position: f32, repeating: bool) -> LinearRgba {
-    sample_gradient_color(stops, normalize_gradient_t(position, stops, repeating))
-}
-
-fn sample_gradient_color(stops: &[ResolvedGradientStop], t: f32) -> LinearRgba {
-    let Some(first) = stops.first().copied() else {
-        return LinearRgba::TRANSPARENT;
-    };
-    if t <= first.position {
-        return first.color;
-    }
-
-    for pair in stops.windows(2) {
-        let start = pair[0];
-        let end = pair[1];
-        if t > end.position {
-            continue;
-        }
-
-        let span = end.position - start.position;
-        if span.abs() <= f32::EPSILON {
-            return end.color;
-        }
-
-        return start.color.lerp(end.color, (t - start.position) / span);
-    }
-
-    stops.last().map(|stop| stop.color).unwrap_or(first.color)
 }
 
 fn draw_rounded_ring(
@@ -1944,16 +1867,16 @@ mod tests {
     use cssimpler_core::fonts::{FontFamily, TextStyle, register_font_file};
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, BoxShadow, CircleRadius, Color, ConicGradient,
-        CornerRadius, ElementPath, GradientDirection, GradientHorizontal, GradientPoint,
-        GradientStop, LayoutBox, LengthPercentageValue, LinearGradient, Overflow, RadialGradient,
-        RadialShape, RenderNode, VisualStyle,
+        CornerRadius, ElementPath, GradientDirection, GradientHorizontal, GradientInterpolation,
+        GradientPoint, GradientStop, LayoutBox, LengthPercentageValue, LinearGradient, Overflow,
+        RadialGradient, RadialShape, RenderNode, VisualStyle,
     };
 
     use crate::{
         ViewportSize, WindowConfig, blend_pixel, dispatch_click, drawable_viewport_size,
-        hit_test_element_path, pack_rgb,
-        render_scene_update, render_to_buffer, resize_buffer, scenes_match_visuals,
-        should_present_frame, should_present_scene, should_suspend_updates, window_options,
+        hit_test_element_path, pack_rgb, render_scene_update, render_to_buffer, resize_buffer,
+        scenes_match_visuals, should_present_frame, should_present_scene, should_suspend_updates,
+        window_options,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -2040,11 +1963,41 @@ mod tests {
     }
 
     #[test]
-    fn linear_gradients_interpolate_in_linear_color_space() {
+    fn linear_gradients_interpolate_in_oklab_by_default() {
         let scene = vec![
             RenderNode::container(LayoutBox::new(0.0, 0.0, 3.0, 1.0)).with_style(VisualStyle {
                 background_layers: vec![BackgroundLayer::LinearGradient(LinearGradient {
                     direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                    interpolation: GradientInterpolation::Oklab,
+                    repeating: false,
+                    stops: vec![
+                        GradientStop {
+                            color: Color::BLACK,
+                            position: LengthPercentageValue::from_fraction(0.0),
+                        },
+                        GradientStop {
+                            color: Color::WHITE,
+                            position: LengthPercentageValue::from_fraction(1.0),
+                        },
+                    ],
+                })],
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 3];
+
+        render_to_buffer(&scene, &mut buffer, 3, 1, Color::BLACK);
+
+        assert_eq!(buffer[1], pack_rgb(Color::rgb(99, 99, 99)));
+    }
+
+    #[test]
+    fn linear_gradients_can_still_interpolate_in_linear_color_space() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 3.0, 1.0)).with_style(VisualStyle {
+                background_layers: vec![BackgroundLayer::LinearGradient(LinearGradient {
+                    direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                    interpolation: GradientInterpolation::LinearSrgb,
                     repeating: false,
                     stops: vec![
                         GradientStop {
@@ -2074,6 +2027,7 @@ mod tests {
                 background_layers: vec![
                     BackgroundLayer::LinearGradient(LinearGradient {
                         direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                        interpolation: GradientInterpolation::Oklab,
                         repeating: false,
                         stops: vec![
                             GradientStop {
@@ -2088,6 +2042,7 @@ mod tests {
                     }),
                     BackgroundLayer::LinearGradient(LinearGradient {
                         direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                        interpolation: GradientInterpolation::Oklab,
                         repeating: false,
                         stops: vec![
                             GradientStop {
@@ -2117,6 +2072,7 @@ mod tests {
             RenderNode::container(LayoutBox::new(0.0, 0.0, 5.0, 1.0)).with_style(VisualStyle {
                 background_layers: vec![BackgroundLayer::LinearGradient(LinearGradient {
                     direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                    interpolation: GradientInterpolation::Oklab,
                     repeating: false,
                     stops: vec![
                         GradientStop {
@@ -2148,6 +2104,7 @@ mod tests {
                 background_layers: vec![BackgroundLayer::RadialGradient(RadialGradient {
                     shape: RadialShape::Circle(CircleRadius::Explicit(2.0)),
                     center: GradientPoint::CENTER,
+                    interpolation: GradientInterpolation::Oklab,
                     repeating: false,
                     stops: vec![
                         GradientStop {
@@ -2178,6 +2135,7 @@ mod tests {
                 background_layers: vec![BackgroundLayer::ConicGradient(ConicGradient {
                     angle: 0.0,
                     center: GradientPoint::CENTER,
+                    interpolation: GradientInterpolation::Oklab,
                     repeating: false,
                     stops: vec![
                         GradientStop {

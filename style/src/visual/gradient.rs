@@ -2,7 +2,7 @@ use cssimpler_core::{
     AnglePercentageValue, BackgroundLayer, CircleRadius as CoreCircleRadius,
     ConicGradient as CoreConicGradient, EllipseRadius as CoreEllipseRadius,
     GradientDirection as CoreGradientDirection, GradientHorizontal as CoreGradientHorizontal,
-    GradientPoint as CoreGradientPoint, GradientStop as CoreGradientStop,
+    GradientInterpolation, GradientPoint as CoreGradientPoint, GradientStop as CoreGradientStop,
     GradientVertical as CoreGradientVertical, LengthPercentageValue,
     LinearGradient as CoreLinearGradient, RadialGradient as CoreRadialGradient,
     RadialShape as CoreRadialShape, ShapeExtent as CoreShapeExtent, Style,
@@ -167,6 +167,7 @@ fn background_layer_from_declaration(
         BackgroundLayerDeclaration::LinearGradient(gradient) => {
             BackgroundLayer::LinearGradient(CoreLinearGradient {
                 direction: gradient.direction,
+                interpolation: GradientInterpolation::Oklab,
                 repeating: gradient.repeating,
                 stops: gradient
                     .stops
@@ -182,6 +183,7 @@ fn background_layer_from_declaration(
             BackgroundLayer::RadialGradient(CoreRadialGradient {
                 shape: gradient.shape,
                 center: gradient.center,
+                interpolation: GradientInterpolation::Oklab,
                 repeating: gradient.repeating,
                 stops: gradient
                     .stops
@@ -197,6 +199,7 @@ fn background_layer_from_declaration(
             BackgroundLayer::ConicGradient(CoreConicGradient {
                 angle: gradient.angle,
                 center: gradient.center,
+                interpolation: GradientInterpolation::Oklab,
                 repeating: gradient.repeating,
                 stops: gradient
                     .stops

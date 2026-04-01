@@ -1207,8 +1207,8 @@ mod tests {
 
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient,
-        GradientDirection, GradientHorizontal, GradientPoint, GradientStop, LengthPercentageValue,
-        LinearGradient, Node, RadialShape, ScrollbarWidth, ShapeExtent,
+        GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
+        LengthPercentageValue, LinearGradient, Node, RadialShape, ScrollbarWidth, ShapeExtent,
     };
     use taffy::prelude::{
         AlignItems as TaffyAlignItems, Dimension, Display as TaffyDisplay,
@@ -1372,6 +1372,7 @@ mod tests {
             scene.style.background_layers,
             vec![BackgroundLayer::LinearGradient(LinearGradient {
                 direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                interpolation: GradientInterpolation::Oklab,
                 repeating: false,
                 stops: vec![
                     GradientStop {
@@ -1411,6 +1412,7 @@ mod tests {
             BackgroundLayer::RadialGradient(cssimpler_core::RadialGradient {
                 shape: RadialShape::Circle(CircleRadius::Extent(ShapeExtent::FarthestCorner)),
                 center: GradientPoint::CENTER,
+                interpolation: GradientInterpolation::Oklab,
                 repeating: false,
                 stops: vec![
                     GradientStop {
@@ -1432,6 +1434,7 @@ mod tests {
                     x: LengthPercentageValue::from_fraction(0.25),
                     y: LengthPercentageValue::from_fraction(0.75),
                 },
+                interpolation: GradientInterpolation::Oklab,
                 repeating: false,
                 stops: vec![
                     GradientStop {
