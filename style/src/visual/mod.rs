@@ -1,6 +1,7 @@
 mod border;
 mod color;
 mod gradient;
+mod scrollbar;
 mod shadow;
 
 pub use gradient::BackgroundLayerDeclaration;
@@ -8,6 +9,7 @@ pub use shadow::ShadowDeclaration;
 
 use cssimpler_core::Style;
 use lightningcss::properties::Property;
+use taffy::Layout as TaffyLayout;
 
 use crate::{Declaration, StyleError};
 
@@ -16,6 +18,10 @@ use crate::{Declaration, StyleError};
 pub(crate) fn extract_property(
     property: &Property<'_>,
 ) -> Option<Result<Vec<Declaration>, StyleError>> {
+    if let Some(declarations) = scrollbar::custom_property_declarations(property) {
+        return Some(declarations);
+    }
+
     match property {
         Property::BackgroundColor(color) => Some(color::background_color_declaration(color)),
         Property::Background(backgrounds) => Some(gradient::background_declarations(backgrounds)),
@@ -116,6 +122,29 @@ pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) ->
             shadow::apply_box_shadows(style, shadows);
             true
         }
+        Declaration::ScrollbarWidth(width) => {
+            scrollbar::apply_scrollbar_width(style, *width);
+            true
+        }
+        Declaration::ScrollbarColors(thumb_color, track_color) => {
+            scrollbar::apply_scrollbar_colors(style, *thumb_color, *track_color);
+            true
+        }
         _ => false,
     }
+}
+
+pub(crate) fn scrollbars_from_layout(
+    style: &Style,
+    layout: &TaffyLayout,
+) -> Option<cssimpler_core::ScrollbarData> {
+    scrollbar::scrollbars_from_layout(style, layout)
+}
+
+pub(crate) fn sync_scrollbar_gutter(style: &mut Style) {
+    scrollbar::sync_taffy_scrollbar_width(style);
+}
+
+pub(crate) fn taffy_overflow_from_mode(mode: cssimpler_core::OverflowMode) -> taffy::Overflow {
+    scrollbar::taffy_overflow_from_mode(mode)
 }

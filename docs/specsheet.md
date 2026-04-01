@@ -27,6 +27,7 @@ Acceptance
 Status sync
 - `A1` through `G4` are implemented in the workspace
 - `G4` currently uses renderer-side dirty-region diffing and partial repaint while preserving the public API
+- `H1` through `H5` are planned for real typography, system fonts, and arbitrary font loading
 
 ---
 

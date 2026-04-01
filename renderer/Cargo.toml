@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+ab_glyph.workspace = true
 cssimpler-core.workspace = true
 font8x8.workspace = true
 minifb.workspace = true

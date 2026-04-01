@@ -286,6 +286,107 @@ Acceptance
 
 ---
 
+# Epic H - Typography & font system
+
+## H1. Typography model
+Depends: A3, C2  
+Status: planned  
+
+Purpose:
+- Represent text styling as first-class engine data instead of assuming one built-in bitmap font
+
+Add:
+- `TextStyle` or equivalent typography data on resolved styles / render nodes
+- `font-family`
+- `font-size`
+- `font-weight`
+- `font-style`
+- `line-height`
+
+Where this lands:
+- `core/` owns the font-related data carried by `Style` and `RenderNode`
+- `macro/` does not need new syntax
+
+Acceptance
+- A render node can describe which font family stack it wants
+- Text styling is detached from any specific renderer implementation
+
+---
+
+## H2. Font source resolution
+Depends: H1, E2  
+Status: planned  
+
+Purpose:
+- Resolve CSS family requests to actual fonts from either the host system or explicit user-provided files
+
+Support:
+- System font lookup by family name
+- Arbitrary font registration from file path or embedded bytes
+- Family fallback stacks
+
+Where this lands:
+- `renderer/` owns the platform-facing font database / loader
+- `app/` or a small shared text module may expose registration APIs for custom fonts
+
+Acceptance
+- `font-family: "Segoe UI", Arial, sans-serif` can resolve against installed fonts
+- A demo can register and use a `.ttf` or `.otf` font that is not installed system-wide
+- Missing families fall back deterministically
+
+---
+
+## H3. Text measurement for layout
+Depends: H1, H2, D2  
+Status: planned  
+
+Purpose:
+- Replace fixed glyph constants with real font metrics so layout matches the font actually drawn
+
+Where this lands:
+- `style/` parses typography declarations and resolves them into style data
+- `style/` replaces `GLYPH_WIDTH`, `GLYPH_HEIGHT`, and text wrapping heuristics with font-aware measurement
+- `LeafMeasureContext` carries both text content and resolved text style
+
+Acceptance
+- Text width and height come from font metrics, not hardcoded character cells
+- Wrapping changes when `font-size`, `line-height`, or family changes
+- Layout and paint agree on line breaks
+
+---
+
+## H4. Text shaping and rasterization
+Depends: H2, H3, E2  
+Status: planned  
+
+Purpose:
+- Draw the resolved font instead of always using the baked-in `font8x8` glyph set
+
+Where this lands:
+- `renderer/` replaces the current `draw_text` path with a font-backed text renderer
+- Renderer keeps glyph caching / atlasing concerns local
+
+Acceptance
+- Rendered text visually changes when the chosen font family changes
+- Font size affects the final pixels on screen
+- Unicode coverage is no longer limited to the bitmap font table
+
+---
+
+## H5. Arbitrary font demos and validation
+Depends: H2, H4  
+Status: planned  
+
+Purpose:
+- Prove both system fonts and custom fonts work in real examples
+
+Acceptance
+- One example uses a Windows system font such as `Segoe UI`
+- One example loads a project-local font asset
+- Screenshots or golden tests confirm that changing the font changes both layout and paint
+
+---
+
 # Epic F - Event system & interaction
 
 ## F1. Hit testing
@@ -390,6 +491,99 @@ Acceptance
 
 ---
 
+# Epic I - Scrollbars (engine-owned, CSS-styled)
+
+## I1. Scrollbar style model
+Depends: C2, C4, E3  
+Status: done  
+
+Purpose:
+- Add first-class scrollbar support without ever falling back to platform-default visuals
+- Make scrollbar appearance an explicit CSS concern instead of an implicit renderer detail
+
+Support:
+- `overflow`
+- `overflow-x`
+- `overflow-y`
+- `scrollbar-width`
+- `scrollbar-color`
+- Dedicated scrollbar parts for track, thumb, and corner
+- Familiar CSS entry points for scrollbar styling, even if the engine keeps the supported subset intentionally small
+
+File ownership note:
+- Scrollbar work should live in dedicated `scrollbar.rs` files, not be implemented inline in crate `lib.rs` files
+- Expected ownership:
+- `core/src/scrollbar.rs` for scrollbar state and shared data
+- `style/src/visual/scrollbar.rs` for parsed / resolved visual scrollbar styles
+- `renderer/src/scrollbar.rs` for painting and interaction-facing render data
+- Crate `lib.rs` files should only wire modules / exports
+
+Acceptance
+- A scrollable container never shows an unstyled default scrollbar
+- Resolved CSS fully determines the scrollbar's visible look
+- Scrollbar styling data stays separate from top-level crate glue
+
+---
+
+## I2. Scroll container model and layout reservation
+Depends: I1, D2, D3, E3  
+Status: done  
+
+Purpose:
+- Model scrollable content, viewport size, scroll offsets, and scrollbar gutter reservation
+
+Where this lands:
+- `core/` owns scroll state, viewport metrics, content metrics, and axis visibility decisions
+- Layout integration computes when scrollbars appear and how much space they reserve
+
+Acceptance
+- Scrollbars appear only when content overflows or CSS explicitly requests them
+- Viewport, content size, and scroll offset are deterministic engine data
+- Gutter reservation is stable and does not depend on host platform behavior
+
+---
+
+## I3. Scrollbar rendering
+Depends: I1, I2, E2  
+Status: done  
+
+Purpose:
+- Render scrollbar track, thumb, and corner as engine-owned draw primitives
+
+Support:
+- Background color
+- Border
+- Radius
+- Hover / active visual states
+- Thumb sizing based on visible content ratio
+
+Acceptance
+- Scrollbar track and thumb render with CSS-resolved visuals
+- Thumb size reflects viewport-to-content ratio
+- Scrollbar painting respects clipping and element bounds
+
+---
+
+## I4. Scroll input and interaction
+Depends: I2, I3, F2  
+Status: done  
+
+Purpose:
+- Allow scrollbars to behave like real interactive controls instead of decorative overlays
+
+Support:
+- Mouse wheel / trackpad scrolling
+- Thumb dragging
+- Optional track click paging
+- Hover / pressed state transitions
+
+Acceptance
+- Pointer wheel input updates scroll offset on the correct scroll container
+- Dragging the thumb updates the scroll position deterministically
+- Interactive state changes can restyle the scrollbar without falling back to platform widgets
+
+---
+
 # Constraints (explicit)
 
 - Rust-only (no JS, no webview)  
@@ -411,11 +605,13 @@ Acceptance
 4. C2 + C4 (apply styles)  
 5. D1 + D2 (layout working)  
 6. E2 (basic rendering)  
-7. F1 + F2 (click handling)  
-8. E3 (shadows, visuals)  
-9. G1 + G2 (full loop)  
-10. G3 
-11. g4 
+7. H1 + H2 + H3 + H4 (real typography, system fonts, arbitrary fonts)  
+8. F1 + F2 (click handling)  
+9. E3 (shadows, visuals)  
+10. I1 + I2 + I3 + I4 (engine-owned CSS scrollbars)  
+11. G1 + G2 (full loop)  
+12. G3  
+13. G4  
 Polish: selectors, styling depth, performance  
 
 ---

@@ -3,13 +3,15 @@ use std::fmt::{Display, Formatter};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod fonts;
+mod scrollbar;
+
 use cssimpler_core::{
     AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, CornerRadius,
     EllipseRadius, EventHandler, GradientDirection, GradientHorizontal, GradientPoint,
     GradientStop, GradientVertical, Insets, LayoutBox, LengthPercentageValue, LinearGradient,
     LinearRgba, RadialGradient, RadialShape, RenderKind, RenderNode, ShapeExtent,
 };
-use font8x8::{BASIC_FONTS, UnicodeFonts};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 #[cfg(windows)]
 use winapi::um::winuser::{GetAsyncKeyState, VK_LBUTTON, VK_LWIN, VK_RWIN};
@@ -29,6 +31,7 @@ pub struct WindowConfig {
     pub height: usize,
     pub clear_color: Color,
     pub frame_time: Duration,
+    pub middle_button_auto_scroll: bool,
 }
 
 impl WindowConfig {
@@ -39,6 +42,7 @@ impl WindowConfig {
             height,
             clear_color: Color::rgb(248, 250, 252),
             frame_time: Duration::from_millis(16),
+            middle_button_auto_scroll: true,
         }
     }
 }
@@ -132,7 +136,10 @@ where
     let mut last_frame = Instant::now();
     let mut frame_index = 0_u64;
     let mut previous_left_down = false;
+    let mut previous_middle_down = false;
     let mut previous_presented_scene: Option<Vec<RenderNode>> = None;
+    let mut previous_presented_indicator: Option<scrollbar::AutoScrollIndicator> = None;
+    let mut scrollbar_controller = scrollbar::ScrollbarController::default();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
@@ -140,6 +147,7 @@ where
         last_frame = now;
 
         let left_down = window.get_mouse_down(MouseButton::Left);
+        let middle_down = window.get_mouse_down(MouseButton::Middle);
         let suspend_updates_for_system_drag = should_suspend_updates(
             left_down,
             window.is_key_down(Key::LeftSuper),
@@ -149,28 +157,57 @@ where
         if suspend_updates_for_system_drag {
             freeze_during_native_window_drag(&mut window);
             previous_left_down = false;
+            previous_middle_down = false;
             continue;
         }
 
         let frame = FrameInfo { frame_index, delta };
         scene_provider.update(frame);
+        let mut scene = scene_provider.capture_scene();
+        scrollbar_controller.apply_to_scene(&mut scene);
+        let mouse_position = window.get_mouse_pos(MouseMode::Clamp);
         let click_started = left_down && !previous_left_down;
-
-        let click_triggered_rerender = if click_started {
-            if let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Clamp) {
-                dispatch_click(scene_provider.scene(), mouse_x, mouse_y)
-            } else {
-                false
+        let middle_click_started = middle_down && !previous_middle_down;
+        let auto_scroll_canceled_click =
+            click_started && scrollbar_controller.cancel_middle_button_auto_scroll();
+        if config.middle_button_auto_scroll {
+            if middle_click_started {
+                let _ =
+                    scrollbar_controller.toggle_middle_button_auto_scroll(&scene, mouse_position);
             }
         } else {
-            false
-        };
+            let _ = scrollbar_controller.cancel_middle_button_auto_scroll();
+        }
+        let _ =
+            scrollbar_controller.step_middle_button_auto_scroll(&mut scene, mouse_position, delta);
+        scrollbar_controller.handle_wheel(&mut scene, mouse_position, window.get_scroll_wheel());
+        let scrollbar_consumed_click = scrollbar_controller.handle_pointer(
+            &mut scene,
+            mouse_position,
+            left_down,
+            click_started,
+        );
+
+        let click_triggered_rerender =
+            if click_started && !auto_scroll_canceled_click && !scrollbar_consumed_click {
+                if let Some((mouse_x, mouse_y)) = mouse_position {
+                    dispatch_click(&scene, mouse_x, mouse_y)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
 
         if click_triggered_rerender {
             scene_provider.update(frame);
+            scene = scene_provider.capture_scene();
+            scrollbar_controller.apply_to_scene(&mut scene);
+            scrollbar_controller.handle_pointer(&mut scene, mouse_position, left_down, false);
         }
 
-        let scene = scene_provider.scene();
+        let auto_scroll_indicator = scrollbar_controller.auto_scroll_indicator();
+
         let (window_width, window_height) = window.get_size();
         let resized = buffer_width != window_width.max(1) || buffer_height != window_height.max(1);
         resize_buffer(
@@ -181,7 +218,13 @@ where
             window_height,
             config.clear_color,
         );
-        if should_present_scene(previous_presented_scene.as_deref(), &scene, resized) {
+        if should_present_frame(
+            previous_presented_scene.as_deref(),
+            &scene,
+            previous_presented_indicator,
+            auto_scroll_indicator,
+            resized,
+        ) {
             if resized {
                 render_to_buffer(
                     &scene,
@@ -208,13 +251,24 @@ where
                     config.clear_color,
                 );
             }
+            redraw_auto_scroll_indicator_regions(
+                previous_presented_indicator,
+                auto_scroll_indicator,
+                &scene,
+                &mut buffer,
+                buffer_width,
+                buffer_height,
+                config.clear_color,
+            );
             window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
-            previous_presented_scene = Some(scene_provider.capture_scene());
+            previous_presented_scene = Some(scene.clone());
+            previous_presented_indicator = auto_scroll_indicator;
         } else {
             window.update();
         }
 
         previous_left_down = left_down;
+        previous_middle_down = middle_down;
         frame_index += 1;
     }
 
@@ -283,6 +337,52 @@ fn should_present_scene(
     !scenes_match_visuals(previous_scene, scene)
 }
 
+fn should_present_frame(
+    previous_scene: Option<&[RenderNode]>,
+    scene: &[RenderNode],
+    previous_indicator: Option<scrollbar::AutoScrollIndicator>,
+    indicator: Option<scrollbar::AutoScrollIndicator>,
+    resized: bool,
+) -> bool {
+    should_present_scene(previous_scene, scene, resized) || previous_indicator != indicator
+}
+
+fn redraw_auto_scroll_indicator_regions(
+    previous_indicator: Option<scrollbar::AutoScrollIndicator>,
+    indicator: Option<scrollbar::AutoScrollIndicator>,
+    scene: &[RenderNode],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+) {
+    let mut bounds = Vec::new();
+    if let Some(previous_indicator) = previous_indicator {
+        bounds.push(scrollbar::auto_scroll_indicator_bounds(previous_indicator));
+    }
+    if let Some(indicator) = indicator {
+        let indicator_bounds = scrollbar::auto_scroll_indicator_bounds(indicator);
+        if !bounds.iter().any(|existing| *existing == indicator_bounds) {
+            bounds.push(indicator_bounds);
+        }
+    }
+
+    let full_clip = ClipRect::full(width as f32, height as f32);
+    for bounds in bounds {
+        let Some(clip) = full_clip.intersect(layout_clip(bounds)) else {
+            continue;
+        };
+        clear_clip(buffer, width, height, clip, clear_color);
+        for node in scene {
+            draw_node(node, buffer, width, height, clip, CullMode::Subtree);
+        }
+    }
+
+    if let Some(indicator) = indicator {
+        scrollbar::draw_auto_scroll_indicator(indicator, buffer, width, height);
+    }
+}
+
 fn scenes_match_visuals(left: &[RenderNode], right: &[RenderNode]) -> bool {
     left.len() == right.len()
         && left
@@ -301,6 +401,7 @@ fn render_nodes_match_own_visuals(left: &RenderNode, right: &RenderNode) -> bool
         && left.layout == right.layout
         && left.style == right.style
         && left.content_inset == right.content_inset
+        && left.scrollbars == right.scrollbars
 }
 
 fn should_suspend_updates(left_down: bool, left_super_down: bool, right_super_down: bool) -> bool {
@@ -433,16 +534,15 @@ fn draw_node(
     draw_background_and_border(node, buffer, width, height, clip);
 
     if let RenderKind::Text(content) = &node.kind {
-        let text_layout = inset_layout(node.layout, node.content_inset);
-        let text_clip = clip
-            .intersect(layout_clip(text_layout))
-            .unwrap_or(ClipRect::full(0.0, 0.0));
-        draw_text(
+        let text_layout = scrollbar::text_layout(node);
+        let text_clip = scrollbar::text_clip(node, clip);
+        fonts::draw_text(
             buffer,
             width,
             height,
             text_layout,
             content,
+            &node.style.text,
             node.style.foreground,
             text_clip,
         );
@@ -461,6 +561,8 @@ fn draw_node(
     for child in &node.children {
         draw_node(child, buffer, width, height, child_clip, cull_mode);
     }
+
+    scrollbar::draw_scrollbars(node, buffer, width, height, clip);
 }
 
 fn node_intersects_clip(node: &RenderNode, clip: ClipRect, cull_mode: CullMode) -> bool {
@@ -1146,54 +1248,6 @@ fn draw_rounded_ring(
     }
 }
 
-fn draw_text(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    layout: LayoutBox,
-    text: &str,
-    color: Color,
-    clip: ClipRect,
-) {
-    let scale = 2_i32;
-    let start_x = layout.x.round() as i32;
-    let mut cursor_x = start_x;
-    let mut cursor_y = layout.y.round() as i32;
-    let lines = wrap_text(text, layout.width);
-
-    for (line_index, line) in lines.iter().enumerate() {
-        if line_index > 0 {
-            cursor_x = start_x;
-            cursor_y += 10 * scale;
-        }
-
-        for character in line.chars() {
-            if let Some(glyph) = BASIC_FONTS.get(character) {
-                for (row_index, row) in glyph.iter().enumerate() {
-                    for column in 0..8 {
-                        if ((*row >> column) & 1) == 0 {
-                            continue;
-                        }
-
-                        for y_step in 0..scale {
-                            for x_step in 0..scale {
-                                let x = cursor_x + (column * scale) + x_step;
-                                let y = cursor_y + (row_index as i32 * scale) + y_step;
-                                if !clip.contains(x as f32 + 0.5, y as f32 + 0.5) {
-                                    continue;
-                                }
-                                blend_pixel(buffer, width, height, x, y, color);
-                            }
-                        }
-                    }
-                }
-            }
-
-            cursor_x += 9 * scale;
-        }
-    }
-}
-
 fn dirty_regions_between_scenes(
     previous_scene: &[RenderNode],
     scene: &[RenderNode],
@@ -1637,73 +1691,6 @@ fn expand_corner_radius(radius: CornerRadius, amount: f32) -> CornerRadius {
     }
 }
 
-fn wrap_text(text: &str, width: f32) -> Vec<String> {
-    let max_columns = ((width.max(18.0)) / 18.0).floor().max(1.0) as usize;
-    let mut wrapped = Vec::new();
-    for source_line in text.lines() {
-        wrap_line(source_line, max_columns, &mut wrapped);
-    }
-    if wrapped.is_empty() {
-        wrapped.push(String::new());
-    }
-    wrapped
-}
-
-fn wrap_line(line: &str, max_columns: usize, wrapped: &mut Vec<String>) {
-    if line.is_empty() {
-        wrapped.push(String::new());
-        return;
-    }
-
-    let mut current = String::new();
-    let mut current_len = 0;
-    for word in line.split_whitespace() {
-        let word_len = word.chars().count();
-        let spacing = usize::from(current_len != 0);
-
-        if word_len > max_columns {
-            if current_len != 0 {
-                wrapped.push(std::mem::take(&mut current));
-                current_len = 0;
-            }
-            push_broken_word(word, max_columns, wrapped);
-            continue;
-        }
-
-        if current_len + spacing + word_len > max_columns {
-            wrapped.push(std::mem::take(&mut current));
-            current_len = 0;
-        }
-
-        if current_len != 0 {
-            current.push(' ');
-            current_len += 1;
-        }
-        current.push_str(word);
-        current_len += word_len;
-    }
-
-    if current_len != 0 {
-        wrapped.push(current);
-    }
-}
-
-fn push_broken_word(word: &str, max_columns: usize, wrapped: &mut Vec<String>) {
-    let mut segment = String::new();
-    let mut segment_len = 0;
-    for character in word.chars() {
-        if segment_len == max_columns {
-            wrapped.push(std::mem::take(&mut segment));
-            segment_len = 0;
-        }
-        segment.push(character);
-        segment_len += 1;
-    }
-    if segment_len != 0 {
-        wrapped.push(segment);
-    }
-}
-
 fn blend_pixel(buffer: &mut [u32], width: usize, height: usize, x: i32, y: i32, color: Color) {
     if color.a == 0 {
         return;
@@ -1765,8 +1752,9 @@ mod tests {
     };
 
     use crate::{
-        blend_pixel, dispatch_click, pack_rgb, render_scene_update, render_to_buffer,
-        resize_buffer, scenes_match_visuals, should_present_scene, should_suspend_updates,
+        WindowConfig, blend_pixel, dispatch_click, pack_rgb, render_scene_update, render_to_buffer,
+        resize_buffer, scenes_match_visuals, should_present_frame, should_present_scene,
+        should_suspend_updates,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -2172,6 +2160,26 @@ mod tests {
         assert!(should_suspend_updates(true, true, true));
         assert!(!should_suspend_updates(false, true, false));
         assert!(!should_suspend_updates(true, false, false));
+    }
+
+    #[test]
+    fn window_config_enables_middle_button_auto_scroll_by_default() {
+        let config = WindowConfig::new("cssimpler", 960, 540);
+
+        assert!(config.middle_button_auto_scroll);
+    }
+
+    #[test]
+    fn auto_scroll_indicator_changes_force_a_present() {
+        let scene = vec![RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0))];
+
+        assert!(should_present_frame(
+            Some(&scene),
+            &scene,
+            None,
+            Some(crate::scrollbar::AutoScrollIndicator { x: 24.0, y: 18.0 }),
+            false,
+        ));
     }
 
     #[test]

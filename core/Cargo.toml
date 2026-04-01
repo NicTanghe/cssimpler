@@ -4,4 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+ab_glyph.workspace = true
+fontdb.workspace = true
 taffy.workspace = true

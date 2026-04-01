@@ -16,8 +16,10 @@ cssimpler-core = { path = "core" }
 cssimpler-renderer = { path = "renderer" }
 cssimpler-style = { path = "style" }
 cssimpler-macro = { path = "macro" }
+ab_glyph = "0.2.32"
 anyhow = "1"
 font8x8 = "0.3"
+fontdb = "0.23.0"
 lightningcss = "1.0.0-alpha.70"
 minifb = "0.27"
 taffy = "0.7"

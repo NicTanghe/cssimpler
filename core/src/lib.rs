@@ -1,4 +1,13 @@
+pub mod fonts;
+pub mod scrollbar;
+
+use crate::fonts::TextStyle;
 use taffy::Style as TaffyStyle;
+
+pub use scrollbar::{
+    OverflowMode, ScrollbarAxisState, ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics,
+    ScrollbarStyle, ScrollbarWidth,
+};
 
 pub type EventHandler = fn();
 
@@ -496,23 +505,27 @@ pub struct BoxShadow {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Overflow {
-    pub clip_x: bool,
-    pub clip_y: bool,
+    pub x: OverflowMode,
+    pub y: OverflowMode,
 }
 
 impl Overflow {
     pub const VISIBLE: Self = Self {
-        clip_x: false,
-        clip_y: false,
+        x: OverflowMode::Visible,
+        y: OverflowMode::Visible,
     };
 
     pub const CLIP: Self = Self {
-        clip_x: true,
-        clip_y: true,
+        x: OverflowMode::Clip,
+        y: OverflowMode::Clip,
     };
 
     pub fn clips_any_axis(self) -> bool {
-        self.clip_x || self.clip_y
+        self.x.clips() || self.y.clips()
+    }
+
+    pub fn allows_scrolling(self) -> bool {
+        self.x.allows_scrolling() || self.y.allows_scrolling()
     }
 }
 
@@ -521,10 +534,12 @@ pub struct VisualStyle {
     pub background: Option<Color>,
     pub background_layers: Vec<BackgroundLayer>,
     pub foreground: Color,
+    pub text: TextStyle,
     pub corner_radius: CornerRadius,
     pub border: BorderStyle,
     pub shadows: Vec<BoxShadow>,
     pub overflow: Overflow,
+    pub scrollbar: ScrollbarStyle,
 }
 
 impl Default for VisualStyle {
@@ -533,10 +548,12 @@ impl Default for VisualStyle {
             background: None,
             background_layers: Vec::new(),
             foreground: Color::BLACK,
+            text: TextStyle::default(),
             corner_radius: CornerRadius::ZERO,
             border: BorderStyle::default(),
             shadows: Vec::new(),
             overflow: Overflow::VISIBLE,
+            scrollbar: ScrollbarStyle::default(),
         }
     }
 }
@@ -578,6 +595,7 @@ pub struct RenderNode {
     pub layout: LayoutBox,
     pub style: VisualStyle,
     pub content_inset: Insets,
+    pub scrollbars: Option<ScrollbarData>,
     pub on_click: Option<EventHandler>,
     pub children: Vec<RenderNode>,
 }
@@ -589,6 +607,7 @@ impl RenderNode {
             layout,
             style: VisualStyle::default(),
             content_inset: Insets::ZERO,
+            scrollbars: None,
             on_click: None,
             children: Vec::new(),
         }
@@ -600,6 +619,7 @@ impl RenderNode {
             layout,
             style: VisualStyle::default(),
             content_inset: Insets::ZERO,
+            scrollbars: None,
             on_click: None,
             children: Vec::new(),
         }
@@ -612,6 +632,11 @@ impl RenderNode {
 
     pub fn with_content_inset(mut self, content_inset: Insets) -> Self {
         self.content_inset = content_inset;
+        self
+    }
+
+    pub fn with_scrollbars(mut self, scrollbars: ScrollbarData) -> Self {
+        self.scrollbars = Some(scrollbars);
         self
     }
 

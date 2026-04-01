@@ -2,7 +2,9 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
-    Color, ElementNode, EventHandler, LayoutBox, LayoutStyle, Node, RenderNode, Style,
+    Color, ElementNode, EventHandler, LayoutBox, LayoutStyle, Node, OverflowMode, RenderNode,
+    ScrollbarWidth, Style,
+    fonts::{TextStyle, layout_text_block},
 };
 use lightningcss::declaration::DeclarationBlock;
 use lightningcss::properties::Property;
@@ -24,7 +26,6 @@ use lightningcss::rules::CssRule;
 use lightningcss::selector::{Component, Selector as LightningSelector};
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto};
-use taffy::Overflow as TaffyOverflow;
 use taffy::geometry::{Line, Size as TaffySize};
 use taffy::prelude::{
     AlignContent as TaffyAlignContent, AlignItems as TaffyAlignItems, AlignSelf as TaffyAlignSelf,
@@ -36,12 +37,15 @@ use taffy::prelude::{
     TrackSizingFunction,
 };
 
+mod fonts;
 mod visual;
 
-pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
+use self::fonts::{
+    FontSizeDeclaration, FontWeightDeclaration, LineHeightDeclaration, apply_font_declaration,
+    extract_property as extract_font_property,
+};
 
-const GLYPH_WIDTH: f32 = 18.0;
-const GLYPH_HEIGHT: f32 = 20.0;
+pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
@@ -83,6 +87,11 @@ pub enum Declaration {
     Background(Color),
     BackgroundLayers(Vec<BackgroundLayerDeclaration>),
     Foreground(Color),
+    FontFamilies(Vec<cssimpler_core::fonts::FontFamily>),
+    FontSize(FontSizeDeclaration),
+    FontWeight(FontWeightDeclaration),
+    FontStyle(cssimpler_core::fonts::FontStyle),
+    LineHeight(LineHeightDeclaration),
     CornerTopLeft(f32),
     CornerTopRight(f32),
     CornerBottomRight(f32),
@@ -93,8 +102,10 @@ pub enum Declaration {
     BorderLeftWidth(f32),
     BorderColor(Option<Color>),
     BoxShadows(Vec<ShadowDeclaration>),
-    OverflowX(TaffyOverflow, bool),
-    OverflowY(TaffyOverflow, bool),
+    OverflowX(OverflowMode),
+    OverflowY(OverflowMode),
+    ScrollbarWidth(ScrollbarWidth),
+    ScrollbarColors(Option<Color>, Option<Color>),
     Display(TaffyDisplay),
     Position(TaffyPosition),
     InsetTop(TaffyLengthPercentageAuto),
@@ -200,6 +211,7 @@ struct LayoutTree {
 #[derive(Clone, Debug, Default)]
 struct LeafMeasureContext {
     text: String,
+    text_style: TextStyle,
 }
 
 pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
@@ -236,7 +248,18 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
 }
 
 pub fn resolve_style(element: &ElementNode, stylesheet: &Stylesheet) -> Style {
+    resolve_style_with_inherited_text(element, stylesheet, None)
+}
+
+fn resolve_style_with_inherited_text(
+    element: &ElementNode,
+    stylesheet: &Stylesheet,
+    inherited_text: Option<&TextStyle>,
+) -> Style {
     let mut resolved = element.style.clone();
+    if let Some(inherited_text) = inherited_text {
+        resolved.visual.text = inherited_text.clone();
+    }
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
     let element_ref = ElementRef {
         tag: &element.tag,
@@ -262,7 +285,7 @@ pub fn build_render_tree(root: &Node, stylesheet: &Stylesheet) -> RenderNode {
         panic!("render tree roots must be elements");
     };
 
-    let resolved = resolve_element_tree(root_element, stylesheet);
+    let resolved = resolve_element_tree(root_element, stylesheet, None);
     let mut taffy = TaffyTree::<LeafMeasureContext>::new();
     let layout_tree = build_layout_tree(&resolved, &mut taffy);
     let available_space = available_space_from_root(&layout_tree.style.layout.taffy);
@@ -276,7 +299,14 @@ pub fn build_render_tree(root: &Node, stylesheet: &Stylesheet) -> RenderNode {
                         width: 0.0,
                         height: 0.0,
                     },
-                    |context| measure_text(&context.text, known_dimensions, available_space),
+                    |context| {
+                        measure_text(
+                            &context.text,
+                            &context.text_style,
+                            known_dimensions,
+                            available_space,
+                        )
+                    },
                 )
             },
         )
@@ -318,6 +348,10 @@ fn extract_declarations(block: &DeclarationBlock<'_>) -> Result<Vec<Declaration>
 }
 
 fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleError> {
+    if let Some(declarations) = extract_font_property(property) {
+        return declarations;
+    }
+
     if let Some(declarations) = visual::extract_property(property) {
         return declarations;
     }
@@ -437,21 +471,20 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
 }
 
 fn overflow_x_declaration(value: CssOverflowKeyword) -> Declaration {
-    let (overflow, clip) = overflow_from_css_keyword(value);
-    Declaration::OverflowX(overflow, clip)
+    Declaration::OverflowX(overflow_mode_from_css_keyword(value))
 }
 
 fn overflow_y_declaration(value: CssOverflowKeyword) -> Declaration {
-    let (overflow, clip) = overflow_from_css_keyword(value);
-    Declaration::OverflowY(overflow, clip)
+    Declaration::OverflowY(overflow_mode_from_css_keyword(value))
 }
 
-fn overflow_from_css_keyword(value: CssOverflowKeyword) -> (TaffyOverflow, bool) {
+fn overflow_mode_from_css_keyword(value: CssOverflowKeyword) -> OverflowMode {
     match value {
-        CssOverflowKeyword::Visible => (TaffyOverflow::Visible, false),
-        CssOverflowKeyword::Clip => (TaffyOverflow::Clip, true),
-        CssOverflowKeyword::Hidden => (TaffyOverflow::Hidden, true),
-        CssOverflowKeyword::Scroll | CssOverflowKeyword::Auto => (TaffyOverflow::Scroll, true),
+        CssOverflowKeyword::Visible => OverflowMode::Visible,
+        CssOverflowKeyword::Clip => OverflowMode::Clip,
+        CssOverflowKeyword::Hidden => OverflowMode::Hidden,
+        CssOverflowKeyword::Auto => OverflowMode::Auto,
+        CssOverflowKeyword::Scroll => OverflowMode::Scroll,
     }
 }
 
@@ -795,18 +828,24 @@ fn grid_placement_from_css(line: &CssGridLine<'_>) -> Result<GridPlacement, Styl
 }
 
 fn apply_declaration(style: &mut Style, position_explicit: &mut bool, declaration: &Declaration) {
+    if apply_font_declaration(style, declaration) {
+        return;
+    }
+
     if visual::apply_declaration(style, declaration) {
         return;
     }
 
     match declaration {
-        Declaration::OverflowX(value, clip) => {
-            style.layout.taffy.overflow.x = *value;
-            style.visual.overflow.clip_x = *clip;
+        Declaration::OverflowX(mode) => {
+            style.layout.taffy.overflow.x = visual::taffy_overflow_from_mode(*mode);
+            style.visual.overflow.x = *mode;
+            visual::sync_scrollbar_gutter(style);
         }
-        Declaration::OverflowY(value, clip) => {
-            style.layout.taffy.overflow.y = *value;
-            style.visual.overflow.clip_y = *clip;
+        Declaration::OverflowY(mode) => {
+            style.layout.taffy.overflow.y = visual::taffy_overflow_from_mode(*mode);
+            style.visual.overflow.y = *mode;
+            visual::sync_scrollbar_gutter(style);
         }
         Declaration::Display(display) => style.layout.taffy.display = *display,
         Declaration::Position(position) => {
@@ -874,16 +913,26 @@ fn apply_declaration(style: &mut Style, position_explicit: &mut bool, declaratio
     }
 }
 
-fn resolve_element_tree(element: &ElementNode, stylesheet: &Stylesheet) -> ResolvedElement {
+fn resolve_element_tree(
+    element: &ElementNode,
+    stylesheet: &Stylesheet,
+    inherited_text: Option<&TextStyle>,
+) -> ResolvedElement {
+    let style = resolve_style_with_inherited_text(element, stylesheet, inherited_text);
+
     ResolvedElement {
-        style: resolve_style(element, stylesheet),
+        style: style.clone(),
         text: element_text(element),
         on_click: element.on_click,
         children: element
             .children
             .iter()
             .filter_map(|child| match child {
-                Node::Element(child) => Some(resolve_element_tree(child, stylesheet)),
+                Node::Element(child) => Some(resolve_element_tree(
+                    child,
+                    stylesheet,
+                    Some(&style.visual.text),
+                )),
                 Node::Text(_) => None,
             })
             .collect(),
@@ -906,6 +955,7 @@ fn build_layout_tree(
                 to_taffy(&resolved.style.layout),
                 LeafMeasureContext {
                     text: resolved.text.clone(),
+                    text_style: resolved.style.visual.text.clone(),
                 },
             )
             .expect("leaf style should be accepted by taffy")
@@ -956,11 +1006,15 @@ fn render_node_from_layout(
         .map(|child| render_node_from_layout(child, taffy, x, y))
         .collect();
     let content_inset = content_inset_from_taffy(&tree.style.layout.taffy);
+    let scrollbars = visual::scrollbars_from_layout(&tree.style, layout);
 
     if child_nodes.is_empty() && !tree.text.is_empty() {
         let mut node = RenderNode::text(layout_box, tree.text.clone())
             .with_style(tree.style.visual.clone())
             .with_content_inset(content_inset);
+        if let Some(scrollbars) = scrollbars {
+            node = node.with_scrollbars(scrollbars);
+        }
         if let Some(handler) = tree.on_click {
             node = node.on_click(handler);
         }
@@ -970,6 +1024,9 @@ fn render_node_from_layout(
             .with_style(tree.style.visual.clone())
             .with_content_inset(content_inset)
             .with_children(child_nodes);
+        if let Some(scrollbars) = scrollbars {
+            node = node.with_scrollbars(scrollbars);
+        }
         if let Some(handler) = tree.on_click {
             node = node.on_click(handler);
         }
@@ -1000,6 +1057,7 @@ fn collect_text(node: &Node, buffer: &mut String) {
 
 fn measure_text(
     text: &str,
+    text_style: &TextStyle,
     known_dimensions: TaffySize<Option<f32>>,
     available_space: TaffySize<AvailableSpace>,
 ) -> TaffySize<f32> {
@@ -1013,97 +1071,14 @@ fn measure_text(
     let wrap_width = known_dimensions
         .width
         .or_else(|| match available_space.width {
-            AvailableSpace::Definite(width) => Some(width.max(GLYPH_WIDTH)),
+            AvailableSpace::Definite(width) => Some(width.max(1.0)),
             AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
         });
-    let lines = wrap_text(text, wrap_width);
-    let line_count = lines.len();
-    let max_columns = lines
-        .iter()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(0);
+    let layout = layout_text_block(text, text_style, wrap_width);
 
     TaffySize {
-        width: known_dimensions
-            .width
-            .unwrap_or(max_columns as f32 * GLYPH_WIDTH),
-        height: known_dimensions
-            .height
-            .unwrap_or(line_count as f32 * GLYPH_HEIGHT),
-    }
-}
-
-fn wrap_text(text: &str, wrap_width: Option<f32>) -> Vec<String> {
-    let max_columns = wrap_width.map(|width| (width / GLYPH_WIDTH).floor().max(1.0) as usize);
-    let Some(max_columns) = max_columns else {
-        return text.lines().map(|line| line.to_string()).collect();
-    };
-
-    let mut wrapped = Vec::new();
-    for source_line in text.lines() {
-        wrap_line(source_line, max_columns, &mut wrapped);
-    }
-
-    if wrapped.is_empty() {
-        wrapped.push(String::new());
-    }
-
-    wrapped
-}
-
-fn wrap_line(line: &str, max_columns: usize, wrapped: &mut Vec<String>) {
-    if line.is_empty() {
-        wrapped.push(String::new());
-        return;
-    }
-
-    let mut current = String::new();
-    let mut current_len = 0;
-    for word in line.split_whitespace() {
-        let word_len = word.chars().count();
-        let spacing = usize::from(current_len != 0);
-
-        if word_len > max_columns {
-            if current_len != 0 {
-                wrapped.push(std::mem::take(&mut current));
-                current_len = 0;
-            }
-            push_broken_word(word, max_columns, wrapped);
-            continue;
-        }
-
-        if current_len + spacing + word_len > max_columns {
-            wrapped.push(std::mem::take(&mut current));
-            current_len = 0;
-        }
-
-        if current_len != 0 {
-            current.push(' ');
-            current_len += 1;
-        }
-        current.push_str(word);
-        current_len += word_len;
-    }
-
-    if current_len != 0 {
-        wrapped.push(current);
-    }
-}
-
-fn push_broken_word(word: &str, max_columns: usize, wrapped: &mut Vec<String>) {
-    let mut segment = String::new();
-    let mut segment_len = 0;
-    for character in word.chars() {
-        if segment_len == max_columns {
-            wrapped.push(std::mem::take(&mut segment));
-            segment_len = 0;
-        }
-        segment.push(character);
-        segment_len += 1;
-    }
-    if segment_len != 0 {
-        wrapped.push(segment);
+        width: known_dimensions.width.unwrap_or(layout.width),
+        height: known_dimensions.height.unwrap_or(layout.height),
     }
 }
 
@@ -1128,7 +1103,7 @@ mod tests {
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient,
         GradientDirection, GradientHorizontal, GradientPoint, GradientStop, LengthPercentageValue,
-        LinearGradient, Node, RadialShape, ShapeExtent,
+        LinearGradient, Node, RadialShape, ScrollbarWidth, ShapeExtent,
     };
     use taffy::prelude::{
         AlignItems as TaffyAlignItems, Dimension, Display as TaffyDisplay,
@@ -1218,6 +1193,32 @@ mod tests {
             stylesheet.rules[0]
                 .declarations
                 .contains(&Declaration::Width(Dimension::Length(120.0)))
+        );
+    }
+
+    #[test]
+    fn parser_supports_scrollbar_custom_properties() {
+        let stylesheet = parse_stylesheet(
+            ".pane {
+                overflow: auto;
+                scrollbar-width: thin;
+                scrollbar-color: #112233 #ddeeff;
+            }",
+        )
+        .expect("scrollbar stylesheet should parse");
+
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::ScrollbarWidth(ScrollbarWidth::Thin))
+        );
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::ScrollbarColors(
+                    Some(Color::rgb(17, 34, 51)),
+                    Some(Color::rgb(221, 238, 255)),
+                ))
         );
     }
 
@@ -1521,5 +1522,34 @@ mod tests {
         assert!(scene.on_click.is_some());
         assert_eq!(scene.layout.width, 90.0);
         assert!(matches!(scene.kind, cssimpler_core::RenderKind::Text(_)));
+    }
+
+    #[test]
+    fn render_tree_attaches_scrollbar_metrics_from_layout() {
+        let stylesheet = parse_stylesheet(
+            "#pane {
+                width: 100px;
+                height: 80px;
+                overflow-y: scroll;
+                scrollbar-width: 12px;
+                background-color: #ffffff;
+            }
+            .tall {
+                width: 88px;
+                height: 200px;
+                background-color: #0f172a;
+            }",
+        )
+        .expect("scrollbar stylesheet should parse");
+        let tree = Node::element("div")
+            .with_id("pane")
+            .with_child(Node::element("div").with_class("tall").into())
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+        let scrollbars = scene.scrollbars.expect("scrollbars should be attached");
+
+        assert!(scrollbars.shows_vertical());
+        assert_eq!(scrollbars.metrics.reserved_width, 12.0);
+        assert!(scrollbars.metrics.max_offset_y > 0.0);
     }
 }
