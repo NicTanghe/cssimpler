@@ -7,9 +7,10 @@ mod scrollbar;
 
 use cssimpler_core::{
     AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, CornerRadius,
-    EllipseRadius, EventHandler, GradientDirection, GradientHorizontal, GradientPoint,
-    GradientStop, GradientVertical, Insets, LayoutBox, LengthPercentageValue, LinearGradient,
-    LinearRgba, RadialGradient, RadialShape, RenderKind, RenderNode, ShapeExtent,
+    ElementInteractionState, ElementPath, EllipseRadius, EventHandler, GradientDirection,
+    GradientHorizontal, GradientPoint, GradientStop, GradientVertical, Insets, LayoutBox,
+    LengthPercentageValue, LinearGradient, LinearRgba, RadialGradient, RadialShape, RenderKind,
+    RenderNode, ShapeExtent,
 };
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
@@ -99,6 +100,11 @@ pub trait SceneProvider {
 
     fn capture_scene(&mut self) -> Vec<RenderNode> {
         self.scene().to_vec()
+    }
+
+    fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
+        let _ = interaction;
+        false
     }
 }
 
@@ -199,6 +205,7 @@ where
     let mut previous_left_down = false;
     let mut previous_middle_down = false;
     let mut suppress_left_pointer_until_release = false;
+    let mut element_interaction = ElementInteractionState::default();
     let mut previous_presented_scene: Option<Vec<RenderNode>> = None;
     let mut previous_presented_indicator: Option<scrollbar::AutoScrollIndicator> = None;
     let mut scrollbar_controller = scrollbar::ScrollbarController::default();
@@ -253,17 +260,28 @@ where
             interactive_left_down,
             click_started,
         );
+        let normal_click_started =
+            click_started && !auto_scroll_canceled_click && !scrollbar_consumed_click;
+        settle_element_interaction(
+            &mut scene_provider,
+            frame,
+            &mut scene,
+            &mut scrollbar_controller,
+            mouse_position,
+            interactive_left_down,
+            normal_click_started,
+            &mut element_interaction,
+        );
 
-        let click_triggered_rerender =
-            if click_started && !auto_scroll_canceled_click && !scrollbar_consumed_click {
-                if let Some((mouse_x, mouse_y)) = mouse_position {
-                    dispatch_click(&scene, mouse_x, mouse_y)
-                } else {
-                    false
-                }
+        let click_triggered_rerender = if normal_click_started {
+            if let Some((mouse_x, mouse_y)) = mouse_position {
+                dispatch_click(&scene, mouse_x, mouse_y)
             } else {
                 false
-            };
+            }
+        } else {
+            false
+        };
 
         if click_triggered_rerender {
             scene_provider.update(frame);
@@ -274,6 +292,16 @@ where
                 mouse_position,
                 interactive_left_down,
                 false,
+            );
+            settle_element_interaction(
+                &mut scene_provider,
+                frame,
+                &mut scene,
+                &mut scrollbar_controller,
+                mouse_position,
+                interactive_left_down,
+                false,
+                &mut element_interaction,
             );
         }
 
@@ -642,6 +670,22 @@ fn hit_test_scene(scene: &[RenderNode], x: f32, y: f32) -> Option<EventHandler> 
         .find_map(|node| hit_test_node(node, x, y, ClipRect::unbounded()))
 }
 
+fn hit_test_element_path(scene: &[RenderNode], x: f32, y: f32) -> Option<ElementPath> {
+    scene
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(root_index, node)| {
+            hit_test_element_path_node(
+                node,
+                x,
+                y,
+                ClipRect::unbounded(),
+                &ElementPath::root(root_index),
+            )
+        })
+}
+
 fn hit_test_node(node: &RenderNode, x: f32, y: f32, clip: ClipRect) -> Option<EventHandler> {
     if !clip.contains(x, y) || !layout_contains(node.layout, x, y) {
         return None;
@@ -660,6 +704,91 @@ fn hit_test_node(node: &RenderNode, x: f32, y: f32, clip: ClipRect) -> Option<Ev
     }
 
     node.on_click
+}
+
+fn hit_test_element_path_node(
+    node: &RenderNode,
+    x: f32,
+    y: f32,
+    clip: ClipRect,
+    path: &ElementPath,
+) -> Option<ElementPath> {
+    if !clip.contains(x, y) || !layout_contains(node.layout, x, y) {
+        return None;
+    }
+
+    let child_clip = if node.style.overflow.clips_any_axis() {
+        clip.intersect(layout_clip(node.layout))?
+    } else {
+        clip
+    };
+
+    for (index, child) in node.children.iter().enumerate().rev() {
+        let child_path = path.with_child(index);
+        if let Some(hit) = hit_test_element_path_node(child, x, y, child_clip, &child_path) {
+            return Some(hit);
+        }
+    }
+
+    Some(path.clone())
+}
+
+fn settle_element_interaction<P>(
+    scene_provider: &mut P,
+    frame: FrameInfo,
+    scene: &mut Vec<RenderNode>,
+    scrollbar_controller: &mut scrollbar::ScrollbarController,
+    mouse_position: Option<(f32, f32)>,
+    interactive_left_down: bool,
+    press_started: bool,
+    interaction: &mut ElementInteractionState,
+) where
+    P: SceneProvider,
+{
+    let mut press_started = press_started;
+
+    for _ in 0..4 {
+        let hovered = mouse_position
+            .and_then(|(mouse_x, mouse_y)| hit_test_element_path(scene, mouse_x, mouse_y));
+        let next = next_element_interaction_state(
+            interaction,
+            hovered,
+            interactive_left_down,
+            press_started,
+        );
+        press_started = false;
+
+        if next == *interaction {
+            break;
+        }
+
+        *interaction = next.clone();
+        if !scene_provider.set_element_interaction(next) {
+            break;
+        }
+
+        scene_provider.update(frame);
+        *scene = scene_provider.capture_scene();
+        scrollbar_controller.apply_to_scene(scene);
+        scrollbar_controller.handle_pointer(scene, mouse_position, interactive_left_down, false);
+    }
+}
+
+fn next_element_interaction_state(
+    previous: &ElementInteractionState,
+    hovered: Option<ElementPath>,
+    left_down: bool,
+    press_started: bool,
+) -> ElementInteractionState {
+    let active = if press_started {
+        hovered.clone()
+    } else if left_down {
+        previous.active.clone()
+    } else {
+        None
+    };
+
+    ElementInteractionState { hovered, active }
 }
 
 fn layout_contains(layout: LayoutBox, x: f32, y: f32) -> bool {
@@ -1800,15 +1929,15 @@ mod tests {
     use cssimpler_core::fonts::{FontFamily, TextStyle, register_font_file};
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, BoxShadow, CircleRadius, Color, ConicGradient,
-        CornerRadius, GradientDirection, GradientHorizontal, GradientPoint, GradientStop,
-        LayoutBox, LengthPercentageValue, LinearGradient, Overflow, RadialGradient, RadialShape,
-        RenderNode, VisualStyle,
+        CornerRadius, ElementPath, GradientDirection, GradientHorizontal, GradientPoint,
+        GradientStop, LayoutBox, LengthPercentageValue, LinearGradient, Overflow, RadialGradient,
+        RadialShape, RenderNode, VisualStyle,
     };
 
     use crate::{
-        WindowConfig, blend_pixel, dispatch_click, pack_rgb, render_scene_update, render_to_buffer,
-        resize_buffer, scenes_match_visuals, should_present_frame, should_present_scene,
-        should_suspend_updates, window_options,
+        WindowConfig, blend_pixel, dispatch_click, hit_test_element_path, pack_rgb,
+        render_scene_update, render_to_buffer, resize_buffer, scenes_match_visuals,
+        should_present_frame, should_present_scene, should_suspend_updates, window_options,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -2220,6 +2349,51 @@ mod tests {
         assert!(dispatch_click(&scene, 12.0, 12.0));
         assert_eq!(CLICK_COUNT.load(Ordering::SeqCst), 1);
         assert!(!dispatch_click(&scene, 28.0, 28.0));
+    }
+
+    #[test]
+    fn hit_test_element_path_returns_the_deepest_visible_node() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 80.0, 60.0)).with_child(
+                RenderNode::container(LayoutBox::new(12.0, 10.0, 30.0, 20.0))
+                    .with_child(RenderNode::container(LayoutBox::new(18.0, 14.0, 8.0, 6.0))),
+            ),
+        ];
+
+        assert_eq!(
+            hit_test_element_path(&scene, 20.0, 18.0),
+            Some(ElementPath {
+                root: 0,
+                children: vec![0, 0],
+            })
+        );
+        assert_eq!(
+            hit_test_element_path(&scene, 6.0, 6.0),
+            Some(ElementPath::root(0))
+        );
+    }
+
+    #[test]
+    fn hit_test_element_path_respects_parent_clipping() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0))
+                .with_style(VisualStyle {
+                    overflow: Overflow::CLIP,
+                    ..VisualStyle::default()
+                })
+                .with_child(RenderNode::container(LayoutBox::new(
+                    10.0, 10.0, 20.0, 20.0,
+                ))),
+        ];
+
+        assert_eq!(
+            hit_test_element_path(&scene, 12.0, 12.0),
+            Some(ElementPath {
+                root: 0,
+                children: vec![0],
+            })
+        );
+        assert_eq!(hit_test_element_path(&scene, 28.0, 28.0), None);
     }
 
     #[test]

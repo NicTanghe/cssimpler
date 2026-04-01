@@ -1,11 +1,13 @@
 pub mod dom;
 pub mod fonts;
+pub mod interaction;
 pub mod scrollbar;
 
 use crate::fonts::TextStyle;
 use taffy::Style as TaffyStyle;
 
 pub use dom::{ElementNode, EventHandler, IntoNode, Node, into_node};
+pub use interaction::{ElementInteractionState, ElementPath};
 pub use scrollbar::{
     OverflowMode, ScrollbarAxisState, ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics,
     ScrollbarStyle, ScrollbarWidth,

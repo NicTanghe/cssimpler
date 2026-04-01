@@ -1,8 +1,11 @@
 use std::marker::PhantomData;
 
-use crate::core::{Node, RenderNode};
+use crate::core::{ElementInteractionState, Node, RenderNode};
 use crate::renderer::{self, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
-use crate::style::{Stylesheet, build_render_tree, build_render_tree_in_viewport};
+use crate::style::{
+    Stylesheet, build_render_tree_in_viewport_with_interaction_at_root,
+    build_render_tree_with_interaction_at_root,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Invalidation {
@@ -159,6 +162,7 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     update: Update,
     view: View,
     viewport: Option<ViewportSize>,
+    interaction: ElementInteractionState,
     render_mode: RenderMode,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
@@ -178,6 +182,7 @@ where
             update,
             view,
             viewport: None,
+            interaction: ElementInteractionState::default(),
             render_mode: RenderMode::OnInvalidation,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
@@ -239,9 +244,16 @@ where
         let view = &mut self.view;
         let tree = view(&self.state);
         let scene = if let Some(viewport) = self.viewport {
-            build_render_tree_in_viewport(&tree, self.stylesheet, viewport.width, viewport.height)
+            build_render_tree_in_viewport_with_interaction_at_root(
+                &tree,
+                self.stylesheet,
+                viewport.width,
+                viewport.height,
+                &self.interaction,
+                0,
+            )
         } else {
-            build_render_tree(&tree, self.stylesheet)
+            build_render_tree_with_interaction_at_root(&tree, self.stylesheet, &self.interaction, 0)
         };
         self.cached_scene = Some(vec![scene]);
         self.pending_refresh = Refresh::clean();
@@ -251,6 +263,16 @@ where
         self.cached_scene
             .as_deref()
             .expect("app scene should be cached after the first frame")
+    }
+
+    fn set_interaction_state(&mut self, interaction: ElementInteractionState) -> bool {
+        if self.interaction == interaction {
+            return false;
+        }
+
+        self.interaction = interaction;
+        self.invalidate(Invalidation::Paint);
+        true
     }
 }
 
@@ -271,6 +293,10 @@ where
     fn scene(&self) -> &[RenderNode] {
         App::scene(self)
     }
+
+    fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
+        App::set_interaction_state(self, interaction)
+    }
 }
 
 pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
@@ -279,6 +305,7 @@ pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     update: Update,
     fragments: Vec<Fragment<'a, State>>,
     viewport: Option<ViewportSize>,
+    interaction: ElementInteractionState,
     render_mode: RenderMode,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
@@ -300,6 +327,7 @@ where
             update,
             fragments: fragments.into_iter().collect(),
             viewport: None,
+            interaction: ElementInteractionState::default(),
             render_mode: RenderMode::OnInvalidation,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
@@ -388,7 +416,8 @@ where
         let scene = self
             .fragments
             .iter()
-            .map(|fragment| self.render_fragment(fragment))
+            .enumerate()
+            .map(|(index, fragment)| self.render_fragment(index, fragment))
             .collect();
         self.cached_scene = Some(scene);
     }
@@ -411,7 +440,7 @@ where
                 return false;
             };
             let node = self.fragments[index].render(&self.state);
-            replacements.push((index, self.render_node(&node)));
+            replacements.push((index, self.render_node(&node, index)));
         }
 
         let scene = self
@@ -425,16 +454,28 @@ where
         true
     }
 
-    fn render_fragment(&self, fragment: &Fragment<'a, State>) -> RenderNode {
+    fn render_fragment(&self, index: usize, fragment: &Fragment<'a, State>) -> RenderNode {
         let node = fragment.render(&self.state);
-        self.render_node(&node)
+        self.render_node(&node, index)
     }
 
-    fn render_node(&self, node: &Node) -> RenderNode {
+    fn render_node(&self, node: &Node, root_index: usize) -> RenderNode {
         if let Some(viewport) = self.viewport {
-            build_render_tree_in_viewport(node, self.stylesheet, viewport.width, viewport.height)
+            build_render_tree_in_viewport_with_interaction_at_root(
+                node,
+                self.stylesheet,
+                viewport.width,
+                viewport.height,
+                &self.interaction,
+                root_index,
+            )
         } else {
-            build_render_tree(node, self.stylesheet)
+            build_render_tree_with_interaction_at_root(
+                node,
+                self.stylesheet,
+                &self.interaction,
+                root_index,
+            )
         }
     }
 
@@ -442,6 +483,40 @@ where
         self.cached_scene
             .as_deref()
             .expect("fragment app scene should be cached after the first frame")
+    }
+
+    fn set_interaction_state(&mut self, interaction: ElementInteractionState) -> bool {
+        if self.interaction == interaction {
+            return false;
+        }
+
+        let refresh = self.interaction_refresh(&self.interaction, &interaction);
+        self.interaction = interaction;
+        self.invalidate(refresh);
+        true
+    }
+
+    fn interaction_refresh(
+        &self,
+        previous: &ElementInteractionState,
+        next: &ElementInteractionState,
+    ) -> Refresh {
+        let mut fragment_ids = Vec::new();
+        for root in interaction_roots(previous)
+            .into_iter()
+            .chain(interaction_roots(next))
+        {
+            let Some(fragment) = self.fragments.get(root) else {
+                return Refresh::full(Invalidation::Paint);
+            };
+            push_unique_id(&mut fragment_ids, fragment.id().to_string());
+        }
+
+        if fragment_ids.is_empty() {
+            Refresh::clean()
+        } else {
+            Refresh::fragments(fragment_ids, Invalidation::Paint)
+        }
     }
 }
 
@@ -460,6 +535,10 @@ where
 
     fn scene(&self) -> &[RenderNode] {
         FragmentApp::scene(self)
+    }
+
+    fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
+        FragmentApp::set_interaction_state(self, interaction)
     }
 }
 
@@ -484,12 +563,30 @@ fn push_unique_id(ids: &mut Vec<String>, candidate: String) {
     }
 }
 
+fn interaction_roots(interaction: &ElementInteractionState) -> Vec<usize> {
+    let mut roots = Vec::new();
+
+    for root in interaction
+        .hovered
+        .as_ref()
+        .map(|path| path.root)
+        .into_iter()
+        .chain(interaction.active.as_ref().map(|path| path.root))
+    {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+
+    roots
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::time::Duration;
 
-    use crate::core::{RenderKind, RenderNode};
+    use crate::core::{ElementInteractionState, ElementPath, RenderKind, RenderNode};
     use crate::ui;
 
     use super::{App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode};
@@ -810,6 +907,90 @@ mod tests {
         assert_eq!(second[0].layout.width, 320.0);
         assert_eq!(third[0].layout.width, 640.0);
         assert_eq!(third[0].layout.height, 360.0);
+    }
+
+    #[test]
+    fn app_rerenders_when_element_interaction_changes() {
+        let stylesheet =
+            parse_stylesheet(".button { color: #111111; } .button:hover { color: #2563eb; }")
+                .expect("interactive stylesheet should parse");
+        let render_calls = Cell::new(0_u32);
+        let mut app = App::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Invalidation::Clean,
+            |_state| {
+                render_calls.set(render_calls.get() + 1);
+                ui! {
+                    <button class="button">{"hover me"}</button>
+                }
+            },
+        );
+
+        let first = app.frame(frame(0));
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(0)),
+                active: None,
+            },
+        ));
+        let second = app.frame(frame(1));
+
+        assert_eq!(render_calls.get(), 2);
+        assert_eq!(
+            first[0].style.foreground,
+            crate::core::Color::rgb(17, 17, 17)
+        );
+        assert_eq!(
+            second[0].style.foreground,
+            crate::core::Color::rgb(37, 99, 235)
+        );
+    }
+
+    #[test]
+    fn fragment_app_limits_interaction_rerenders_to_affected_roots() {
+        let stylesheet = parse_stylesheet(".button:hover { color: #2563eb; }")
+            .expect("interactive stylesheet should parse");
+        let left_calls = Cell::new(0_u32);
+        let right_calls = Cell::new(0_u32);
+        let mut app = FragmentApp::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Refresh::clean(),
+            [
+                Fragment::new("left", |_state: &()| {
+                    left_calls.set(left_calls.get() + 1);
+                    ui! {
+                        <button class="button">{"left"}</button>
+                    }
+                }),
+                Fragment::new("right", |_state: &()| {
+                    right_calls.set(right_calls.get() + 1);
+                    ui! {
+                        <button class="button">{"right"}</button>
+                    }
+                }),
+            ],
+        );
+
+        app.frame(frame(0));
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(1)),
+                active: None,
+            },
+        ));
+        let scene = app.frame(frame(1));
+
+        assert_eq!(left_calls.get(), 1);
+        assert_eq!(right_calls.get(), 2);
+        assert_eq!(scene[0].style.foreground, crate::core::Color::BLACK);
+        assert_eq!(
+            scene[1].style.foreground,
+            crate::core::Color::rgb(37, 99, 235)
+        );
     }
 
     fn frame(frame_index: u64) -> FrameInfo {

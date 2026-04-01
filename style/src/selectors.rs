@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use cssimpler_core::ElementNode;
+use cssimpler_core::{ElementInteractionState, ElementNode, ElementPath};
 use cssparser::ToCss;
 use lightningcss::selector::{
-    Combinator as LightningCombinator, Component, Selector as LightningSelector,
+    Combinator as LightningCombinator, Component, PseudoClass, Selector as LightningSelector,
 };
 
 use crate::StyleError;
@@ -15,10 +15,25 @@ pub enum SimpleSelector {
     Tag(String),
     AttributeExists(String),
     AttributeEquals { name: String, value: String },
+    Hover,
+    Active,
 }
 
 impl SimpleSelector {
     pub fn matches(&self, element: ElementRef<'_>) -> bool {
+        self.matches_with_interaction(
+            element,
+            &ElementPath::root(0),
+            &ElementInteractionState::default(),
+        )
+    }
+
+    pub fn matches_with_interaction(
+        &self,
+        element: ElementRef<'_>,
+        element_path: &ElementPath,
+        interaction: &ElementInteractionState,
+    ) -> bool {
         match self {
             Self::Class(expected) => element
                 .classes
@@ -30,6 +45,8 @@ impl SimpleSelector {
             Self::AttributeEquals { name, value } => {
                 element.attribute(name) == Some(value.as_str())
             }
+            Self::Hover => interaction.is_hovered(element_path),
+            Self::Active => interaction.is_active(element_path),
         }
     }
 }
@@ -49,9 +66,22 @@ impl CompoundSelector {
     }
 
     pub fn matches(&self, element: ElementRef<'_>) -> bool {
+        self.matches_with_interaction(
+            element,
+            &ElementPath::root(0),
+            &ElementInteractionState::default(),
+        )
+    }
+
+    pub fn matches_with_interaction(
+        &self,
+        element: ElementRef<'_>,
+        element_path: &ElementPath,
+        interaction: &ElementInteractionState,
+    ) -> bool {
         self.simple_selectors
             .iter()
-            .all(|selector| selector.matches(element))
+            .all(|selector| selector.matches_with_interaction(element, element_path, interaction))
     }
 }
 
@@ -129,7 +159,29 @@ impl Selector {
         element: ElementRef<'_>,
         ancestors: &[ElementRef<'_>],
     ) -> bool {
-        if !self.rightmost.matches(element) {
+        let mut path = ElementPath::root(0);
+        for _ in ancestors {
+            path = path.with_child(0);
+        }
+        self.matches_with_ancestors_and_interaction(
+            element,
+            ancestors,
+            &path,
+            &ElementInteractionState::default(),
+        )
+    }
+
+    pub fn matches_with_ancestors_and_interaction(
+        &self,
+        element: ElementRef<'_>,
+        ancestors: &[ElementRef<'_>],
+        element_path: &ElementPath,
+        interaction: &ElementInteractionState,
+    ) -> bool {
+        if !self
+            .rightmost
+            .matches_with_interaction(element, element_path, interaction)
+        {
             return false;
         }
 
@@ -140,16 +192,32 @@ impl Selector {
                     let Some(parent) = ancestors.get(ancestor_index) else {
                         return false;
                     };
-                    if !selector.compound.matches(*parent) {
+                    let Some(parent_path) = ancestor_path(element_path, ancestor_index) else {
+                        return false;
+                    };
+                    if !selector.compound.matches_with_interaction(
+                        *parent,
+                        &parent_path,
+                        interaction,
+                    ) {
                         return false;
                     }
                     ancestor_index += 1;
                 }
                 SelectorCombinator::Descendant => {
-                    let Some(offset) = ancestors[ancestor_index..]
-                        .iter()
-                        .position(|ancestor| selector.compound.matches(*ancestor))
-                    else {
+                    let Some(offset) = ancestors[ancestor_index..].iter().enumerate().position(
+                        |(offset, ancestor)| {
+                            ancestor_path(element_path, ancestor_index + offset).is_some_and(
+                                |ancestor_path| {
+                                    selector.compound.matches_with_interaction(
+                                        *ancestor,
+                                        &ancestor_path,
+                                        interaction,
+                                    )
+                                },
+                            )
+                        },
+                    ) else {
                         return false;
                     };
                     ancestor_index += offset + 1;
@@ -257,6 +325,8 @@ fn extract_simple_selector(
             local_name.as_ref(),
             Some(value.as_ref()),
         )?)),
+        Component::NonTSPseudoClass(PseudoClass::Hover) => Ok(Some(SimpleSelector::Hover)),
+        Component::NonTSPseudoClass(PseudoClass::Active) => Ok(Some(SimpleSelector::Active)),
         Component::ExplicitUniversalType => Ok(None),
         _ => Err(unsupported_selector(selector)),
     }
@@ -331,13 +401,17 @@ fn unsupported_selector(selector: &LightningSelector<'_>) -> StyleError {
     StyleError::UnsupportedSelector(format!("{selector:?}"))
 }
 
+fn ancestor_path(path: &ElementPath, ancestor_index: usize) -> Option<ElementPath> {
+    path.ancestor(ancestor_index + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use cssimpler_core::{Color, Node};
+    use cssimpler_core::{Color, ElementInteractionState, ElementPath, Node};
 
-    use crate::{StyleError, parse_stylesheet, resolve_style};
+    use crate::{StyleError, parse_stylesheet, resolve_style, resolve_style_with_interaction};
 
     use super::{
         AncestorSelector, CompoundSelector, ElementRef, Selector, SelectorCombinator,
@@ -459,6 +533,36 @@ mod tests {
     }
 
     #[test]
+    fn interactive_selectors_match_current_and_ancestor_paths() {
+        let classes = vec!["button".to_string()];
+        let attributes = BTreeMap::new();
+        let button = ElementRef {
+            tag: "button",
+            id: None,
+            classes: &classes,
+            attributes: &attributes,
+        };
+        let label = ElementPath::root(0).with_child(0).with_child(1);
+        let button_path = label.ancestor(1).expect("button ancestor path");
+        let interaction = ElementInteractionState {
+            hovered: Some(label.clone()),
+            active: Some(label),
+        };
+
+        assert!(SimpleSelector::Hover.matches_with_interaction(button, &button_path, &interaction));
+        assert!(SimpleSelector::Active.matches_with_interaction(
+            button,
+            &button_path,
+            &interaction
+        ));
+        assert!(!SimpleSelector::Hover.matches_with_interaction(
+            button,
+            &ElementPath::root(1),
+            &interaction
+        ));
+    }
+
+    #[test]
     fn style_time_element_refs_expose_generic_attributes() {
         let element = Node::element("div")
             .with_id("hero")
@@ -514,6 +618,28 @@ mod tests {
     }
 
     #[test]
+    fn parser_supports_hover_and_active_pseudo_classes() {
+        let stylesheet =
+            parse_stylesheet(".button:hover { width: 120px; } .button:active { height: 40px; }")
+                .expect("interactive pseudo classes should parse");
+
+        assert_eq!(
+            stylesheet.rules[0].selector,
+            Selector::compound(vec![
+                SimpleSelector::Class("button".to_string()),
+                SimpleSelector::Hover,
+            ])
+        );
+        assert_eq!(
+            stylesheet.rules[1].selector,
+            Selector::compound(vec![
+                SimpleSelector::Class("button".to_string()),
+                SimpleSelector::Active,
+            ])
+        );
+    }
+
+    #[test]
     fn attribute_selectors_participate_in_style_resolution() {
         let stylesheet = parse_stylesheet(
             "[data-text] { color: #2563eb; } [aria-hidden=\"true\"] { width: 120px; }",
@@ -523,6 +649,30 @@ mod tests {
             .with_attribute("data-text", "uiverse")
             .with_attribute("aria-hidden", "true");
         let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.visual.foreground, Color::rgb(37, 99, 235));
+        assert_eq!(
+            resolved.layout.taffy.size.width,
+            taffy::prelude::Dimension::Length(120.0)
+        );
+    }
+
+    #[test]
+    fn interactive_pseudo_classes_participate_in_style_resolution() {
+        let stylesheet =
+            parse_stylesheet(".button:hover { color: #2563eb; } .button:active { width: 120px; }")
+                .expect("interactive selectors should parse");
+        let button = Node::element("button").with_class("button");
+        let interaction = ElementInteractionState {
+            hovered: Some(ElementPath::root(0)),
+            active: Some(ElementPath::root(0)),
+        };
+        let resolved = resolve_style_with_interaction(
+            &button,
+            &stylesheet,
+            &interaction,
+            &ElementPath::root(0),
+        );
 
         assert_eq!(resolved.visual.foreground, Color::rgb(37, 99, 235));
         assert_eq!(
@@ -543,6 +693,14 @@ mod tests {
     fn parser_rejects_unsupported_combinators() {
         let error = parse_stylesheet(".button + .hover-text { width: 120px; }")
             .expect_err("sibling selectors should be rejected");
+
+        assert!(matches!(error, StyleError::UnsupportedSelector(_)));
+    }
+
+    #[test]
+    fn parser_rejects_unsupported_pseudo_classes() {
+        let error = parse_stylesheet(".button:focus { width: 120px; }")
+            .expect_err("focus stays out of scope for this slice");
 
         assert!(matches!(error, StyleError::UnsupportedSelector(_)));
     }

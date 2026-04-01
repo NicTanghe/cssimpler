@@ -672,7 +672,7 @@ Acceptance
 
 ## K2. Interactive pseudo-class state
 Depends: F1, F2, G3  
-Status: planned  
+Status: done  
 
 Purpose:
 - Represent transient pointer-driven state for normal elements, not just scrollbars

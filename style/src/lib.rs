@@ -2,8 +2,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
-    Color, ElementNode, EventHandler, LayoutBox, LayoutStyle, Node, OverflowMode, RenderNode,
-    ScrollbarWidth, Style,
+    Color, ElementInteractionState, ElementNode, ElementPath, EventHandler, LayoutBox, LayoutStyle,
+    Node, OverflowMode, RenderNode, ScrollbarWidth, Style,
     fonts::{TextStyle, layout_text_block},
 };
 use lightningcss::declaration::DeclarationBlock;
@@ -68,17 +68,26 @@ impl Stylesheet {
         &'a self,
         element: ElementRef<'a>,
     ) -> impl Iterator<Item = &'a StyleRule> {
-        self.matching_rules_with_ancestors(element, &[])
-    }
-
-    pub fn matching_rules_with_ancestors(
-        &self,
-        element: ElementRef<'_>,
-        ancestors: &[ElementRef<'_>],
-    ) -> impl Iterator<Item = &StyleRule> {
         self.rules
             .iter()
-            .filter(move |rule| rule.selector.matches_with_ancestors(element, ancestors))
+            .filter(move |rule| rule.selector.matches(element))
+    }
+
+    pub fn matching_rules_with_context<'a>(
+        &'a self,
+        element: ElementRef<'a>,
+        ancestors: &'a [ElementRef<'a>],
+        element_path: &'a ElementPath,
+        interaction: &'a ElementInteractionState,
+    ) -> impl Iterator<Item = &'a StyleRule> {
+        self.rules.iter().filter(move |rule| {
+            rule.selector.matches_with_ancestors_and_interaction(
+                element,
+                ancestors,
+                element_path,
+                interaction,
+            )
+        })
     }
 }
 
@@ -236,7 +245,21 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
 }
 
 pub fn resolve_style(element: &ElementNode, stylesheet: &Stylesheet) -> Style {
-    resolve_style_with_inherited_text(element, stylesheet, None, &[])
+    resolve_style_with_interaction(
+        element,
+        stylesheet,
+        &ElementInteractionState::default(),
+        &ElementPath::root(0),
+    )
+}
+
+pub fn resolve_style_with_interaction(
+    element: &ElementNode,
+    stylesheet: &Stylesheet,
+    interaction: &ElementInteractionState,
+    element_path: &ElementPath,
+) -> Style {
+    resolve_style_with_inherited_text(element, stylesheet, None, &[], interaction, element_path)
 }
 
 fn resolve_style_with_inherited_text(
@@ -244,6 +267,8 @@ fn resolve_style_with_inherited_text(
     stylesheet: &Stylesheet,
     inherited_text: Option<&TextStyle>,
     ancestors: &[ElementRef<'_>],
+    interaction: &ElementInteractionState,
+    element_path: &ElementPath,
 ) -> Style {
     let mut resolved = element.style.clone();
     if let Some(inherited_text) = inherited_text {
@@ -252,7 +277,9 @@ fn resolve_style_with_inherited_text(
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
     let element_ref = ElementRef::from(element);
 
-    for rule in stylesheet.matching_rules_with_ancestors(element_ref, ancestors) {
+    for rule in
+        stylesheet.matching_rules_with_context(element_ref, ancestors, element_path, interaction)
+    {
         for declaration in &rule.declarations {
             apply_declaration(&mut resolved, &mut position_explicit, declaration);
         }
@@ -266,7 +293,24 @@ pub fn to_taffy(style: &LayoutStyle) -> TaffyStyle {
 }
 
 pub fn build_render_tree(root: &Node, stylesheet: &Stylesheet) -> RenderNode {
-    build_render_tree_with_available_space(root, stylesheet, None)
+    build_render_tree_with_interaction(root, stylesheet, &ElementInteractionState::default())
+}
+
+pub fn build_render_tree_with_interaction(
+    root: &Node,
+    stylesheet: &Stylesheet,
+    interaction: &ElementInteractionState,
+) -> RenderNode {
+    build_render_tree_with_interaction_at_root(root, stylesheet, interaction, 0)
+}
+
+pub fn build_render_tree_with_interaction_at_root(
+    root: &Node,
+    stylesheet: &Stylesheet,
+    interaction: &ElementInteractionState,
+    root_index: usize,
+) -> RenderNode {
+    build_render_tree_with_available_space(root, stylesheet, None, interaction, root_index)
 }
 
 pub fn build_render_tree_in_viewport(
@@ -275,23 +319,72 @@ pub fn build_render_tree_in_viewport(
     viewport_width: usize,
     viewport_height: usize,
 ) -> RenderNode {
+    build_render_tree_in_viewport_with_interaction(
+        root,
+        stylesheet,
+        viewport_width,
+        viewport_height,
+        &ElementInteractionState::default(),
+    )
+}
+
+pub fn build_render_tree_in_viewport_with_interaction(
+    root: &Node,
+    stylesheet: &Stylesheet,
+    viewport_width: usize,
+    viewport_height: usize,
+    interaction: &ElementInteractionState,
+) -> RenderNode {
+    build_render_tree_in_viewport_with_interaction_at_root(
+        root,
+        stylesheet,
+        viewport_width,
+        viewport_height,
+        interaction,
+        0,
+    )
+}
+
+pub fn build_render_tree_in_viewport_with_interaction_at_root(
+    root: &Node,
+    stylesheet: &Stylesheet,
+    viewport_width: usize,
+    viewport_height: usize,
+    interaction: &ElementInteractionState,
+    root_index: usize,
+) -> RenderNode {
     let viewport = TaffySize {
         width: AvailableSpace::Definite(viewport_width.max(1) as f32),
         height: AvailableSpace::Definite(viewport_height.max(1) as f32),
     };
-    build_render_tree_with_available_space(root, stylesheet, Some(viewport))
+    build_render_tree_with_available_space(
+        root,
+        stylesheet,
+        Some(viewport),
+        interaction,
+        root_index,
+    )
 }
 
 fn build_render_tree_with_available_space(
     root: &Node,
     stylesheet: &Stylesheet,
     available_space_override: Option<TaffySize<AvailableSpace>>,
+    interaction: &ElementInteractionState,
+    root_index: usize,
 ) -> RenderNode {
     let Node::Element(root_element) = root else {
         panic!("render tree roots must be elements");
     };
 
-    let resolved = resolve_element_tree(root_element, stylesheet, None, &[]);
+    let resolved = resolve_element_tree(
+        root_element,
+        stylesheet,
+        None,
+        &[],
+        interaction,
+        &ElementPath::root(root_index),
+    );
     let mut taffy = TaffyTree::<LeafMeasureContext>::new();
     let layout_tree = build_layout_tree(&resolved, &mut taffy);
     let available_space = available_space_override
@@ -905,11 +998,21 @@ fn resolve_element_tree(
     stylesheet: &Stylesheet,
     inherited_text: Option<&TextStyle>,
     ancestors: &[ElementRef<'_>],
+    interaction: &ElementInteractionState,
+    element_path: &ElementPath,
 ) -> ResolvedElement {
-    let style = resolve_style_with_inherited_text(element, stylesheet, inherited_text, ancestors);
+    let style = resolve_style_with_inherited_text(
+        element,
+        stylesheet,
+        inherited_text,
+        ancestors,
+        interaction,
+        element_path,
+    );
     let mut child_ancestors = Vec::with_capacity(ancestors.len() + 1);
     child_ancestors.push(ElementRef::from(element));
     child_ancestors.extend_from_slice(ancestors);
+    let mut child_index = 0;
 
     ResolvedElement {
         style: style.clone(),
@@ -919,12 +1022,18 @@ fn resolve_element_tree(
             .children
             .iter()
             .filter_map(|child| match child {
-                Node::Element(child) => Some(resolve_element_tree(
-                    child,
-                    stylesheet,
-                    Some(&style.visual.text),
-                    &child_ancestors,
-                )),
+                Node::Element(child) => {
+                    let child_path = element_path.with_child(child_index);
+                    child_index += 1;
+                    Some(resolve_element_tree(
+                        child,
+                        stylesheet,
+                        Some(&style.visual.text),
+                        &child_ancestors,
+                        interaction,
+                        &child_path,
+                    ))
+                }
                 Node::Text(_) => None,
             })
             .collect(),
