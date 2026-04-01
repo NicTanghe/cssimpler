@@ -188,12 +188,7 @@ pub fn run_with_scene_provider<P>(config: WindowConfig, mut scene_provider: P) -
 where
     P: SceneProvider,
 {
-    let mut window = Window::new(
-        &config.title,
-        config.width,
-        config.height,
-        window_options(),
-    )?;
+    let mut window = Window::new(&config.title, config.width, config.height, window_options())?;
     window.set_target_fps(frame_time_to_fps(config.frame_time));
 
     let mut buffer_width = config.width.max(1);
@@ -1799,8 +1794,10 @@ fn frame_time_to_fps(frame_time: Duration) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use cssimpler_core::fonts::{FontFamily, TextStyle, register_font_file};
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, BoxShadow, CircleRadius, Color, ConicGradient,
         CornerRadius, GradientDirection, GradientHorizontal, GradientPoint, GradientStop,
@@ -1831,6 +1828,38 @@ mod tests {
 
     fn alternate_click_handler() {
         CLICK_COUNT.fetch_add(10, Ordering::SeqCst);
+    }
+
+    fn bundled_font_family() -> String {
+        let asset_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/assets/powerline-demo.ttf");
+        let families = register_font_file(&asset_path)
+            .expect("bundled powerline demo font should register during renderer tests");
+        families
+            .into_iter()
+            .next()
+            .expect("bundled powerline font should expose at least one family name")
+    }
+
+    fn text_scene(style: TextStyle) -> Vec<RenderNode> {
+        vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 320.0, 120.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(245, 247, 250)),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::text(
+                        LayoutBox::new(20.0, 28.0, 280.0, 56.0),
+                        "WWW iii 0123456789",
+                    )
+                    .with_style(VisualStyle {
+                        foreground: Color::rgb(17, 37, 61),
+                        text: style,
+                        ..VisualStyle::default()
+                    }),
+                ),
+        ]
     }
 
     #[test]
@@ -2106,6 +2135,42 @@ mod tests {
         blend_pixel(&mut buffer, 1, 1, 0, 0, Color::rgba(255, 255, 255, 128));
 
         assert_eq!(buffer[0], pack_rgb(Color::rgb(188, 188, 188)));
+    }
+
+    #[test]
+    fn rendered_text_pixels_change_when_font_family_changes() {
+        let bundled_family = bundled_font_family();
+        let baseline_style = TextStyle {
+            size_px: 28.0,
+            ..TextStyle::default()
+        };
+        let bundled_style = TextStyle {
+            families: vec![FontFamily::Named(bundled_family)],
+            size_px: 28.0,
+            ..TextStyle::default()
+        };
+        let baseline_scene = text_scene(baseline_style);
+        let bundled_scene = text_scene(bundled_style);
+        let mut baseline_buffer = vec![0_u32; 320 * 120];
+        let mut bundled_buffer = vec![0_u32; 320 * 120];
+
+        render_to_buffer(
+            &baseline_scene,
+            &mut baseline_buffer,
+            320,
+            120,
+            Color::WHITE,
+        );
+        render_to_buffer(&bundled_scene, &mut bundled_buffer, 320, 120, Color::WHITE);
+
+        let different_pixels = baseline_buffer
+            .iter()
+            .zip(&bundled_buffer)
+            .filter(|(left, right)| left != right)
+            .count();
+
+        assert_ne!(baseline_buffer, bundled_buffer);
+        assert!(different_pixels > 100);
     }
 
     #[test]

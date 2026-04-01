@@ -550,9 +550,23 @@ fn wrap_long_word(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
         FontFamily, GenericFontFamily, LineHeight, TextStyle, layout_text_block, query_families,
+        register_font_file,
     };
+
+    fn bundled_font_family() -> String {
+        let asset_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/assets/powerline-demo.ttf");
+        let families = register_font_file(&asset_path)
+            .expect("bundled powerline demo font should register during typography tests");
+        families
+            .into_iter()
+            .next()
+            .expect("bundled powerline font should expose at least one family name")
+    }
 
     #[test]
     fn default_text_style_prefers_generic_sans_serif() {
@@ -595,5 +609,31 @@ mod tests {
         let families = query_families(&style);
 
         assert!(!families.is_empty());
+    }
+
+    #[test]
+    fn bundled_font_changes_wrapping_and_measurement() {
+        let bundled_family = bundled_font_family();
+        let sample = "WWW iii WWW iii WWW iii WWW iii";
+        let baseline = TextStyle {
+            size_px: 24.0,
+            ..TextStyle::default()
+        };
+        let bundled = TextStyle {
+            families: vec![FontFamily::Named(bundled_family)],
+            size_px: 24.0,
+            ..TextStyle::default()
+        };
+
+        let baseline_single_line = layout_text_block(sample, &baseline, None);
+        let bundled_single_line = layout_text_block(sample, &bundled, None);
+        let wrap_width = (baseline_single_line.width.min(bundled_single_line.width)
+            + baseline_single_line.width.max(bundled_single_line.width))
+            / 2.0;
+        let baseline_wrapped = layout_text_block(sample, &baseline, Some(wrap_width));
+        let bundled_wrapped = layout_text_block(sample, &bundled, Some(wrap_width));
+
+        assert_ne!(baseline_single_line.width, bundled_single_line.width);
+        assert_ne!(baseline_wrapped.lines.len(), bundled_wrapped.lines.len());
     }
 }

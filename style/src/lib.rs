@@ -23,7 +23,6 @@ use lightningcss::properties::overflow::OverflowKeyword as CssOverflowKeyword;
 use lightningcss::properties::position::Position as CssPosition;
 use lightningcss::properties::size::Size as CssSize;
 use lightningcss::rules::CssRule;
-use lightningcss::selector::{Component, Selector as LightningSelector};
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto};
 use taffy::geometry::{Line, Size as TaffySize};
@@ -38,13 +37,16 @@ use taffy::prelude::{
 };
 
 mod fonts;
+mod selectors;
 mod visual;
 
 use self::fonts::{
     FontSizeDeclaration, FontWeightDeclaration, LineHeightDeclaration, apply_font_declaration,
     extract_property as extract_font_property,
 };
+use self::selectors::extract_selector;
 
+pub use selectors::{ElementRef, Selector};
 pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 
 #[derive(Clone, Debug, Default)]
@@ -143,33 +145,6 @@ pub enum Declaration {
     GridRowEnd(GridPlacement),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Selector {
-    Class(String),
-    Id(String),
-    Tag(String),
-}
-
-impl Selector {
-    pub fn matches(&self, element: ElementRef<'_>) -> bool {
-        match self {
-            Self::Class(expected) => element
-                .classes
-                .iter()
-                .any(|class_name| class_name == expected),
-            Self::Id(expected) => element.id.is_some_and(|actual| actual == expected),
-            Self::Tag(expected) => element.tag == expected,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ElementRef<'a> {
-    pub tag: &'a str,
-    pub id: Option<&'a str>,
-    pub classes: &'a [String],
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StyleError {
     Parse(String),
@@ -261,11 +236,7 @@ fn resolve_style_with_inherited_text(
         resolved.visual.text = inherited_text.clone();
     }
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
-    let element_ref = ElementRef {
-        tag: &element.tag,
-        id: element.id.as_deref(),
-        classes: &element.classes,
-    };
+    let element_ref = ElementRef::from(element);
 
     for rule in stylesheet.matching_rules(element_ref) {
         for declaration in &rule.declarations {
@@ -335,28 +306,6 @@ fn build_render_tree_with_available_space(
         .expect("resolved layout should be valid for taffy");
 
     render_node_from_layout(&layout_tree, &taffy, 0.0, 0.0)
-}
-
-fn extract_selector(selector: &LightningSelector<'_>) -> Result<Selector, StyleError> {
-    let mut resolved = None;
-
-    for component in selector.iter_raw_match_order() {
-        let candidate = match component {
-            Component::Class(name) => Selector::Class(name.0.to_string()),
-            Component::ID(name) => Selector::Id(name.0.to_string()),
-            Component::LocalName(name) => Selector::Tag(name.name.0.to_string()),
-            Component::ExplicitUniversalType => continue,
-            _ => {
-                return Err(StyleError::UnsupportedSelector(format!("{selector:?}")));
-            }
-        };
-
-        if resolved.replace(candidate).is_some() {
-            return Err(StyleError::UnsupportedSelector(format!("{selector:?}")));
-        }
-    }
-
-    resolved.ok_or_else(|| StyleError::UnsupportedSelector(format!("{selector:?}")))
 }
 
 fn extract_declarations(block: &DeclarationBlock<'_>) -> Result<Vec<Declaration>, StyleError> {
@@ -1122,6 +1071,8 @@ fn resolved_length(value: TaffyLengthPercentage) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient,
         GradientDirection, GradientHorizontal, GradientPoint, GradientStop, LengthPercentageValue,
@@ -1140,23 +1091,9 @@ mod tests {
     };
 
     #[test]
-    fn selectors_match_supported_primitives() {
-        let classes = vec!["card".to_string(), "selected".to_string()];
-        let element = ElementRef {
-            tag: "div",
-            id: Some("hero"),
-            classes: &classes,
-        };
-
-        assert!(Selector::Class("card".to_string()).matches(element));
-        assert!(Selector::Id("hero".to_string()).matches(element));
-        assert!(Selector::Tag("div".to_string()).matches(element));
-        assert!(!Selector::Class("ghost".to_string()).matches(element));
-    }
-
-    #[test]
     fn matching_rules_are_returned_in_insertion_order() {
         let classes = vec!["card".to_string()];
+        let attributes = BTreeMap::new();
         let mut stylesheet = Stylesheet::default();
         stylesheet.push(StyleRule::new(
             Selector::Class("card".to_string()),
@@ -1172,6 +1109,7 @@ mod tests {
                 tag: "div",
                 id: None,
                 classes: &classes,
+                attributes: &attributes,
             })
             .collect();
 

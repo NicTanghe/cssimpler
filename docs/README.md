@@ -8,5 +8,7 @@ Current focus:
 - `style/` holds stylesheet parsing, selector matching, and DOM-to-render-tree resolution.
 - `macro/` is the bootstrap home for `ui!`.
 - `examples/demo.rs` is the small demo app edge.
+- `examples/collapsible_sidebar.rs` proves Windows/system font resolution against a live UI.
+- `examples/powerline_typography.rs` registers a bundled Powerline TTF from `examples/assets/`.
 
-The workspace now has the foundations through rendering, interaction, scoped invalidation, and renderer-side dirty-region diffing in place.
+The workspace now has the foundations through rendering, typography and font resolution, interaction, scoped invalidation, and renderer-side dirty-region diffing in place.

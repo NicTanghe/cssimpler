@@ -8,8 +8,10 @@ use cssimpler::ui;
 
 fn main() -> Result<()> {
     let config = WindowConfig::new("cssimpler / gradient gallery", 1280, 840);
-    cssimpler_renderer::run_with_viewport(config, |_, viewport| render(viewport.width, viewport.height))
-        .map_err(Into::into)
+    cssimpler_renderer::run_with_viewport(config, |_, viewport| {
+        render(viewport.width, viewport.height)
+    })
+    .map_err(Into::into)
 }
 
 fn render(viewport_width: usize, viewport_height: usize) -> Vec<RenderNode> {
