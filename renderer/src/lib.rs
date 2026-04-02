@@ -454,7 +454,10 @@ fn render_scene_update(
 
     let full_clip = ClipRect::full(width as f32, height as f32);
     for dirty_region in dirty_regions {
-        let Some(dirty_region) = dirty_region.intersect(full_clip) else {
+        let Some(dirty_region) = dirty_region
+            .intersect(full_clip)
+            .and_then(|clip| snap_clip_to_pixel_grid(clip, width, height))
+        else {
             continue;
         };
         clear_clip(buffer, width, height, dirty_region, clear_color);
@@ -512,7 +515,10 @@ fn redraw_auto_scroll_indicator_regions(
 
     let full_clip = ClipRect::full(width as f32, height as f32);
     for bounds in bounds {
-        let Some(clip) = full_clip.intersect(layout_clip(bounds)) else {
+        let Some(clip) = full_clip
+            .intersect(layout_clip(bounds))
+            .and_then(|clip| snap_clip_to_pixel_grid(clip, width, height))
+        else {
             continue;
         };
         clear_clip(buffer, width, height, clip, clear_color);
@@ -1706,6 +1712,16 @@ fn clip_pixel_bounds(clip: ClipRect, width: usize, height: usize) -> Option<(i32
     let x1 = clip.x1.ceil().min(width as f32) as i32;
     let y1 = clip.y1.ceil().min(height as f32) as i32;
     (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+}
+
+fn snap_clip_to_pixel_grid(clip: ClipRect, width: usize, height: usize) -> Option<ClipRect> {
+    let (x0, y0, x1, y1) = clip_pixel_bounds(clip, width, height)?;
+    Some(ClipRect {
+        x0: x0 as f32,
+        y0: y0 as f32,
+        x1: x1 as f32,
+        y1: y1 as f32,
+    })
 }
 
 fn point_in_rounded_rect(x: f32, y: f32, layout: LayoutBox, radius: CornerRadius) -> bool {
@@ -2902,6 +2918,131 @@ mod tests {
         render_to_buffer(&previous, &mut incremental, 20, 20, Color::WHITE);
         render_scene_update(&previous, &next, &mut incremental, 20, 20, Color::WHITE);
         render_to_buffer(&next, &mut full, 20, 20, Color::WHITE);
+
+        assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn incremental_render_redraws_pixels_cleared_by_fractional_dirty_regions() {
+        let background =
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 32.0, 16.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(226, 232, 240)),
+                ..VisualStyle::default()
+            });
+        let static_bar =
+            RenderNode::container(LayoutBox::new(6.0, 4.0, 20.0, 8.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(15, 23, 42)),
+                ..VisualStyle::default()
+            });
+        let previous = vec![
+            background.clone(),
+            static_bar.clone(),
+            RenderNode::container(LayoutBox::new(10.0, 0.0, 7.2, 16.0)),
+        ];
+        let next = vec![
+            background,
+            static_bar,
+            RenderNode::container(LayoutBox::new(10.0, 0.0, 11.6, 16.0)),
+        ];
+        let mut incremental = vec![0_u32; 32 * 16];
+        let mut full = vec![0_u32; 32 * 16];
+
+        render_to_buffer(&previous, &mut incremental, 32, 16, Color::WHITE);
+        render_scene_update(&previous, &next, &mut incremental, 32, 16, Color::WHITE);
+        render_to_buffer(&next, &mut full, 32, 16, Color::WHITE);
+
+        assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn incremental_render_matches_full_render_for_fractional_dirty_regions_over_text() {
+        let background =
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 160.0, 80.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(245, 247, 250)),
+                ..VisualStyle::default()
+            });
+        let text =
+            RenderNode::text(LayoutBox::new(24.0, 20.0, 112.0, 36.0), "UIVERSE").with_style(
+                VisualStyle {
+                    foreground: Color::rgba(255, 255, 255, 0),
+                    text: TextStyle {
+                        size_px: 32.0,
+                        ..TextStyle::default()
+                    },
+                    text_stroke: TextStrokeStyle {
+                        width: 1.0,
+                        color: Some(Color::rgb(15, 23, 42)),
+                    },
+                    ..VisualStyle::default()
+                },
+            );
+        let previous = vec![
+            background.clone(),
+            text.clone(),
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 53.2, 80.0)),
+        ];
+        let next = vec![
+            background,
+            text,
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 57.7, 80.0)),
+        ];
+        let mut incremental = vec![0_u32; 160 * 80];
+        let mut full = vec![0_u32; 160 * 80];
+
+        render_to_buffer(&previous, &mut incremental, 160, 80, Color::WHITE);
+        render_scene_update(&previous, &next, &mut incremental, 160, 80, Color::WHITE);
+        render_to_buffer(&next, &mut full, 160, 80, Color::WHITE);
+
+        assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn incremental_render_does_not_leave_stripes_after_a_fractional_reveal_sweeps_over_text() {
+        fn scene(reveal_width: f32) -> Vec<RenderNode> {
+            vec![
+                RenderNode::container(LayoutBox::new(0.0, 0.0, 200.0, 96.0)).with_style(
+                    VisualStyle {
+                        background: Some(Color::rgb(38, 38, 38)),
+                        ..VisualStyle::default()
+                    },
+                ),
+                RenderNode::text(LayoutBox::new(28.0, 28.0, 144.0, 40.0), "UIVERSE").with_style(
+                    VisualStyle {
+                        foreground: Color::rgba(255, 255, 255, 0),
+                        text: TextStyle {
+                            size_px: 36.0,
+                            ..TextStyle::default()
+                        },
+                        text_stroke: TextStrokeStyle {
+                            width: 1.0,
+                            color: Some(Color::rgb(240, 240, 240)),
+                        },
+                        ..VisualStyle::default()
+                    },
+                ),
+                RenderNode::container(LayoutBox::new(28.0, 20.0, reveal_width, 56.0)).with_style(
+                    VisualStyle {
+                        overflow: Overflow::CLIP,
+                        ..VisualStyle::default()
+                    },
+                ),
+            ]
+        }
+
+        let widths = [4.2, 21.4, 39.8, 58.1, 76.6, 95.2, 63.7, 27.3, 4.2];
+        let mut incremental = vec![0_u32; 200 * 96];
+        let mut previous = scene(widths[0]);
+        render_to_buffer(&previous, &mut incremental, 200, 96, Color::WHITE);
+
+        for width in widths.iter().copied().skip(1) {
+            let next = scene(width);
+            render_scene_update(&previous, &next, &mut incremental, 200, 96, Color::WHITE);
+            previous = next;
+        }
+
+        let final_scene = scene(*widths.last().expect("sequence should not be empty"));
+        let mut full = vec![0_u32; 200 * 96];
+        render_to_buffer(&final_scene, &mut full, 200, 96, Color::WHITE);
 
         assert_eq!(incremental, full);
     }

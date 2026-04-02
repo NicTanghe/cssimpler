@@ -124,6 +124,39 @@ mod tests {
         &button(root).children[1]
     }
 
+    fn actual_text_node(root: &RenderNode) -> &RenderNode {
+        &button(root).children[0].children[0].children[0]
+    }
+
+    fn hover_fill_text_node(root: &RenderNode) -> &RenderNode {
+        &hover_mask(root).children[0].children[0].children[0]
+    }
+
+    #[test]
+    fn hover_reveal_keeps_the_text_node_layouts_stable() {
+        let tree = build_ui(&());
+        let idle = build_render_tree_in_viewport_with_interaction(
+            &tree,
+            stylesheet(),
+            1280,
+            720,
+            &ElementInteractionState::default(),
+        );
+        let hovered = build_render_tree_in_viewport_with_interaction(
+            &tree,
+            stylesheet(),
+            1280,
+            720,
+            &ElementInteractionState {
+                hovered: Some(ElementPath::root(0).with_child(0).with_child(1)),
+                active: None,
+            },
+        );
+
+        assert_eq!(actual_text_node(&idle).layout, actual_text_node(&hovered).layout);
+        assert_eq!(hover_fill_text_node(&idle).layout, hover_fill_text_node(&hovered).layout);
+    }
+
     #[test]
     fn reveal_transition_keeps_the_hover_label_on_one_line() {
         let stylesheet = parse_stylesheet(
