@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 
 use ab_glyph::{Font, ScaleFont, point};
 use cssimpler_core::fonts::{ResolvedFont, TextLayout, TextStyle, layout_text_block, resolve_font};
@@ -11,6 +12,8 @@ use crate::{ClipRect, blend_pixel};
 const BITMAP_LINE_HEIGHT_PX: f32 = 20.0;
 const MAX_TEXT_RASTER_CACHE_ENTRIES: usize = 256;
 const MAX_TEXT_EFFECT_CACHE_ENTRIES: usize = 512;
+const MAX_TEXT_EFFECT_WORKERS: usize = 8;
+const MIN_PARALLEL_BLUR_PIXELS: usize = 24_576;
 
 pub(crate) fn draw_text(
     buffer: &mut [u32],
@@ -306,9 +309,15 @@ fn shadow_mask_from_raster(raster: &AlphaMask, shadow: ShadowEffect) -> AlphaMas
 }
 
 fn stroke_mask_from_raster(raster: &AlphaMask, width: f32) -> AlphaMask {
-    let padded = pad_mask(raster, width);
-    let dilated = dilate_mask(&padded, width);
-    subtract_mask(&dilated, &padded)
+    let radius = width.ceil().max(0.0);
+    if radius <= 0.0 {
+        return raster.clone();
+    }
+
+    let padded = pad_mask(raster, radius);
+    let outer = dilate_mask(&padded, radius);
+    let inner = erode_mask(&padded, radius);
+    subtract_mask(&outer, &inner)
 }
 
 fn split_layout_for_cache(layout: LayoutBox) -> (LayoutBox, i32, i32) {
@@ -512,42 +521,200 @@ fn dilate_mask(mask: &AlphaMask, radius: f32) -> AlphaMask {
     expanded
 }
 
+fn erode_mask(mask: &AlphaMask, radius: f32) -> AlphaMask {
+    let radius = radius.max(0.0);
+    if radius <= 0.0 {
+        return mask.clone();
+    }
+
+    let pad = radius.ceil() as i32;
+    let radius_squared = radius * radius;
+    let mut contracted = mask.clone();
+
+    for y in 0..mask.height {
+        for x in 0..mask.width {
+            let mut alpha = 255_u8;
+            for dy in -pad..=pad {
+                for dx in -pad..=pad {
+                    let distance_squared = (dx * dx + dy * dy) as f32;
+                    if distance_squared > radius_squared {
+                        continue;
+                    }
+
+                    alpha = alpha.min(mask.get(x as i32 + dx, y as i32 + dy));
+                    if alpha == 0 {
+                        break;
+                    }
+                }
+                if alpha == 0 {
+                    break;
+                }
+            }
+            contracted.alpha[x + y * mask.width] = alpha;
+        }
+    }
+
+    contracted
+}
+
 fn blur_mask(mask: &AlphaMask, radius: f32) -> AlphaMask {
     let radius = radius.max(0.0);
     if radius <= 0.0 {
         return mask.clone();
     }
 
-    let blur = radius.ceil() as i32;
-    let radius_squared = radius * radius;
+    let kernel_radius = radius.ceil() as usize;
+    if kernel_radius == 0 || mask.width == 0 || mask.height == 0 {
+        return mask.clone();
+    }
+
+    let worker_count = blur_worker_count(mask);
+    blur_mask_with_workers(mask, kernel_radius, worker_count)
+}
+
+fn blur_mask_with_workers(mask: &AlphaMask, radius: usize, worker_count: usize) -> AlphaMask {
+    // Keep large glow renders responsive by using a separable box blur instead of
+    // scanning the full blur disk for every destination pixel. For big masks, split
+    // each pass across a few worker threads so the first heavy hover doesn't block
+    // a full frame on the UI thread.
+    let horizontal = blur_mask_horizontally(mask, radius, worker_count);
+    blur_mask_vertically(&horizontal, radius, worker_count)
+}
+
+fn blur_worker_count(mask: &AlphaMask) -> usize {
+    let total_pixels = mask.width.saturating_mul(mask.height);
+    if total_pixels < MIN_PARALLEL_BLUR_PIXELS {
+        return 1;
+    }
+
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_TEXT_EFFECT_WORKERS)
+        .max(1)
+}
+
+fn blur_mask_horizontally(mask: &AlphaMask, radius: usize, worker_count: usize) -> AlphaMask {
     let mut blurred = mask.clone();
+    let worker_count = worker_count.max(1).min(mask.height.max(1));
 
-    for y in 0..mask.height {
+    if worker_count == 1 {
+        blurred.alpha = blur_rows(mask, radius, 0, mask.height);
+        return blurred;
+    }
+
+    let rows_per_worker = mask.height.div_ceil(worker_count);
+    let mut alpha = vec![0_u8; mask.width * mask.height];
+
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for row_start in (0..mask.height).step_by(rows_per_worker) {
+            let row_end = (row_start + rows_per_worker).min(mask.height);
+            handles.push(scope.spawn(move || (row_start, blur_rows(mask, radius, row_start, row_end))));
+        }
+
+        for handle in handles {
+            let (row_start, chunk) = handle
+                .join()
+                .expect("horizontal text blur worker should not panic");
+            let start = row_start * mask.width;
+            let end = start + chunk.len();
+            alpha[start..end].copy_from_slice(&chunk);
+        }
+    });
+
+    blurred.alpha = alpha;
+    blurred
+}
+
+fn blur_rows(mask: &AlphaMask, radius: usize, row_start: usize, row_end: usize) -> Vec<u8> {
+    let mut alpha = vec![0_u8; (row_end - row_start) * mask.width];
+
+    for y in row_start..row_end {
+        let source_row_start = y * mask.width;
+        let target_row_start = (y - row_start) * mask.width;
+        let mut prefix = vec![0_u32; mask.width + 1];
         for x in 0..mask.width {
-            let mut alpha_sum = 0_u32;
-            let mut weight_sum = 0_u32;
+            prefix[x + 1] = prefix[x] + mask.alpha[source_row_start + x] as u32;
+        }
 
-            for dy in -blur..=blur {
-                for dx in -blur..=blur {
-                    let distance_squared = (dx * dx + dy * dy) as f32;
-                    if distance_squared > radius_squared {
-                        continue;
-                    }
-
-                    alpha_sum += mask.get(x as i32 + dx, y as i32 + dy) as u32;
-                    weight_sum += 1;
-                }
-            }
-
-            blurred.alpha[x + y * mask.width] = if weight_sum == 0 {
-                0
-            } else {
-                (alpha_sum / weight_sum) as u8
-            };
+        for x in 0..mask.width {
+            let left = x.saturating_sub(radius);
+            let right = (x + radius + 1).min(mask.width);
+            let sum = prefix[right] - prefix[left];
+            let count = (right - left) as u32;
+            alpha[target_row_start + x] = (sum / count) as u8;
         }
     }
 
+    alpha
+}
+
+fn blur_mask_vertically(mask: &AlphaMask, radius: usize, worker_count: usize) -> AlphaMask {
+    let mut blurred = mask.clone();
+    let worker_count = worker_count.max(1).min(mask.width.max(1));
+
+    if worker_count == 1 {
+        blurred.alpha = blur_columns(mask, radius, 0, mask.width);
+        return blurred;
+    }
+
+    let columns_per_worker = mask.width.div_ceil(worker_count);
+    let mut alpha = vec![0_u8; mask.width * mask.height];
+
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for column_start in (0..mask.width).step_by(columns_per_worker) {
+            let column_end = (column_start + columns_per_worker).min(mask.width);
+            handles.push(scope.spawn(move || {
+                (
+                    column_start,
+                    column_end,
+                    blur_columns(mask, radius, column_start, column_end),
+                )
+            }));
+        }
+
+        for handle in handles {
+            let (column_start, column_end, chunk) = handle
+                .join()
+                .expect("vertical text blur worker should not panic");
+            let chunk_width = column_end - column_start;
+            for y in 0..mask.height {
+                let source_row_start = y * chunk_width;
+                let destination_row_start = y * mask.width + column_start;
+                let destination_row_end = destination_row_start + chunk_width;
+                alpha[destination_row_start..destination_row_end]
+                    .copy_from_slice(&chunk[source_row_start..source_row_start + chunk_width]);
+            }
+        }
+    });
+
+    blurred.alpha = alpha;
     blurred
+}
+
+fn blur_columns(mask: &AlphaMask, radius: usize, column_start: usize, column_end: usize) -> Vec<u8> {
+    let chunk_width = column_end - column_start;
+    let mut alpha = vec![0_u8; chunk_width * mask.height];
+
+    for x in column_start..column_end {
+        let local_x = x - column_start;
+        let mut prefix = vec![0_u32; mask.height + 1];
+        for y in 0..mask.height {
+            prefix[y + 1] = prefix[y] + mask.alpha[x + y * mask.width] as u32;
+        }
+
+        for y in 0..mask.height {
+            let top = y.saturating_sub(radius);
+            let bottom = (y + radius + 1).min(mask.height);
+            let sum = prefix[bottom] - prefix[top];
+            let count = (bottom - top) as u32;
+            alpha[local_x + y * chunk_width] = (sum / count) as u8;
+        }
+    }
+
+    alpha
 }
 
 fn subtract_mask(mask: &AlphaMask, subtract: &AlphaMask) -> AlphaMask {
@@ -686,7 +853,7 @@ mod tests {
     use cssimpler_core::{LayoutBox, ShadowEffect};
 
     use super::{
-        TextEffectCacheKind, cached_text_effect_mask, cached_text_mask,
+        TextEffectCacheKind, blur_mask_with_workers, cached_text_effect_mask, cached_text_mask,
         clear_text_mask_cache_for_tests, shadow_mask_from_raster,
     };
 
@@ -741,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn stroke_mask_excludes_the_original_fill_area() {
+    fn stroke_mask_keeps_edge_pixels_inside_the_original_fill_area() {
         let mut raster = super::AlphaMask::new(0, 0, 3, 3);
         for y in 0..3 {
             for x in 0..3 {
@@ -751,14 +918,39 @@ mod tests {
 
         let outline = super::stroke_mask_from_raster(&raster, 1.0);
 
+        assert_eq!(outline.get(1 - outline.origin_x, 1 - outline.origin_y), 0);
+
         for y in 0..3 {
             for x in 0..3 {
-                let local_x = (x - outline.origin_x) as i32;
-                let local_y = (y - outline.origin_y) as i32;
-                assert_eq!(outline.get(local_x, local_y), 0);
+                if x == 1 && y == 1 {
+                    continue;
+                }
+                let local_x = x - outline.origin_x;
+                let local_y = y - outline.origin_y;
+                assert!(outline.get(local_x, local_y) > 0);
             }
         }
 
         assert!(outline.alpha.iter().any(|alpha| *alpha > 0));
+    }
+
+    #[test]
+    fn multithreaded_blur_matches_the_single_threaded_result() {
+        let mut mask = super::AlphaMask::new(0, 0, 96, 64);
+        for y in 0..64 {
+            for x in 0..96 {
+                let value = (((x * 13) + (y * 17)) % 256) as u8;
+                mask.set_max(x, y, value);
+            }
+        }
+
+        let single = blur_mask_with_workers(&mask, 12, 1);
+        let threaded = blur_mask_with_workers(&mask, 12, 4);
+
+        assert_eq!(single.origin_x, threaded.origin_x);
+        assert_eq!(single.origin_y, threaded.origin_y);
+        assert_eq!(single.width, threaded.width);
+        assert_eq!(single.height, threaded.height);
+        assert_eq!(single.alpha, threaded.alpha);
     }
 }

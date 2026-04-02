@@ -129,42 +129,45 @@ mod tests {
         let stylesheet = parse_stylesheet(
             r#"
             .button {
-              width: 304px;
-              height: 86px;
+              width: 320px;
+              height: 88px;
               display: flex;
               justify-content: center;
               align-items: center;
               position: relative;
               font-size: 44px;
+              font-weight: 700;
+              line-height: 1;
               letter-spacing: 2px;
               text-transform: uppercase;
             }
 
             .actual-text {
               display: flex;
-              width: 304px;
-              height: 86px;
+              width: 320px;
+              height: 88px;
               justify-content: center;
               align-items: center;
             }
 
             .actual-label {
               display: flex;
-              width: 304px;
-              height: 86px;
+              width: 320px;
+              height: 88px;
               justify-content: center;
               align-items: center;
               flex-shrink: 0;
             }
 
             .actual-label-text {
-              width: 240px;
+              display: block;
+              width: 252px;
               flex-shrink: 0;
             }
 
             .hover-text {
               width: 0px;
-              height: 86px;
+              height: 88px;
               position: absolute;
               inset: 0;
               overflow: hidden;
@@ -178,23 +181,24 @@ mod tests {
 
             .hover-fill {
               display: flex;
-              width: 304px;
-              height: 86px;
+              width: 320px;
+              height: 88px;
               justify-content: center;
               align-items: center;
             }
 
             .hover-label {
               display: flex;
-              width: 304px;
-              height: 86px;
+              width: 320px;
+              height: 88px;
               justify-content: center;
               align-items: center;
               flex-shrink: 0;
             }
 
             .hover-label-text {
-              width: 240px;
+              display: block;
+              width: 252px;
               flex-shrink: 0;
             }
             "#,

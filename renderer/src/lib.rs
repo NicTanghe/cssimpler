@@ -203,21 +203,43 @@ pub fn run_with_scene_provider<P>(config: WindowConfig, mut scene_provider: P) -
 where
     P: SceneProvider,
 {
+    let initial_viewport = ViewportSize::new(config.width, config.height);
+    scene_provider.set_viewport(initial_viewport);
+    scene_provider.update(FrameInfo {
+        frame_index: 0,
+        delta: Duration::ZERO,
+    });
+    let mut initial_scene = scene_provider.capture_scene();
+    let mut scrollbar_controller = scrollbar::ScrollbarController::default();
+    scrollbar_controller.apply_to_scene(&mut initial_scene);
+    let initial_indicator = scrollbar_controller.auto_scroll_indicator();
+
     let mut window = Window::new(&config.title, config.width, config.height, window_options())?;
     window.set_target_fps(frame_time_to_fps(config.frame_time));
 
     let mut buffer_width = config.width.max(1);
     let mut buffer_height = config.height.max(1);
     let mut buffer = vec![pack_rgb(config.clear_color); buffer_width * buffer_height];
+    render_to_buffer(
+        &initial_scene,
+        &mut buffer,
+        buffer_width,
+        buffer_height,
+        config.clear_color,
+    );
+    if let Some(indicator) = initial_indicator {
+        scrollbar::draw_auto_scroll_indicator(indicator, &mut buffer, buffer_width, buffer_height);
+    }
+    window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
+
     let mut last_frame = Instant::now();
-    let mut frame_index = 0_u64;
+    let mut frame_index = 1_u64;
     let mut previous_left_down = false;
     let mut previous_middle_down = false;
     let mut suppress_left_pointer_until_release = false;
     let mut element_interaction = ElementInteractionState::default();
-    let mut previous_presented_scene: Option<Vec<RenderNode>> = None;
-    let mut previous_presented_indicator: Option<scrollbar::AutoScrollIndicator> = None;
-    let mut scrollbar_controller = scrollbar::ScrollbarController::default();
+    let mut previous_presented_scene: Option<Vec<RenderNode>> = Some(initial_scene);
+    let mut previous_presented_indicator: Option<scrollbar::AutoScrollIndicator> = initial_indicator;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
