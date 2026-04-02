@@ -522,8 +522,12 @@ pub(crate) fn text_clip(node: &RenderNode, clip: ClipRect) -> ClipRect {
         viewport.height = (viewport.height - scrollbars.metrics.reserved_height).max(0.0);
     }
 
-    clip.intersect(layout_clip(viewport))
-        .unwrap_or(ClipRect::full(0.0, 0.0))
+    if node.style.overflow.clips_any_axis() || node.scrollbars.is_some() {
+        clip.intersect(layout_clip(viewport))
+            .unwrap_or(ClipRect::full(0.0, 0.0))
+    } else {
+        clip
+    }
 }
 
 pub(crate) fn draw_scrollbars(

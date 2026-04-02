@@ -245,16 +245,12 @@ where
         let state = &mut self.state;
         let refresh = update(state, frame).into();
         self.pending_refresh = std::mem::take(&mut self.pending_refresh).merge(refresh);
-        let mut rebuilt = false;
 
         if self.needs_rerender() {
             self.rebuild_scene();
-            rebuilt = true;
         }
 
-        if !rebuilt {
-            self.advance_scene_transition(frame.delta);
-        }
+        self.advance_scene_transition(frame.delta);
     }
 
     fn needs_rerender(&self) -> bool {
@@ -435,16 +431,12 @@ where
         let state = &mut self.state;
         let refresh = update(state, frame).into();
         self.pending_refresh = std::mem::take(&mut self.pending_refresh).merge(refresh);
-        let mut rebuilt = false;
 
         if self.needs_rerender() {
             self.refresh_scene();
-            rebuilt = true;
         }
 
-        if !rebuilt {
-            self.advance_scene_transition(frame.delta);
-        }
+        self.advance_scene_transition(frame.delta);
     }
 
     fn needs_rerender(&self) -> bool {
@@ -1305,9 +1297,9 @@ mod tests {
 
         assert_eq!(render_calls.get(), 2);
         assert_eq!(first[0].style.foreground, Color::rgb(17, 17, 17));
-        assert_eq!(second[0].style.foreground, Color::rgb(17, 17, 17));
-        assert_ne!(third[0].style.foreground, Color::rgb(17, 17, 17));
-        assert_ne!(third[0].style.foreground, Color::rgb(37, 99, 235));
+        assert_ne!(second[0].style.foreground, Color::rgb(17, 17, 17));
+        assert_ne!(second[0].style.foreground, Color::rgb(37, 99, 235));
+        assert_eq!(third[0].style.foreground, Color::rgb(37, 99, 235));
         assert_eq!(fourth[0].style.foreground, Color::rgb(37, 99, 235));
     }
 
@@ -1347,8 +1339,8 @@ mod tests {
 
         assert_eq!(render_calls.get(), 2);
         assert_eq!(first[0].layout.width, 80.0);
-        assert_eq!(second[0].layout.width, 80.0);
-        assert!((third[0].layout.width - 120.0).abs() < 0.01);
+        assert!((second[0].layout.width - 120.0).abs() < 0.01);
+        assert_eq!(third[0].layout.width, 160.0);
         assert_eq!(fourth[0].layout.width, 160.0);
     }
 

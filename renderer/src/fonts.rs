@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use ab_glyph::{Font, ScaleFont, point};
 use cssimpler_core::fonts::{ResolvedFont, TextLayout, TextStyle, layout_text_block, resolve_font};
 use cssimpler_core::{Color, LayoutBox, ShadowEffect, TextStrokeStyle, VisualStyle};
@@ -6,6 +9,8 @@ use font8x8::{BASIC_FONTS, UnicodeFonts};
 use crate::{ClipRect, blend_pixel};
 
 const BITMAP_LINE_HEIGHT_PX: f32 = 20.0;
+const MAX_TEXT_RASTER_CACHE_ENTRIES: usize = 256;
+const MAX_TEXT_EFFECT_CACHE_ENTRIES: usize = 512;
 
 pub(crate) fn draw_text(
     buffer: &mut [u32],
@@ -16,14 +21,7 @@ pub(crate) fn draw_text(
     style: &VisualStyle,
     clip: ClipRect,
 ) {
-    let wrapped = layout_text_block(text, &style.text, Some(layout.width.max(1.0)));
-    let raster = if let Some(font) = resolve_font(&style.text) {
-        rasterize_resolved_text(layout, &wrapped, &font, style.text.letter_spacing_px)
-    } else {
-        rasterize_bitmap_text(layout, &wrapped, &style.text)
-    };
-
-    let Some(raster) = raster else {
+    let Some(raster) = cached_text_mask(layout, text, &style.text) else {
         return;
     };
 
@@ -55,25 +53,39 @@ pub(crate) fn draw_text(
         );
     }
 
-    draw_mask(buffer, width, height, &raster, style.foreground, 0, 0, clip);
+    draw_mask(
+        buffer,
+        width,
+        height,
+        &raster.mask,
+        style.foreground,
+        raster.offset_x,
+        raster.offset_y,
+        clip,
+    );
 }
 
 fn draw_shadow_mask(
     buffer: &mut [u32],
     width: usize,
     height: usize,
-    raster: &AlphaMask,
+    raster: &CachedTextMask,
     shadow: ShadowEffect,
     fallback_color: Color,
     clip: ClipRect,
 ) {
-    let mut mask = raster.clone();
-    if shadow.spread > 0.0 {
-        mask = dilate_mask(&mask, shadow.spread);
-    }
-    if shadow.blur_radius > 0.0 {
-        mask = blur_mask(&pad_mask(&mask, shadow.blur_radius), shadow.blur_radius);
-    }
+    let mask = if shadow.spread > 0.0 || shadow.blur_radius > 0.0 {
+        cached_text_effect_mask(
+            raster,
+            TextEffectCacheKind::Shadow {
+                spread_bits: shadow.spread.to_bits(),
+                blur_bits: shadow.blur_radius.to_bits(),
+            },
+            |base| shadow_mask_from_raster(base, shadow),
+        )
+    } else {
+        raster.mask.clone()
+    };
 
     draw_mask(
         buffer,
@@ -81,8 +93,8 @@ fn draw_shadow_mask(
         height,
         &mask,
         shadow.color.unwrap_or(fallback_color),
-        shadow.offset_x.round() as i32,
-        shadow.offset_y.round() as i32,
+        raster.offset_x + shadow.offset_x.round() as i32,
+        raster.offset_y + shadow.offset_y.round() as i32,
         clip,
     );
 }
@@ -91,20 +103,26 @@ fn draw_stroke_mask(
     buffer: &mut [u32],
     width: usize,
     height: usize,
-    raster: &AlphaMask,
+    raster: &CachedTextMask,
     stroke: TextStrokeStyle,
     fallback_color: Color,
     clip: ClipRect,
 ) {
-    let outline = dilate_mask(&pad_mask(raster, stroke.width), stroke.width);
+    let outline = cached_text_effect_mask(
+        raster,
+        TextEffectCacheKind::Stroke {
+            width_bits: stroke.width.to_bits(),
+        },
+        |base| stroke_mask_from_raster(base, stroke.width),
+    );
     draw_mask(
         buffer,
         width,
         height,
         &outline,
         stroke.color.unwrap_or(fallback_color),
-        0,
-        0,
+        raster.offset_x,
+        raster.offset_y,
         clip,
     );
 }
@@ -189,6 +207,124 @@ fn rasterize_resolved_text(
 
     let _ = scaled_font;
     Some(mask)
+}
+
+fn cached_text_mask(layout: LayoutBox, text: &str, text_style: &TextStyle) -> Option<CachedTextMask> {
+    let (relative_layout, offset_x, offset_y) = split_layout_for_cache(layout);
+    let key = TextRasterCacheKey {
+        text: text.to_string(),
+        style_signature: format!("{text_style:?}"),
+        width_bits: relative_layout.width.to_bits(),
+        origin_x_bits: relative_layout.x.to_bits(),
+        origin_y_bits: relative_layout.y.to_bits(),
+    };
+
+    if let Some(mask) = cached_raster_mask(&key) {
+        return Some(CachedTextMask {
+            mask,
+            key,
+            offset_x,
+            offset_y,
+        });
+    }
+
+    let wrapped = layout_text_block(text, text_style, Some(relative_layout.width.max(1.0)));
+    let mask = if let Some(font) = resolve_font(text_style) {
+        rasterize_resolved_text(relative_layout, &wrapped, &font, text_style.letter_spacing_px)
+    } else {
+        rasterize_bitmap_text(relative_layout, &wrapped, text_style)
+    }?;
+    let mask = Arc::new(mask);
+
+    insert_cached_raster_mask(key.clone(), mask.clone());
+
+    Some(CachedTextMask {
+        mask,
+        key,
+        offset_x,
+        offset_y,
+    })
+}
+
+fn cached_raster_mask(key: &TextRasterCacheKey) -> Option<Arc<AlphaMask>> {
+    let cache = text_mask_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    cache.rasters.get(key).cloned()
+}
+
+fn insert_cached_raster_mask(key: TextRasterCacheKey, mask: Arc<AlphaMask>) {
+    let mut cache = text_mask_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if cache.rasters.len() >= MAX_TEXT_RASTER_CACHE_ENTRIES {
+        cache.rasters.clear();
+        cache.effects.clear();
+    }
+    cache.rasters.insert(key, mask);
+}
+
+fn cached_text_effect_mask(
+    raster: &CachedTextMask,
+    kind: TextEffectCacheKind,
+    build: impl FnOnce(&AlphaMask) -> AlphaMask,
+) -> Arc<AlphaMask> {
+    let key = TextEffectCacheKey {
+        raster: raster.key.clone(),
+        kind,
+    };
+
+    {
+        let cache = text_mask_cache()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(mask) = cache.effects.get(&key) {
+            return mask.clone();
+        }
+    }
+
+    let mask = Arc::new(build(raster.mask.as_ref()));
+    let mut cache = text_mask_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if cache.effects.len() >= MAX_TEXT_EFFECT_CACHE_ENTRIES {
+        cache.effects.clear();
+    }
+    cache.effects.insert(key, mask.clone());
+    mask
+}
+
+fn shadow_mask_from_raster(raster: &AlphaMask, shadow: ShadowEffect) -> AlphaMask {
+    let mut mask = raster.clone();
+    if shadow.spread > 0.0 {
+        mask = dilate_mask(&mask, shadow.spread);
+    }
+    if shadow.blur_radius > 0.0 {
+        mask = blur_mask(&pad_mask(&mask, shadow.blur_radius), shadow.blur_radius);
+    }
+    mask
+}
+
+fn stroke_mask_from_raster(raster: &AlphaMask, width: f32) -> AlphaMask {
+    let padded = pad_mask(raster, width);
+    let dilated = dilate_mask(&padded, width);
+    subtract_mask(&dilated, &padded)
+}
+
+fn split_layout_for_cache(layout: LayoutBox) -> (LayoutBox, i32, i32) {
+    let offset_x = layout.x.floor() as i32;
+    let offset_y = layout.y.floor() as i32;
+
+    (
+        LayoutBox::new(
+            layout.x - offset_x as f32,
+            layout.y - offset_y as f32,
+            layout.width,
+            layout.height,
+        ),
+        offset_x,
+        offset_y,
+    )
 }
 
 fn positioned_glyphs(
@@ -414,6 +550,22 @@ fn blur_mask(mask: &AlphaMask, radius: f32) -> AlphaMask {
     blurred
 }
 
+fn subtract_mask(mask: &AlphaMask, subtract: &AlphaMask) -> AlphaMask {
+    let mut result = mask.clone();
+
+    for y in 0..result.height {
+        for x in 0..result.width {
+            let world_x = result.origin_x + x as i32;
+            let world_y = result.origin_y + y as i32;
+            let source = result.alpha[x + y * result.width];
+            let removed = subtract.get(world_x - subtract.origin_x, world_y - subtract.origin_y);
+            result.alpha[x + y * result.width] = source.saturating_sub(removed);
+        }
+    }
+
+    result
+}
+
 fn union_pixel_bounds(
     current: Option<(i32, i32, i32, i32)>,
     bounds: ab_glyph::Rect,
@@ -474,5 +626,139 @@ impl AlphaMask {
 
         let index = x as usize + y as usize * self.width;
         self.alpha[index] = self.alpha[index].max(alpha);
+    }
+}
+
+#[derive(Clone)]
+struct CachedTextMask {
+    mask: Arc<AlphaMask>,
+    key: TextRasterCacheKey,
+    offset_x: i32,
+    offset_y: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TextRasterCacheKey {
+    text: String,
+    style_signature: String,
+    width_bits: u32,
+    origin_x_bits: u32,
+    origin_y_bits: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum TextEffectCacheKind {
+    Stroke { width_bits: u32 },
+    Shadow { spread_bits: u32, blur_bits: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TextEffectCacheKey {
+    raster: TextRasterCacheKey,
+    kind: TextEffectCacheKind,
+}
+
+#[derive(Default)]
+struct TextMaskCache {
+    rasters: HashMap<TextRasterCacheKey, Arc<AlphaMask>>,
+    effects: HashMap<TextEffectCacheKey, Arc<AlphaMask>>,
+}
+
+fn text_mask_cache() -> &'static Mutex<TextMaskCache> {
+    static CACHE: OnceLock<Mutex<TextMaskCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(TextMaskCache::default()))
+}
+
+#[cfg(test)]
+fn clear_text_mask_cache_for_tests() {
+    let mut cache = text_mask_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    cache.rasters.clear();
+    cache.effects.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use cssimpler_core::fonts::TextStyle;
+    use cssimpler_core::{LayoutBox, ShadowEffect};
+
+    use super::{
+        TextEffectCacheKind, cached_text_effect_mask, cached_text_mask,
+        clear_text_mask_cache_for_tests, shadow_mask_from_raster,
+    };
+
+    #[test]
+    fn identical_text_masks_are_reused_across_integer_position_changes() {
+        clear_text_mask_cache_for_tests();
+        let style = TextStyle::default();
+        let first =
+            cached_text_mask(LayoutBox::new(10.25, 20.0, 160.0, 40.0), "Cache", &style)
+                .expect("first text mask should rasterize");
+        let second =
+            cached_text_mask(LayoutBox::new(90.25, 44.0, 160.0, 40.0), "Cache", &style)
+                .expect("second text mask should rasterize");
+
+        assert!(Arc::ptr_eq(&first.mask, &second.mask));
+        assert_eq!(first.offset_x, 10);
+        assert_eq!(second.offset_x, 90);
+    }
+
+    #[test]
+    fn identical_shadow_masks_are_reused_for_the_same_text_raster() {
+        clear_text_mask_cache_for_tests();
+        let style = TextStyle::default();
+        let raster =
+            cached_text_mask(LayoutBox::new(12.0, 16.0, 160.0, 40.0), "Glow", &style)
+                .expect("text mask should rasterize");
+        let shadow = ShadowEffect {
+            color: None,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            blur_radius: 6.0,
+            spread: 0.0,
+        };
+        let first = cached_text_effect_mask(
+            &raster,
+            TextEffectCacheKind::Shadow {
+                spread_bits: shadow.spread.to_bits(),
+                blur_bits: shadow.blur_radius.to_bits(),
+            },
+            |base| shadow_mask_from_raster(base, shadow),
+        );
+        let second = cached_text_effect_mask(
+            &raster,
+            TextEffectCacheKind::Shadow {
+                spread_bits: shadow.spread.to_bits(),
+                blur_bits: shadow.blur_radius.to_bits(),
+            },
+            |base| shadow_mask_from_raster(base, shadow),
+        );
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn stroke_mask_excludes_the_original_fill_area() {
+        let mut raster = super::AlphaMask::new(0, 0, 3, 3);
+        for y in 0..3 {
+            for x in 0..3 {
+                raster.set_max(x, y, 255);
+            }
+        }
+
+        let outline = super::stroke_mask_from_raster(&raster, 1.0);
+
+        for y in 0..3 {
+            for x in 0..3 {
+                let local_x = (x - outline.origin_x) as i32;
+                let local_y = (y - outline.origin_y) as i32;
+                assert_eq!(outline.get(local_x, local_y), 0);
+            }
+        }
+
+        assert!(outline.alpha.iter().any(|alpha| *alpha > 0));
     }
 }

@@ -1,0 +1,125 @@
+#app {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  padding: 24px;
+  justify-content: center;
+  align-items: center;
+  background-color: #262626;
+}
+
+.spotlight {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  width: 380px;
+  padding: 28px 24px;
+  background-color: rgba(0, 0, 0, 0.0);
+  box-shadow: 0 0 0 rgba(0, 0, 0, 0.0);
+}
+
+.kicker {
+  color: #6f7a86;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+
+.note {
+  width: 320px;
+  color: #7f8a95;
+}
+
+.button {
+  --button-width: 304px;
+  --button-height: 86px;
+  --label-width: 240px;
+  --border-right: 4px;
+  --text-stroke-color: rgba(255, 255, 255, 0.62);
+  --animation-color: #37ff8b;
+  --fs-size: 44px;
+  display: flex;
+  width: var(--button-width);
+  height: var(--button-height);
+  padding: 0px;
+  justify-content: center;
+  align-items: center;
+  position: relative;
+  background-color: rgba(255, 255, 255, 0.0);
+  border: 0px solid rgba(255, 255, 255, 0.0);
+  overflow: visible;
+  font-family: "Arial";
+  font-size: var(--fs-size);
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+
+.actual-text {
+  display: flex;
+  width: var(--button-width);
+  height: var(--button-height);
+  justify-content: center;
+  align-items: center;
+}
+
+.actual-label {
+  display: flex;
+  width: var(--button-width);
+  height: var(--button-height);
+  justify-content: center;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.actual-label-text {
+  width: var(--label-width);
+  flex-shrink: 0;
+  color: rgba(255, 255, 255, 0.0);
+  -webkit-text-stroke: 1px var(--text-stroke-color);
+}
+
+.hover-text {
+  width: 0px;
+  height: var(--button-height);
+  position: absolute;
+  inset: 0;
+  background-color: rgba(255, 255, 255, 0.0);
+  overflow: hidden;
+  border-right: var(--border-right) solid var(--animation-color);
+  transition: width 0.24s linear;
+}
+
+.hover-fill {
+  display: flex;
+  width: var(--button-width);
+  height: var(--button-height);
+  justify-content: center;
+  align-items: center;
+  background-color: rgba(255, 255, 255, 0.0);
+}
+
+.hover-label {
+  display: flex;
+  width: var(--button-width);
+  height: var(--button-height);
+  justify-content: center;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.hover-label-text {
+  width: var(--label-width);
+  flex-shrink: 0;
+  color: var(--animation-color);
+}
+
+.button:hover .hover-text {
+  width: 100%;
+}
+
+.button:hover .hover-label-text {
+  text-shadow:
+    0 0 6px rgba(55, 255, 139, 0.92),
+    0 0 16px rgba(55, 255, 139, 0.68),
+    0 0 30px rgba(55, 255, 139, 0.42);
+}

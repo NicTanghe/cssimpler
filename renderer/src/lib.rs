@@ -2542,6 +2542,73 @@ mod tests {
     }
 
     #[test]
+    fn visible_overflow_text_shadow_can_paint_beyond_the_text_layout_box() {
+        let background = Color::rgb(245, 247, 250);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 240.0, 120.0))
+                .with_style(VisualStyle {
+                    background: Some(background),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::text(LayoutBox::new(80.0, 40.0, 84.0, 36.0), "Glow").with_style(
+                        VisualStyle {
+                            foreground: Color::rgb(34, 197, 94),
+                            text: TextStyle::default(),
+                            text_shadows: vec![ShadowEffect {
+                                color: Some(Color::rgba(34, 197, 94, 200)),
+                                offset_x: 0.0,
+                                offset_y: 0.0,
+                                blur_radius: 6.0,
+                                spread: 3.0,
+                            }],
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 240 * 120];
+
+        render_to_buffer(&scene, &mut buffer, 240, 120, Color::WHITE);
+
+        assert_ne!(buffer[48 * 240 + 76], pack_rgb(background));
+    }
+
+    #[test]
+    fn clipped_text_shadow_stays_inside_the_text_layout_box() {
+        let background = Color::rgb(245, 247, 250);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 240.0, 120.0))
+                .with_style(VisualStyle {
+                    background: Some(background),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::text(LayoutBox::new(80.0, 40.0, 84.0, 36.0), "Glow").with_style(
+                        VisualStyle {
+                            foreground: Color::rgb(34, 197, 94),
+                            text: TextStyle::default(),
+                            text_shadows: vec![ShadowEffect {
+                                color: Some(Color::rgba(34, 197, 94, 200)),
+                                offset_x: 0.0,
+                                offset_y: 0.0,
+                                blur_radius: 6.0,
+                                spread: 3.0,
+                            }],
+                            overflow: Overflow::CLIP,
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 240 * 120];
+
+        render_to_buffer(&scene, &mut buffer, 240, 120, Color::WHITE);
+
+        assert_eq!(buffer[48 * 240 + 76], pack_rgb(background));
+    }
+
+    #[test]
     fn filter_drop_shadow_renders_for_supported_container_layers() {
         let scene = vec![
             RenderNode::container(LayoutBox::new(48.0, 32.0, 72.0, 44.0)).with_style(VisualStyle {
