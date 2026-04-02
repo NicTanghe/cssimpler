@@ -213,7 +213,11 @@ fn rasterize_resolved_text(
     Some(mask)
 }
 
-fn cached_text_mask(layout: LayoutBox, text: &str, text_style: &TextStyle) -> Option<CachedTextMask> {
+fn cached_text_mask(
+    layout: LayoutBox,
+    text: &str,
+    text_style: &TextStyle,
+) -> Option<CachedTextMask> {
     let (relative_layout, offset_x, offset_y) = split_layout_for_cache(layout);
     let key = TextRasterCacheKey {
         text: text.to_string(),
@@ -234,7 +238,12 @@ fn cached_text_mask(layout: LayoutBox, text: &str, text_style: &TextStyle) -> Op
 
     let wrapped = layout_text_block(text, text_style, Some(relative_layout.width.max(1.0)));
     let mask = if let Some(font) = resolve_font(text_style) {
-        rasterize_resolved_text(relative_layout, &wrapped, &font, text_style.letter_spacing_px)
+        rasterize_resolved_text(
+            relative_layout,
+            &wrapped,
+            &font,
+            text_style.letter_spacing_px,
+        )
     } else {
         rasterize_bitmap_text(relative_layout, &wrapped, text_style)
     }?;
@@ -639,7 +648,9 @@ fn blur_mask_horizontally(mask: &AlphaMask, radius: usize, worker_count: usize) 
         let mut handles = Vec::new();
         for row_start in (0..mask.height).step_by(rows_per_worker) {
             let row_end = (row_start + rows_per_worker).min(mask.height);
-            handles.push(scope.spawn(move || (row_start, blur_rows(mask, radius, row_start, row_end))));
+            handles.push(
+                scope.spawn(move || (row_start, blur_rows(mask, radius, row_start, row_end))),
+            );
         }
 
         for handle in handles {
@@ -723,7 +734,12 @@ fn blur_mask_vertically(mask: &AlphaMask, radius: usize, worker_count: usize) ->
     blurred
 }
 
-fn blur_columns(mask: &AlphaMask, radius: usize, column_start: usize, column_end: usize) -> Vec<u8> {
+fn blur_columns(
+    mask: &AlphaMask,
+    radius: usize,
+    column_start: usize,
+    column_end: usize,
+) -> Vec<u8> {
     let chunk_width = column_end - column_start;
     let mut alpha = vec![0_u8; chunk_width * mask.height];
 
@@ -890,12 +906,10 @@ mod tests {
     fn identical_text_masks_are_reused_across_integer_position_changes() {
         clear_text_mask_cache_for_tests();
         let style = TextStyle::default();
-        let first =
-            cached_text_mask(LayoutBox::new(10.25, 20.0, 160.0, 40.0), "Cache", &style)
-                .expect("first text mask should rasterize");
-        let second =
-            cached_text_mask(LayoutBox::new(90.25, 44.0, 160.0, 40.0), "Cache", &style)
-                .expect("second text mask should rasterize");
+        let first = cached_text_mask(LayoutBox::new(10.25, 20.0, 160.0, 40.0), "Cache", &style)
+            .expect("first text mask should rasterize");
+        let second = cached_text_mask(LayoutBox::new(90.25, 44.0, 160.0, 40.0), "Cache", &style)
+            .expect("second text mask should rasterize");
 
         assert!(Arc::ptr_eq(&first.mask, &second.mask));
         assert_eq!(first.offset_x, 10);
@@ -906,9 +920,8 @@ mod tests {
     fn identical_shadow_masks_are_reused_for_the_same_text_raster() {
         clear_text_mask_cache_for_tests();
         let style = TextStyle::default();
-        let raster =
-            cached_text_mask(LayoutBox::new(12.0, 16.0, 160.0, 40.0), "Glow", &style)
-                .expect("text mask should rasterize");
+        let raster = cached_text_mask(LayoutBox::new(12.0, 16.0, 160.0, 40.0), "Glow", &style)
+            .expect("text mask should rasterize");
         let shadow = ShadowEffect {
             color: None,
             offset_x: 0.0,

@@ -239,7 +239,8 @@ where
     let mut suppress_left_pointer_until_release = false;
     let mut element_interaction = ElementInteractionState::default();
     let mut previous_presented_scene: Option<Vec<RenderNode>> = Some(initial_scene);
-    let mut previous_presented_indicator: Option<scrollbar::AutoScrollIndicator> = initial_indicator;
+    let mut previous_presented_indicator: Option<scrollbar::AutoScrollIndicator> =
+        initial_indicator;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
@@ -2961,21 +2962,20 @@ mod tests {
                 background: Some(Color::rgb(245, 247, 250)),
                 ..VisualStyle::default()
             });
-        let text =
-            RenderNode::text(LayoutBox::new(24.0, 20.0, 112.0, 36.0), "UIVERSE").with_style(
-                VisualStyle {
-                    foreground: Color::rgba(255, 255, 255, 0),
-                    text: TextStyle {
-                        size_px: 32.0,
-                        ..TextStyle::default()
-                    },
-                    text_stroke: TextStrokeStyle {
-                        width: 1.0,
-                        color: Some(Color::rgb(15, 23, 42)),
-                    },
-                    ..VisualStyle::default()
+        let text = RenderNode::text(LayoutBox::new(24.0, 20.0, 112.0, 36.0), "UIVERSE").with_style(
+            VisualStyle {
+                foreground: Color::rgba(255, 255, 255, 0),
+                text: TextStyle {
+                    size_px: 32.0,
+                    ..TextStyle::default()
                 },
-            );
+                text_stroke: TextStrokeStyle {
+                    width: 1.0,
+                    color: Some(Color::rgb(15, 23, 42)),
+                },
+                ..VisualStyle::default()
+            },
+        );
         let previous = vec![
             background.clone(),
             text.clone(),

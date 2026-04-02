@@ -153,8 +153,14 @@ mod tests {
             },
         );
 
-        assert_eq!(actual_text_node(&idle).layout, actual_text_node(&hovered).layout);
-        assert_eq!(hover_fill_text_node(&idle).layout, hover_fill_text_node(&hovered).layout);
+        assert_eq!(
+            actual_text_node(&idle).layout,
+            actual_text_node(&hovered).layout
+        );
+        assert_eq!(
+            hover_fill_text_node(&idle).layout,
+            hover_fill_text_node(&hovered).layout
+        );
     }
 
     #[test]

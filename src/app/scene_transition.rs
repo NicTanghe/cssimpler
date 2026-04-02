@@ -104,7 +104,8 @@ fn transition_end_time_for_node(from: &RenderNode, to: &RenderNode) -> f32 {
             transition_entries_for(to)
                 .into_iter()
                 .filter(|entry| {
-                    is_layout_transition_name(&entry.property) && transition_entry_is_animating(entry)
+                    is_layout_transition_name(&entry.property)
+                        && transition_entry_is_animating(entry)
                 })
                 .map(|entry| entry.delay_seconds + entry.duration_seconds)
                 .fold(0.0_f32, f32::max),
@@ -145,7 +146,8 @@ fn sample_render_node(
         && let Some(progress) = transition_progress(&entry, elapsed_seconds)
         && from.style.foreground != to.style.foreground
     {
-        node.style.foreground = interpolate_color(from.style.foreground, to.style.foreground, progress);
+        node.style.foreground =
+            interpolate_color(from.style.foreground, to.style.foreground, progress);
     }
 
     if let Some(entry) = matching_transition_entry(to, "background-color")
@@ -170,7 +172,8 @@ fn sample_render_node(
         && let Some(progress) = transition_progress(&entry, elapsed_seconds)
         && from.style.border.color != to.style.border.color
     {
-        node.style.border.color = interpolate_color(from.style.border.color, to.style.border.color, progress);
+        node.style.border.color =
+            interpolate_color(from.style.border.color, to.style.border.color, progress);
     }
 
     node.children = from
@@ -209,11 +212,9 @@ fn layout_transition_for_node(from: &RenderNode, to: &RenderNode) -> Option<Tran
         return None;
     }
 
-    transition_entries_for(to)
-        .into_iter()
-        .find(|entry| {
-            is_layout_transition_name(&entry.property) && transition_entry_is_animating(entry)
-        })
+    transition_entries_for(to).into_iter().find(|entry| {
+        is_layout_transition_name(&entry.property) && transition_entry_is_animating(entry)
+    })
 }
 
 fn is_layout_transition_name(property: &TransitionPropertyName) -> bool {
@@ -257,7 +258,8 @@ fn transition_progress(entry: &TransitionEntry, elapsed_seconds: f32) -> Option<
         return Some(1.0);
     }
 
-    let progress = ((elapsed_seconds - entry.delay_seconds) / entry.duration_seconds).clamp(0.0, 1.0);
+    let progress =
+        ((elapsed_seconds - entry.delay_seconds) / entry.duration_seconds).clamp(0.0, 1.0);
     Some(apply_timing_function(entry.timing_function, progress))
 }
 
@@ -298,8 +300,12 @@ fn cubic_curve(t: f32, p1: f32, p2: f32) -> f32 {
 }
 
 fn interpolate_optional_color(from: Option<Color>, to: Option<Color>, progress: f32) -> Color {
-    let from = from.map(Color::to_linear_rgba).unwrap_or(LinearRgba::TRANSPARENT);
-    let to = to.map(Color::to_linear_rgba).unwrap_or(LinearRgba::TRANSPARENT);
+    let from = from
+        .map(Color::to_linear_rgba)
+        .unwrap_or(LinearRgba::TRANSPARENT);
+    let to = to
+        .map(Color::to_linear_rgba)
+        .unwrap_or(LinearRgba::TRANSPARENT);
     Color::from_linear_rgba(from.lerp(to, progress))
 }
 
@@ -390,14 +396,18 @@ mod tests {
     }
 
     fn text_node(layout: LayoutBox, foreground: Color, transitions: TransitionStyle) -> RenderNode {
-        RenderNode::text(layout, "label").with_style(VisualStyle {
-            foreground,
-            ..VisualStyle::default()
-        })
-        .with_transitions(transitions)
+        RenderNode::text(layout, "label")
+            .with_style(VisualStyle {
+                foreground,
+                ..VisualStyle::default()
+            })
+            .with_transitions(transitions)
     }
 
-    fn color_transition(duration_seconds: f32, timing_function: TransitionTimingFunction) -> TransitionStyle {
+    fn color_transition(
+        duration_seconds: f32,
+        timing_function: TransitionTimingFunction,
+    ) -> TransitionStyle {
         TransitionStyle {
             properties: vec![TransitionPropertyName::Property("color".to_string())],
             durations_seconds: vec![duration_seconds],

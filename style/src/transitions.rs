@@ -8,18 +8,24 @@ pub(crate) fn extract_property(
     property: &Property<'_>,
 ) -> Option<Result<Vec<Declaration>, StyleError>> {
     match property {
-        Property::TransitionProperty(properties, _) => Some(Ok(vec![
-            Declaration::TransitionProperties(transition_properties_from_css(properties)),
-        ])),
-        Property::TransitionDuration(durations, _) => Some(Ok(vec![
-            Declaration::TransitionDurations(transition_times_from_css(durations)),
-        ])),
-        Property::TransitionDelay(delays, _) => Some(Ok(vec![
-            Declaration::TransitionDelays(transition_times_from_css(delays)),
-        ])),
-        Property::TransitionTimingFunction(timings, _) => Some(Ok(vec![
-            Declaration::TransitionTimingFunctions(transition_timings_from_css(timings)),
-        ])),
+        Property::TransitionProperty(properties, _) => {
+            Some(Ok(vec![Declaration::TransitionProperties(
+                transition_properties_from_css(properties),
+            )]))
+        }
+        Property::TransitionDuration(durations, _) => {
+            Some(Ok(vec![Declaration::TransitionDurations(
+                transition_times_from_css(durations),
+            )]))
+        }
+        Property::TransitionDelay(delays, _) => Some(Ok(vec![Declaration::TransitionDelays(
+            transition_times_from_css(delays),
+        )])),
+        Property::TransitionTimingFunction(timings, _) => {
+            Some(Ok(vec![Declaration::TransitionTimingFunctions(
+                transition_timings_from_css(timings),
+            )]))
+        }
         Property::Transition(transitions, _) => Some(Ok(vec![
             Declaration::TransitionProperties(
                 transitions

@@ -52,13 +52,14 @@ use self::fonts::{
     extract_property as extract_font_property,
 };
 use self::selectors::extract_selector;
+#[cfg(test)]
+pub(crate) use render_tree::resolve_element_tree;
 pub use render_tree::{
-    build_render_tree, build_render_tree_in_viewport, build_render_tree_in_viewport_with_interaction,
+    build_render_tree, build_render_tree_in_viewport,
+    build_render_tree_in_viewport_with_interaction,
     build_render_tree_in_viewport_with_interaction_at_root, build_render_tree_with_interaction,
     build_render_tree_with_interaction_at_root,
 };
-#[cfg(test)]
-pub(crate) use render_tree::resolve_element_tree;
 
 pub use attributes::{AttributeTextSource, parse_attribute_text_source};
 pub use invalidation::StyleInvalidation;
@@ -320,15 +321,13 @@ fn resolve_style_target(
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
     let element_ref = ElementRef::from(element);
 
-    for rule in
-        stylesheet.matching_rules_with_context_and_pseudo(
-            element_ref,
-            ancestors,
-            element_path,
-            interaction,
-            pseudo_element,
-        )
-    {
+    for rule in stylesheet.matching_rules_with_context_and_pseudo(
+        element_ref,
+        ancestors,
+        element_path,
+        interaction,
+        pseudo_element,
+    ) {
         for declaration in &rule.declarations {
             if matches!(declaration, Declaration::CustomProperty { .. }) {
                 apply_declaration(&mut resolved, &mut position_explicit, declaration);
@@ -336,15 +335,13 @@ fn resolve_style_target(
         }
     }
 
-    for rule in
-        stylesheet.matching_rules_with_context_and_pseudo(
-            element_ref,
-            ancestors,
-            element_path,
-            interaction,
-            pseudo_element,
-        )
-    {
+    for rule in stylesheet.matching_rules_with_context_and_pseudo(
+        element_ref,
+        ancestors,
+        element_path,
+        interaction,
+        pseudo_element,
+    ) {
         for declaration in &rule.declarations {
             if !matches!(declaration, Declaration::CustomProperty { .. }) {
                 apply_declaration(&mut resolved, &mut position_explicit, declaration);
@@ -393,9 +390,11 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
     }
 
     match property {
-        Property::Custom(custom) if custom.name.as_ref() == "content" => Ok(vec![
-            Declaration::Content(parse_content_text_source(&custom.value)?),
-        ]),
+        Property::Custom(custom) if custom.name.as_ref() == "content" => {
+            Ok(vec![Declaration::Content(parse_content_text_source(
+                &custom.value,
+            )?)])
+        }
         Property::Overflow(overflow) => Ok(vec![
             overflow_x_declaration(overflow.x),
             overflow_y_declaration(overflow.y),
@@ -515,10 +514,14 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
     }
 }
 
-fn attribute_text_source_to_core(source: AttributeTextSource) -> cssimpler_core::GeneratedTextSource {
+fn attribute_text_source_to_core(
+    source: AttributeTextSource,
+) -> cssimpler_core::GeneratedTextSource {
     match source {
         AttributeTextSource::Literal(value) => cssimpler_core::GeneratedTextSource::Literal(value),
-        AttributeTextSource::Attribute(name) => cssimpler_core::GeneratedTextSource::Attribute(name),
+        AttributeTextSource::Attribute(name) => {
+            cssimpler_core::GeneratedTextSource::Attribute(name)
+        }
     }
 }
 
@@ -1188,24 +1191,24 @@ mod tests {
         .expect("transition stylesheet should parse");
 
         assert!(
-            stylesheet.rules[0].declarations.contains(&Declaration::TransitionProperties(vec![
-                TransitionPropertyName::Property("color".to_string()),
-                TransitionPropertyName::Property("width".to_string()),
-            ]))
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TransitionProperties(vec![
+                    TransitionPropertyName::Property("color".to_string()),
+                    TransitionPropertyName::Property("width".to_string()),
+                ]))
         );
         assert!(
             stylesheet.rules[0]
                 .declarations
                 .contains(&Declaration::TransitionDurations(vec![0.18, 0.32]))
         );
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::TransitionTimingFunctions(vec![
-                    TransitionTimingFunction::Linear,
-                    TransitionTimingFunction::EaseInOut,
-                ]))
-        );
+        assert!(stylesheet.rules[0].declarations.contains(
+            &Declaration::TransitionTimingFunctions(vec![
+                TransitionTimingFunction::Linear,
+                TransitionTimingFunction::EaseInOut,
+            ])
+        ));
     }
 
     #[test]
@@ -1278,7 +1281,10 @@ mod tests {
             .into();
         let scene = build_render_tree(&tree, &stylesheet);
 
-        assert_eq!(text_nodes(&scene), vec!["[".to_string(), "done".to_string()]);
+        assert_eq!(
+            text_nodes(&scene),
+            vec!["[".to_string(), "done".to_string()]
+        );
         assert_eq!(scene.children[0].style.foreground, Color::rgb(37, 99, 235));
         assert_eq!(scene.children[1].style.foreground, Color::rgb(249, 115, 22));
     }

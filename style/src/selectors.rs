@@ -408,14 +408,16 @@ fn extract_compound_selector(
     let simple_selectors = compound
         .iter()
         .map(|component| {
-            extract_simple_selector(selector, component).map(|(simple_selector, component_pseudo)| {
-                if let Some(component_pseudo) = component_pseudo {
-                    if pseudo_element.replace(component_pseudo).is_some() {
-                        return Err(unsupported_selector(selector));
+            extract_simple_selector(selector, component).map(
+                |(simple_selector, component_pseudo)| {
+                    if let Some(component_pseudo) = component_pseudo {
+                        if pseudo_element.replace(component_pseudo).is_some() {
+                            return Err(unsupported_selector(selector));
+                        }
                     }
-                }
-                Ok(simple_selector)
-            })?
+                    Ok(simple_selector)
+                },
+            )?
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -436,7 +438,9 @@ fn extract_simple_selector(
     match component {
         Component::Class(name) => Ok((Some(SimpleSelector::Class(name.0.to_string())), None)),
         Component::ID(name) => Ok((Some(SimpleSelector::Id(name.0.to_string())), None)),
-        Component::LocalName(name) => Ok((Some(SimpleSelector::Tag(name.name.0.to_string())), None)),
+        Component::LocalName(name) => {
+            Ok((Some(SimpleSelector::Tag(name.name.0.to_string())), None))
+        }
         Component::AttributeInNoNamespaceExists { local_name, .. } => Ok((
             Some(extract_attribute_selector(
                 component,
@@ -458,7 +462,9 @@ fn extract_simple_selector(
             None,
         )),
         Component::NonTSPseudoClass(PseudoClass::Hover) => Ok((Some(SimpleSelector::Hover), None)),
-        Component::NonTSPseudoClass(PseudoClass::Active) => Ok((Some(SimpleSelector::Active), None)),
+        Component::NonTSPseudoClass(PseudoClass::Active) => {
+            Ok((Some(SimpleSelector::Active), None))
+        }
         Component::PseudoElement(LightningPseudoElement::Before) => {
             Ok((None, Some(PseudoElementKind::Before)))
         }
