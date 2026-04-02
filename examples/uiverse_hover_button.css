@@ -123,7 +123,7 @@
 
 .button:hover .hover-label-text {
   text-shadow:
-    0 0 6px rgba(55, 255, 139, 0.92),
-    0 0 16px rgba(55, 255, 139, 0.68),
-    0 0 30px rgba(55, 255, 139, 0.42);
+    0 0 10px rgba(55, 255, 139, 0.92),
+    0 0 24px rgba(55, 255, 139, 0.68),
+    0 0 48px rgba(55, 255, 139, 0.42);
 }

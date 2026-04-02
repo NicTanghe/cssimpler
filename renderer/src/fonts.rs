@@ -14,6 +14,7 @@ const MAX_TEXT_RASTER_CACHE_ENTRIES: usize = 256;
 const MAX_TEXT_EFFECT_CACHE_ENTRIES: usize = 512;
 const MAX_TEXT_EFFECT_WORKERS: usize = 8;
 const MIN_PARALLEL_BLUR_PIXELS: usize = 24_576;
+const TEXT_BLUR_PASS_COUNT: usize = 3;
 
 pub(crate) fn draw_text(
     buffer: &mut [u32],
@@ -573,12 +574,15 @@ fn blur_mask(mask: &AlphaMask, radius: f32) -> AlphaMask {
 }
 
 fn blur_mask_with_workers(mask: &AlphaMask, radius: usize, worker_count: usize) -> AlphaMask {
-    // Keep large glow renders responsive by using a separable box blur instead of
-    // scanning the full blur disk for every destination pixel. For big masks, split
-    // each pass across a few worker threads so the first heavy hover doesn't block
-    // a full frame on the UI thread.
-    let horizontal = blur_mask_horizontally(mask, radius, worker_count);
-    blur_mask_vertically(&horizontal, radius, worker_count)
+    // A single wide box blur looks chunky and rectangular. Split the requested
+    // radius across a few smaller separable passes so the glow falloff reads more
+    // like a soft Gaussian while staying linear-time and cache-friendly.
+    let mut blurred = mask.clone();
+    for pass_radius in blur_pass_radii(radius) {
+        blurred = blur_mask_horizontally(&blurred, pass_radius, worker_count);
+        blurred = blur_mask_vertically(&blurred, pass_radius, worker_count);
+    }
+    blurred
 }
 
 fn blur_worker_count(mask: &AlphaMask) -> usize {
@@ -592,6 +596,31 @@ fn blur_worker_count(mask: &AlphaMask) -> usize {
         .unwrap_or(1)
         .min(MAX_TEXT_EFFECT_WORKERS)
         .max(1)
+}
+
+fn blur_pass_radii(radius: usize) -> Vec<usize> {
+    if radius == 0 {
+        return Vec::new();
+    }
+
+    let pass_count = TEXT_BLUR_PASS_COUNT.min(radius.max(1));
+    let base_radius = radius / pass_count;
+    let remainder = radius % pass_count;
+    let mut radii = Vec::with_capacity(pass_count);
+
+    for pass_index in 0..pass_count {
+        let extra = usize::from(pass_index < remainder);
+        let pass_radius = base_radius + extra;
+        if pass_radius > 0 {
+            radii.push(pass_radius);
+        }
+    }
+
+    if radii.is_empty() {
+        radii.push(1);
+    }
+
+    radii
 }
 
 fn blur_mask_horizontally(mask: &AlphaMask, radius: usize, worker_count: usize) -> AlphaMask {
@@ -853,8 +882,8 @@ mod tests {
     use cssimpler_core::{LayoutBox, ShadowEffect};
 
     use super::{
-        TextEffectCacheKind, blur_mask_with_workers, cached_text_effect_mask, cached_text_mask,
-        clear_text_mask_cache_for_tests, shadow_mask_from_raster,
+        TextEffectCacheKind, blur_mask_with_workers, blur_pass_radii, cached_text_effect_mask,
+        cached_text_mask, clear_text_mask_cache_for_tests, shadow_mask_from_raster,
     };
 
     #[test]
@@ -952,5 +981,15 @@ mod tests {
         assert_eq!(single.width, threaded.width);
         assert_eq!(single.height, threaded.height);
         assert_eq!(single.alpha, threaded.alpha);
+    }
+
+    #[test]
+    fn blur_passes_preserve_the_requested_total_radius() {
+        assert_eq!(blur_pass_radii(1), vec![1]);
+        assert_eq!(blur_pass_radii(2), vec![1, 1]);
+        assert_eq!(blur_pass_radii(3), vec![1, 1, 1]);
+        assert_eq!(blur_pass_radii(6), vec![2, 2, 2]);
+        assert_eq!(blur_pass_radii(10), vec![4, 3, 3]);
+        assert_eq!(blur_pass_radii(10).iter().sum::<usize>(), 10);
     }
 }
