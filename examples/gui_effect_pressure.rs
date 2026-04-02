@@ -107,7 +107,7 @@ fn apply_frame(state: &mut EffectStressState, frame: FrameInfo, actions: u64) ->
         invalidation = invalidation.max(Invalidation::Layout);
     }
 
-    if state.animate && frame.frame_index % PHASE_STEP_FRAMES == 0 {
+    if state.animate && frame.frame_index.is_multiple_of(PHASE_STEP_FRAMES) {
         state.phase = (state.phase + 1) % PHASE_COUNT;
         let tick_invalidation = if state.pulse_layout {
             Invalidation::Layout
