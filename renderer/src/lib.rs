@@ -1,7 +1,8 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,7 @@ const MIN_PARALLEL_RENDER_PIXELS: usize = 640 * 480;
 const MIN_INCREMENTAL_PIXELS_PER_WORKER: usize = 160 * 160;
 const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 80;
 const MAX_RENDER_WORKERS: usize = 12;
+const MAX_SHADOW_MASK_CACHE_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FramePaintMode {
@@ -65,6 +67,47 @@ struct PaintStats {
 struct DirtyRenderJob {
     clip: ClipRect,
     pixel_count: usize,
+}
+
+#[derive(Clone)]
+struct ShadowMask {
+    origin_x: i32,
+    origin_y: i32,
+    width: usize,
+    height: usize,
+    alpha: Vec<u8>,
+}
+
+impl ShadowMask {
+    fn new(origin_x: i32, origin_y: i32, width: i32, height: i32) -> Self {
+        let width = width.max(0) as usize;
+        let height = height.max(0) as usize;
+        Self {
+            origin_x,
+            origin_y,
+            width,
+            height,
+            alpha: vec![0; width.saturating_mul(height)],
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShadowMaskCacheKey {
+    x_bits: u32,
+    y_bits: u32,
+    width_bits: u32,
+    height_bits: u32,
+    top_left_bits: u32,
+    top_right_bits: u32,
+    bottom_right_bits: u32,
+    bottom_left_bits: u32,
+    blur_bits: u32,
+}
+
+#[derive(Default)]
+struct ShadowMaskCache {
+    masks: HashMap<ShadowMaskCacheKey, Arc<ShadowMask>>,
 }
 
 static FRAME_TIMING_STATS: OnceLock<Mutex<FrameTimingStats>> = OnceLock::new();
@@ -176,6 +219,82 @@ fn dirty_job_group_rows(jobs: &[DirtyRenderJob]) -> Option<BufferRows> {
         end = end.max(job.clip.y1.max(0.0) as usize);
     }
     (start < end).then_some(BufferRows::new(start, end))
+}
+
+fn shadow_mask_cache() -> &'static Mutex<ShadowMaskCache> {
+    static CACHE: OnceLock<Mutex<ShadowMaskCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ShadowMaskCache::default()))
+}
+
+#[cfg(test)]
+fn clear_shadow_mask_cache_for_tests() {
+    let mut cache = shadow_mask_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    cache.masks.clear();
+}
+
+fn split_layout_for_shadow_cache(layout: LayoutBox) -> (LayoutBox, i32, i32) {
+    let offset_x = layout.x.floor() as i32;
+    let offset_y = layout.y.floor() as i32;
+    (
+        LayoutBox::new(
+            layout.x - offset_x as f32,
+            layout.y - offset_y as f32,
+            layout.width,
+            layout.height,
+        ),
+        offset_x,
+        offset_y,
+    )
+}
+
+fn shadow_mask_cache_key(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    blur_radius: f32,
+) -> ShadowMaskCacheKey {
+    ShadowMaskCacheKey {
+        x_bits: layout.x.to_bits(),
+        y_bits: layout.y.to_bits(),
+        width_bits: layout.width.to_bits(),
+        height_bits: layout.height.to_bits(),
+        top_left_bits: radius.top_left.to_bits(),
+        top_right_bits: radius.top_right.to_bits(),
+        bottom_right_bits: radius.bottom_right.to_bits(),
+        bottom_left_bits: radius.bottom_left.to_bits(),
+        blur_bits: blur_radius.to_bits(),
+    }
+}
+
+fn cached_shadow_mask(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    blur_radius: f32,
+) -> (Arc<ShadowMask>, i32, i32) {
+    let blur_radius = blur_radius.max(0.0);
+    let (relative_layout, offset_x, offset_y) = split_layout_for_shadow_cache(layout);
+    let key = shadow_mask_cache_key(relative_layout, radius, blur_radius);
+
+    if let Some(mask) = shadow_mask_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .masks
+        .get(&key)
+        .cloned()
+    {
+        return (mask, offset_x, offset_y);
+    }
+
+    let mask = Arc::new(rasterize_shadow_mask(relative_layout, radius, blur_radius));
+    let mut cache = shadow_mask_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if cache.masks.len() >= MAX_SHADOW_MASK_CACHE_ENTRIES {
+        cache.masks.clear();
+    }
+    cache.masks.insert(key, mask.clone());
+    (mask, offset_x, offset_y)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1491,30 +1610,17 @@ fn draw_shadow(
         return;
     }
 
-    let blurred_bounds = expand_layout(base_layout, blur_radius);
-    let Some((x0, y0, x1, y1)) = pixel_bounds(blurred_bounds, clip, width, height) else {
-        return;
-    };
-
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let alpha = shadow_alpha(
-                px,
-                py,
-                base_layout,
-                base_radius,
-                blur_radius,
-                shadow.color.a,
-            );
-            if alpha == 0 {
-                continue;
-            }
-
-            blend_pixel(buffer, width, height, x, y, shadow.color.with_alpha(alpha));
-        }
-    }
+    let (mask, offset_x, offset_y) = cached_shadow_mask(base_layout, base_radius, blur_radius);
+    draw_shadow_mask(
+        buffer,
+        width,
+        height,
+        &mask,
+        shadow.color,
+        offset_x,
+        offset_y,
+        clip,
+    );
 }
 
 fn draw_shadow_effect(
@@ -1542,6 +1648,94 @@ fn draw_shadow_effect(
         },
         clip,
     );
+}
+
+fn rasterize_shadow_mask(layout: LayoutBox, radius: CornerRadius, blur_radius: f32) -> ShadowMask {
+    let blurred_bounds = expand_layout(layout, blur_radius);
+    let x0 = blurred_bounds.x.floor() as i32;
+    let y0 = blurred_bounds.y.floor() as i32;
+    let x1 = (blurred_bounds.x + blurred_bounds.width).ceil() as i32;
+    let y1 = (blurred_bounds.y + blurred_bounds.height).ceil() as i32;
+    let mut mask = ShadowMask::new(x0, y0, x1 - x0, y1 - y0);
+
+    if mask.width == 0 || mask.height == 0 {
+        return mask;
+    }
+
+    for y in y0..y1 {
+        let local_row_start = (y - y0) as usize * mask.width;
+        for x in x0..x1 {
+            let alpha = shadow_alpha(
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                layout,
+                radius,
+                blur_radius,
+                u8::MAX,
+            );
+            if alpha == 0 {
+                continue;
+            }
+
+            let index = local_row_start + (x - x0) as usize;
+            mask.alpha[index] = alpha;
+        }
+    }
+
+    mask
+}
+
+fn draw_shadow_mask(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    mask: &ShadowMask,
+    color: Color,
+    offset_x: i32,
+    offset_y: i32,
+    clip: ClipRect,
+) {
+    if color.a == 0 || mask.width == 0 || mask.height == 0 {
+        return;
+    }
+
+    let Some((clip_x0, clip_y0, clip_x1, clip_y1)) = clip_pixel_bounds(clip, width, height) else {
+        return;
+    };
+    let mask_x0 = mask.origin_x + offset_x;
+    let mask_y0 = mask.origin_y + offset_y;
+    let mask_x1 = mask_x0 + mask.width as i32;
+    let mask_y1 = mask_y0 + mask.height as i32;
+    let draw_x0 = mask_x0.max(clip_x0);
+    let draw_y0 = mask_y0.max(clip_y0);
+    let draw_x1 = mask_x1.min(clip_x1);
+    let draw_y1 = mask_y1.min(clip_y1);
+
+    if draw_x0 >= draw_x1 || draw_y0 >= draw_y1 {
+        return;
+    }
+
+    for y in draw_y0..draw_y1 {
+        let local_y = (y - mask_y0) as usize;
+        let row_start = local_y * mask.width;
+        for x in draw_x0..draw_x1 {
+            let coverage = mask.alpha[row_start + (x - mask_x0) as usize];
+            if coverage == 0 {
+                continue;
+            }
+
+            let alpha = if color.a == u8::MAX {
+                coverage
+            } else {
+                ((u16::from(coverage) * u16::from(color.a) + 127) / 255) as u8
+            };
+            if alpha == 0 {
+                continue;
+            }
+
+            blend_pixel(buffer, width, height, x, y, color.with_alpha(alpha));
+        }
+    }
 }
 
 fn draw_rounded_rect(
@@ -2820,6 +3014,37 @@ mod tests {
         super::render_to_buffer_parallel(&scene, &mut threaded, 128, 96, Color::BLACK, 4);
 
         assert_eq!(single, threaded);
+    }
+
+    #[test]
+    fn identical_box_shadow_masks_are_reused_across_integer_position_changes() {
+        super::clear_shadow_mask_cache_for_tests();
+        let shadow = BoxShadow {
+            color: Color::rgba(15, 23, 42, 120),
+            offset_x: 6.0,
+            offset_y: 8.0,
+            blur_radius: 12.0,
+            spread: 2.0,
+        };
+        let radius = CornerRadius::all(16.0);
+        let first_layout = super::offset_layout(
+            super::expand_layout(LayoutBox::new(10.25, 20.0, 96.0, 72.0), shadow.spread),
+            shadow.offset_x,
+            shadow.offset_y,
+        );
+        let second_layout = super::offset_layout(
+            super::expand_layout(LayoutBox::new(74.25, 52.0, 96.0, 72.0), shadow.spread),
+            shadow.offset_x,
+            shadow.offset_y,
+        );
+        let shadow_radius = super::expand_corner_radius(radius, shadow.spread);
+
+        let (first, _, _) =
+            super::cached_shadow_mask(first_layout, shadow_radius, shadow.blur_radius);
+        let (second, _, _) =
+            super::cached_shadow_mask(second_layout, shadow_radius, shadow.blur_radius);
+
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
     }
 
     #[test]

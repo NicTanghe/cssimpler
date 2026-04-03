@@ -278,19 +278,24 @@ fn build_tile(tile_index: usize, state: &EffectStressState) -> Node {
     } else {
         "band-rest"
     };
-    let phase = if animated_tile {
-        phase_class((state.phase + tile_index) % PHASE_COUNT)
-    } else {
-        phase_class(static_phase(tile_index, 0))
-    };
+    let phase = phase_class(static_phase(tile_index, 0));
+    let band_indicator = add_class(
+        ui! {
+            <div class="tile-band-indicator"></div>
+        },
+        band_state,
+    );
 
     add_classes(
         ui! {
             <article class="effect-tile">
                 <div class="tile-header">
-                    <p class="tile-label">
-                        {format!("bank {:02}", tile_index % 100)}
-                    </p>
+                    <div class="tile-title-row">
+                        {band_indicator}
+                        <p class="tile-label">
+                            {format!("bank {:02}", tile_index % 100)}
+                        </p>
+                    </div>
                     <p class="tile-meta">
                         {format!("{} fx", state.passes_per_tile)}
                     </p>
@@ -298,7 +303,7 @@ fn build_tile(tile_index: usize, state: &EffectStressState) -> Node {
                 {build_pod_grid(tile_index, state)}
             </article>
         },
-        [variant, band_state, phase],
+        [variant, phase],
     )
 }
 
