@@ -7,7 +7,7 @@ use cssimpler_core::fonts::{ResolvedFont, TextLayout, TextStyle, layout_text_blo
 use cssimpler_core::{Color, LayoutBox, ShadowEffect, TextStrokeStyle, VisualStyle};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 
-use crate::{ClipRect, blend_pixel};
+use crate::{ClipRect, PreparedBlendColor, blend_prepared_pixel, scale_alpha};
 
 const BITMAP_LINE_HEIGHT_PX: f32 = 20.0;
 const MAX_TEXT_RASTER_CACHE_ENTRIES: usize = 256;
@@ -141,6 +141,7 @@ fn draw_mask(
     offset_y: i32,
     clip: ClipRect,
 ) {
+    let prepared_color = PreparedBlendColor::new(color);
     for y in 0..mask.height {
         for x in 0..mask.width {
             let alpha = mask.alpha[x + y * mask.width];
@@ -154,20 +155,18 @@ fn draw_mask(
                 continue;
             }
 
-            let alpha = ((alpha as f32 / 255.0) * color.a as f32)
-                .round()
-                .clamp(0.0, 255.0) as u8;
+            let alpha = scale_alpha(alpha, color.a);
             if alpha == 0 {
                 continue;
             }
 
-            blend_pixel(
+            blend_prepared_pixel(
                 buffer,
                 width,
                 height,
                 pixel_x,
                 pixel_y,
-                color.with_alpha(alpha),
+                prepared_color.with_alpha(alpha),
             );
         }
     }

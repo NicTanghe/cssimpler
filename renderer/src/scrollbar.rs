@@ -4,8 +4,8 @@ use std::time::Duration;
 use cssimpler_core::{Color, CornerRadius, LayoutBox, LinearRgba, RenderNode};
 
 use crate::{
-    ClipRect, blend_pixel, draw_rounded_rect, inset_layout, layout_clip, layout_contains,
-    offset_layout,
+    ClipRect, PreparedBlendColor, blend_prepared_pixel, draw_rounded_rect, inset_layout,
+    layout_clip, layout_contains, offset_layout,
 };
 
 const MIN_THUMB_LENGTH: f32 = 18.0;
@@ -1115,14 +1115,15 @@ fn draw_line_segment(
     let delta_x = end_x - start_x;
     let delta_y = end_y - start_y;
     let steps = delta_x.abs().max(delta_y.abs()).ceil() as i32;
+    let prepared_color = PreparedBlendColor::new(color);
     if steps <= 0 {
-        blend_pixel(
+        blend_prepared_pixel(
             buffer,
             width,
             height,
             start_x.round() as i32,
             start_y.round() as i32,
-            color,
+            prepared_color,
         );
         return;
     }
@@ -1136,13 +1137,13 @@ fn draw_line_segment(
                 if offset_x.abs() + offset_y.abs() > 1 {
                     continue;
                 }
-                blend_pixel(
+                blend_prepared_pixel(
                     buffer,
                     width,
                     height,
                     x.round() as i32 + offset_x,
                     y.round() as i32 + offset_y,
-                    color,
+                    prepared_color,
                 );
             }
         }

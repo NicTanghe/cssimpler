@@ -1715,6 +1715,7 @@ fn draw_shadow_mask(
         return;
     }
 
+    let prepared_color = PreparedBlendColor::new(color);
     for y in draw_y0..draw_y1 {
         let local_y = (y - mask_y0) as usize;
         let row_start = local_y * mask.width;
@@ -1724,16 +1725,12 @@ fn draw_shadow_mask(
                 continue;
             }
 
-            let alpha = if color.a == u8::MAX {
-                coverage
-            } else {
-                ((u16::from(coverage) * u16::from(color.a) + 127) / 255) as u8
-            };
+            let alpha = scale_alpha(coverage, color.a);
             if alpha == 0 {
                 continue;
             }
 
-            blend_pixel(buffer, width, height, x, y, color.with_alpha(alpha));
+            blend_prepared_pixel(buffer, width, height, x, y, prepared_color.with_alpha(alpha));
         }
     }
 }
@@ -1751,10 +1748,11 @@ fn draw_rounded_rect(
         return;
     };
 
+    let prepared_color = PreparedBlendColor::new(color);
     for y in y0..y1 {
         for x in x0..x1 {
             if point_in_rounded_rect(x as f32 + 0.5, y as f32 + 0.5, layout, radius) {
-                blend_pixel(buffer, width, height, x, y, color);
+                blend_prepared_pixel(buffer, width, height, x, y, prepared_color);
             }
         }
     }
@@ -1838,12 +1836,8 @@ fn draw_linear_gradient(
                 continue;
             }
 
-            let color = Color::from_linear_rgba(sample_prepared_gradient(
-                &prepared,
-                projection,
-                gradient.repeating,
-            ));
-            blend_pixel(buffer, width, height, x, y, color);
+            let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
+            blend_linear_pixel(buffer, width, height, x, y, color);
             projection += projection_step;
         }
     }
@@ -1904,23 +1898,19 @@ fn draw_radial_gradient(
                 let normalized_distance = ((dx * dx) * inverse_radius_x_squared
                     + (dy * dy) * inverse_radius_y_squared)
                     .sqrt();
-                Color::from_linear_rgba(sample_prepared_gradient(
-                    prepared_unit_gradient,
-                    normalized_distance,
-                    gradient.repeating,
-                ))
+                sample_prepared_gradient(prepared_unit_gradient, normalized_distance, gradient.repeating)
             } else {
                 let distance = (dx * dx + dy * dy).sqrt();
                 let ray_length = radial_ray_length(dx, dy, resolved_shape);
-                Color::from_linear_rgba(sample_prepared_length_gradient(
+                sample_prepared_length_gradient(
                     &prepared_length_gradient,
                     ray_length,
                     0.0,
                     distance,
                     gradient.repeating,
-                ))
+                )
             };
-            blend_pixel(buffer, width, height, x, y, color);
+            blend_linear_pixel(buffer, width, height, x, y, color);
         }
     }
 }
@@ -1962,12 +1952,8 @@ fn draw_conic_gradient(
                 dx.atan2(-dy).to_degrees().rem_euclid(360.0)
             };
             let position = (angle - gradient.angle).rem_euclid(360.0);
-            let color = Color::from_linear_rgba(sample_prepared_gradient(
-                &prepared,
-                position,
-                gradient.repeating,
-            ));
-            blend_pixel(buffer, width, height, x, y, color);
+            let color = sample_prepared_gradient(&prepared, position, gradient.repeating);
+            blend_linear_pixel(buffer, width, height, x, y, color);
         }
     }
 }
@@ -2192,6 +2178,7 @@ fn draw_rounded_ring(
         return;
     };
 
+    let prepared_color = PreparedBlendColor::new(color);
     for y in y0..y1 {
         for x in x0..x1 {
             let px = x as f32 + 0.5;
@@ -2206,7 +2193,7 @@ fn draw_rounded_ring(
                 continue;
             }
 
-            blend_pixel(buffer, width, height, x, y, color);
+            blend_prepared_pixel(buffer, width, height, x, y, prepared_color);
         }
     }
 }
@@ -2815,38 +2802,140 @@ fn expand_corner_radius(radius: CornerRadius, amount: f32) -> CornerRadius {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PreparedBlendColor {
+    packed: u32,
+    linear: LinearRgba,
+}
+
+impl PreparedBlendColor {
+    fn new(color: Color) -> Self {
+        Self {
+            packed: pack_rgb(color),
+            linear: color.to_linear_rgba(),
+        }
+    }
+
+    fn with_alpha(self, alpha: u8) -> Self {
+        Self {
+            linear: LinearRgba {
+                a: alpha as f32 / 255.0,
+                ..self.linear
+            },
+            ..self
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn blend_pixel(buffer: &mut [u32], width: usize, height: usize, x: i32, y: i32, color: Color) {
     if color.a == 0 {
         return;
     }
 
-    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+    let Some(index) = buffer_pixel_index(width, height, x, y) else {
         return;
-    }
-    let rows = current_render_buffer_rows();
-    let y = y as usize;
-    if y < rows.start || y >= rows.end {
-        return;
-    }
-
-    let index = (y - rows.start) * width + x as usize;
+    };
     if color.a == 255 {
         buffer[index] = pack_rgb(color);
         return;
     }
 
-    let source = color.to_linear_rgba();
+    blend_linear_over(buffer, index, color.to_linear_rgba());
+}
+
+fn blend_prepared_pixel(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    color: PreparedBlendColor,
+) {
+    if color.linear.a <= 0.0 {
+        return;
+    }
+
+    let Some(index) = buffer_pixel_index(width, height, x, y) else {
+        return;
+    };
+    if color.linear.a >= 1.0 {
+        buffer[index] = color.packed;
+        return;
+    }
+
+    blend_linear_over(buffer, index, color.linear);
+}
+
+fn blend_linear_pixel(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    color: LinearRgba,
+) {
+    let alpha = color.a.clamp(0.0, 1.0);
+    if alpha <= 0.0 {
+        return;
+    }
+
+    let Some(index) = buffer_pixel_index(width, height, x, y) else {
+        return;
+    };
+    if alpha >= 1.0 {
+        buffer[index] = pack_linear_rgb(color);
+        return;
+    }
+
+    blend_linear_over(
+        buffer,
+        index,
+        LinearRgba {
+            a: alpha,
+            ..color
+        },
+    );
+}
+
+fn buffer_pixel_index(width: usize, height: usize, x: i32, y: i32) -> Option<usize> {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return None;
+    }
+
+    let rows = current_render_buffer_rows();
+    let y = y as usize;
+    if y < rows.start || y >= rows.end {
+        return None;
+    }
+
+    Some((y - rows.start) * width + x as usize)
+}
+
+fn blend_linear_over(buffer: &mut [u32], index: usize, source: LinearRgba) {
     let destination = unpack_rgb(buffer[index]).to_linear_rgba();
     let alpha = source.a;
     let inverse_alpha = 1.0 - alpha;
-    let blended = Color::from_linear_rgba(LinearRgba {
+    let blended = LinearRgba {
         r: source.r * alpha + destination.r * inverse_alpha,
         g: source.g * alpha + destination.g * inverse_alpha,
         b: source.b * alpha + destination.b * inverse_alpha,
         a: 1.0,
-    });
+    };
 
-    buffer[index] = pack_rgb(blended);
+    buffer[index] = pack_linear_rgb(blended);
+}
+
+fn scale_alpha(coverage: u8, alpha: u8) -> u8 {
+    if alpha == u8::MAX {
+        coverage
+    } else {
+        ((u16::from(coverage) * u16::from(alpha) + 127) / 255) as u8
+    }
+}
+
+fn pack_linear_rgb(color: LinearRgba) -> u32 {
+    pack_rgb(Color::from_linear_rgba(LinearRgba { a: 1.0, ..color }))
 }
 
 fn pack_rgb(color: Color) -> u32 {

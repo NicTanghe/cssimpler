@@ -1,9 +1,14 @@
+use std::sync::OnceLock;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GradientInterpolation {
     LinearSrgb,
     #[default]
     Oklab,
 }
+
+const SRGB_CHANNEL_COUNT: usize = 256;
+const LINEAR_TO_SRGB_BOUNDARY_COUNT: usize = 255;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
@@ -141,7 +146,42 @@ fn mix(start: f32, end: f32, t: f32) -> f32 {
 }
 
 fn srgb_channel_to_linear(channel: u8) -> f32 {
-    let value = channel as f32 / 255.0;
+    srgb_to_linear_table()[channel as usize]
+}
+
+fn linear_channel_to_srgb(value: f32) -> u8 {
+    let value = value.clamp(0.0, 1.0) as f64;
+    linear_to_srgb_boundaries()
+        .partition_point(|boundary| *boundary <= value) as u8
+}
+
+fn srgb_to_linear_table() -> &'static [f32; SRGB_CHANNEL_COUNT] {
+    static TABLE: OnceLock<[f32; SRGB_CHANNEL_COUNT]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [0.0; SRGB_CHANNEL_COUNT];
+        let mut channel = 0;
+        while channel < SRGB_CHANNEL_COUNT {
+            table[channel] = srgb_unit_to_linear(channel as f32 / 255.0);
+            channel += 1;
+        }
+        table
+    })
+}
+
+fn linear_to_srgb_boundaries() -> &'static [f64; LINEAR_TO_SRGB_BOUNDARY_COUNT] {
+    static BOUNDARIES: OnceLock<[f64; LINEAR_TO_SRGB_BOUNDARY_COUNT]> = OnceLock::new();
+    BOUNDARIES.get_or_init(|| {
+        let mut boundaries = [0.0; LINEAR_TO_SRGB_BOUNDARY_COUNT];
+        let mut channel = 0;
+        while channel < LINEAR_TO_SRGB_BOUNDARY_COUNT {
+            boundaries[channel] = srgb_unit_to_linear_f64((channel as f64 + 0.5) / 255.0);
+            channel += 1;
+        }
+        boundaries
+    })
+}
+
+fn srgb_unit_to_linear(value: f32) -> f32 {
     if value <= 0.04045 {
         value / 12.92
     } else {
@@ -149,19 +189,17 @@ fn srgb_channel_to_linear(channel: u8) -> f32 {
     }
 }
 
-fn linear_channel_to_srgb(value: f32) -> u8 {
-    let value = value.clamp(0.0, 1.0);
-    let srgb = if value <= 0.003_130_8 {
-        value * 12.92
+fn srgb_unit_to_linear_f64(value: f64) -> f64 {
+    if value <= 0.04045 {
+        value / 12.92
     } else {
-        1.055 * value.powf(1.0 / 2.4) - 0.055
-    };
-    (srgb * 255.0).round() as u8
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, GradientInterpolation, LinearRgba};
+    use super::{Color, GradientInterpolation, LinearRgba, linear_channel_to_srgb, srgb_channel_to_linear};
 
     #[test]
     fn linear_rgba_interpolates_in_oklab_by_default() {
@@ -187,5 +225,30 @@ mod tests {
         let round_trip = LinearRgba::from_oklab(original.to_oklab(), original.a);
 
         assert_eq!(Color::from_linear_rgba(round_trip), Color::rgb(29, 78, 216));
+    }
+
+    #[test]
+    fn srgb_lookup_round_trips_all_byte_values() {
+        for channel in 0_u16..=255 {
+            assert_eq!(linear_channel_to_srgb(srgb_channel_to_linear(channel as u8)), channel as u8);
+        }
+    }
+
+    #[test]
+    fn linear_lookup_matches_reference_curve() {
+        for step in 0_u32..=65_536 {
+            let value = step as f32 / 65_536.0;
+            assert_eq!(linear_channel_to_srgb(value), reference_linear_channel_to_srgb(value));
+        }
+    }
+
+    fn reference_linear_channel_to_srgb(value: f32) -> u8 {
+        let value = value.clamp(0.0, 1.0);
+        let srgb = if value <= 0.003_130_8 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        };
+        (srgb * 255.0).round() as u8
     }
 }
