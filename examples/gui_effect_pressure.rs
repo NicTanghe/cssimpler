@@ -270,10 +270,16 @@ fn build_tile_wall(state: &EffectStressState) -> Node {
 
 fn build_tile(tile_index: usize, state: &EffectStressState) -> Node {
     let variant = variant_class(tile_index);
-    let band_state = if tile_is_animated(tile_index, state) {
+    let animated_tile = tile_is_animated(tile_index, state);
+    let band_state = if animated_tile {
         "band-active"
     } else {
         "band-rest"
+    };
+    let phase = if animated_tile {
+        phase_class((state.phase + tile_index) % PHASE_COUNT)
+    } else {
+        phase_class(static_phase(tile_index, 0))
     };
 
     add_classes(
@@ -290,7 +296,7 @@ fn build_tile(tile_index: usize, state: &EffectStressState) -> Node {
                 {build_pod_grid(tile_index, state)}
             </article>
         },
-        [variant, band_state],
+        [variant, band_state, phase],
     )
 }
 
