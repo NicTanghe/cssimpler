@@ -161,7 +161,7 @@ fn maybe_log_perf(state: &mut EffectStressState, actions: u64) {
     }
 
     eprintln!(
-        "[gui_effect_pressure] anim={} phase={} tiles={} passes={} dt={}ms tree={} paint={} present={} total={} mode={} dirty={} workers={}",
+        "[gui_effect_pressure] anim={} phase={} tiles={} passes={} dt={}ms tree={} paint={} present={} total={} mode={} dirty={} jobs={} workers={}",
         animation_label(state),
         phase_label(state.phase),
         state.tile_count,
@@ -173,6 +173,7 @@ fn maybe_log_perf(state: &mut EffectStressState, actions: u64) {
         format_us(state.renderer_stats.total_us),
         paint_mode_label(state.renderer_stats),
         state.renderer_stats.dirty_regions,
+        state.renderer_stats.dirty_jobs,
         state.renderer_stats.render_workers,
     );
 }
@@ -225,6 +226,7 @@ fn build_metric_row(state: &EffectStressState) -> Node {
             {stat_chip("frame total", format_us(state.renderer_stats.total_us))}
             {stat_chip("paint mode", paint_mode_label(state.renderer_stats))}
             {stat_chip("dirty regions", state.renderer_stats.dirty_regions.to_string())}
+            {stat_chip("dirty jobs", state.renderer_stats.dirty_jobs.to_string())}
             {stat_chip("workers", state.renderer_stats.render_workers.to_string())}
         </div>
     }
@@ -448,7 +450,12 @@ fn paint_mode_label(stats: FrameTimingStats) -> String {
                 "full".to_string()
             }
         }
-        FramePaintMode::Incremental => format!("incremental {}", stats.dirty_regions),
+        FramePaintMode::Incremental => {
+            format!(
+                "incremental {} -> {}",
+                stats.dirty_regions, stats.dirty_jobs
+            )
+        }
     }
 }
 

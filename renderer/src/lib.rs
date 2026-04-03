@@ -48,6 +48,7 @@ pub struct FrameTimingStats {
     pub total_us: u64,
     pub render_workers: usize,
     pub dirty_regions: usize,
+    pub dirty_jobs: usize,
     pub paint_mode: FramePaintMode,
 }
 
@@ -55,6 +56,7 @@ pub struct FrameTimingStats {
 struct PaintStats {
     workers: usize,
     dirty_regions: usize,
+    dirty_jobs: usize,
     mode: FramePaintMode,
 }
 
@@ -334,6 +336,7 @@ where
         total_us: duration_to_us(startup_begin.elapsed()),
         render_workers: initial_paint_stats.workers,
         dirty_regions: initial_paint_stats.dirty_regions,
+        dirty_jobs: initial_paint_stats.dirty_jobs,
         paint_mode: initial_paint_stats.mode,
         ..FrameTimingStats::default()
     });
@@ -507,6 +510,7 @@ where
             frame_stats.paint_us = duration_to_us(paint_start.elapsed());
             frame_stats.render_workers = paint_stats.workers;
             frame_stats.dirty_regions = paint_stats.dirty_regions;
+            frame_stats.dirty_jobs = paint_stats.dirty_jobs;
             frame_stats.paint_mode = paint_stats.mode;
 
             let present_start = Instant::now();
@@ -573,6 +577,7 @@ fn render_to_buffer_internal(
     PaintStats {
         workers: worker_count.max(1),
         dirty_regions: 0,
+        dirty_jobs: worker_count.max(1),
         mode: FramePaintMode::Full,
     }
 }
@@ -709,6 +714,7 @@ fn render_scene_update_internal(
         return PaintStats {
             workers: worker_count,
             dirty_regions: dirty_region_count,
+            dirty_jobs: dirty_jobs.len(),
             mode: FramePaintMode::Incremental,
         };
     }
@@ -723,6 +729,7 @@ fn render_scene_update_internal(
     PaintStats {
         workers: 1,
         dirty_regions: dirty_region_count,
+        dirty_jobs: dirty_region_count,
         mode: FramePaintMode::Incremental,
     }
 }
