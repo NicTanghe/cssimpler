@@ -1,5 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 mod color;
@@ -15,8 +17,57 @@ use cssimpler_core::{
 };
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
-const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 8;
-const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.5;
+const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 32;
+const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.85;
+const MIN_PARALLEL_RENDER_PIXELS: usize = 640 * 480;
+const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 120;
+const MAX_RENDER_WORKERS: usize = 8;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FramePaintMode {
+    #[default]
+    Idle,
+    Full,
+    Incremental,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameTimingStats {
+    pub update_us: u64,
+    pub scene_prep_us: u64,
+    pub paint_us: u64,
+    pub present_us: u64,
+    pub total_us: u64,
+    pub render_workers: usize,
+    pub dirty_regions: usize,
+    pub paint_mode: FramePaintMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PaintStats {
+    workers: usize,
+    dirty_regions: usize,
+    mode: FramePaintMode,
+}
+
+static FRAME_TIMING_STATS: OnceLock<Mutex<FrameTimingStats>> = OnceLock::new();
+
+pub fn latest_frame_timing_stats() -> FrameTimingStats {
+    *frame_timing_stats_store()
+        .lock()
+        .expect("frame timing stats mutex should not be poisoned")
+}
+
+fn record_frame_timing_stats(stats: FrameTimingStats) {
+    *frame_timing_stats_store()
+        .lock()
+        .expect("frame timing stats mutex should not be poisoned") = stats;
+}
+
+fn frame_timing_stats_store() -> &'static Mutex<FrameTimingStats> {
+    FRAME_TIMING_STATS.get_or_init(|| Mutex::new(FrameTimingStats::default()))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FrameInfo {
     pub frame_index: u64,
@@ -203,6 +254,7 @@ pub fn run_with_scene_provider<P>(config: WindowConfig, mut scene_provider: P) -
 where
     P: SceneProvider,
 {
+    let startup_begin = Instant::now();
     let initial_viewport = ViewportSize::new(config.width, config.height);
     scene_provider.set_viewport(initial_viewport);
     scene_provider.update(FrameInfo {
@@ -220,17 +272,30 @@ where
     let mut buffer_width = config.width.max(1);
     let mut buffer_height = config.height.max(1);
     let mut buffer = vec![pack_rgb(config.clear_color); buffer_width * buffer_height];
-    render_to_buffer(
+    let initial_paint_start = Instant::now();
+    let initial_paint_stats = render_to_buffer_internal(
         &initial_scene,
         &mut buffer,
         buffer_width,
         buffer_height,
         config.clear_color,
     );
+    let initial_paint_us = duration_to_us(initial_paint_start.elapsed());
     if let Some(indicator) = initial_indicator {
         scrollbar::draw_auto_scroll_indicator(indicator, &mut buffer, buffer_width, buffer_height);
     }
+    let initial_present_start = Instant::now();
     window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
+    let initial_present_us = duration_to_us(initial_present_start.elapsed());
+    record_frame_timing_stats(FrameTimingStats {
+        paint_us: initial_paint_us,
+        present_us: initial_present_us,
+        total_us: duration_to_us(startup_begin.elapsed()),
+        render_workers: initial_paint_stats.workers,
+        dirty_regions: initial_paint_stats.dirty_regions,
+        paint_mode: initial_paint_stats.mode,
+        ..FrameTimingStats::default()
+    });
 
     let mut last_frame = Instant::now();
     let mut frame_index = 1_u64;
@@ -243,6 +308,8 @@ where
         initial_indicator;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        let frame_begin = Instant::now();
+        let mut frame_stats = FrameTimingStats::default();
         let now = Instant::now();
         let delta = now.saturating_duration_since(last_frame);
         last_frame = now;
@@ -274,7 +341,11 @@ where
         };
         scene_provider.set_viewport(viewport);
         let frame = FrameInfo { frame_index, delta };
+        let update_start = Instant::now();
         scene_provider.update(frame);
+        frame_stats.update_us += duration_to_us(update_start.elapsed());
+
+        let scene_prep_start = Instant::now();
         let mut scene = scene_provider.capture_scene();
         scrollbar_controller.apply_to_scene(&mut scene);
         let mouse_position = window.get_mouse_pos(MouseMode::Clamp);
@@ -323,7 +394,9 @@ where
         };
 
         if click_triggered_rerender {
+            let rerender_start = Instant::now();
             scene_provider.update(frame);
+            frame_stats.update_us += duration_to_us(rerender_start.elapsed());
             scene = scene_provider.capture_scene();
             scrollbar_controller.apply_to_scene(&mut scene);
             scrollbar_controller.handle_pointer(
@@ -343,6 +416,7 @@ where
                 &mut element_interaction,
             );
         }
+        frame_stats.scene_prep_us = duration_to_us(scene_prep_start.elapsed());
 
         let auto_scroll_indicator = scrollbar_controller.auto_scroll_indicator();
 
@@ -362,32 +436,39 @@ where
             auto_scroll_indicator,
             resized,
         ) {
-            if resized {
-                render_to_buffer(
+            let paint_start = Instant::now();
+            let paint_stats = if resized {
+                render_to_buffer_internal(
                     &scene,
                     &mut buffer,
                     buffer_width,
                     buffer_height,
                     config.clear_color,
-                );
+                )
             } else if let Some(previous_scene) = previous_presented_scene.as_deref() {
-                render_scene_update(
+                render_scene_update_internal(
                     previous_scene,
                     &scene,
                     &mut buffer,
                     buffer_width,
                     buffer_height,
                     config.clear_color,
-                );
+                )
             } else {
-                render_to_buffer(
+                render_to_buffer_internal(
                     &scene,
                     &mut buffer,
                     buffer_width,
                     buffer_height,
                     config.clear_color,
-                );
-            }
+                )
+            };
+            frame_stats.paint_us = duration_to_us(paint_start.elapsed());
+            frame_stats.render_workers = paint_stats.workers;
+            frame_stats.dirty_regions = paint_stats.dirty_regions;
+            frame_stats.paint_mode = paint_stats.mode;
+
+            let present_start = Instant::now();
             redraw_auto_scroll_indicator_regions(
                 previous_presented_indicator,
                 auto_scroll_indicator,
@@ -398,14 +479,19 @@ where
                 config.clear_color,
             );
             window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
-            previous_presented_scene = Some(scene.clone());
+            frame_stats.present_us = duration_to_us(present_start.elapsed());
+            previous_presented_scene = Some(scene);
             previous_presented_indicator = auto_scroll_indicator;
         } else {
+            let present_start = Instant::now();
             window.update();
+            frame_stats.present_us = duration_to_us(present_start.elapsed());
         }
 
         previous_left_down = interactive_left_down;
         previous_middle_down = middle_down;
+        frame_stats.total_us = duration_to_us(frame_begin.elapsed());
+        record_frame_timing_stats(frame_stats);
         frame_index += 1;
     }
 
@@ -426,6 +512,37 @@ pub fn render_to_buffer(
     height: usize,
     clear_color: Color,
 ) {
+    let _ = render_to_buffer_internal(scene, buffer, width, height, clear_color);
+}
+
+fn render_to_buffer_internal(
+    scene: &[RenderNode],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+) -> PaintStats {
+    let worker_count = full_redraw_worker_count(width, height);
+    if worker_count <= 1 {
+        render_to_buffer_serial(scene, buffer, width, height, clear_color);
+    } else {
+        render_to_buffer_parallel(scene, buffer, width, height, clear_color, worker_count);
+    }
+
+    PaintStats {
+        workers: worker_count.max(1),
+        dirty_regions: 0,
+        mode: FramePaintMode::Full,
+    }
+}
+
+fn render_to_buffer_serial(
+    scene: &[RenderNode],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+) {
     buffer.fill(pack_rgb(clear_color));
     let clip = ClipRect::full(width as f32, height as f32);
 
@@ -434,6 +551,63 @@ pub fn render_to_buffer(
     }
 }
 
+fn render_to_buffer_parallel(
+    scene: &[RenderNode],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+    worker_count: usize,
+) {
+    let clear = pack_rgb(clear_color);
+    let band_count = worker_count.max(1).min(height.max(1));
+    let rows_per_worker = height.div_ceil(band_count);
+    let bands = (0..height)
+        .step_by(rows_per_worker)
+        .map(|row_start| (row_start, (row_start + rows_per_worker).min(height)))
+        .collect::<Vec<_>>();
+    let mut worker_buffers = (0..bands.len())
+        .map(|_| vec![clear; width * height])
+        .collect::<Vec<_>>();
+
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (worker_buffer, (row_start, row_end)) in
+            worker_buffers.iter_mut().zip(bands.iter().copied())
+        {
+            let band_clip = ClipRect {
+                x0: 0.0,
+                y0: row_start as f32,
+                x1: width as f32,
+                y1: row_end as f32,
+            };
+            handles.push(scope.spawn(move || {
+                for node in scene {
+                    draw_node(
+                        node,
+                        worker_buffer,
+                        width,
+                        height,
+                        band_clip,
+                        CullMode::Subtree,
+                    );
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("render worker should not panic");
+        }
+    });
+
+    for (worker_buffer, (row_start, row_end)) in worker_buffers.into_iter().zip(bands) {
+        let start = row_start * width;
+        let end = row_end * width;
+        buffer[start..end].copy_from_slice(&worker_buffer[start..end]);
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn render_scene_update(
     previous_scene: &[RenderNode],
     scene: &[RenderNode],
@@ -442,30 +616,146 @@ fn render_scene_update(
     height: usize,
     clear_color: Color,
 ) {
+    let _ = render_scene_update_internal(previous_scene, scene, buffer, width, height, clear_color);
+}
+
+fn render_scene_update_internal(
+    previous_scene: &[RenderNode],
+    scene: &[RenderNode],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+) -> PaintStats {
     let mut dirty_regions = dirty_regions_between_scenes(previous_scene, scene);
     if dirty_regions.is_empty() {
-        return;
+        return PaintStats::default();
     }
 
     coalesce_dirty_regions(&mut dirty_regions);
     if should_full_redraw(&dirty_regions, width, height) {
-        render_to_buffer(scene, buffer, width, height, clear_color);
-        return;
+        let mut stats = render_to_buffer_internal(scene, buffer, width, height, clear_color);
+        stats.dirty_regions = dirty_regions.len();
+        return stats;
     }
 
+    let dirty_region_count = dirty_regions.len();
     let full_clip = ClipRect::full(width as f32, height as f32);
-    for dirty_region in dirty_regions {
-        let Some(dirty_region) = dirty_region
-            .intersect(full_clip)
-            .and_then(|clip| snap_clip_to_pixel_grid(clip, width, height))
-        else {
-            continue;
+    let snapped_dirty_regions = dirty_regions
+        .into_iter()
+        .filter_map(|dirty_region| {
+            dirty_region
+                .intersect(full_clip)
+                .and_then(|clip| snap_clip_to_pixel_grid(clip, width, height))
+        })
+        .collect::<Vec<_>>();
+    let cached_bounds = cache_scene_subtree_bounds(scene);
+
+    let worker_count = incremental_render_worker_count(width, height, snapped_dirty_regions.len());
+    if worker_count > 1 {
+        render_scene_update_parallel(
+            scene,
+            &cached_bounds,
+            buffer,
+            width,
+            height,
+            clear_color,
+            &snapped_dirty_regions,
+            worker_count,
+        );
+        return PaintStats {
+            workers: worker_count,
+            dirty_regions: dirty_region_count,
+            mode: FramePaintMode::Incremental,
         };
+    }
+
+    for dirty_region in snapped_dirty_regions {
         clear_clip(buffer, width, height, dirty_region, clear_color);
-        for node in scene {
-            draw_node(node, buffer, width, height, dirty_region, CullMode::Subtree);
+        for (node, bounds) in scene.iter().zip(&cached_bounds) {
+            draw_node_with_cached_bounds(node, bounds, buffer, width, height, dirty_region);
         }
     }
+
+    PaintStats {
+        workers: 1,
+        dirty_regions: dirty_region_count,
+        mode: FramePaintMode::Incremental,
+    }
+}
+
+fn render_scene_update_parallel(
+    scene: &[RenderNode],
+    cached_bounds: &[CachedSubtreeBounds],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+    dirty_regions: &[ClipRect],
+    worker_count: usize,
+) {
+    let worker_count = worker_count.max(1).min(dirty_regions.len().max(1));
+    let region_groups = dirty_regions
+        .chunks(dirty_regions.len().div_ceil(worker_count))
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
+    let clear = pack_rgb(clear_color);
+    let mut worker_buffers = (0..region_groups.len())
+        .map(|_| vec![clear; width * height])
+        .collect::<Vec<_>>();
+
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (worker_buffer, regions) in worker_buffers.iter_mut().zip(region_groups.iter()) {
+            handles.push(scope.spawn(move || {
+                for &dirty_region in regions {
+                    for (node, bounds) in scene.iter().zip(cached_bounds) {
+                        draw_node_with_cached_bounds(
+                            node,
+                            bounds,
+                            worker_buffer,
+                            width,
+                            height,
+                            dirty_region,
+                        );
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("incremental render worker should not panic");
+        }
+    });
+
+    for (worker_buffer, regions) in worker_buffers.into_iter().zip(region_groups) {
+        for dirty_region in regions {
+            let Some((x0, y0, x1, y1)) = clip_pixel_bounds(dirty_region, width, height) else {
+                continue;
+            };
+
+            for y in y0..y1 {
+                let row_start = y as usize * width;
+                let start = row_start + x0 as usize;
+                let end = row_start + x1 as usize;
+                buffer[start..end].copy_from_slice(&worker_buffer[start..end]);
+            }
+        }
+    }
+}
+
+fn incremental_render_worker_count(
+    width: usize,
+    height: usize,
+    dirty_region_count: usize,
+) -> usize {
+    if dirty_region_count <= 1 {
+        return 1;
+    }
+
+    full_redraw_worker_count(width, height).min(dirty_region_count)
 }
 
 fn should_present_scene(
@@ -564,6 +854,12 @@ enum CullMode {
     Subtree,
 }
 
+#[derive(Clone, Debug)]
+struct CachedSubtreeBounds {
+    bounds: Option<ClipRect>,
+    children: Vec<CachedSubtreeBounds>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ClipRect {
     x0: f32,
@@ -644,6 +940,46 @@ fn draw_node(
         return;
     }
 
+    draw_node_contents(node, None, buffer, width, height, clip, cull_mode);
+}
+
+fn draw_node_with_cached_bounds(
+    node: &RenderNode,
+    cached_bounds: &CachedSubtreeBounds,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clip: ClipRect,
+) {
+    if clip.is_empty()
+        || cached_bounds
+            .bounds
+            .and_then(|bounds| clip.intersect(bounds))
+            .is_none()
+    {
+        return;
+    }
+
+    draw_node_contents(
+        node,
+        Some(cached_bounds),
+        buffer,
+        width,
+        height,
+        clip,
+        CullMode::Subtree,
+    );
+}
+
+fn draw_node_contents(
+    node: &RenderNode,
+    cached_bounds: Option<&CachedSubtreeBounds>,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clip: ClipRect,
+    cull_mode: CullMode,
+) {
     for shadow in &node.style.shadows {
         draw_shadow(
             buffer,
@@ -697,8 +1033,14 @@ fn draw_node(
         return;
     };
 
-    for child in &node.children {
-        draw_node(child, buffer, width, height, child_clip, cull_mode);
+    if let Some(cached_bounds) = cached_bounds {
+        for (child, child_bounds) in node.children.iter().zip(&cached_bounds.children) {
+            draw_node_with_cached_bounds(child, child_bounds, buffer, width, height, child_clip);
+        }
+    } else {
+        for child in &node.children {
+            draw_node(child, buffer, width, height, child_clip, cull_mode);
+        }
     }
 
     scrollbar::draw_scrollbars(node, buffer, width, height, clip);
@@ -1561,6 +1903,29 @@ fn subtree_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
     bounds
 }
 
+fn cache_scene_subtree_bounds(scene: &[RenderNode]) -> Vec<CachedSubtreeBounds> {
+    scene.iter().map(cache_subtree_bounds).collect()
+}
+
+fn cache_subtree_bounds(node: &RenderNode) -> CachedSubtreeBounds {
+    let mut bounds = node_visual_bounds(node);
+    let parent_clip = non_empty_layout_clip(node.layout);
+    let mut children = Vec::with_capacity(node.children.len());
+
+    for child in &node.children {
+        let mut cached_child = cache_subtree_bounds(child);
+        if node.style.overflow.clips_any_axis() {
+            cached_child.bounds = cached_child
+                .bounds
+                .and_then(|child_bounds| parent_clip.and_then(|clip| child_bounds.intersect(clip)));
+        }
+        bounds = union_optional_bounds(bounds, cached_child.bounds);
+        children.push(cached_child);
+    }
+
+    CachedSubtreeBounds { bounds, children }
+}
+
 fn node_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
     let mut bounds = non_empty_layout_clip(node.layout);
 
@@ -1675,6 +2040,25 @@ fn resize_buffer(
     *width = next_width;
     *height = next_height;
     buffer.resize(next_width * next_height, pack_rgb(clear_color));
+}
+
+fn full_redraw_worker_count(width: usize, height: usize) -> usize {
+    let total_pixels = width.saturating_mul(height);
+    if total_pixels < MIN_PARALLEL_RENDER_PIXELS {
+        return 1;
+    }
+
+    let max_workers_from_rows = height.div_ceil(MIN_PARALLEL_RENDER_ROWS_PER_WORKER).max(1);
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_RENDER_WORKERS)
+        .min(max_workers_from_rows)
+        .max(1)
+}
+
+fn duration_to_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 fn layout_clip(layout: LayoutBox) -> ClipRect {
@@ -2075,6 +2459,62 @@ mod tests {
         render_to_buffer(&scene, &mut buffer, 20, 20, Color::WHITE);
 
         assert!(buffer.contains(&pack_rgb(Color::rgb(40, 120, 220))));
+    }
+
+    #[test]
+    fn multithreaded_full_redraw_matches_the_single_threaded_result() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(8.0, 8.0, 96.0, 72.0))
+                .with_style(VisualStyle {
+                    background_layers: vec![BackgroundLayer::LinearGradient(LinearGradient {
+                        direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                        interpolation: GradientInterpolation::Oklab,
+                        repeating: false,
+                        stops: vec![
+                            GradientStop {
+                                color: Color::rgb(14, 165, 233),
+                                position: LengthPercentageValue::from_fraction(0.0),
+                            },
+                            GradientStop {
+                                color: Color::rgb(244, 114, 182),
+                                position: LengthPercentageValue::from_fraction(1.0),
+                            },
+                        ],
+                    })],
+                    shadows: vec![BoxShadow {
+                        color: Color::rgba(15, 23, 42, 120),
+                        offset_x: 6.0,
+                        offset_y: 8.0,
+                        blur_radius: 12.0,
+                        spread: 2.0,
+                    }],
+                    corner_radius: CornerRadius::all(16.0),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(20.0, 20.0, 40.0, 24.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgba(255, 255, 255, 180)),
+                            filter_drop_shadows: vec![ShadowEffect {
+                                color: Some(Color::rgba(56, 189, 248, 110)),
+                                offset_x: 0.0,
+                                offset_y: 0.0,
+                                blur_radius: 8.0,
+                                spread: 0.0,
+                            }],
+                            corner_radius: CornerRadius::all(12.0),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut single = vec![0_u32; 128 * 96];
+        let mut threaded = vec![0_u32; 128 * 96];
+
+        super::render_to_buffer_serial(&scene, &mut single, 128, 96, Color::BLACK);
+        super::render_to_buffer_parallel(&scene, &mut threaded, 128, 96, Color::BLACK, 4);
+
+        assert_eq!(single, threaded);
     }
 
     #[test]

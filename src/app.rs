@@ -1,7 +1,9 @@
 mod scene_transition;
 
 use std::marker::PhantomData;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+use std::time::Instant;
 
 use self::scene_transition::SceneTransition;
 use crate::core::{ElementInteractionState, Node, RenderNode};
@@ -10,6 +12,34 @@ use crate::style::{
     Stylesheet, build_render_tree_in_viewport_with_interaction_at_root,
     build_render_tree_with_interaction_at_root,
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeStats {
+    pub view_us: u64,
+    pub render_tree_us: u64,
+    pub scene_swap_us: u64,
+    pub transition_us: u64,
+    pub rerendered: bool,
+    pub transition_active: bool,
+}
+
+static RUNTIME_STATS: OnceLock<Mutex<RuntimeStats>> = OnceLock::new();
+
+pub fn latest_runtime_stats() -> RuntimeStats {
+    *runtime_stats_store()
+        .lock()
+        .expect("runtime stats mutex should not be poisoned")
+}
+
+fn record_runtime_stats(stats: RuntimeStats) {
+    *runtime_stats_store()
+        .lock()
+        .expect("runtime stats mutex should not be poisoned") = stats;
+}
+
+fn runtime_stats_store() -> &'static Mutex<RuntimeStats> {
+    RUNTIME_STATS.get_or_init(|| Mutex::new(RuntimeStats::default()))
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Invalidation {
@@ -241,16 +271,19 @@ where
     }
 
     fn advance(&mut self, frame: FrameInfo) {
+        let mut stats = RuntimeStats::default();
         let update = &mut self.update;
         let state = &mut self.state;
         let refresh = update(state, frame).into();
         self.pending_refresh = std::mem::take(&mut self.pending_refresh).merge(refresh);
 
         if self.needs_rerender() {
-            self.rebuild_scene();
+            self.rebuild_scene(&mut stats);
         }
 
-        self.advance_scene_transition(frame.delta);
+        self.advance_scene_transition(frame.delta, &mut stats);
+        stats.transition_active = self.scene_transition.is_some();
+        record_runtime_stats(stats);
     }
 
     fn needs_rerender(&self) -> bool {
@@ -259,9 +292,13 @@ where
             || self.pending_refresh.needs_rerender()
     }
 
-    fn rebuild_scene(&mut self) {
+    fn rebuild_scene(&mut self, stats: &mut RuntimeStats) {
         let view = &mut self.view;
+        let view_start = Instant::now();
         let tree = view(&self.state);
+        stats.view_us = duration_to_us(view_start.elapsed());
+
+        let render_tree_start = Instant::now();
         let scene = vec![if let Some(viewport) = self.viewport {
             build_render_tree_in_viewport_with_interaction_at_root(
                 &tree,
@@ -274,7 +311,12 @@ where
         } else {
             build_render_tree_with_interaction_at_root(&tree, self.stylesheet, &self.interaction, 0)
         }];
+        stats.render_tree_us = duration_to_us(render_tree_start.elapsed());
+
+        let scene_swap_start = Instant::now();
         self.replace_scene(scene);
+        stats.scene_swap_us = duration_to_us(scene_swap_start.elapsed());
+        stats.rerendered = true;
         self.pending_refresh = Refresh::clean();
     }
 
@@ -285,23 +327,27 @@ where
     }
 
     fn replace_scene(&mut self, scene: Vec<RenderNode>) {
-        if let Some(previous) = self.cached_scene.clone()
-            && let Some(transition) = SceneTransition::new(previous, scene.clone())
-        {
-            self.cached_scene = Some(transition.sample());
-            self.scene_transition = Some(transition);
-            return;
+        if let Some(previous) = self.cached_scene.take() {
+            if SceneTransition::should_create(&previous, &scene) {
+                let transition = SceneTransition::new(previous, scene)
+                    .expect("scene transition should exist after precheck");
+                self.cached_scene = Some(transition.sample());
+                self.scene_transition = Some(transition);
+                return;
+            }
         }
 
         self.cached_scene = Some(scene);
         self.scene_transition = None;
     }
 
-    fn advance_scene_transition(&mut self, delta: Duration) {
+    fn advance_scene_transition(&mut self, delta: Duration, stats: &mut RuntimeStats) {
         let Some(transition) = self.scene_transition.as_mut() else {
             return;
         };
+        let sample_start = Instant::now();
         self.cached_scene = Some(transition.advance(delta));
+        stats.transition_us = duration_to_us(sample_start.elapsed());
         if !transition.is_active() {
             self.scene_transition = None;
         }
@@ -427,16 +473,19 @@ where
     }
 
     fn advance(&mut self, frame: FrameInfo) {
+        let mut stats = RuntimeStats::default();
         let update = &mut self.update;
         let state = &mut self.state;
         let refresh = update(state, frame).into();
         self.pending_refresh = std::mem::take(&mut self.pending_refresh).merge(refresh);
 
         if self.needs_rerender() {
-            self.refresh_scene();
+            self.refresh_scene(&mut stats);
         }
 
-        self.advance_scene_transition(frame.delta);
+        self.advance_scene_transition(frame.delta, &mut stats);
+        stats.transition_active = self.scene_transition.is_some();
+        record_runtime_stats(stats);
     }
 
     fn needs_rerender(&self) -> bool {
@@ -445,19 +494,23 @@ where
             || self.pending_refresh.needs_rerender()
     }
 
-    fn refresh_scene(&mut self) {
+    fn refresh_scene(&mut self, stats: &mut RuntimeStats) {
+        let refresh_start = Instant::now();
         let must_full_refresh = self.cached_scene.is_none()
             || matches!(self.render_mode, RenderMode::EveryFrame)
             || matches!(self.pending_refresh.target, RefreshTarget::Full);
 
         if must_full_refresh {
             self.rebuild_all_fragments();
+            stats.render_tree_us = duration_to_us(refresh_start.elapsed());
+            stats.rerendered = true;
             self.pending_refresh = Refresh::clean();
             return;
         }
 
         let fragment_ids = match &self.pending_refresh.target {
             RefreshTarget::None => {
+                stats.render_tree_us = duration_to_us(refresh_start.elapsed());
                 self.pending_refresh = Refresh::clean();
                 return;
             }
@@ -469,6 +522,8 @@ where
             self.rebuild_all_fragments();
         }
 
+        stats.render_tree_us = duration_to_us(refresh_start.elapsed());
+        stats.rerendered = true;
         self.pending_refresh = Refresh::clean();
     }
 
@@ -483,7 +538,7 @@ where
     }
 
     fn refresh_fragments(&mut self, ids: &[String]) -> bool {
-        let Some(existing_scene) = self.cached_scene.clone() else {
+        let Some(existing_scene) = self.cached_scene.as_ref() else {
             return false;
         };
         if existing_scene.len() != self.fragments.len() {
@@ -503,7 +558,10 @@ where
             replacements.push((index, self.render_node(&node, index)));
         }
 
-        let mut scene = existing_scene;
+        let mut scene = self
+            .cached_scene
+            .take()
+            .expect("fragment app scene should be cached while refreshing fragments");
         for (index, node) in replacements {
             scene[index] = node;
         }
@@ -545,23 +603,27 @@ where
     }
 
     fn replace_scene(&mut self, scene: Vec<RenderNode>) {
-        if let Some(previous) = self.cached_scene.clone()
-            && let Some(transition) = SceneTransition::new(previous, scene.clone())
-        {
-            self.cached_scene = Some(transition.sample());
-            self.scene_transition = Some(transition);
-            return;
+        if let Some(previous) = self.cached_scene.take() {
+            if SceneTransition::should_create(&previous, &scene) {
+                let transition = SceneTransition::new(previous, scene)
+                    .expect("scene transition should exist after precheck");
+                self.cached_scene = Some(transition.sample());
+                self.scene_transition = Some(transition);
+                return;
+            }
         }
 
         self.cached_scene = Some(scene);
         self.scene_transition = None;
     }
 
-    fn advance_scene_transition(&mut self, delta: Duration) {
+    fn advance_scene_transition(&mut self, delta: Duration, stats: &mut RuntimeStats) {
         let Some(transition) = self.scene_transition.as_mut() else {
             return;
         };
+        let sample_start = Instant::now();
         self.cached_scene = Some(transition.advance(delta));
+        stats.transition_us = duration_to_us(sample_start.elapsed());
         if !transition.is_active() {
             self.scene_transition = None;
         }
@@ -670,6 +732,10 @@ fn interaction_roots(interaction: &ElementInteractionState) -> Vec<usize> {
     }
 
     roots
+}
+
+fn duration_to_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]

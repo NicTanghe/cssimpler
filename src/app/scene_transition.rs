@@ -14,15 +14,20 @@ pub(crate) struct SceneTransition {
 }
 
 impl SceneTransition {
+    pub(crate) fn should_create(from: &[RenderNode], to: &[RenderNode]) -> bool {
+        if !scene_structures_match(from, to) {
+            return false;
+        }
+
+        max_scene_transition_duration(from, to) > f32::EPSILON
+    }
+
     pub(crate) fn new(from: Vec<RenderNode>, to: Vec<RenderNode>) -> Option<Self> {
-        if !scene_structures_match(&from, &to) {
+        if !Self::should_create(&from, &to) {
             return None;
         }
 
         let duration_seconds = max_scene_transition_duration(&from, &to);
-        if duration_seconds <= f32::EPSILON {
-            return None;
-        }
 
         Some(Self {
             from,
