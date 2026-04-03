@@ -491,6 +491,76 @@ Acceptance
 
 ---
 
+# Epic N - Default-on subtree reuse in `App`
+
+## N1. Stable subtree identity for safe reuse
+Depends: G3, J1  
+Status: done  
+
+Purpose:
+- Let normal `App` reuse previously built subtrees when their boundary is stable
+- Make partial rerender the default behavior when the engine can prove it is safe
+- Preserve deterministic fallback to full rerender when subtree identity is ambiguous
+
+Rules:
+- Subtree reuse must live in normal `App`, not require migration to `FragmentApp`
+- Reuse boundaries must be driven by stable identity, not guessed only from current tree shape
+- Stable identity may come from explicit ids, future keys, or other engine-owned boundary metadata
+- If a subtree cannot be matched confidently, the engine must rebuild instead of risking stale UI
+
+Acceptance  
+- Normal `App` can reuse stable subtrees without changing the public update/render model  
+- Reordering or replacing ambiguous children never reuses the wrong cached subtree  
+- Full rerender remains available as the correctness fallback  
+
+---
+
+## N2. Conservative default-on partial rerender in normal `App`
+Depends: N1  
+Status: done  
+
+Purpose:
+- Bring the same user expectation as `FragmentApp` to the default app path
+- Reduce `tree build` cost for paint-only and local layout updates without changing app code
+
+Rules:
+- The feature is on by default in normal `App`
+- The engine should refresh only the smallest safe subtree rooted at a stable boundary
+- `paint` invalidation should avoid rebuilding unrelated stable-id subtrees when cached layout can be reused safely
+- `layout` invalidation may promote to a larger subtree or full rerender until safe layout-boundary reuse exists
+- `structure` invalidation may promote to a larger subtree or full rerender
+
+Non-goals:
+- Do not require a full virtual DOM diff before shipping the first version
+- Do not weaken correctness guarantees to chase a smaller refresh scope
+
+Acceptance  
+- Paint-only changes in one stable region do not rebuild unrelated stable regions in normal `App`  
+- Layout changes still fall back deterministically when safe reuse is unclear  
+- Structure changes still produce deterministic output even when they force a larger refresh  
+
+---
+
+## N3. Explicit boundaries remain available for power users
+Depends: N2, G3  
+Status: done  
+
+Purpose:
+- Keep `FragmentApp` as the explicit performance contract for apps that want hard refresh partitions
+- Avoid making the default `App` path so magical that advanced control becomes impossible
+
+Rules:
+- `FragmentApp` remains the opt-in API for author-declared refresh boundaries
+- Normal `App` auto-reuse and `FragmentApp` explicit reuse should share the same correctness rules where possible
+- Documentation should explain when to rely on default `App` behavior and when to promote to `FragmentApp`
+
+Acceptance  
+- `App` is fast by default when boundaries are stable  
+- `FragmentApp` still provides stronger author control over refresh scope  
+- Both paths preserve identical visual output for the same state  
+
+---
+
 # Epic I - Scrollbars (engine-owned, CSS-styled)
 
 ## I1. Scrollbar style model

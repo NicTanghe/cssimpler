@@ -58,7 +58,7 @@ pub use render_tree::{
     build_render_tree, build_render_tree_in_viewport,
     build_render_tree_in_viewport_with_interaction,
     build_render_tree_in_viewport_with_interaction_at_root, build_render_tree_with_interaction,
-    build_render_tree_with_interaction_at_root,
+    build_render_tree_with_interaction_at_root, rebuild_render_tree_with_cached_layout,
 };
 
 pub use attributes::{AttributeTextSource, parse_attribute_text_source};
@@ -320,14 +320,17 @@ fn resolve_style_target(
     }
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
     let element_ref = ElementRef::from(element);
+    let matching_rules = stylesheet
+        .matching_rules_with_context_and_pseudo(
+            element_ref,
+            ancestors,
+            element_path,
+            interaction,
+            pseudo_element,
+        )
+        .collect::<Vec<_>>();
 
-    for rule in stylesheet.matching_rules_with_context_and_pseudo(
-        element_ref,
-        ancestors,
-        element_path,
-        interaction,
-        pseudo_element,
-    ) {
+    for rule in &matching_rules {
         for declaration in &rule.declarations {
             if matches!(declaration, Declaration::CustomProperty { .. }) {
                 apply_declaration(&mut resolved, &mut position_explicit, declaration);
@@ -335,13 +338,7 @@ fn resolve_style_target(
         }
     }
 
-    for rule in stylesheet.matching_rules_with_context_and_pseudo(
-        element_ref,
-        ancestors,
-        element_path,
-        interaction,
-        pseudo_element,
-    ) {
+    for rule in &matching_rules {
         for declaration in &rule.declarations {
             if !matches!(declaration, Declaration::CustomProperty { .. }) {
                 apply_declaration(&mut resolved, &mut position_explicit, declaration);
@@ -1008,8 +1005,8 @@ mod tests {
 
     use super::{
         Declaration, ElementRef, Selector, ShadowDeclaration, StyleError, StyleRule, Stylesheet,
-        build_render_tree, build_render_tree_in_viewport, parse_stylesheet, resolve_element_tree,
-        resolve_style, to_taffy,
+        build_render_tree, build_render_tree_in_viewport, parse_stylesheet,
+        rebuild_render_tree_with_cached_layout, resolve_element_tree, resolve_style, to_taffy,
     };
 
     #[test]
@@ -1731,6 +1728,71 @@ mod tests {
         assert_eq!(scene.children[0].layout.x, 12.0);
         assert_eq!(scene.children[0].layout.y, 12.0);
         assert_eq!(scene.children[0].layout.width, 616.0);
+    }
+
+    #[test]
+    fn cached_layout_rerender_updates_visuals_without_rebuilding_layout() {
+        let stylesheet = parse_stylesheet(
+            "#app { width: 120px; height: 40px; }
+             #panel { width: 80px; height: 20px; color: #111111; }
+             #panel.hot { color: #2563eb; }",
+        )
+        .expect("stylesheet should parse");
+        let base = Node::element("div").with_id("app").with_child(
+            Node::element("section")
+                .with_id("panel")
+                .with_child(Node::text("value"))
+                .into(),
+        );
+        let next = Node::element("section")
+            .with_id("panel")
+            .with_class("hot")
+            .with_child(Node::text("value"))
+            .into();
+        let scene = build_render_tree(&base.into(), &stylesheet);
+        let rerendered = rebuild_render_tree_with_cached_layout(
+            &next,
+            &stylesheet,
+            &cssimpler_core::ElementInteractionState::default(),
+            &cssimpler_core::ElementPath::root(0).with_child(0),
+            &scene.children[0],
+        )
+        .expect("cached layout rerender should succeed");
+
+        assert_eq!(rerendered.layout, scene.children[0].layout);
+        assert_eq!(rerendered.style.foreground, Color::rgb(37, 99, 235));
+        assert_eq!(text_nodes(&rerendered), vec!["value".to_string()]);
+    }
+
+    #[test]
+    fn cached_layout_rerender_falls_back_when_structure_changes() {
+        let stylesheet = parse_stylesheet(
+            "#app { width: 120px; height: 40px; }
+             #panel { width: 80px; height: 20px; color: #111111; }",
+        )
+        .expect("stylesheet should parse");
+        let base = Node::element("div").with_id("app").with_child(
+            Node::element("section")
+                .with_id("panel")
+                .with_child(Node::text("value"))
+                .into(),
+        );
+        let next = Node::element("section")
+            .with_id("panel")
+            .with_child(Node::element("span").with_child(Node::text("value")).into())
+            .into();
+        let scene = build_render_tree(&base.into(), &stylesheet);
+
+        assert!(
+            rebuild_render_tree_with_cached_layout(
+                &next,
+                &stylesheet,
+                &cssimpler_core::ElementInteractionState::default(),
+                &cssimpler_core::ElementPath::root(0).with_child(0),
+                &scene.children[0],
+            )
+            .is_none()
+        );
     }
 
     fn text_nodes(node: &cssimpler_core::RenderNode) -> Vec<String> {

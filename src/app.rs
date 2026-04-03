@@ -6,11 +6,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use self::scene_transition::SceneTransition;
-use crate::core::{ElementInteractionState, Node, RenderNode};
+use crate::core::{ElementInteractionState, ElementPath, Node, RenderNode};
 use crate::renderer::{self, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
 use crate::style::{
     Stylesheet, build_render_tree_in_viewport_with_interaction_at_root,
-    build_render_tree_with_interaction_at_root,
+    build_render_tree_with_interaction_at_root, rebuild_render_tree_with_cached_layout,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -201,6 +201,22 @@ impl<'a, State> Fragment<'a, State> {
     }
 }
 
+enum UniqueMatch<T> {
+    None,
+    Single(T),
+    Multiple,
+}
+
+struct NodeBoundaryMatch<'a> {
+    node: &'a Node,
+    path: ElementPath,
+}
+
+struct RenderBoundaryMatch<'a> {
+    node: &'a RenderNode,
+    path: ElementPath,
+}
+
 pub struct App<'a, State, Update, View, Signal = Invalidation> {
     state: State,
     stylesheet: &'a Stylesheet,
@@ -278,7 +294,7 @@ where
         self.pending_refresh = std::mem::take(&mut self.pending_refresh).merge(refresh);
 
         if self.needs_rerender() {
-            self.rebuild_scene(&mut stats);
+            self.refresh_scene(&mut stats);
         }
 
         self.advance_scene_transition(frame.delta, &mut stats);
@@ -292,6 +308,34 @@ where
             || self.pending_refresh.needs_rerender()
     }
 
+    fn refresh_scene(&mut self, stats: &mut RuntimeStats) {
+        let must_full_refresh = self.cached_scene.is_none()
+            || matches!(self.render_mode, RenderMode::EveryFrame)
+            || matches!(self.pending_refresh.target, RefreshTarget::Full)
+            || !matches!(self.pending_refresh.invalidation, Invalidation::Paint);
+
+        if must_full_refresh {
+            self.rebuild_scene(stats);
+            return;
+        }
+
+        let fragment_ids = match &self.pending_refresh.target {
+            RefreshTarget::None => {
+                self.pending_refresh = Refresh::clean();
+                return;
+            }
+            RefreshTarget::Full => unreachable!("full refreshes return early"),
+            RefreshTarget::Fragments(ids) => ids.clone(),
+        };
+
+        if !self.refresh_fragments(&fragment_ids, stats) {
+            self.rebuild_scene(stats);
+            return;
+        }
+
+        self.pending_refresh = Refresh::clean();
+    }
+
     fn rebuild_scene(&mut self, stats: &mut RuntimeStats) {
         let view = &mut self.view;
         let view_start = Instant::now();
@@ -299,18 +343,7 @@ where
         stats.view_us = duration_to_us(view_start.elapsed());
 
         let render_tree_start = Instant::now();
-        let scene = vec![if let Some(viewport) = self.viewport {
-            build_render_tree_in_viewport_with_interaction_at_root(
-                &tree,
-                self.stylesheet,
-                viewport.width,
-                viewport.height,
-                &self.interaction,
-                0,
-            )
-        } else {
-            build_render_tree_with_interaction_at_root(&tree, self.stylesheet, &self.interaction, 0)
-        }];
+        let scene = vec![self.render_root(&tree)];
         stats.render_tree_us = duration_to_us(render_tree_start.elapsed());
 
         let scene_swap_start = Instant::now();
@@ -318,6 +351,95 @@ where
         stats.scene_swap_us = duration_to_us(scene_swap_start.elapsed());
         stats.rerendered = true;
         self.pending_refresh = Refresh::clean();
+    }
+
+    fn refresh_fragments(&mut self, ids: &[String], stats: &mut RuntimeStats) -> bool {
+        let Some(existing_scene) = self.cached_scene.as_ref() else {
+            return false;
+        };
+        if existing_scene.len() != 1 {
+            return false;
+        }
+        let existing_root = &existing_scene[0];
+
+        let view = &mut self.view;
+        let view_start = Instant::now();
+        let tree = view(&self.state);
+        stats.view_us = duration_to_us(view_start.elapsed());
+
+        let render_tree_start = Instant::now();
+        let mut replacements = Vec::with_capacity(ids.len());
+        for id in ids {
+            let UniqueMatch::Single(node_match) =
+                find_unique_node_boundary(&tree, id, &ElementPath::root(0))
+            else {
+                return false;
+            };
+            let UniqueMatch::Single(render_match) = find_unique_render_boundary(existing_root, id)
+            else {
+                return false;
+            };
+            if node_match.path != render_match.path {
+                return false;
+            }
+            let Some(node) = rebuild_render_tree_with_cached_layout(
+                node_match.node,
+                self.stylesheet,
+                &self.interaction,
+                &node_match.path,
+                render_match.node,
+            ) else {
+                return false;
+            };
+            replacements.push((render_match.path, node));
+        }
+        stats.render_tree_us = duration_to_us(render_tree_start.elapsed());
+
+        replacements.sort_by_key(|(path, _)| path.children.len());
+        let mut filtered = Vec::with_capacity(replacements.len());
+        for (path, node) in replacements {
+            if filtered
+                .iter()
+                .any(|(existing_path, _): &(ElementPath, RenderNode)| {
+                    existing_path.is_prefix_of(&path)
+                })
+            {
+                continue;
+            }
+            filtered.push((path, node));
+        }
+
+        let mut scene = self
+            .cached_scene
+            .take()
+            .expect("app scene should be cached while refreshing fragments");
+        for (path, node) in filtered {
+            let Some(target) = find_render_node_mut(&mut scene[0], &path) else {
+                return false;
+            };
+            *target = node;
+        }
+
+        let scene_swap_start = Instant::now();
+        self.replace_scene(scene);
+        stats.scene_swap_us = duration_to_us(scene_swap_start.elapsed());
+        stats.rerendered = true;
+        true
+    }
+
+    fn render_root(&self, tree: &Node) -> RenderNode {
+        if let Some(viewport) = self.viewport {
+            build_render_tree_in_viewport_with_interaction_at_root(
+                tree,
+                self.stylesheet,
+                viewport.width,
+                viewport.height,
+                &self.interaction,
+                0,
+            )
+        } else {
+            build_render_tree_with_interaction_at_root(tree, self.stylesheet, &self.interaction, 0)
+        }
     }
 
     fn scene(&self) -> &[RenderNode] {
@@ -374,7 +496,33 @@ where
             .stylesheet
             .interaction_invalidation(previous, next)
             .into();
-        invalidation.into()
+        if !invalidation.needs_rerender() {
+            return Refresh::clean();
+        }
+        if !matches!(invalidation, Invalidation::Paint) {
+            return Refresh::full(invalidation);
+        }
+
+        let Some(root) = self.cached_scene.as_deref().and_then(|scene| scene.first()) else {
+            return Refresh::full(invalidation);
+        };
+
+        let mut fragment_ids = Vec::new();
+        for path in interaction_paths(previous)
+            .into_iter()
+            .chain(interaction_paths(next))
+        {
+            let Some(fragment_id) = stable_boundary_id_for_path(root, &path) else {
+                return Refresh::full(invalidation);
+            };
+            push_unique_id(&mut fragment_ids, fragment_id);
+        }
+
+        if fragment_ids.is_empty() {
+            Refresh::full(invalidation)
+        } else {
+            Refresh::fragments(fragment_ids, invalidation)
+        }
     }
 }
 
@@ -732,6 +880,126 @@ fn interaction_roots(interaction: &ElementInteractionState) -> Vec<usize> {
     }
 
     roots
+}
+
+fn interaction_paths(interaction: &ElementInteractionState) -> Vec<ElementPath> {
+    let mut paths = Vec::new();
+    for path in interaction
+        .hovered
+        .as_ref()
+        .into_iter()
+        .chain(interaction.active.as_ref())
+    {
+        if !paths.iter().any(|existing| existing == path) {
+            paths.push(path.clone());
+        }
+    }
+    paths
+}
+
+fn stable_boundary_id_for_path(root: &RenderNode, path: &ElementPath) -> Option<String> {
+    let mut deepest = None;
+    collect_boundary_id_for_path(root, path, &mut deepest);
+    deepest
+}
+
+fn collect_boundary_id_for_path(
+    node: &RenderNode,
+    path: &ElementPath,
+    deepest: &mut Option<String>,
+) {
+    let Some(node_path) = node.element_path.as_ref() else {
+        return;
+    };
+    if !node_path.is_prefix_of(path) {
+        return;
+    }
+    if let Some(element_id) = &node.element_id {
+        *deepest = Some(element_id.clone());
+    }
+    for child in &node.children {
+        collect_boundary_id_for_path(child, path, deepest);
+    }
+}
+
+fn find_unique_node_boundary<'a>(
+    node: &'a Node,
+    id: &str,
+    path: &ElementPath,
+) -> UniqueMatch<NodeBoundaryMatch<'a>> {
+    let Node::Element(element) = node else {
+        return UniqueMatch::None;
+    };
+
+    let mut result = if element.id.as_deref() == Some(id) {
+        UniqueMatch::Single(NodeBoundaryMatch {
+            node,
+            path: path.clone(),
+        })
+    } else {
+        UniqueMatch::None
+    };
+
+    let mut child_index = 0;
+    for child in &element.children {
+        let Node::Element(_) = child else {
+            continue;
+        };
+        let child_path = path.with_child(child_index);
+        child_index += 1;
+        result = merge_unique_match(result, find_unique_node_boundary(child, id, &child_path));
+        if matches!(result, UniqueMatch::Multiple) {
+            return result;
+        }
+    }
+
+    result
+}
+
+fn find_unique_render_boundary<'a>(
+    node: &'a RenderNode,
+    id: &str,
+) -> UniqueMatch<RenderBoundaryMatch<'a>> {
+    let mut result = if node.element_id.as_deref() == Some(id) {
+        node.element_path
+            .clone()
+            .map(|path| RenderBoundaryMatch { node, path })
+            .map_or(UniqueMatch::None, UniqueMatch::Single)
+    } else {
+        UniqueMatch::None
+    };
+
+    for child in &node.children {
+        result = merge_unique_match(result, find_unique_render_boundary(child, id));
+        if matches!(result, UniqueMatch::Multiple) {
+            return result;
+        }
+    }
+
+    result
+}
+
+fn merge_unique_match<T>(left: UniqueMatch<T>, right: UniqueMatch<T>) -> UniqueMatch<T> {
+    match (left, right) {
+        (UniqueMatch::Multiple, _) | (_, UniqueMatch::Multiple) => UniqueMatch::Multiple,
+        (UniqueMatch::None, other) | (other, UniqueMatch::None) => other,
+        (UniqueMatch::Single(_), UniqueMatch::Single(_)) => UniqueMatch::Multiple,
+    }
+}
+
+fn find_render_node_mut<'a>(
+    node: &'a mut RenderNode,
+    path: &ElementPath,
+) -> Option<&'a mut RenderNode> {
+    if node.element_path.as_ref() == Some(path) {
+        return Some(node);
+    }
+    for child in &mut node.children {
+        if let Some(found) = find_render_node_mut(child, path) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn duration_to_us(duration: Duration) -> u64 {
@@ -1103,6 +1371,95 @@ mod tests {
             second[0].style.foreground,
             crate::core::Color::rgb(37, 99, 235)
         );
+    }
+
+    #[test]
+    fn app_descendant_hover_rules_target_the_nearest_stable_id_boundary() {
+        let stylesheet = parse_stylesheet(".button:hover .hover-text { color: #2563eb; }")
+            .expect("interactive stylesheet should parse");
+        let mut app = App::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Refresh::clean(),
+            |_state| {
+                ui! {
+                    <div id="app">
+                        <section id="left">
+                            <div class="button">
+                                <span class="hover-text">{"left"}</span>
+                            </div>
+                        </section>
+                        <section id="right">
+                            <div class="button">
+                                <span class="hover-text">{"right"}</span>
+                            </div>
+                        </section>
+                    </div>
+                }
+            },
+        );
+
+        app.frame(frame(0));
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(
+                    ElementPath::root(0)
+                        .with_child(1)
+                        .with_child(0)
+                        .with_child(0)
+                ),
+                active: None,
+            },
+        ));
+
+        assert_eq!(
+            app.pending_refresh,
+            Refresh::fragment("right", Invalidation::Paint)
+        );
+    }
+
+    #[test]
+    fn app_manual_fragment_refresh_keeps_other_stable_regions_intact() {
+        let stylesheet = Stylesheet::default();
+        let mut app = App::new(
+            (1_u32, 10_u32),
+            &stylesheet,
+            |state, frame| {
+                if frame.frame_index == 1 {
+                    state.1 = 42;
+                    Refresh::fragment("right", Invalidation::Paint)
+                } else {
+                    Refresh::clean()
+                }
+            },
+            |state| {
+                ui! {
+                    <div id="app">
+                        <section id="left">
+                            <p>{format!("left {}", state.0)}</p>
+                        </section>
+                        <section id="right">
+                            <p>{format!("right {}", state.1)}</p>
+                        </section>
+                    </div>
+                }
+            },
+        );
+
+        let first = app.frame(frame(0));
+        let second = app.frame(frame(1));
+
+        assert_eq!(
+            text_nodes(&first),
+            vec!["left 1".to_string(), "right 10".to_string()]
+        );
+        assert_eq!(
+            text_nodes(&second),
+            vec!["left 1".to_string(), "right 42".to_string()]
+        );
+        assert_eq!(second[0].children[0].layout, first[0].children[0].layout);
+        assert_eq!(second[0].children[1].layout, first[0].children[1].layout);
     }
 
     #[test]

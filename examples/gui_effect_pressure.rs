@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use cssimpler::app::{App, Invalidation, RuntimeStats, latest_runtime_stats};
+use cssimpler::app::{App, Invalidation, Refresh, RuntimeStats, latest_runtime_stats};
 use cssimpler::core::Node;
 use cssimpler::renderer::{
     FrameInfo, FramePaintMode, FrameTimingStats, WindowConfig, latest_frame_timing_stats,
@@ -21,7 +21,7 @@ const ACTION_RESET: u64 = 1 << 5;
 const PHASE_COUNT: usize = 3;
 const PHASE_STEP_INTERVAL: Duration = Duration::from_millis(120);
 const PERF_LOG_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_TILE_COUNT: usize = 48;
+pub const MAX_TILE_COUNT: usize = 48;
 const ANIMATED_TILE_WINDOW: usize = 2;
 const ACTIVE_PODS_PER_ANIMATED_TILE: usize = 2;
 const DEFAULT_TILE_COUNT: usize = 12;
@@ -34,7 +34,7 @@ const SPIKE_PASS_STEP: usize = 4;
 static ACTIONS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct EffectStressState {
+pub struct EffectStressState {
     frame_index: u64,
     last_frame_ms: u128,
     tile_count: usize,
@@ -76,14 +76,15 @@ fn main() -> Result<()> {
         .map_err(Into::into)
 }
 
-fn update(state: &mut EffectStressState, frame: FrameInfo) -> Invalidation {
+fn update(state: &mut EffectStressState, frame: FrameInfo) -> Refresh {
     let actions = ACTIONS.swap(0, Ordering::Relaxed);
+    let previous = state.clone();
     let invalidation = apply_frame(state, frame, actions);
     maybe_log_perf(state, actions);
-    invalidation
+    normal_app_refresh(&previous, state, invalidation)
 }
 
-fn apply_frame(state: &mut EffectStressState, frame: FrameInfo, actions: u64) -> Invalidation {
+pub fn apply_frame(state: &mut EffectStressState, frame: FrameInfo, actions: u64) -> Invalidation {
     state.frame_index = frame.frame_index;
     state.last_frame_ms = frame.delta.as_millis();
     state.renderer_stats = latest_frame_timing_stats();
@@ -150,7 +151,7 @@ fn apply_frame(state: &mut EffectStressState, frame: FrameInfo, actions: u64) ->
     invalidation.max(animation_invalidation(state))
 }
 
-fn maybe_log_perf(state: &mut EffectStressState, actions: u64) {
+pub fn maybe_log_perf(state: &mut EffectStressState, actions: u64) {
     let should_log = actions != 0 || state.log_elapsed >= PERF_LOG_INTERVAL;
     if !should_log {
         return;
@@ -181,22 +182,8 @@ fn maybe_log_perf(state: &mut EffectStressState, actions: u64) {
 fn build_ui(state: &EffectStressState) -> Node {
     ui! {
         <div id="app">
-            <section class="hero">
-                <div class="hero-copy">
-                    <p class="eyebrow">
-                        {"Example / GUI effect pressure"}
-                    </p>
-                    <h1 class="hero-title">
-                        {"Effect-heavy animated wall"}
-                    </h1>
-                    <p class="hero-note">
-                        {"This scene keeps text tiny on purpose and puts the pressure into gradients, glows, box shadows, and a narrow moving band of live effect pods."}
-                    </p>
-                </div>
-                {build_metric_row(state)}
-                {build_control_row(state)}
-            </section>
-            <section class="wall-shell">
+            {with_id(build_ui_hero(state), "hero")}
+            <section id="wall-shell" class="wall-shell">
                 {build_tile_wall(state)}
             </section>
         </div>
@@ -287,7 +274,8 @@ fn build_tile(tile_index: usize, state: &EffectStressState) -> Node {
     );
 
     add_classes(
-        ui! {
+        with_id(
+            ui! {
             <article class="effect-tile">
                 <div class="tile-header">
                     <div class="tile-title-row">
@@ -302,7 +290,9 @@ fn build_tile(tile_index: usize, state: &EffectStressState) -> Node {
                 </div>
                 {build_pod_grid(tile_index, state)}
             </article>
-        },
+            },
+            tile_fragment_id(tile_index),
+        ),
         [variant, phase],
     )
 }
@@ -406,6 +396,14 @@ fn add_class(node: Node, class_name: &'static str) -> Node {
     }
 }
 
+fn with_id(node: Node, id: impl Into<String>) -> Node {
+    let id = id.into();
+    match node {
+        Node::Element(element) => element.with_id(id).into(),
+        Node::Text(_) => node,
+    }
+}
+
 fn add_classes<const N: usize>(node: Node, classes: [&'static str; N]) -> Node {
     classes.into_iter().fold(node, add_class)
 }
@@ -493,7 +491,7 @@ fn tile_is_animated(index: usize, state: &EffectStressState) -> bool {
         && animated_tile_indices(state.tile_count, state.animation_band_start).contains(&index)
 }
 
-fn animated_tile_indices(tile_count: usize, band_start: usize) -> Vec<usize> {
+pub fn animated_tile_indices(tile_count: usize, band_start: usize) -> Vec<usize> {
     if tile_count == 0 {
         return Vec::new();
     }
@@ -546,6 +544,79 @@ fn layout_class(pulse_layout: bool) -> &'static str {
     }
 }
 
+fn build_ui_hero(state: &EffectStressState) -> Node {
+    ui! {
+        <section class="hero">
+            <div class="hero-copy">
+                <p class="eyebrow">
+                    {"Example / GUI effect pressure"}
+                </p>
+                <h1 class="hero-title">
+                    {"Effect-heavy animated wall"}
+                </h1>
+                <p class="hero-note">
+                    {"This scene keeps text tiny on purpose and puts the pressure into gradients, glows, box shadows, and a narrow moving band of live effect pods."}
+                </p>
+            </div>
+            {build_metric_row(state)}
+            {build_control_row(state)}
+        </section>
+    }
+}
+
+fn fragment_tile_position_class(tile_index: usize) -> &'static str {
+    match tile_index {
+        0 => "fragment-tile-pos-0",
+        1 => "fragment-tile-pos-1",
+        2 => "fragment-tile-pos-2",
+        3 => "fragment-tile-pos-3",
+        4 => "fragment-tile-pos-4",
+        5 => "fragment-tile-pos-5",
+        6 => "fragment-tile-pos-6",
+        7 => "fragment-tile-pos-7",
+        8 => "fragment-tile-pos-8",
+        9 => "fragment-tile-pos-9",
+        10 => "fragment-tile-pos-10",
+        11 => "fragment-tile-pos-11",
+        12 => "fragment-tile-pos-12",
+        13 => "fragment-tile-pos-13",
+        14 => "fragment-tile-pos-14",
+        15 => "fragment-tile-pos-15",
+        16 => "fragment-tile-pos-16",
+        17 => "fragment-tile-pos-17",
+        18 => "fragment-tile-pos-18",
+        19 => "fragment-tile-pos-19",
+        20 => "fragment-tile-pos-20",
+        21 => "fragment-tile-pos-21",
+        22 => "fragment-tile-pos-22",
+        23 => "fragment-tile-pos-23",
+        24 => "fragment-tile-pos-24",
+        25 => "fragment-tile-pos-25",
+        26 => "fragment-tile-pos-26",
+        27 => "fragment-tile-pos-27",
+        28 => "fragment-tile-pos-28",
+        29 => "fragment-tile-pos-29",
+        30 => "fragment-tile-pos-30",
+        31 => "fragment-tile-pos-31",
+        32 => "fragment-tile-pos-32",
+        33 => "fragment-tile-pos-33",
+        34 => "fragment-tile-pos-34",
+        35 => "fragment-tile-pos-35",
+        36 => "fragment-tile-pos-36",
+        37 => "fragment-tile-pos-37",
+        38 => "fragment-tile-pos-38",
+        39 => "fragment-tile-pos-39",
+        40 => "fragment-tile-pos-40",
+        41 => "fragment-tile-pos-41",
+        42 => "fragment-tile-pos-42",
+        43 => "fragment-tile-pos-43",
+        44 => "fragment-tile-pos-44",
+        45 => "fragment-tile-pos-45",
+        46 => "fragment-tile-pos-46",
+        _ => "fragment-tile-pos-47",
+    }
+}
+
 fn add_tiles() {
     ACTIONS.fetch_or(ACTION_ADD_TILES, Ordering::Relaxed);
 }
@@ -570,13 +641,117 @@ fn reset() {
     ACTIONS.fetch_or(ACTION_RESET, Ordering::Relaxed);
 }
 
-fn stylesheet() -> &'static Stylesheet {
+pub fn stylesheet() -> &'static Stylesheet {
     static STYLESHEET: OnceLock<Stylesheet> = OnceLock::new();
 
     STYLESHEET.get_or_init(|| {
         parse_stylesheet(include_str!("gui_effect_pressure.css"))
             .expect("gui effect pressure stylesheet should stay valid")
     })
+}
+
+pub fn take_actions() -> u64 {
+    ACTIONS.swap(0, Ordering::Relaxed)
+}
+
+pub fn tile_fragment_id(tile_index: usize) -> String {
+    format!("tile-{tile_index:02}")
+}
+
+pub fn normal_app_refresh(
+    previous: &EffectStressState,
+    next: &EffectStressState,
+    invalidation: Invalidation,
+) -> Refresh {
+    match invalidation {
+        Invalidation::Clean => Refresh::clean(),
+        Invalidation::Paint => {
+            let mut ids = vec!["hero".to_string()];
+            for tile_index in
+                animated_tile_indices(previous.tile_count, previous.animation_band_start)
+                    .into_iter()
+                    .chain(animated_tile_indices(
+                        next.tile_count,
+                        next.animation_band_start,
+                    ))
+            {
+                let id = tile_fragment_id(tile_index);
+                if !ids.iter().any(|existing| existing == &id) {
+                    ids.push(id);
+                }
+            }
+            Refresh::fragments(ids, Invalidation::Paint)
+        }
+        Invalidation::Layout | Invalidation::Structure => Refresh::full(invalidation),
+    }
+}
+
+pub fn fragment_refresh(
+    previous: &EffectStressState,
+    next: &EffectStressState,
+    invalidation: Invalidation,
+) -> Refresh {
+    match invalidation {
+        Invalidation::Clean => Refresh::clean(),
+        Invalidation::Paint => {
+            let mut ids = vec!["hero".to_string()];
+            for tile_index in
+                animated_tile_indices(previous.tile_count, previous.animation_band_start)
+                    .into_iter()
+                    .chain(animated_tile_indices(
+                        next.tile_count,
+                        next.animation_band_start,
+                    ))
+            {
+                let id = tile_fragment_id(tile_index);
+                if !ids.iter().any(|existing| existing == &id) {
+                    ids.push(id);
+                }
+            }
+            Refresh::fragments(ids, Invalidation::Paint)
+        }
+        Invalidation::Layout | Invalidation::Structure => {
+            let mut ids = vec!["hero".to_string(), "wall-shell".to_string()];
+            ids.extend((0..MAX_TILE_COUNT).map(tile_fragment_id));
+            Refresh::fragments(ids, invalidation)
+        }
+    }
+}
+
+pub fn build_fragment_backdrop() -> Node {
+    with_id(
+        ui! {
+            <div class="fragment-backdrop"></div>
+        },
+        "backdrop",
+    )
+}
+
+pub fn build_fragment_hero(state: &EffectStressState) -> Node {
+    with_id(add_class(build_ui_hero(state), "fragment-hero"), "hero")
+}
+
+pub fn build_fragment_wall_shell() -> Node {
+    with_id(
+        add_class(
+            ui! {
+                <section class="wall-shell"></section>
+            },
+            "fragment-wall-shell",
+        ),
+        "wall-shell",
+    )
+}
+
+pub fn build_fragment_tile(tile_index: usize, state: &EffectStressState) -> Node {
+    let mut node = add_classes(
+        with_id(build_tile(tile_index, state), tile_fragment_id(tile_index)),
+        ["fragment-tile", fragment_tile_position_class(tile_index)],
+    );
+    if tile_index >= state.tile_count {
+        node = add_class(node, "fragment-hidden");
+    }
+    node
 }
 
 #[cfg(test)]
@@ -586,9 +761,9 @@ mod tests {
     use super::{
         ACTION_ADD_PASSES, ACTION_ADD_TILES, ACTION_RESET, ACTION_SPIKE, ACTION_TOGGLE_ANIMATION,
         ACTION_TOGGLE_PULSE, DEFAULT_PASSES_PER_TILE, DEFAULT_TILE_COUNT, EffectStressState,
-        animated_pod_count, estimated_effect_nodes, phase_label,
+        animated_pod_count, estimated_effect_nodes, normal_app_refresh, phase_label,
     };
-    use cssimpler::app::Invalidation;
+    use cssimpler::app::{Invalidation, Refresh};
     use cssimpler::renderer::FrameInfo;
 
     #[test]
@@ -683,6 +858,30 @@ mod tests {
     #[test]
     fn animated_band_wraps_through_the_visible_tiles() {
         assert_eq!(super::animated_tile_indices(5, 4), vec![4, 0]);
+    }
+
+    #[test]
+    fn normal_app_refresh_targets_only_the_live_band_for_paint() {
+        let previous = EffectStressState {
+            tile_count: 8,
+            animation_band_start: 0,
+            ..EffectStressState::default()
+        };
+        let next = EffectStressState {
+            tile_count: 8,
+            animation_band_start: 1,
+            ..previous.clone()
+        };
+
+        let refresh = normal_app_refresh(&previous, &next, Invalidation::Paint);
+
+        assert_eq!(
+            refresh,
+            Refresh::fragments(
+                ["hero", "tile-00", "tile-01", "tile-02"],
+                Invalidation::Paint
+            )
+        );
     }
 
     fn frame(frame_index: u64) -> FrameInfo {

@@ -1,6 +1,6 @@
 use cssimpler_core::{
     CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandler, LayoutBox,
-    Node, RenderNode, Style, TransitionStyle,
+    Node, RenderNode, ScrollbarData, Style, TransitionStyle,
     fonts::{TextStyle, layout_text_block},
 };
 use taffy::geometry::Size as TaffySize;
@@ -13,6 +13,7 @@ use crate::{ElementRef, PseudoElementKind, Stylesheet};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedElement {
+    pub(crate) element_id: Option<String>,
     pub(crate) style: Style,
     pub(crate) text: String,
     pub(crate) element_path: ElementPath,
@@ -23,6 +24,7 @@ pub(crate) struct ResolvedElement {
 #[derive(Clone, Debug)]
 struct LayoutTree {
     node_id: NodeId,
+    element_id: Option<String>,
     style: Style,
     text: String,
     element_path: ElementPath,
@@ -55,6 +57,28 @@ pub fn build_render_tree_with_interaction_at_root(
     root_index: usize,
 ) -> RenderNode {
     build_render_tree_with_available_space(root, stylesheet, None, interaction, root_index)
+}
+
+pub fn rebuild_render_tree_with_cached_layout(
+    root: &Node,
+    stylesheet: &Stylesheet,
+    interaction: &ElementInteractionState,
+    element_path: &ElementPath,
+    template: &RenderNode,
+) -> Option<RenderNode> {
+    let Node::Element(root_element) = root else {
+        return None;
+    };
+    let resolved = resolve_element_tree(
+        root_element,
+        stylesheet,
+        None,
+        None,
+        &[],
+        interaction,
+        element_path,
+    );
+    render_node_with_cached_layout(&resolved, template)
 }
 
 pub fn build_render_tree_in_viewport(
@@ -160,6 +184,7 @@ pub(crate) fn resolve_element_tree(
 
     if before.is_none() && after.is_none() && !has_element_children {
         return ResolvedElement {
+            element_id: element.id.clone(),
             style,
             text: direct_text,
             element_path: element_path.clone(),
@@ -200,6 +225,7 @@ pub(crate) fn resolve_element_tree(
     }
 
     ResolvedElement {
+        element_id: element.id.clone(),
         style,
         text: String::new(),
         element_path: element_path.clone(),
@@ -286,6 +312,7 @@ fn build_layout_tree(
 
     LayoutTree {
         node_id,
+        element_id: resolved.element_id.clone(),
         style: resolved.style.clone(),
         text: resolved.text.clone(),
         element_path: resolved.element_path.clone(),
@@ -334,6 +361,9 @@ fn render_node_from_layout(
             .with_transitions(tree.style.transitions.clone())
             .with_element_path(tree.element_path.clone())
             .with_content_inset(content_inset);
+        if let Some(element_id) = &tree.element_id {
+            node = node.with_element_id(element_id.clone());
+        }
         if let Some(scrollbars) = scrollbars {
             node = node.with_scrollbars(scrollbars);
         }
@@ -348,6 +378,9 @@ fn render_node_from_layout(
             .with_element_path(tree.element_path.clone())
             .with_content_inset(content_inset)
             .with_children(child_nodes);
+        if let Some(element_id) = &tree.element_id {
+            node = node.with_element_id(element_id.clone());
+        }
         if let Some(scrollbars) = scrollbars {
             node = node.with_scrollbars(scrollbars);
         }
@@ -387,6 +420,7 @@ fn resolve_pseudo_element_tree(
     };
 
     Some(ResolvedElement {
+        element_id: None,
         style,
         text,
         element_path: element_path.clone(),
@@ -416,12 +450,102 @@ fn flush_text_child(
     }
 
     children.push(ResolvedElement {
+        element_id: None,
         style: text_child_style(parent_style),
         text: std::mem::take(pending_text),
         element_path: element_path.clone(),
         on_click: None,
         children: Vec::new(),
     });
+}
+
+fn render_node_with_cached_layout(
+    resolved: &ResolvedElement,
+    template: &RenderNode,
+) -> Option<RenderNode> {
+    if resolved.element_id != template.element_id {
+        return None;
+    }
+    if template.element_path.as_ref() != Some(&resolved.element_path) {
+        return None;
+    }
+
+    let content_inset = content_inset_from_taffy(&resolved.style.layout.taffy);
+    let scrollbars = scrollbars_with_cached_metrics(&resolved.style, template)?;
+
+    if resolved.children.is_empty() && !resolved.text.is_empty() {
+        if !matches!(template.kind, cssimpler_core::RenderKind::Text(_))
+            || !template.children.is_empty()
+        {
+            return None;
+        }
+
+        let mut node = RenderNode::text(template.layout, resolved.text.clone())
+            .with_style(resolved.style.visual.clone())
+            .with_transitions(resolved.style.transitions.clone())
+            .with_element_path(resolved.element_path.clone())
+            .with_content_inset(content_inset);
+        if let Some(element_id) = &resolved.element_id {
+            node = node.with_element_id(element_id.clone());
+        }
+        if let Some(scrollbars) = scrollbars {
+            node = node.with_scrollbars(scrollbars);
+        }
+        if let Some(handler) = resolved.on_click {
+            node = node.on_click(handler);
+        }
+        return Some(node);
+    }
+
+    if !matches!(template.kind, cssimpler_core::RenderKind::Container) {
+        return None;
+    }
+    if resolved.children.len() != template.children.len() {
+        return None;
+    }
+
+    let children = resolved
+        .children
+        .iter()
+        .zip(&template.children)
+        .map(|(child, child_template)| render_node_with_cached_layout(child, child_template))
+        .collect::<Option<Vec<_>>>()?;
+
+    let mut node = RenderNode::container(template.layout)
+        .with_style(resolved.style.visual.clone())
+        .with_transitions(resolved.style.transitions.clone())
+        .with_element_path(resolved.element_path.clone())
+        .with_content_inset(content_inset)
+        .with_children(children);
+    if let Some(element_id) = &resolved.element_id {
+        node = node.with_element_id(element_id.clone());
+    }
+    if let Some(scrollbars) = scrollbars {
+        node = node.with_scrollbars(scrollbars);
+    }
+    if let Some(handler) = resolved.on_click {
+        node = node.on_click(handler);
+    }
+    Some(node)
+}
+
+fn scrollbars_with_cached_metrics(
+    style: &Style,
+    template: &RenderNode,
+) -> Option<Option<ScrollbarData>> {
+    match (
+        style.visual.overflow.allows_scrolling(),
+        template.scrollbars,
+    ) {
+        (false, _) => Some(None),
+        (true, Some(previous)) => Some(Some(ScrollbarData::new(
+            style.visual.overflow.x,
+            style.visual.overflow.y,
+            style.visual.scrollbar,
+            previous.metrics,
+        ))),
+        (true, None) => None,
+    }
 }
 
 fn text_child_style(parent_style: &Style) -> Style {

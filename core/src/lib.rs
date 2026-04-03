@@ -404,6 +404,7 @@ pub struct RenderNode {
     pub layout: LayoutBox,
     pub style: VisualStyle,
     pub transitions: TransitionStyle,
+    pub element_id: Option<String>,
     pub element_path: Option<ElementPath>,
     pub content_inset: Insets,
     pub scrollbars: Option<ScrollbarData>,
@@ -418,6 +419,7 @@ impl RenderNode {
             layout,
             style: VisualStyle::default(),
             transitions: TransitionStyle::default(),
+            element_id: None,
             element_path: None,
             content_inset: Insets::ZERO,
             scrollbars: None,
@@ -432,6 +434,7 @@ impl RenderNode {
             layout,
             style: VisualStyle::default(),
             transitions: TransitionStyle::default(),
+            element_id: None,
             element_path: None,
             content_inset: Insets::ZERO,
             scrollbars: None,
@@ -447,6 +450,11 @@ impl RenderNode {
 
     pub fn with_transitions(mut self, transitions: TransitionStyle) -> Self {
         self.transitions = transitions;
+        self
+    }
+
+    pub fn with_element_id(mut self, element_id: impl Into<String>) -> Self {
+        self.element_id = Some(element_id.into());
         self
     }
 
