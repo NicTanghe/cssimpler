@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::{Mutex, OnceLock};
@@ -69,6 +70,37 @@ struct DirtyRenderJob {
 static FRAME_TIMING_STATS: OnceLock<Mutex<FrameTimingStats>> = OnceLock::new();
 static WORKER_BUFFER_POOL: OnceLock<Mutex<Vec<Vec<u32>>>> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BufferRows {
+    start: usize,
+    end: usize,
+}
+
+impl BufferRows {
+    const fn new(start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end: if end < start { start } else { end },
+        }
+    }
+
+    const fn full() -> Self {
+        Self::new(0, usize::MAX)
+    }
+
+    fn len(self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    fn pixel_len(self, width: usize) -> usize {
+        width.saturating_mul(self.len())
+    }
+}
+
+thread_local! {
+    static RENDER_BUFFER_ROWS: Cell<BufferRows> = Cell::new(BufferRows::full());
+}
+
 pub fn latest_frame_timing_stats() -> FrameTimingStats {
     *frame_timing_stats_store()
         .lock()
@@ -89,15 +121,16 @@ fn worker_buffer_pool() -> &'static Mutex<Vec<Vec<u32>>> {
     WORKER_BUFFER_POOL.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn acquire_worker_buffers(count: usize, len: usize) -> Vec<Vec<u32>> {
+fn acquire_worker_buffers(lengths: &[usize]) -> Vec<Vec<u32>> {
     let mut pool = worker_buffer_pool()
         .lock()
         .expect("worker buffer pool mutex should not be poisoned");
-    let mut buffers = Vec::with_capacity(count);
-    for _ in 0..count {
+    let mut buffers = Vec::with_capacity(lengths.len());
+    for &len in lengths {
         let mut buffer = pool.pop().unwrap_or_default();
-        if buffer.len() < len {
-            buffer.resize(len, 0);
+        buffer.resize(len, 0);
+        if buffer.capacity() > len.saturating_mul(2).max(1) {
+            buffer.shrink_to(len);
         }
         buffers.push(buffer);
     }
@@ -109,6 +142,40 @@ fn release_worker_buffers(buffers: Vec<Vec<u32>>) {
         .lock()
         .expect("worker buffer pool mutex should not be poisoned");
     pool.extend(buffers);
+}
+
+fn with_render_buffer_rows<T>(rows: BufferRows, render: impl FnOnce() -> T) -> T {
+    struct RenderBufferRowsReset<'a> {
+        cell: &'a Cell<BufferRows>,
+        previous: BufferRows,
+    }
+
+    impl Drop for RenderBufferRowsReset<'_> {
+        fn drop(&mut self) {
+            self.cell.set(self.previous);
+        }
+    }
+
+    RENDER_BUFFER_ROWS.with(|cell| {
+        let previous = cell.replace(rows);
+        let _reset = RenderBufferRowsReset { cell, previous };
+        render()
+    })
+}
+
+fn current_render_buffer_rows() -> BufferRows {
+    RENDER_BUFFER_ROWS.with(|cell| cell.get())
+}
+
+fn dirty_job_group_rows(jobs: &[DirtyRenderJob]) -> Option<BufferRows> {
+    let first = jobs.first()?;
+    let mut start = first.clip.y0.max(0.0) as usize;
+    let mut end = first.clip.y1.max(0.0) as usize;
+    for job in jobs.iter().skip(1) {
+        start = start.min(job.clip.y0.max(0.0) as usize);
+        end = end.max(job.clip.y1.max(0.0) as usize);
+    }
+    (start < end).then_some(BufferRows::new(start, end))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -610,33 +677,37 @@ fn render_to_buffer_parallel(
     let rows_per_worker = height.div_ceil(band_count);
     let bands = (0..height)
         .step_by(rows_per_worker)
-        .map(|row_start| (row_start, (row_start + rows_per_worker).min(height)))
+        .map(|row_start| BufferRows::new(row_start, (row_start + rows_per_worker).min(height)))
         .collect::<Vec<_>>();
-    let mut worker_buffers = acquire_worker_buffers(bands.len(), width * height);
+    let worker_buffer_lengths = bands
+        .iter()
+        .map(|rows| rows.pixel_len(width))
+        .collect::<Vec<_>>();
+    let mut worker_buffers = acquire_worker_buffers(&worker_buffer_lengths);
 
     thread::scope(|scope| {
         let mut handles = Vec::new();
-        for (worker_buffer, (row_start, row_end)) in
-            worker_buffers.iter_mut().zip(bands.iter().copied())
-        {
+        for (worker_buffer, rows) in worker_buffers.iter_mut().zip(bands.iter().copied()) {
             let band_clip = ClipRect {
                 x0: 0.0,
-                y0: row_start as f32,
+                y0: rows.start as f32,
                 x1: width as f32,
-                y1: row_end as f32,
+                y1: rows.end as f32,
             };
             handles.push(scope.spawn(move || {
-                clear_rows(worker_buffer, width, row_start, row_end, clear);
-                for node in scene {
-                    draw_node(
-                        node,
-                        worker_buffer,
-                        width,
-                        height,
-                        band_clip,
-                        CullMode::Subtree,
-                    );
-                }
+                with_render_buffer_rows(rows, || {
+                    worker_buffer.fill(clear);
+                    for node in scene {
+                        draw_node(
+                            node,
+                            worker_buffer,
+                            width,
+                            height,
+                            band_clip,
+                            CullMode::Subtree,
+                        );
+                    }
+                });
             }));
         }
 
@@ -645,10 +716,10 @@ fn render_to_buffer_parallel(
         }
     });
 
-    for (worker_buffer, (row_start, row_end)) in worker_buffers.iter().zip(bands.iter().copied()) {
-        let start = row_start * width;
-        let end = row_end * width;
-        buffer[start..end].copy_from_slice(&worker_buffer[start..end]);
+    for (worker_buffer, rows) in worker_buffers.iter().zip(bands.iter().copied()) {
+        let start = rows.start * width;
+        let end = rows.end * width;
+        buffer[start..end].copy_from_slice(worker_buffer);
     }
 
     release_worker_buffers(worker_buffers);
@@ -746,26 +817,43 @@ fn render_scene_update_parallel(
 ) {
     let worker_count = worker_count.max(1).min(dirty_jobs.len().max(1));
     let job_groups = distribute_dirty_render_jobs(dirty_jobs, worker_count);
+    let group_rows = job_groups
+        .iter()
+        .map(|jobs| {
+            dirty_job_group_rows(jobs)
+                .expect("dirty render groups should only contain non-empty row spans")
+        })
+        .collect::<Vec<_>>();
     let clear = pack_rgb(clear_color);
-    let mut worker_buffers = acquire_worker_buffers(job_groups.len(), width * height);
+    let worker_buffer_lengths = group_rows
+        .iter()
+        .map(|rows| rows.pixel_len(width))
+        .collect::<Vec<_>>();
+    let mut worker_buffers = acquire_worker_buffers(&worker_buffer_lengths);
 
     thread::scope(|scope| {
         let mut handles = Vec::new();
-        for (worker_buffer, jobs) in worker_buffers.iter_mut().zip(job_groups.iter()) {
+        for ((worker_buffer, jobs), rows) in worker_buffers
+            .iter_mut()
+            .zip(job_groups.iter())
+            .zip(group_rows.iter().copied())
+        {
             handles.push(scope.spawn(move || {
-                for job in jobs {
-                    clear_clip_packed(worker_buffer, width, height, job.clip, clear);
-                    for (node, bounds) in scene.iter().zip(cached_bounds) {
-                        draw_node_with_cached_bounds(
-                            node,
-                            bounds,
-                            worker_buffer,
-                            width,
-                            height,
-                            job.clip,
-                        );
+                with_render_buffer_rows(rows, || {
+                    for job in jobs {
+                        clear_clip_packed(worker_buffer, width, height, job.clip, clear);
+                        for (node, bounds) in scene.iter().zip(cached_bounds) {
+                            draw_node_with_cached_bounds(
+                                node,
+                                bounds,
+                                worker_buffer,
+                                width,
+                                height,
+                                job.clip,
+                            );
+                        }
                     }
-                }
+                });
             }));
         }
 
@@ -776,17 +864,25 @@ fn render_scene_update_parallel(
         }
     });
 
-    for (worker_buffer, jobs) in worker_buffers.iter().zip(job_groups.iter()) {
+    for ((worker_buffer, jobs), rows) in worker_buffers
+        .iter()
+        .zip(job_groups.iter())
+        .zip(group_rows.iter().copied())
+    {
         for job in jobs {
             let Some((x0, y0, x1, y1)) = clip_pixel_bounds(job.clip, width, height) else {
                 continue;
             };
 
             for y in y0..y1 {
-                let row_start = y as usize * width;
-                let start = row_start + x0 as usize;
-                let end = row_start + x1 as usize;
-                buffer[start..end].copy_from_slice(&worker_buffer[start..end]);
+                let destination_row_start = y as usize * width;
+                let source_row_start = (y as usize - rows.start) * width;
+                let destination_start = destination_row_start + x0 as usize;
+                let destination_end = destination_row_start + x1 as usize;
+                let source_start = source_row_start + x0 as usize;
+                let source_end = source_row_start + x1 as usize;
+                buffer[destination_start..destination_end]
+                    .copy_from_slice(&worker_buffer[source_start..source_end]);
             }
         }
     }
@@ -2211,22 +2307,14 @@ fn clear_clip_packed(buffer: &mut [u32], width: usize, height: usize, clip: Clip
     let Some((x0, y0, x1, y1)) = clip_pixel_bounds(clip, width, height) else {
         return;
     };
+    let rows = current_render_buffer_rows();
+    let row_start = (y0 as usize).max(rows.start);
+    let row_end = (y1 as usize).min(rows.end);
 
-    for y in y0..y1 {
-        let start = y as usize * width + x0 as usize;
-        let end = y as usize * width + x1 as usize;
-        buffer[start..end].fill(clear);
-    }
-}
-
-fn clear_rows(buffer: &mut [u32], width: usize, row_start: usize, row_end: usize, clear: u32) {
-    if row_start >= row_end {
-        return;
-    }
-
-    let start = row_start.saturating_mul(width);
-    let end = row_end.saturating_mul(width).min(buffer.len());
-    if start < end {
+    for y in row_start..row_end {
+        let local_row_start = (y - rows.start) * width;
+        let start = local_row_start + x0 as usize;
+        let end = local_row_start + x1 as usize;
         buffer[start..end].fill(clear);
     }
 }
@@ -2541,8 +2629,13 @@ fn blend_pixel(buffer: &mut [u32], width: usize, height: usize, x: i32, y: i32, 
     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
         return;
     }
+    let rows = current_render_buffer_rows();
+    let y = y as usize;
+    if y < rows.start || y >= rows.end {
+        return;
+    }
 
-    let index = y as usize * width + x as usize;
+    let index = (y - rows.start) * width + x as usize;
     if color.a == 255 {
         buffer[index] = pack_rgb(color);
         return;
@@ -2727,6 +2820,19 @@ mod tests {
         super::render_to_buffer_parallel(&scene, &mut threaded, 128, 96, Color::BLACK, 4);
 
         assert_eq!(single, threaded);
+    }
+
+    #[test]
+    fn blend_pixel_respects_local_worker_row_offsets() {
+        let mut buffer = vec![0_u32; 3 * 2];
+
+        super::with_render_buffer_rows(super::BufferRows::new(4, 6), || {
+            blend_pixel(&mut buffer, 3, 8, 1, 4, Color::rgb(40, 120, 220));
+            blend_pixel(&mut buffer, 3, 8, 2, 5, Color::rgb(220, 38, 38));
+        });
+
+        assert_eq!(buffer[1], pack_rgb(Color::rgb(40, 120, 220)));
+        assert_eq!(buffer[5], pack_rgb(Color::rgb(220, 38, 38)));
     }
 
     #[test]
