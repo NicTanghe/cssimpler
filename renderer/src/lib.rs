@@ -8,7 +8,11 @@ mod color;
 mod fonts;
 mod scrollbar;
 
-use crate::color::{resolve_angle_stops, resolve_length_stops, sample_gradient};
+use crate::color::{
+    length_stops_use_fraction_only, prepare_length_gradient, prepare_resolved_gradient,
+    resolve_angle_stops, resolve_length_stops, sample_prepared_gradient,
+    sample_prepared_length_gradient,
+};
 use cssimpler_core::{
     BackgroundLayer, CircleRadius, Color, ConicGradient, CornerRadius, ElementInteractionState,
     ElementPath, EllipseRadius, EventHandler, GradientDirection, GradientHorizontal, GradientPoint,
@@ -19,9 +23,13 @@ use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
 const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 32;
 const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.85;
+const DIRTY_BRANCH_COLLAPSE_THRESHOLD: usize = 3;
+const DIRTY_BRANCH_COLLAPSE_MAX_AREA_RATIO: f32 = 2.5;
+const DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO: f32 = 1.35;
 const MIN_PARALLEL_RENDER_PIXELS: usize = 640 * 480;
-const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 120;
-const MAX_RENDER_WORKERS: usize = 8;
+const MIN_INCREMENTAL_PIXELS_PER_WORKER: usize = 160 * 160;
+const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 80;
+const MAX_RENDER_WORKERS: usize = 12;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FramePaintMode {
@@ -50,7 +58,14 @@ struct PaintStats {
     mode: FramePaintMode,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DirtyRenderJob {
+    clip: ClipRect,
+    pixel_count: usize,
+}
+
 static FRAME_TIMING_STATS: OnceLock<Mutex<FrameTimingStats>> = OnceLock::new();
+static WORKER_BUFFER_POOL: OnceLock<Mutex<Vec<Vec<u32>>>> = OnceLock::new();
 
 pub fn latest_frame_timing_stats() -> FrameTimingStats {
     *frame_timing_stats_store()
@@ -66,6 +81,32 @@ fn record_frame_timing_stats(stats: FrameTimingStats) {
 
 fn frame_timing_stats_store() -> &'static Mutex<FrameTimingStats> {
     FRAME_TIMING_STATS.get_or_init(|| Mutex::new(FrameTimingStats::default()))
+}
+
+fn worker_buffer_pool() -> &'static Mutex<Vec<Vec<u32>>> {
+    WORKER_BUFFER_POOL.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn acquire_worker_buffers(count: usize, len: usize) -> Vec<Vec<u32>> {
+    let mut pool = worker_buffer_pool()
+        .lock()
+        .expect("worker buffer pool mutex should not be poisoned");
+    let mut buffers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut buffer = pool.pop().unwrap_or_default();
+        if buffer.len() < len {
+            buffer.resize(len, 0);
+        }
+        buffers.push(buffer);
+    }
+    buffers
+}
+
+fn release_worker_buffers(buffers: Vec<Vec<u32>>) {
+    let mut pool = worker_buffer_pool()
+        .lock()
+        .expect("worker buffer pool mutex should not be poisoned");
+    pool.extend(buffers);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -566,9 +607,7 @@ fn render_to_buffer_parallel(
         .step_by(rows_per_worker)
         .map(|row_start| (row_start, (row_start + rows_per_worker).min(height)))
         .collect::<Vec<_>>();
-    let mut worker_buffers = (0..bands.len())
-        .map(|_| vec![clear; width * height])
-        .collect::<Vec<_>>();
+    let mut worker_buffers = acquire_worker_buffers(bands.len(), width * height);
 
     thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -582,6 +621,7 @@ fn render_to_buffer_parallel(
                 y1: row_end as f32,
             };
             handles.push(scope.spawn(move || {
+                clear_rows(worker_buffer, width, row_start, row_end, clear);
                 for node in scene {
                     draw_node(
                         node,
@@ -600,11 +640,13 @@ fn render_to_buffer_parallel(
         }
     });
 
-    for (worker_buffer, (row_start, row_end)) in worker_buffers.into_iter().zip(bands) {
+    for (worker_buffer, (row_start, row_end)) in worker_buffers.iter().zip(bands.iter().copied()) {
         let start = row_start * width;
         let end = row_end * width;
         buffer[start..end].copy_from_slice(&worker_buffer[start..end]);
     }
+
+    release_worker_buffers(worker_buffers);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -651,7 +693,8 @@ fn render_scene_update_internal(
         .collect::<Vec<_>>();
     let cached_bounds = cache_scene_subtree_bounds(scene);
 
-    let worker_count = incremental_render_worker_count(width, height, snapped_dirty_regions.len());
+    let dirty_jobs = build_incremental_render_jobs(&snapped_dirty_regions, width, height);
+    let worker_count = incremental_render_worker_count(&dirty_jobs);
     if worker_count > 1 {
         render_scene_update_parallel(
             scene,
@@ -660,7 +703,7 @@ fn render_scene_update_internal(
             width,
             height,
             clear_color,
-            &snapped_dirty_regions,
+            &dirty_jobs,
             worker_count,
         );
         return PaintStats {
@@ -691,24 +734,20 @@ fn render_scene_update_parallel(
     width: usize,
     height: usize,
     clear_color: Color,
-    dirty_regions: &[ClipRect],
+    dirty_jobs: &[DirtyRenderJob],
     worker_count: usize,
 ) {
-    let worker_count = worker_count.max(1).min(dirty_regions.len().max(1));
-    let region_groups = dirty_regions
-        .chunks(dirty_regions.len().div_ceil(worker_count))
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>();
+    let worker_count = worker_count.max(1).min(dirty_jobs.len().max(1));
+    let job_groups = distribute_dirty_render_jobs(dirty_jobs, worker_count);
     let clear = pack_rgb(clear_color);
-    let mut worker_buffers = (0..region_groups.len())
-        .map(|_| vec![clear; width * height])
-        .collect::<Vec<_>>();
+    let mut worker_buffers = acquire_worker_buffers(job_groups.len(), width * height);
 
     thread::scope(|scope| {
         let mut handles = Vec::new();
-        for (worker_buffer, regions) in worker_buffers.iter_mut().zip(region_groups.iter()) {
+        for (worker_buffer, jobs) in worker_buffers.iter_mut().zip(job_groups.iter()) {
             handles.push(scope.spawn(move || {
-                for &dirty_region in regions {
+                for job in jobs {
+                    clear_clip_packed(worker_buffer, width, height, job.clip, clear);
                     for (node, bounds) in scene.iter().zip(cached_bounds) {
                         draw_node_with_cached_bounds(
                             node,
@@ -716,7 +755,7 @@ fn render_scene_update_parallel(
                             worker_buffer,
                             width,
                             height,
-                            dirty_region,
+                            job.clip,
                         );
                     }
                 }
@@ -730,9 +769,9 @@ fn render_scene_update_parallel(
         }
     });
 
-    for (worker_buffer, regions) in worker_buffers.into_iter().zip(region_groups) {
-        for dirty_region in regions {
-            let Some((x0, y0, x1, y1)) = clip_pixel_bounds(dirty_region, width, height) else {
+    for (worker_buffer, jobs) in worker_buffers.iter().zip(job_groups.iter()) {
+        for job in jobs {
+            let Some((x0, y0, x1, y1)) = clip_pixel_bounds(job.clip, width, height) else {
                 continue;
             };
 
@@ -744,18 +783,90 @@ fn render_scene_update_parallel(
             }
         }
     }
+
+    release_worker_buffers(worker_buffers);
 }
 
-fn incremental_render_worker_count(
+fn build_incremental_render_jobs(
+    dirty_regions: &[ClipRect],
     width: usize,
     height: usize,
-    dirty_region_count: usize,
-) -> usize {
-    if dirty_region_count <= 1 {
+) -> Vec<DirtyRenderJob> {
+    let mut jobs = Vec::new();
+
+    for &dirty_region in dirty_regions {
+        let Some((x0, y0, x1, y1)) = clip_pixel_bounds(dirty_region, width, height) else {
+            continue;
+        };
+
+        let band_height = MIN_PARALLEL_RENDER_ROWS_PER_WORKER.max(1);
+        let region_width = (x1 - x0).max(0) as usize;
+        for band_y0 in (y0 as usize..y1 as usize).step_by(band_height) {
+            let band_y1 = (band_y0 + band_height).min(y1 as usize);
+            let pixel_count = region_width.saturating_mul(band_y1.saturating_sub(band_y0));
+            if pixel_count == 0 {
+                continue;
+            }
+            jobs.push(DirtyRenderJob {
+                clip: ClipRect {
+                    x0: x0 as f32,
+                    y0: band_y0 as f32,
+                    x1: x1 as f32,
+                    y1: band_y1 as f32,
+                },
+                pixel_count,
+            });
+        }
+    }
+
+    jobs
+}
+
+fn distribute_dirty_render_jobs(
+    dirty_jobs: &[DirtyRenderJob],
+    worker_count: usize,
+) -> Vec<Vec<DirtyRenderJob>> {
+    let worker_count = worker_count.max(1).min(dirty_jobs.len().max(1));
+    let mut groups = vec![Vec::new(); worker_count];
+    let mut loads = vec![0_usize; worker_count];
+    let mut jobs = dirty_jobs.to_vec();
+    jobs.sort_by(|left, right| right.pixel_count.cmp(&left.pixel_count));
+
+    for job in jobs {
+        let Some((target_index, _)) = loads.iter().enumerate().min_by_key(|(_, load)| **load)
+        else {
+            break;
+        };
+        loads[target_index] = loads[target_index].saturating_add(job.pixel_count);
+        groups[target_index].push(job);
+    }
+
+    groups
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .collect()
+}
+
+fn incremental_render_worker_count(dirty_jobs: &[DirtyRenderJob]) -> usize {
+    if dirty_jobs.len() <= 1 {
         return 1;
     }
 
-    full_redraw_worker_count(width, height).min(dirty_region_count)
+    let total_dirty_pixels = dirty_jobs.iter().map(|job| job.pixel_count).sum::<usize>();
+    if total_dirty_pixels < MIN_INCREMENTAL_PIXELS_PER_WORKER {
+        return 1;
+    }
+
+    let max_workers_from_pixels = total_dirty_pixels
+        .div_ceil(MIN_INCREMENTAL_PIXELS_PER_WORKER)
+        .max(1);
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_RENDER_WORKERS)
+        .min(dirty_jobs.len())
+        .min(max_workers_from_pixels)
+        .max(1)
 }
 
 fn should_present_scene(
@@ -1417,22 +1528,26 @@ fn draw_linear_gradient(
     }
 
     let stops = resolve_length_stops(&gradient.stops, projection_span, min_projection);
+    let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
+    let projection_step = direction.0;
     for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        let mut projection =
+            ((x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
         for x in x0..x1 {
             let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
             if !point_in_rounded_rect(px, py, layout, radius) {
+                projection += projection_step;
                 continue;
             }
 
-            let projection = ((px - center_x) * direction.0) + ((py - center_y) * direction.1);
-            let color = Color::from_linear_rgba(sample_gradient(
-                &stops,
+            let color = Color::from_linear_rgba(sample_prepared_gradient(
+                &prepared,
                 projection,
                 gradient.repeating,
-                gradient.interpolation,
             ));
             blend_pixel(buffer, width, height, x, y, color);
+            projection += projection_step;
         }
     }
 }
@@ -1469,25 +1584,45 @@ fn draw_radial_gradient(
         return;
     }
 
+    let prepared_length_gradient = prepare_length_gradient(&gradient.stops, gradient.interpolation);
+    let fraction_only = length_stops_use_fraction_only(&gradient.stops);
+    let prepared_unit_gradient = fraction_only.then(|| {
+        let unit_stops = resolve_length_stops(&gradient.stops, 1.0, 0.0);
+        prepare_resolved_gradient(&unit_stops, gradient.interpolation)
+    });
+    let inverse_radius_x_squared = 1.0 / (resolved_shape.radius_x * resolved_shape.radius_x);
+    let inverse_radius_y_squared = 1.0 / (resolved_shape.radius_y * resolved_shape.radius_y);
+
     for y in y0..y1 {
+        let py = y as f32 + 0.5;
         for x in x0..x1 {
             let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
             if !point_in_rounded_rect(px, py, layout, radius) {
                 continue;
             }
 
             let dx = px - center_x;
             let dy = py - center_y;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let ray_length = radial_ray_length(dx, dy, resolved_shape);
-            let stops = resolve_length_stops(&gradient.stops, ray_length, 0.0);
-            let color = Color::from_linear_rgba(sample_gradient(
-                &stops,
-                distance,
-                gradient.repeating,
-                gradient.interpolation,
-            ));
+            let color = if let Some(prepared_unit_gradient) = &prepared_unit_gradient {
+                let normalized_distance = ((dx * dx) * inverse_radius_x_squared
+                    + (dy * dy) * inverse_radius_y_squared)
+                    .sqrt();
+                Color::from_linear_rgba(sample_prepared_gradient(
+                    prepared_unit_gradient,
+                    normalized_distance,
+                    gradient.repeating,
+                ))
+            } else {
+                let distance = (dx * dx + dy * dy).sqrt();
+                let ray_length = radial_ray_length(dx, dy, resolved_shape);
+                Color::from_linear_rgba(sample_prepared_length_gradient(
+                    &prepared_length_gradient,
+                    ray_length,
+                    0.0,
+                    distance,
+                    gradient.repeating,
+                ))
+            };
             blend_pixel(buffer, width, height, x, y, color);
         }
     }
@@ -1511,6 +1646,7 @@ fn draw_conic_gradient(
     };
 
     let stops = resolve_angle_stops(&gradient.stops);
+    let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
     let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
 
     for y in y0..y1 {
@@ -1529,11 +1665,10 @@ fn draw_conic_gradient(
                 dx.atan2(-dy).to_degrees().rem_euclid(360.0)
             };
             let position = (angle - gradient.angle).rem_euclid(360.0);
-            let color = Color::from_linear_rgba(sample_gradient(
-                &stops,
+            let color = Color::from_linear_rgba(sample_prepared_gradient(
+                &prepared,
                 position,
                 gradient.repeating,
-                gradient.interpolation,
             ));
             blend_pixel(buffer, width, height, x, y, color);
         }
@@ -1827,7 +1962,9 @@ fn collect_node_dirty_regions(
         return;
     }
 
+    let start_len = dirty_regions.len();
     collect_scene_dirty_regions(&previous.children, &current.children, dirty_regions);
+    maybe_collapse_branch_dirty_regions(previous, current, dirty_regions, start_len);
 }
 
 fn push_subtree_dirty_region(node: &RenderNode, dirty_regions: &mut Vec<ClipRect>) {
@@ -1842,13 +1979,49 @@ fn push_dirty_region(region: Option<ClipRect>, dirty_regions: &mut Vec<ClipRect>
     }
 }
 
+fn maybe_collapse_branch_dirty_regions(
+    previous: &RenderNode,
+    current: &RenderNode,
+    dirty_regions: &mut Vec<ClipRect>,
+    start_len: usize,
+) {
+    let descendant_count = dirty_regions.len().saturating_sub(start_len);
+    if descendant_count < DIRTY_BRANCH_COLLAPSE_THRESHOLD {
+        return;
+    }
+
+    let Some(branch_bounds) = union_optional_bounds(
+        subtree_visual_bounds(previous),
+        subtree_visual_bounds(current),
+    ) else {
+        return;
+    };
+
+    let descendant_area: f32 = dirty_regions[start_len..]
+        .iter()
+        .filter_map(|region| region.intersect(branch_bounds))
+        .map(ClipRect::area)
+        .sum();
+
+    if descendant_area <= f32::EPSILON {
+        return;
+    }
+
+    if branch_bounds.area() > descendant_area * DIRTY_BRANCH_COLLAPSE_MAX_AREA_RATIO {
+        return;
+    }
+
+    dirty_regions.truncate(start_len);
+    dirty_regions.push(branch_bounds);
+}
+
 fn coalesce_dirty_regions(dirty_regions: &mut Vec<ClipRect>) {
     let mut index = 0;
     while index < dirty_regions.len() {
         let mut merged = false;
         let mut other_index = index + 1;
         while other_index < dirty_regions.len() {
-            if dirty_regions[index].overlaps_or_touches(dirty_regions[other_index]) {
+            if should_merge_dirty_regions(dirty_regions[index], dirty_regions[other_index]) {
                 dirty_regions[index] = dirty_regions[index].union(dirty_regions[other_index]);
                 dirty_regions.swap_remove(other_index);
                 merged = true;
@@ -1861,6 +2034,20 @@ fn coalesce_dirty_regions(dirty_regions: &mut Vec<ClipRect>) {
             index += 1;
         }
     }
+}
+
+fn should_merge_dirty_regions(left: ClipRect, right: ClipRect) -> bool {
+    if !left.overlaps_or_touches(right) {
+        return false;
+    }
+
+    let union = left.union(right);
+    let combined_area = left.area() + right.area();
+    if combined_area <= f32::EPSILON {
+        return false;
+    }
+
+    union.area() <= combined_area * DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO
 }
 
 fn should_full_redraw(dirty_regions: &[ClipRect], width: usize, height: usize) -> bool {
@@ -2010,14 +2197,29 @@ fn union_optional_bounds(left: Option<ClipRect>, right: Option<ClipRect>) -> Opt
 }
 
 fn clear_clip(buffer: &mut [u32], width: usize, height: usize, clip: ClipRect, clear_color: Color) {
+    clear_clip_packed(buffer, width, height, clip, pack_rgb(clear_color));
+}
+
+fn clear_clip_packed(buffer: &mut [u32], width: usize, height: usize, clip: ClipRect, clear: u32) {
     let Some((x0, y0, x1, y1)) = clip_pixel_bounds(clip, width, height) else {
         return;
     };
-    let clear = pack_rgb(clear_color);
 
     for y in y0..y1 {
         let start = y as usize * width + x0 as usize;
         let end = y as usize * width + x1 as usize;
+        buffer[start..end].fill(clear);
+    }
+}
+
+fn clear_rows(buffer: &mut [u32], width: usize, row_start: usize, row_end: usize, clear: u32) {
+    if row_start >= row_end {
+        return;
+    }
+
+    let start = row_start.saturating_mul(width);
+    let end = row_end.saturating_mul(width).min(buffer.len());
+    if start < end {
         buffer[start..end].fill(clear);
     }
 }
@@ -2377,6 +2579,7 @@ fn frame_time_to_fps(frame_time: Duration) -> usize {
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
 
     use cssimpler_core::fonts::{FontFamily, TextStyle, TextTransform, register_font_file};
     use cssimpler_core::{
@@ -2387,10 +2590,12 @@ mod tests {
     };
 
     use crate::{
-        ViewportSize, WindowConfig, blend_pixel, dispatch_click, drawable_viewport_size,
-        hit_test_element_path, pack_rgb, render_scene_update, render_to_buffer, resize_buffer,
-        scenes_match_visuals, should_present_frame, should_present_scene, should_suspend_updates,
-        window_options,
+        ClipRect, DirtyRenderJob, FramePaintMode, ViewportSize, WindowConfig, blend_pixel,
+        build_incremental_render_jobs, coalesce_dirty_regions, dirty_regions_between_scenes,
+        dispatch_click, distribute_dirty_render_jobs, drawable_viewport_size,
+        hit_test_element_path, pack_rgb, render_scene_update, render_scene_update_internal,
+        render_to_buffer, resize_buffer, scenes_match_visuals, should_present_frame,
+        should_present_scene, should_suspend_updates, window_options,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -3323,6 +3528,308 @@ mod tests {
         render_to_buffer(&next, &mut full, 20, 20, Color::WHITE);
 
         assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn dirty_regions_collapse_to_a_branch_when_many_children_change_inside_it() {
+        let previous = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 100.0, 100.0))
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 50.0, 50.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(20, 20, 20)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(50.0, 0.0, 50.0, 50.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(20, 20, 20)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 50.0, 50.0, 50.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(20, 20, 20)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(50.0, 50.0, 50.0, 50.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(20, 20, 20)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+
+        let next = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 100.0, 100.0))
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 50.0, 50.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(220, 80, 80)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(50.0, 0.0, 50.0, 50.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(80, 220, 80)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 50.0, 50.0, 50.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(80, 80, 220)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(50.0, 50.0, 50.0, 50.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(20, 20, 20)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+
+        let dirty_regions = dirty_regions_between_scenes(&previous, &next);
+
+        assert_eq!(dirty_regions.len(), 1);
+        let region = dirty_regions[0];
+        assert_eq!(region.x0, 0.0);
+        assert_eq!(region.y0, 0.0);
+        assert_eq!(region.x1, 100.0);
+        assert_eq!(region.y1, 100.0);
+    }
+
+    #[test]
+    fn dirty_regions_do_not_collapse_to_a_huge_parent_when_children_are_sparse() {
+        let previous =
+            vec![
+                RenderNode::container(LayoutBox::new(0.0, 0.0, 1000.0, 1000.0))
+                    .with_child(
+                        RenderNode::container(LayoutBox::new(0.0, 0.0, 100.0, 100.0)).with_style(
+                            VisualStyle {
+                                background: Some(Color::rgb(20, 20, 20)),
+                                ..VisualStyle::default()
+                            },
+                        ),
+                    )
+                    .with_child(
+                        RenderNode::container(LayoutBox::new(450.0, 450.0, 100.0, 100.0))
+                            .with_style(VisualStyle {
+                                background: Some(Color::rgb(20, 20, 20)),
+                                ..VisualStyle::default()
+                            }),
+                    )
+                    .with_child(
+                        RenderNode::container(LayoutBox::new(900.0, 900.0, 100.0, 100.0))
+                            .with_style(VisualStyle {
+                                background: Some(Color::rgb(20, 20, 20)),
+                                ..VisualStyle::default()
+                            }),
+                    ),
+            ];
+
+        let next =
+            vec![
+                RenderNode::container(LayoutBox::new(0.0, 0.0, 1000.0, 1000.0))
+                    .with_child(
+                        RenderNode::container(LayoutBox::new(0.0, 0.0, 100.0, 100.0)).with_style(
+                            VisualStyle {
+                                background: Some(Color::rgb(220, 80, 80)),
+                                ..VisualStyle::default()
+                            },
+                        ),
+                    )
+                    .with_child(
+                        RenderNode::container(LayoutBox::new(450.0, 450.0, 100.0, 100.0))
+                            .with_style(VisualStyle {
+                                background: Some(Color::rgb(80, 220, 80)),
+                                ..VisualStyle::default()
+                            }),
+                    )
+                    .with_child(
+                        RenderNode::container(LayoutBox::new(900.0, 900.0, 100.0, 100.0))
+                            .with_style(VisualStyle {
+                                background: Some(Color::rgb(80, 80, 220)),
+                                ..VisualStyle::default()
+                            }),
+                    ),
+            ];
+
+        let dirty_regions = dirty_regions_between_scenes(&previous, &next);
+
+        assert_eq!(dirty_regions.len(), 3);
+    }
+
+    #[test]
+    fn coalescing_keeps_diagonal_regions_separate_when_the_bounding_box_bloats() {
+        let mut dirty_regions = vec![
+            ClipRect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 40.0,
+                y1: 40.0,
+            },
+            ClipRect {
+                x0: 30.0,
+                y0: 30.0,
+                x1: 70.0,
+                y1: 70.0,
+            },
+        ];
+
+        coalesce_dirty_regions(&mut dirty_regions);
+
+        assert_eq!(dirty_regions.len(), 2);
+    }
+
+    #[test]
+    fn incremental_render_jobs_split_a_tall_dirty_region_into_bands() {
+        let jobs = build_incremental_render_jobs(
+            &[ClipRect {
+                x0: 10.0,
+                y0: 12.0,
+                x1: 110.0,
+                y1: 252.0,
+            }],
+            160,
+            320,
+        );
+
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].pixel_count, 100 * 80);
+        assert_eq!(jobs[1].pixel_count, 100 * 80);
+        assert_eq!(jobs[2].pixel_count, 100 * 80);
+    }
+
+    #[test]
+    fn incremental_render_job_distribution_keeps_worker_loads_close() {
+        let jobs = vec![
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 120.0,
+                    y1: 80.0,
+                },
+                pixel_count: 9600,
+            },
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 0.0,
+                    y0: 80.0,
+                    x1: 120.0,
+                    y1: 160.0,
+                },
+                pixel_count: 9600,
+            },
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 120.0,
+                    y0: 0.0,
+                    x1: 200.0,
+                    y1: 80.0,
+                },
+                pixel_count: 6400,
+            },
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 120.0,
+                    y0: 80.0,
+                    x1: 200.0,
+                    y1: 160.0,
+                },
+                pixel_count: 6400,
+            },
+        ];
+
+        let groups = distribute_dirty_render_jobs(&jobs, 2);
+        let loads = groups
+            .iter()
+            .map(|group| group.iter().map(|job| job.pixel_count).sum::<usize>())
+            .collect::<Vec<_>>();
+
+        assert_eq!(groups.len(), 2);
+        assert!(loads.iter().all(|&load| load >= 12800));
+        assert!(loads.iter().all(|&load| load <= 16000));
+    }
+
+    #[test]
+    fn incremental_render_can_parallelize_a_single_large_dirty_region() {
+        let background =
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 400.0, 400.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(18, 24, 38)),
+                ..VisualStyle::default()
+            });
+        let previous = vec![
+            background.clone(),
+            RenderNode::container(LayoutBox::new(24.0, 40.0, 320.0, 240.0)).with_style(
+                VisualStyle {
+                    background: Some(Color::rgb(40, 120, 220)),
+                    shadows: vec![BoxShadow {
+                        color: Color::rgba(40, 120, 220, 120),
+                        offset_x: 0.0,
+                        offset_y: 0.0,
+                        blur_radius: 8.0,
+                        spread: 0.0,
+                    }],
+                    ..VisualStyle::default()
+                },
+            ),
+        ];
+        let next = vec![
+            background,
+            RenderNode::container(LayoutBox::new(24.0, 40.0, 320.0, 240.0)).with_style(
+                VisualStyle {
+                    background: Some(Color::rgb(220, 120, 40)),
+                    shadows: vec![BoxShadow {
+                        color: Color::rgba(220, 120, 40, 120),
+                        offset_x: 0.0,
+                        offset_y: 0.0,
+                        blur_radius: 8.0,
+                        spread: 0.0,
+                    }],
+                    ..VisualStyle::default()
+                },
+            ),
+        ];
+        let mut incremental = vec![0_u32; 400 * 400];
+        let mut full = vec![0_u32; 400 * 400];
+
+        render_to_buffer(&previous, &mut incremental, 400, 400, Color::WHITE);
+        let stats = render_scene_update_internal(
+            &previous,
+            &next,
+            &mut incremental,
+            400,
+            400,
+            Color::WHITE,
+        );
+        render_to_buffer(&next, &mut full, 400, 400, Color::WHITE);
+
+        assert_eq!(incremental, full);
+        assert_eq!(stats.mode, FramePaintMode::Incremental);
+        if thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            > 1
+        {
+            assert!(stats.workers > 1);
+        }
     }
 
     #[test]
