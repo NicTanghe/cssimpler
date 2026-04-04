@@ -1611,8 +1611,7 @@ fn draw_background_and_border(
     if !node.style.border.widths.is_zero() {
         let inner_layout = inset_layout(node.layout, node.style.border.widths);
         let inner_radius = inset_corner_radius(node.style.corner_radius, node.style.border.widths);
-
-        draw_rounded_ring(
+        if !draw_axis_aligned_opaque_ring(
             buffer,
             width,
             height,
@@ -1621,7 +1620,18 @@ fn draw_background_and_border(
             Some((inner_layout, inner_radius)),
             node.style.border.color,
             clip,
-        );
+        ) {
+            draw_rounded_ring(
+                buffer,
+                width,
+                height,
+                node.layout,
+                node.style.corner_radius,
+                Some((inner_layout, inner_radius)),
+                node.style.border.color,
+                clip,
+            );
+        }
     }
 
     let fill_layout = if node.style.border.widths.is_zero() {
@@ -1636,7 +1646,7 @@ fn draw_background_and_border(
     };
 
     if let Some(background) = node.style.background {
-        draw_rounded_rect(
+        if !draw_axis_aligned_opaque_rect(
             buffer,
             width,
             height,
@@ -1644,7 +1654,17 @@ fn draw_background_and_border(
             fill_radius,
             background,
             clip,
-        );
+        ) {
+            draw_rounded_rect(
+                buffer,
+                width,
+                height,
+                fill_layout,
+                fill_radius,
+                background,
+                clip,
+            );
+        }
     }
 
     for layer in node.style.background_layers.iter().rev() {
@@ -1835,6 +1855,26 @@ fn draw_rounded_rect(
             }
         }
     }
+}
+
+fn draw_axis_aligned_opaque_rect(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    color: Color,
+    clip: ClipRect,
+) -> bool {
+    if color.a != u8::MAX || !corner_radius_is_zero(layout, radius) {
+        return false;
+    }
+
+    let Some((x0, y0, x1, y1)) = opaque_fill_pixel_bounds(layout, clip, width, height) else {
+        return true;
+    };
+    fill_opaque_span_rows(buffer, width, x0, x1, y0, y1, pack_rgb(color));
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -2281,6 +2321,77 @@ fn draw_rounded_ring(
     }
 }
 
+fn draw_axis_aligned_opaque_ring(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    outer_layout: LayoutBox,
+    outer_radius: CornerRadius,
+    inner: Option<(LayoutBox, CornerRadius)>,
+    color: Color,
+    clip: ClipRect,
+) -> bool {
+    if color.a != u8::MAX || !corner_radius_is_zero(outer_layout, outer_radius) {
+        return false;
+    }
+    if let Some((inner_layout, inner_radius)) = inner
+        && !corner_radius_is_zero(inner_layout, inner_radius)
+    {
+        return false;
+    }
+
+    let Some((outer_x0, outer_y0, outer_x1, outer_y1)) =
+        opaque_fill_pixel_bounds(outer_layout, clip, width, height)
+    else {
+        return true;
+    };
+    let packed = pack_rgb(color);
+
+    let Some((inner_layout, _)) = inner else {
+        fill_opaque_span_rows(
+            buffer, width, outer_x0, outer_x1, outer_y0, outer_y1, packed,
+        );
+        return true;
+    };
+
+    let Some((inner_x0, inner_y0, inner_x1, inner_y1)) =
+        center_pixel_bounds(inner_layout, width, height)
+    else {
+        fill_opaque_span_rows(
+            buffer, width, outer_x0, outer_x1, outer_y0, outer_y1, packed,
+        );
+        return true;
+    };
+
+    fill_opaque_span_rows(
+        buffer,
+        width,
+        outer_x0,
+        outer_x1,
+        outer_y0,
+        inner_y0.min(outer_y1),
+        packed,
+    );
+    fill_opaque_span_rows(
+        buffer,
+        width,
+        outer_x0,
+        outer_x1,
+        inner_y1.max(outer_y0),
+        outer_y1,
+        packed,
+    );
+
+    let middle_y0 = inner_y0.max(outer_y0);
+    let middle_y1 = inner_y1.min(outer_y1);
+    if middle_y0 < middle_y1 {
+        fill_opaque_span_rows(buffer, width, outer_x0, inner_x0.min(outer_x1), middle_y0, middle_y1, packed);
+        fill_opaque_span_rows(buffer, width, inner_x1.max(outer_x0), outer_x1, middle_y0, middle_y1, packed);
+    }
+
+    true
+}
+
 fn dirty_regions_between_scenes(
     previous_scene: &[RenderNode],
     scene: &[RenderNode],
@@ -2685,6 +2796,54 @@ fn pixel_bounds(
     (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
 }
 
+fn opaque_fill_pixel_bounds(
+    layout: LayoutBox,
+    clip: ClipRect,
+    width: usize,
+    height: usize,
+) -> Option<(i32, i32, i32, i32)> {
+    let clip = clip.intersect(ClipRect::full(width as f32, height as f32))?;
+    let x0 = layout.x.max(clip.x0).floor().max(0.0) as i32;
+    let y0 = layout.y.max(clip.y0).floor().max(0.0) as i32;
+    let x1 = (layout.x + layout.width)
+        .min(clip.x1)
+        .ceil()
+        .min(width as f32) as i32;
+    let y1 = (layout.y + layout.height)
+        .min(clip.y1)
+        .ceil()
+        .min(height as f32) as i32;
+    let center_x0 = (layout.x - 0.5).ceil().max(0.0) as i32;
+    let center_y0 = (layout.y - 0.5).ceil().max(0.0) as i32;
+    let center_x1 = ((layout.x + layout.width) - 0.5)
+        .ceil()
+        .min(width as f32) as i32;
+    let center_y1 = ((layout.y + layout.height) - 0.5)
+        .ceil()
+        .min(height as f32) as i32;
+    let x0 = x0.max(center_x0);
+    let y0 = y0.max(center_y0);
+    let x1 = x1.min(center_x1);
+    let y1 = y1.min(center_y1);
+    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+}
+
+fn center_pixel_bounds(
+    layout: LayoutBox,
+    width: usize,
+    height: usize,
+) -> Option<(i32, i32, i32, i32)> {
+    let x0 = (layout.x - 0.5).ceil().max(0.0) as i32;
+    let y0 = (layout.y - 0.5).ceil().max(0.0) as i32;
+    let x1 = ((layout.x + layout.width) - 0.5)
+        .ceil()
+        .min(width as f32) as i32;
+    let y1 = ((layout.y + layout.height) - 0.5)
+        .ceil()
+        .min(height as f32) as i32;
+    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+}
+
 fn clip_pixel_bounds(clip: ClipRect, width: usize, height: usize) -> Option<(i32, i32, i32, i32)> {
     let clip = clip.intersect(ClipRect::full(width as f32, height as f32))?;
     let x0 = clip.x0.floor().max(0.0) as i32;
@@ -2702,6 +2861,29 @@ fn snap_clip_to_pixel_grid(clip: ClipRect, width: usize, height: usize) -> Optio
         x1: x1 as f32,
         y1: y1 as f32,
     })
+}
+
+fn fill_opaque_span_rows(
+    buffer: &mut [u32],
+    width: usize,
+    x0: i32,
+    x1: i32,
+    y0: i32,
+    y1: i32,
+    packed: u32,
+) {
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    let rows = current_render_buffer_rows();
+    for y in y0 as usize..y1 as usize {
+        if y < rows.start || y >= rows.end {
+            continue;
+        }
+        let row_start = (y - rows.start) * width;
+        buffer[row_start + x0 as usize..row_start + x1 as usize].fill(packed);
+    }
 }
 
 fn point_in_rounded_rect(x: f32, y: f32, layout: LayoutBox, radius: CornerRadius) -> bool {
@@ -2761,6 +2943,14 @@ fn point_in_rounded_rect(x: f32, y: f32, layout: LayoutBox, radius: CornerRadius
     }
 
     true
+}
+
+fn corner_radius_is_zero(layout: LayoutBox, radius: CornerRadius) -> bool {
+    let radius = clamp_corner_radius(radius, layout.width, layout.height);
+    radius.top_left == 0.0
+        && radius.top_right == 0.0
+        && radius.bottom_right == 0.0
+        && radius.bottom_left == 0.0
 }
 
 fn point_in_corner(x: f32, y: f32, center_x: f32, center_y: f32, radius: f32) -> bool {
@@ -3078,8 +3268,9 @@ mod tests {
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, BoxShadow, CircleRadius, Color, ConicGradient,
         CornerRadius, ElementPath, GradientDirection, GradientHorizontal, GradientInterpolation,
-        GradientPoint, GradientStop, LayoutBox, LengthPercentageValue, LinearGradient, Overflow,
-        RadialGradient, RadialShape, RenderNode, ShadowEffect, TextStrokeStyle, VisualStyle,
+        GradientPoint, GradientStop, Insets, LayoutBox, LengthPercentageValue, LinearGradient,
+        Overflow, RadialGradient, RadialShape, RenderNode, ShadowEffect, TextStrokeStyle,
+        VisualStyle,
     };
 
     use crate::{
@@ -3274,6 +3465,119 @@ mod tests {
 
         assert_eq!(buffer[2 * 16 + 2], pack_rgb(Color::WHITE));
         assert_eq!(buffer[6 * 16 + 6], pack_rgb(Color::rgb(40, 120, 220)));
+    }
+
+    #[test]
+    fn opaque_rect_fast_path_matches_fractional_center_coverage() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.75, 0.25, 2.0, 2.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(40, 120, 220)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 4 * 4];
+
+        render_to_buffer(&scene, &mut buffer, 4, 4, Color::WHITE);
+
+        let accent = pack_rgb(Color::rgb(40, 120, 220));
+        let white = pack_rgb(Color::WHITE);
+        assert_eq!(buffer, vec![
+            white, accent, accent, white, //
+            white, accent, accent, white, //
+            white, white, white, white, //
+            white, white, white, white,
+        ]);
+    }
+
+    #[test]
+    fn opaque_rect_fast_path_respects_fractional_overflow_clip_edges() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(1.8, 0.0, 2.0, 2.0))
+                .with_style(VisualStyle {
+                    overflow: Overflow::CLIP,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 4.0, 2.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(40, 120, 220)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 5 * 2];
+
+        render_to_buffer(&scene, &mut buffer, 5, 2, Color::WHITE);
+
+        let accent = pack_rgb(Color::rgb(40, 120, 220));
+        let white = pack_rgb(Color::WHITE);
+        assert_eq!(buffer, vec![
+            white, accent, accent, accent, white, //
+            white, accent, accent, accent, white,
+        ]);
+    }
+
+    #[test]
+    fn opaque_rectangular_border_fast_path_matches_expected_ring() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(1.25, 1.25, 4.0, 4.0)).with_style(VisualStyle {
+                border: cssimpler_core::BorderStyle {
+                    color: Color::rgb(15, 23, 42),
+                    widths: Insets::all(1.0),
+                },
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 7 * 7];
+
+        render_to_buffer(&scene, &mut buffer, 7, 7, Color::WHITE);
+
+        let border = pack_rgb(Color::rgb(15, 23, 42));
+        let white = pack_rgb(Color::WHITE);
+        assert_eq!(buffer, vec![
+            white, white, white, white, white, white, white, //
+            white, border, border, border, border, white, white, //
+            white, border, white, white, border, white, white, //
+            white, border, white, white, border, white, white, //
+            white, border, border, border, border, white, white, //
+            white, white, white, white, white, white, white, //
+            white, white, white, white, white, white, white,
+        ]);
+    }
+
+    #[test]
+    fn opaque_border_fast_path_respects_fractional_overflow_clip_edges() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(1.8, 0.0, 2.0, 4.0))
+                .with_style(VisualStyle {
+                    overflow: Overflow::CLIP,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 4.0, 4.0)).with_style(
+                        VisualStyle {
+                            border: cssimpler_core::BorderStyle {
+                                color: Color::rgb(15, 23, 42),
+                                widths: Insets::all(1.0),
+                            },
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 5 * 4];
+
+        render_to_buffer(&scene, &mut buffer, 5, 4, Color::WHITE);
+
+        let border = pack_rgb(Color::rgb(15, 23, 42));
+        let white = pack_rgb(Color::WHITE);
+        assert_eq!(buffer, vec![
+            white, border, border, border, white, //
+            white, white, white, border, white, //
+            white, white, white, border, white, //
+            white, border, border, border, white,
+        ]);
     }
 
     #[test]

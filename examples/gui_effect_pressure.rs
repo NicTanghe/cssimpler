@@ -21,6 +21,16 @@ const ACTION_TOGGLE_ANIMATION: u64 = 1 << 5;
 const ACTION_TOGGLE_PULSE: u64 = 1 << 6;
 const ACTION_SPIKE: u64 = 1 << 7;
 const ACTION_RESET: u64 = 1 << 8;
+const ACTION_TOGGLE_BASELINE: u64 = 1 << 9;
+const MANUAL_ACTION_MASK: u64 = ACTION_ADD_TILES
+    | ACTION_REMOVE_TILES
+    | ACTION_ADD_PASSES
+    | ACTION_ADD_ANIMATED_TILES
+    | ACTION_REMOVE_ANIMATED_TILES
+    | ACTION_TOGGLE_ANIMATION
+    | ACTION_TOGGLE_PULSE
+    | ACTION_SPIKE
+    | ACTION_RESET;
 
 const PHASE_COUNT: usize = 3;
 const PHASE_STEP_INTERVAL: Duration = Duration::from_millis(120);
@@ -35,6 +45,11 @@ const TILE_STEP: usize = 8;
 const PASS_STEP: usize = 2;
 const SPIKE_TILE_STEP: usize = 16;
 const SPIKE_PASS_STEP: usize = 4;
+const BASELINE_TILE_COUNT: usize = DEFAULT_TILE_COUNT + SPIKE_TILE_STEP;
+const BASELINE_PASSES_PER_TILE: usize = DEFAULT_PASSES_PER_TILE + SPIKE_PASS_STEP;
+const BASELINE_ANIMATED_TILE_WINDOW: usize = DEFAULT_ANIMATED_TILE_WINDOW + 1;
+const BASELINE_WARMUP_FRAMES: u32 = 30;
+const BASELINE_SAMPLE_FRAMES: u32 = 120;
 
 static ACTIONS: AtomicU64 = AtomicU64::new(0);
 
@@ -53,6 +68,8 @@ pub struct EffectStressState {
     log_elapsed: Duration,
     renderer_stats: FrameTimingStats,
     app_stats: RuntimeStats,
+    baseline_harness: Option<BaselineHarness>,
+    last_baseline_summary: Option<BaselineSummary>,
 }
 
 impl Default for EffectStressState {
@@ -71,12 +88,164 @@ impl Default for EffectStressState {
             log_elapsed: Duration::ZERO,
             renderer_stats: FrameTimingStats::default(),
             app_stats: RuntimeStats::default(),
+            baseline_harness: None,
+            last_baseline_summary: None,
         }
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BaselineHarness {
+    scenario: BaselineScenario,
+    warmup_frames: u32,
+    sample_frames: u32,
+    warmup_frames_remaining: u32,
+    sample_frames_collected: u32,
+    accumulator: BaselineAccumulator,
+    completed: Vec<BaselineScenarioSummary>,
+}
+
+impl BaselineHarness {
+    fn new() -> Self {
+        Self::new_with_limits(BASELINE_WARMUP_FRAMES, BASELINE_SAMPLE_FRAMES)
+    }
+
+    fn new_with_limits(warmup_frames: u32, sample_frames: u32) -> Self {
+        Self {
+            scenario: BaselineScenario::Idle,
+            warmup_frames,
+            sample_frames: sample_frames.max(1),
+            warmup_frames_remaining: warmup_frames,
+            sample_frames_collected: 0,
+            accumulator: BaselineAccumulator::default(),
+            completed: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BaselineScenario {
+    #[default]
+    Idle,
+    AnimatedPaint,
+    PulseLayout,
+}
+
+impl BaselineScenario {
+    const ALL: [Self; 3] = [Self::Idle, Self::AnimatedPaint, Self::PulseLayout];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::AnimatedPaint => "animated-paint",
+            Self::PulseLayout => "pulse-layout",
+        }
+    }
+
+    fn animates(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    fn pulses_layout(self) -> bool {
+        matches!(self, Self::PulseLayout)
+    }
+
+    fn next(self) -> Option<Self> {
+        match self {
+            Self::Idle => Some(Self::AnimatedPaint),
+            Self::AnimatedPaint => Some(Self::PulseLayout),
+            Self::PulseLayout => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BaselineAccumulator {
+    frame_count: u32,
+    render_tree_us_total: u64,
+    scene_prep_us_total: u64,
+    paint_us_total: u64,
+    present_us_total: u64,
+    total_us_total: u64,
+    max_paint_us: u64,
+    max_total_us: u64,
+    idle_frames: u32,
+    full_frames: u32,
+    incremental_frames: u32,
+}
+
+impl BaselineAccumulator {
+    fn observe(&mut self, state: &EffectStressState) {
+        self.frame_count = self.frame_count.saturating_add(1);
+        self.render_tree_us_total = self
+            .render_tree_us_total
+            .saturating_add(state.app_stats.render_tree_us);
+        self.scene_prep_us_total = self
+            .scene_prep_us_total
+            .saturating_add(state.renderer_stats.scene_prep_us);
+        self.paint_us_total = self.paint_us_total.saturating_add(state.renderer_stats.paint_us);
+        self.present_us_total = self
+            .present_us_total
+            .saturating_add(state.renderer_stats.present_us);
+        self.total_us_total = self.total_us_total.saturating_add(state.renderer_stats.total_us);
+        self.max_paint_us = self.max_paint_us.max(state.renderer_stats.paint_us);
+        self.max_total_us = self.max_total_us.max(state.renderer_stats.total_us);
+        match state.renderer_stats.paint_mode {
+            FramePaintMode::Idle => self.idle_frames = self.idle_frames.saturating_add(1),
+            FramePaintMode::Full => self.full_frames = self.full_frames.saturating_add(1),
+            FramePaintMode::Incremental => {
+                self.incremental_frames = self.incremental_frames.saturating_add(1);
+            }
+        }
+    }
+
+    fn finish(&self, scenario: BaselineScenario) -> BaselineScenarioSummary {
+        BaselineScenarioSummary {
+            scenario,
+            frames: self.frame_count.max(1),
+            avg_render_tree_us: self.render_tree_us_total / u64::from(self.frame_count.max(1)),
+            avg_scene_prep_us: self.scene_prep_us_total / u64::from(self.frame_count.max(1)),
+            avg_paint_us: self.paint_us_total / u64::from(self.frame_count.max(1)),
+            avg_present_us: self.present_us_total / u64::from(self.frame_count.max(1)),
+            avg_total_us: self.total_us_total / u64::from(self.frame_count.max(1)),
+            max_paint_us: self.max_paint_us,
+            max_total_us: self.max_total_us,
+            idle_frames: self.idle_frames,
+            full_frames: self.full_frames,
+            incremental_frames: self.incremental_frames,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BaselineScenarioSummary {
+    scenario: BaselineScenario,
+    frames: u32,
+    avg_render_tree_us: u64,
+    avg_scene_prep_us: u64,
+    avg_paint_us: u64,
+    avg_present_us: u64,
+    avg_total_us: u64,
+    max_paint_us: u64,
+    max_total_us: u64,
+    idle_frames: u32,
+    full_frames: u32,
+    incremental_frames: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BaselineSummary {
+    tile_count: usize,
+    passes_per_tile: usize,
+    animated_tile_window: usize,
+    scenarios: Vec<BaselineScenarioSummary>,
+}
+
 fn main() -> Result<()> {
     let config = WindowConfig::new("cssimpler / gui effect pressure", 1440, 960);
+    if baseline_autostart_requested() {
+        ACTIONS.fetch_or(ACTION_TOGGLE_BASELINE, Ordering::Relaxed);
+    }
 
     App::new(EffectStressState::default(), stylesheet(), update, build_ui)
         .run(config)
@@ -110,6 +279,20 @@ pub fn apply_frame(state: &mut EffectStressState, frame: FrameInfo, actions: u64
     }
 
     let mut invalidation = Invalidation::Clean;
+    let baseline_toggle_requested = actions & ACTION_TOGGLE_BASELINE != 0;
+    let manual_actions = actions & MANUAL_ACTION_MASK;
+
+    if state.baseline_harness.is_some() && manual_actions != 0 && !baseline_toggle_requested {
+        cancel_baseline_harness(state, "manual override");
+    }
+
+    if baseline_toggle_requested {
+        if state.baseline_harness.is_some() {
+            cancel_baseline_harness(state, "stopped");
+        } else {
+            invalidation = invalidation.max(start_baseline_harness(state));
+        }
+    }
 
     if actions & ACTION_ADD_TILES != 0 {
         state.tile_count = (state.tile_count.saturating_add(TILE_STEP)).min(MAX_TILE_COUNT);
@@ -160,6 +343,8 @@ pub fn apply_frame(state: &mut EffectStressState, frame: FrameInfo, actions: u64
         invalidation = invalidation.max(Invalidation::Paint);
     }
 
+    invalidation = invalidation.max(advance_baseline_harness(state));
+
     if !state.animate || state.tile_count == 0 {
         state.phase_elapsed = Duration::ZERO;
         return invalidation;
@@ -176,6 +361,160 @@ pub fn apply_frame(state: &mut EffectStressState, frame: FrameInfo, actions: u64
     state.animation_band_start = (state.animation_band_start + tick_count) % state.tile_count;
 
     invalidation.max(animation_invalidation(state))
+}
+
+fn baseline_autostart_requested() -> bool {
+    matches!(
+        std::env::var("CSSIMPLER_PRESSURE_BASELINE").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn start_baseline_harness(state: &mut EffectStressState) -> Invalidation {
+    let harness = BaselineHarness::new();
+    let invalidation = apply_baseline_scenario(state, harness.scenario);
+    eprintln!(
+        "[gui_effect_pressure_baseline] status=start preset={}t/{}p/{}live warmup={} sample={} scenario={}",
+        BASELINE_TILE_COUNT,
+        BASELINE_PASSES_PER_TILE,
+        BASELINE_ANIMATED_TILE_WINDOW,
+        harness.warmup_frames,
+        harness.sample_frames,
+        harness.scenario.label(),
+    );
+    state.baseline_harness = Some(harness);
+    state.last_baseline_summary = None;
+    invalidation
+}
+
+fn cancel_baseline_harness(state: &mut EffectStressState, reason: &str) {
+    let Some(harness) = state.baseline_harness.take() else {
+        return;
+    };
+    eprintln!(
+        "[gui_effect_pressure_baseline] status=cancel reason={} scenario={} warmup_left={} samples={}/{}",
+        reason,
+        harness.scenario.label(),
+        harness.warmup_frames_remaining,
+        harness.sample_frames_collected,
+        harness.sample_frames,
+    );
+}
+
+fn advance_baseline_harness(state: &mut EffectStressState) -> Invalidation {
+    let Some(mut harness) = state.baseline_harness.take() else {
+        return Invalidation::Clean;
+    };
+
+    if harness.warmup_frames_remaining > 0 {
+        harness.warmup_frames_remaining = harness.warmup_frames_remaining.saturating_sub(1);
+        state.baseline_harness = Some(harness);
+        return Invalidation::Clean;
+    }
+
+    harness.accumulator.observe(state);
+    harness.sample_frames_collected = harness.sample_frames_collected.saturating_add(1);
+
+    if harness.sample_frames_collected < harness.sample_frames {
+        state.baseline_harness = Some(harness);
+        return Invalidation::Clean;
+    }
+
+    let summary = harness.accumulator.finish(harness.scenario);
+    log_baseline_scenario_summary(&summary);
+    harness.completed.push(summary);
+
+    if let Some(next_scenario) = harness.scenario.next() {
+        harness.scenario = next_scenario;
+        harness.warmup_frames_remaining = harness.warmup_frames;
+        harness.sample_frames_collected = 0;
+        harness.accumulator = BaselineAccumulator::default();
+        let invalidation = apply_baseline_scenario(state, next_scenario);
+        eprintln!(
+            "[gui_effect_pressure_baseline] status=transition scenario={}",
+            next_scenario.label(),
+        );
+        state.baseline_harness = Some(harness);
+        return invalidation;
+    }
+
+    let report = BaselineSummary {
+        tile_count: BASELINE_TILE_COUNT,
+        passes_per_tile: BASELINE_PASSES_PER_TILE,
+        animated_tile_window: BASELINE_ANIMATED_TILE_WINDOW,
+        scenarios: harness.completed,
+    };
+    log_baseline_completion(&report);
+    state.last_baseline_summary = Some(report);
+    Invalidation::Clean
+}
+
+fn apply_baseline_scenario(state: &mut EffectStressState, scenario: BaselineScenario) -> Invalidation {
+    let previous_tile_count = state.tile_count;
+    let previous_passes_per_tile = state.passes_per_tile;
+    let previous_animated_tile_window = state.animated_tile_window;
+    let previous_animate = state.animate;
+    let previous_pulse_layout = state.pulse_layout;
+    let previous_phase = state.phase;
+    let previous_band_start = state.animation_band_start;
+
+    state.tile_count = BASELINE_TILE_COUNT;
+    state.passes_per_tile = BASELINE_PASSES_PER_TILE;
+    state.animated_tile_window = BASELINE_ANIMATED_TILE_WINDOW;
+    state.animate = scenario.animates();
+    state.pulse_layout = scenario.pulses_layout();
+    state.phase = 0;
+    state.phase_elapsed = Duration::ZERO;
+    state.animation_band_start = 0;
+
+    if previous_tile_count != state.tile_count
+        || previous_passes_per_tile != state.passes_per_tile
+        || previous_animated_tile_window != state.animated_tile_window
+        || previous_pulse_layout != state.pulse_layout
+    {
+        Invalidation::Layout
+    } else if previous_animate != state.animate
+        || previous_phase != state.phase
+        || previous_band_start != state.animation_band_start
+    {
+        Invalidation::Paint
+    } else {
+        Invalidation::Clean
+    }
+}
+
+fn log_baseline_scenario_summary(summary: &BaselineScenarioSummary) {
+    eprintln!(
+        "[gui_effect_pressure_baseline] scenario={} frames={} avg_tree={} avg_scene_prep={} avg_paint={} avg_present={} avg_total={} max_paint={} max_total={} modes=idle:{}/full:{}/incremental:{}",
+        summary.scenario.label(),
+        summary.frames,
+        format_us(summary.avg_render_tree_us),
+        format_us(summary.avg_scene_prep_us),
+        format_us(summary.avg_paint_us),
+        format_us(summary.avg_present_us),
+        format_us(summary.avg_total_us),
+        format_us(summary.max_paint_us),
+        format_us(summary.max_total_us),
+        summary.idle_frames,
+        summary.full_frames,
+        summary.incremental_frames,
+    );
+}
+
+fn log_baseline_completion(summary: &BaselineSummary) {
+    let scenarios = summary
+        .scenarios
+        .iter()
+        .map(|scenario| scenario.scenario.label())
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[gui_effect_pressure_baseline] status=complete preset={}t/{}p/{}live scenarios={}",
+        summary.tile_count,
+        summary.passes_per_tile,
+        summary.animated_tile_window,
+        scenarios,
+    );
 }
 
 pub fn maybe_log_perf(state: &mut EffectStressState, actions: u64) {
@@ -252,6 +591,7 @@ fn build_metric_row(state: &EffectStressState) -> Node {
             {stat_chip("painted", format_pixels(state.renderer_stats.painted_pixels))}
             {stat_chip("scene passes", state.renderer_stats.scene_passes.to_string())}
             {stat_chip("workers", state.renderer_stats.render_workers.to_string())}
+            {stat_chip("baseline", baseline_status_label(state))}
         </div>
     }
 }
@@ -281,6 +621,15 @@ fn build_control_row(state: &EffectStressState) -> Node {
                 },
                 toggle_pulse,
                 state.pulse_layout,
+            )}
+            {control_button(
+                if state.baseline_harness.is_some() {
+                    "stop baseline"
+                } else {
+                    "run baseline"
+                },
+                toggle_baseline,
+                state.baseline_harness.is_some(),
             )}
             {control_button("spike", spike, false)}
             {control_button("reset", reset, false)}
@@ -520,6 +869,44 @@ fn format_pixels(pixels: usize) -> String {
     }
 }
 
+fn baseline_status_label(state: &EffectStressState) -> String {
+    if let Some(harness) = &state.baseline_harness {
+        if harness.warmup_frames_remaining > 0 {
+            let warmed = harness
+                .warmup_frames
+                .saturating_sub(harness.warmup_frames_remaining);
+            format!(
+                "{} warm {}/{}",
+                harness.scenario.label(),
+                warmed,
+                harness.warmup_frames
+            )
+        } else {
+            format!(
+                "{} sample {}/{}",
+                harness.scenario.label(),
+                harness.sample_frames_collected,
+                harness.sample_frames
+            )
+        }
+    } else if let Some(summary) = &state.last_baseline_summary {
+        let avg_paint_us = summary
+            .scenarios
+            .iter()
+            .map(|scenario| scenario.avg_paint_us)
+            .sum::<u64>()
+            / summary.scenarios.len().max(1) as u64;
+        format!("done avg {}", format_us(avg_paint_us))
+    } else {
+        format!(
+            "ready {}t/{}p/{}live",
+            BASELINE_TILE_COUNT,
+            BASELINE_PASSES_PER_TILE,
+            BASELINE_ANIMATED_TILE_WINDOW
+        )
+    }
+}
+
 fn animation_label(state: &EffectStressState) -> &'static str {
     if state.animate { "running" } else { "paused" }
 }
@@ -726,6 +1113,10 @@ fn toggle_pulse() {
     ACTIONS.fetch_or(ACTION_TOGGLE_PULSE, Ordering::Relaxed);
 }
 
+fn toggle_baseline() {
+    ACTIONS.fetch_or(ACTION_TOGGLE_BASELINE, Ordering::Relaxed);
+}
+
 fn spike() {
     ACTIONS.fetch_or(ACTION_SPIKE, Ordering::Relaxed);
 }
@@ -858,12 +1249,14 @@ mod tests {
     use super::{
         ACTION_ADD_ANIMATED_TILES, ACTION_ADD_PASSES, ACTION_ADD_TILES,
         ACTION_REMOVE_ANIMATED_TILES, ACTION_REMOVE_TILES, ACTION_RESET, ACTION_SPIKE,
-        ACTION_TOGGLE_ANIMATION, ACTION_TOGGLE_PULSE, DEFAULT_ANIMATED_TILE_WINDOW,
+        ACTION_TOGGLE_ANIMATION, ACTION_TOGGLE_BASELINE, ACTION_TOGGLE_PULSE,
+        BASELINE_ANIMATED_TILE_WINDOW, BASELINE_PASSES_PER_TILE, BASELINE_TILE_COUNT,
+        BaselineHarness, BaselineScenario, DEFAULT_ANIMATED_TILE_WINDOW,
         DEFAULT_PASSES_PER_TILE, DEFAULT_TILE_COUNT, EffectStressState, animated_pod_count,
         estimated_effect_nodes, normal_app_refresh, phase_label,
     };
-    use cssimpler::app::{Invalidation, Refresh};
-    use cssimpler::renderer::FrameInfo;
+    use cssimpler::app::{Invalidation, Refresh, RuntimeStats};
+    use cssimpler::renderer::{FrameInfo, FramePaintMode, FrameTimingStats};
 
     #[test]
     fn actions_expand_the_effect_wall() {
@@ -1066,6 +1459,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn baseline_action_starts_the_fixed_pressure_preset() {
+        let mut state = EffectStressState::default();
+
+        let refresh = super::apply_frame(&mut state, frame(1), ACTION_TOGGLE_BASELINE);
+
+        assert_eq!(refresh, Invalidation::Layout);
+        assert_eq!(state.tile_count, BASELINE_TILE_COUNT);
+        assert_eq!(state.passes_per_tile, BASELINE_PASSES_PER_TILE);
+        assert_eq!(state.animated_tile_window, BASELINE_ANIMATED_TILE_WINDOW);
+        assert!(!state.animate);
+        assert!(!state.pulse_layout);
+        assert!(state.baseline_harness.is_some());
+        assert_eq!(
+            state.baseline_harness.as_ref().map(|harness| harness.scenario),
+            Some(BaselineScenario::Idle)
+        );
+    }
+
+    #[test]
+    fn baseline_harness_cycles_idle_paint_and_pulse_modes() {
+        let mut state = EffectStressState::default();
+        state.baseline_harness = Some(BaselineHarness::new_with_limits(1, 2));
+
+        let initial = super::apply_baseline_scenario(&mut state, BaselineScenario::Idle);
+        assert_eq!(initial, Invalidation::Layout);
+
+        for _ in 0..12 {
+            let Some(scenario) = state
+                .baseline_harness
+                .as_ref()
+                .map(|harness| harness.scenario)
+            else {
+                break;
+            };
+            apply_baseline_sample(&mut state, scenario);
+            let _ = super::advance_baseline_harness(&mut state);
+        }
+
+        assert!(state.baseline_harness.is_none());
+        let summary = state
+            .last_baseline_summary
+            .as_ref()
+            .expect("baseline run should complete and keep the last summary");
+        assert_eq!(summary.tile_count, BASELINE_TILE_COUNT);
+        assert_eq!(summary.passes_per_tile, BASELINE_PASSES_PER_TILE);
+        assert_eq!(summary.animated_tile_window, BASELINE_ANIMATED_TILE_WINDOW);
+        assert_eq!(summary.scenarios.len(), BaselineScenario::ALL.len());
+        assert_eq!(summary.scenarios[0].scenario, BaselineScenario::Idle);
+        assert_eq!(summary.scenarios[0].avg_paint_us, 0);
+        assert_eq!(summary.scenarios[0].idle_frames, 2);
+        assert_eq!(summary.scenarios[1].scenario, BaselineScenario::AnimatedPaint);
+        assert_eq!(summary.scenarios[1].avg_paint_us, 320);
+        assert_eq!(summary.scenarios[1].incremental_frames, 2);
+        assert_eq!(summary.scenarios[2].scenario, BaselineScenario::PulseLayout);
+        assert_eq!(summary.scenarios[2].avg_render_tree_us, 140);
+        assert_eq!(summary.scenarios[2].full_frames, 2);
+    }
+
     fn frame(frame_index: u64) -> FrameInfo {
         frame_with_delta(frame_index, 16)
     }
@@ -1075,5 +1527,48 @@ mod tests {
             frame_index,
             delta: Duration::from_millis(delta_ms),
         }
+    }
+
+    fn apply_baseline_sample(state: &mut EffectStressState, scenario: BaselineScenario) {
+        state.app_stats = match scenario {
+            BaselineScenario::Idle => RuntimeStats {
+                render_tree_us: 100,
+                ..RuntimeStats::default()
+            },
+            BaselineScenario::AnimatedPaint => RuntimeStats {
+                render_tree_us: 120,
+                ..RuntimeStats::default()
+            },
+            BaselineScenario::PulseLayout => RuntimeStats {
+                render_tree_us: 140,
+                ..RuntimeStats::default()
+            },
+        };
+        state.renderer_stats = match scenario {
+            BaselineScenario::Idle => FrameTimingStats {
+                scene_prep_us: 200,
+                paint_us: 0,
+                present_us: 300,
+                total_us: 500,
+                paint_mode: FramePaintMode::Idle,
+                ..FrameTimingStats::default()
+            },
+            BaselineScenario::AnimatedPaint => FrameTimingStats {
+                scene_prep_us: 220,
+                paint_us: 320,
+                present_us: 420,
+                total_us: 620,
+                paint_mode: FramePaintMode::Incremental,
+                ..FrameTimingStats::default()
+            },
+            BaselineScenario::PulseLayout => FrameTimingStats {
+                scene_prep_us: 240,
+                paint_us: 340,
+                present_us: 440,
+                total_us: 740,
+                paint_mode: FramePaintMode::Full,
+                ..FrameTimingStats::default()
+            },
+        };
     }
 }

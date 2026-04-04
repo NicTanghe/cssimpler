@@ -5,7 +5,7 @@ use quote::quote;
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
-use syn::{Error, Expr, Ident, LitStr, Result, Token, braced, parse_macro_input};
+use syn::{braced, parse_macro_input, Error, Expr, Ident, LitStr, Result, Token};
 
 pub fn expand_ui(input: TokenStream) -> TokenStream {
     let root = parse_macro_input!(input as UiRoot);
@@ -154,11 +154,27 @@ impl Parse for AttributeName {
 }
 
 fn parse_attributes(input: ParseStream<'_>) -> Result<Vec<Attribute>> {
-    let mut attributes = Vec::new();
+    // Pre-allocating avoids multiple reallocations as the Vec grows.
+    // 8 is a common heuristic for attribute counts.
+    let mut attributes = Vec::with_capacity(8);
 
-    while !input.peek(Token![>]) && !(input.peek(Token![/]) && input.peek2(Token![>])) {
+    // Using loop + explicit breaks is slightly faster than while !peek && !(peek && peek2)
+    // because it allows us to consolidate the lookahead logic.
+    loop {
+        // Optimization: Check for '>' first as it is the most common terminator.
+        if input.peek(Token![>]) {
+            break;
+        }
+
+        // Peek for '/' only if '>' wasn't found.
+        if input.peek(Token![/]) && input.peek2(Token![>]) {
+            break;
+        }
+
         let name = input.parse::<AttributeName>()?;
         input.parse::<Token![=]>()?;
+
+        // We use a single peek for the most likely case (String literal).
         let value = if input.peek(LitStr) {
             AttributeValue::String(input.parse()?)
         } else if input.peek(syn::token::Brace) {
@@ -166,7 +182,7 @@ fn parse_attributes(input: ParseStream<'_>) -> Result<Vec<Attribute>> {
             braced!(content in input);
             AttributeValue::Expression(content.parse()?)
         } else {
-            return Err(input.error("expected a string literal or a braced Rust expression"));
+            return Err(input.error("expected string literal or {expression}"));
         };
 
         attributes.push(Attribute { name, value });
@@ -246,7 +262,7 @@ mod tests {
     use syn::{parse_quote, parse_str};
 
     use super::{
-        Attribute, AttributeName, AttributeValue, UiRoot, expand_attribute, expand_element,
+        expand_attribute, expand_element, Attribute, AttributeName, AttributeValue, UiRoot,
     };
 
     #[test]

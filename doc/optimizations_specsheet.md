@@ -68,7 +68,7 @@ Acceptance
 
 ## O2. Pressure demo baseline and acceptance harness
 Depends: O1  
-Status: planned
+Status: in progress
 
 Purpose:
 
@@ -85,7 +85,7 @@ Acceptance
 
 ## O3. Fast paths for simple opaque fills and borders
 Depends: O2  
-Status: planned
+Status: in progress
 
 Purpose:
 
