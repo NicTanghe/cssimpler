@@ -12,20 +12,24 @@ use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
 
 const ACTION_ADD_TILES: u64 = 1 << 0;
-const ACTION_ADD_PASSES: u64 = 1 << 1;
-const ACTION_TOGGLE_ANIMATION: u64 = 1 << 2;
-const ACTION_TOGGLE_PULSE: u64 = 1 << 3;
-const ACTION_SPIKE: u64 = 1 << 4;
-const ACTION_RESET: u64 = 1 << 5;
+const ACTION_REMOVE_TILES: u64 = 1 << 1;
+const ACTION_ADD_PASSES: u64 = 1 << 2;
+const ACTION_ADD_ANIMATED_TILES: u64 = 1 << 3;
+const ACTION_REMOVE_ANIMATED_TILES: u64 = 1 << 4;
+const ACTION_TOGGLE_ANIMATION: u64 = 1 << 5;
+const ACTION_TOGGLE_PULSE: u64 = 1 << 6;
+const ACTION_SPIKE: u64 = 1 << 7;
+const ACTION_RESET: u64 = 1 << 8;
 
 const PHASE_COUNT: usize = 3;
 const PHASE_STEP_INTERVAL: Duration = Duration::from_millis(120);
 const PERF_LOG_INTERVAL: Duration = Duration::from_secs(1);
 pub const MAX_TILE_COUNT: usize = 48;
-const ANIMATED_TILE_WINDOW: usize = 2;
 const ACTIVE_PODS_PER_ANIMATED_TILE: usize = 2;
+const DEFAULT_ANIMATED_TILE_WINDOW: usize = 2;
 const DEFAULT_TILE_COUNT: usize = 12;
 const DEFAULT_PASSES_PER_TILE: usize = 4;
+const ANIMATED_TILE_STEP: usize = 1;
 const TILE_STEP: usize = 8;
 const PASS_STEP: usize = 2;
 const SPIKE_TILE_STEP: usize = 16;
@@ -39,6 +43,7 @@ pub struct EffectStressState {
     last_frame_ms: u128,
     tile_count: usize,
     passes_per_tile: usize,
+    animated_tile_window: usize,
     animate: bool,
     pulse_layout: bool,
     phase: usize,
@@ -56,6 +61,7 @@ impl Default for EffectStressState {
             last_frame_ms: 0,
             tile_count: DEFAULT_TILE_COUNT,
             passes_per_tile: DEFAULT_PASSES_PER_TILE,
+            animated_tile_window: DEFAULT_ANIMATED_TILE_WINDOW,
             animate: true,
             pulse_layout: false,
             phase: 0,
@@ -109,9 +115,27 @@ pub fn apply_frame(state: &mut EffectStressState, frame: FrameInfo, actions: u64
         invalidation = Invalidation::Layout;
     }
 
+    if actions & ACTION_REMOVE_TILES != 0 {
+        state.tile_count = state.tile_count.saturating_sub(TILE_STEP);
+        invalidation = Invalidation::Layout;
+    }
+
     if actions & ACTION_ADD_PASSES != 0 {
         state.passes_per_tile = state.passes_per_tile.saturating_add(PASS_STEP);
         invalidation = Invalidation::Layout;
+    }
+
+    if actions & ACTION_ADD_ANIMATED_TILES != 0 {
+        state.animated_tile_window = state
+            .animated_tile_window
+            .saturating_add(ANIMATED_TILE_STEP)
+            .min(MAX_TILE_COUNT);
+        invalidation = invalidation.max(Invalidation::Paint);
+    }
+
+    if actions & ACTION_REMOVE_ANIMATED_TILES != 0 {
+        state.animated_tile_window = state.animated_tile_window.saturating_sub(ANIMATED_TILE_STEP);
+        invalidation = invalidation.max(Invalidation::Paint);
     }
 
     if actions & ACTION_TOGGLE_PULSE != 0 {
@@ -162,10 +186,11 @@ pub fn maybe_log_perf(state: &mut EffectStressState, actions: u64) {
     }
 
     eprintln!(
-        "[gui_effect_pressure] anim={} phase={} tiles={} passes={} dt={}ms tree={} paint={} present={} total={} mode={} dirty={} jobs={} workers={}",
+        "[gui_effect_pressure] anim={} phase={} tiles={} live_window={} passes={} dt={}ms tree={} paint={} present={} total={} mode={} dirty={} jobs={} workers={}",
         animation_label(state),
         phase_label(state.phase),
         state.tile_count,
+        state.animated_tile_window,
         state.passes_per_tile,
         state.last_frame_ms,
         format_us(state.app_stats.render_tree_us),
@@ -195,6 +220,7 @@ fn build_metric_row(state: &EffectStressState) -> Node {
         <div class="metric-row">
             {stat_chip("tiles", state.tile_count.to_string())}
             {stat_chip("passes / tile", state.passes_per_tile.to_string())}
+            {stat_chip("live window", state.animated_tile_window.to_string())}
             {stat_chip("effect pods", total_pods(state).to_string())}
             {stat_chip("animated tiles", animated_tile_count(state).to_string())}
             {stat_chip("animated pods", animated_pod_count(state).to_string())}
@@ -222,8 +248,11 @@ fn build_metric_row(state: &EffectStressState) -> Node {
 fn build_control_row(state: &EffectStressState) -> Node {
     ui! {
         <div class="control-row">
+            {control_button("-8 tiles", remove_tiles, false)}
             {control_button("+8 tiles", add_tiles, false)}
             {control_button("+2 passes / tile", add_passes, false)}
+            {control_button("-1 live tile", remove_animated_tiles, false)}
+            {control_button("+1 live tile", add_animated_tiles, false)}
             {control_button(
                 if state.animate {
                     "stop animation"
@@ -421,7 +450,7 @@ fn total_pods(state: &EffectStressState) -> usize {
 
 fn animated_tile_count(state: &EffectStressState) -> usize {
     if state.animate {
-        state.tile_count.min(ANIMATED_TILE_WINDOW)
+        state.tile_count.min(state.animated_tile_window)
     } else {
         0
     }
@@ -488,17 +517,39 @@ fn static_phase(tile_index: usize, pass_index: usize) -> usize {
 
 fn tile_is_animated(index: usize, state: &EffectStressState) -> bool {
     state.animate
-        && animated_tile_indices(state.tile_count, state.animation_band_start).contains(&index)
+        && animation_band_contains(
+            index,
+            state.tile_count,
+            state.animation_band_start,
+            state.animated_tile_window,
+        )
 }
 
-pub fn animated_tile_indices(tile_count: usize, band_start: usize) -> Vec<usize> {
-    if tile_count == 0 {
+pub fn animated_tile_indices(
+    tile_count: usize,
+    band_start: usize,
+    animated_tile_window: usize,
+) -> Vec<usize> {
+    if tile_count == 0 || animated_tile_window == 0 {
         return Vec::new();
     }
 
-    (0..tile_count.min(ANIMATED_TILE_WINDOW))
+    (0..tile_count.min(animated_tile_window))
         .map(|offset| (band_start + offset) % tile_count)
         .collect()
+}
+
+fn animation_band_contains(
+    index: usize,
+    tile_count: usize,
+    band_start: usize,
+    animated_tile_window: usize,
+) -> bool {
+    if tile_count == 0 || animated_tile_window == 0 {
+        return false;
+    }
+
+    (0..tile_count.min(animated_tile_window)).any(|offset| (band_start + offset) % tile_count == index)
 }
 
 fn elapsed_tick_count(elapsed: Duration) -> usize {
@@ -621,8 +672,20 @@ fn add_tiles() {
     ACTIONS.fetch_or(ACTION_ADD_TILES, Ordering::Relaxed);
 }
 
+fn remove_tiles() {
+    ACTIONS.fetch_or(ACTION_REMOVE_TILES, Ordering::Relaxed);
+}
+
 fn add_passes() {
     ACTIONS.fetch_or(ACTION_ADD_PASSES, Ordering::Relaxed);
+}
+
+fn add_animated_tiles() {
+    ACTIONS.fetch_or(ACTION_ADD_ANIMATED_TILES, Ordering::Relaxed);
+}
+
+fn remove_animated_tiles() {
+    ACTIONS.fetch_or(ACTION_REMOVE_ANIMATED_TILES, Ordering::Relaxed);
 }
 
 fn toggle_animation() {
@@ -654,6 +717,18 @@ pub fn take_actions() -> u64 {
     ACTIONS.swap(0, Ordering::Relaxed)
 }
 
+fn active_tile_indices(state: &EffectStressState) -> Vec<usize> {
+    if !state.animate {
+        return Vec::new();
+    }
+
+    animated_tile_indices(
+        state.tile_count,
+        state.animation_band_start,
+        state.animated_tile_window,
+    )
+}
+
 pub fn tile_fragment_id(tile_index: usize) -> String {
     format!("tile-{tile_index:02}")
 }
@@ -667,13 +742,9 @@ pub fn normal_app_refresh(
         Invalidation::Clean => Refresh::clean(),
         Invalidation::Paint => {
             let mut ids = vec!["hero".to_string()];
-            for tile_index in
-                animated_tile_indices(previous.tile_count, previous.animation_band_start)
-                    .into_iter()
-                    .chain(animated_tile_indices(
-                        next.tile_count,
-                        next.animation_band_start,
-                    ))
+            for tile_index in active_tile_indices(previous)
+                .into_iter()
+                .chain(active_tile_indices(next))
             {
                 let id = tile_fragment_id(tile_index);
                 if !ids.iter().any(|existing| existing == &id) {
@@ -695,13 +766,9 @@ pub fn fragment_refresh(
         Invalidation::Clean => Refresh::clean(),
         Invalidation::Paint => {
             let mut ids = vec!["hero".to_string()];
-            for tile_index in
-                animated_tile_indices(previous.tile_count, previous.animation_band_start)
-                    .into_iter()
-                    .chain(animated_tile_indices(
-                        next.tile_count,
-                        next.animation_band_start,
-                    ))
+            for tile_index in active_tile_indices(previous)
+                .into_iter()
+                .chain(active_tile_indices(next))
             {
                 let id = tile_fragment_id(tile_index);
                 if !ids.iter().any(|existing| existing == &id) {
@@ -759,9 +826,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ACTION_ADD_PASSES, ACTION_ADD_TILES, ACTION_RESET, ACTION_SPIKE, ACTION_TOGGLE_ANIMATION,
-        ACTION_TOGGLE_PULSE, DEFAULT_PASSES_PER_TILE, DEFAULT_TILE_COUNT, EffectStressState,
-        animated_pod_count, estimated_effect_nodes, normal_app_refresh, phase_label,
+        ACTION_ADD_ANIMATED_TILES, ACTION_ADD_PASSES, ACTION_ADD_TILES,
+        ACTION_REMOVE_ANIMATED_TILES, ACTION_REMOVE_TILES, ACTION_RESET, ACTION_SPIKE,
+        ACTION_TOGGLE_ANIMATION, ACTION_TOGGLE_PULSE, DEFAULT_ANIMATED_TILE_WINDOW,
+        DEFAULT_PASSES_PER_TILE, DEFAULT_TILE_COUNT, EffectStressState, animated_pod_count,
+        estimated_effect_nodes, normal_app_refresh, phase_label,
     };
     use cssimpler::app::{Invalidation, Refresh};
     use cssimpler::renderer::FrameInfo;
@@ -781,6 +850,60 @@ mod tests {
         assert!(state.passes_per_tile > DEFAULT_PASSES_PER_TILE);
         assert!(state.animate);
         assert!(state.pulse_layout);
+    }
+
+    #[test]
+    fn tile_controls_can_reduce_the_rendered_wall() {
+        let mut state = EffectStressState {
+            tile_count: 20,
+            ..EffectStressState::default()
+        };
+
+        let refresh = super::apply_frame(&mut state, frame(1), ACTION_REMOVE_TILES);
+
+        assert_eq!(refresh, Invalidation::Layout);
+        assert_eq!(state.tile_count, 12);
+    }
+
+    #[test]
+    fn tile_controls_saturate_at_zero() {
+        let mut state = EffectStressState {
+            tile_count: 4,
+            ..EffectStressState::default()
+        };
+
+        let refresh = super::apply_frame(&mut state, frame(1), ACTION_REMOVE_TILES);
+
+        assert_eq!(refresh, Invalidation::Layout);
+        assert_eq!(state.tile_count, 0);
+    }
+
+    #[test]
+    fn live_window_controls_adjust_the_number_of_animated_tiles() {
+        let mut state = EffectStressState::default();
+
+        let refresh = super::apply_frame(&mut state, frame(1), ACTION_ADD_ANIMATED_TILES);
+
+        assert_eq!(refresh, Invalidation::Paint);
+        assert_eq!(
+            state.animated_tile_window,
+            DEFAULT_ANIMATED_TILE_WINDOW + 1
+        );
+        assert_eq!(super::animated_tile_count(&state), DEFAULT_ANIMATED_TILE_WINDOW + 1);
+    }
+
+    #[test]
+    fn live_window_controls_saturate_at_zero() {
+        let mut state = EffectStressState {
+            animated_tile_window: 1,
+            ..EffectStressState::default()
+        };
+
+        let refresh = super::apply_frame(&mut state, frame(1), ACTION_REMOVE_ANIMATED_TILES);
+
+        assert_eq!(refresh, Invalidation::Paint);
+        assert_eq!(state.animated_tile_window, 0);
+        assert_eq!(super::animated_tile_count(&state), 0);
     }
 
     #[test]
@@ -857,7 +980,12 @@ mod tests {
 
     #[test]
     fn animated_band_wraps_through_the_visible_tiles() {
-        assert_eq!(super::animated_tile_indices(5, 4), vec![4, 0]);
+        assert_eq!(super::animated_tile_indices(5, 4, 2), vec![4, 0]);
+    }
+
+    #[test]
+    fn animated_band_uses_the_requested_window_size() {
+        assert_eq!(super::animated_tile_indices(5, 4, 3), vec![4, 0, 1]);
     }
 
     #[test]
@@ -879,6 +1007,30 @@ mod tests {
             refresh,
             Refresh::fragments(
                 ["hero", "tile-00", "tile-01", "tile-02"],
+                Invalidation::Paint
+            )
+        );
+    }
+
+    #[test]
+    fn normal_app_refresh_includes_new_tiles_when_the_live_window_grows() {
+        let previous = EffectStressState {
+            tile_count: 8,
+            animated_tile_window: 2,
+            animation_band_start: 0,
+            ..EffectStressState::default()
+        };
+        let next = EffectStressState {
+            animated_tile_window: 4,
+            ..previous.clone()
+        };
+
+        let refresh = normal_app_refresh(&previous, &next, Invalidation::Paint);
+
+        assert_eq!(
+            refresh,
+            Refresh::fragments(
+                ["hero", "tile-00", "tile-01", "tile-02", "tile-03"],
                 Invalidation::Paint
             )
         );
