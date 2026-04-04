@@ -33,6 +33,7 @@ const MIN_INCREMENTAL_PIXELS_PER_WORKER: usize = 160 * 160;
 const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 80;
 const MAX_RENDER_WORKERS: usize = 12;
 const MAX_SHADOW_MASK_CACHE_ENTRIES: usize = 256;
+const SCENE_TRAVERSAL_COST_PER_NODE: usize = 96;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FramePaintMode {
@@ -40,6 +41,17 @@ pub enum FramePaintMode {
     Idle,
     Full,
     Incremental,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FramePaintReason {
+    #[default]
+    Idle,
+    FullRedraw,
+    DirtyRegionLimit,
+    DirtyAreaLimit,
+    FragmentedDamage,
+    IncrementalDamage,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -52,7 +64,11 @@ pub struct FrameTimingStats {
     pub render_workers: usize,
     pub dirty_regions: usize,
     pub dirty_jobs: usize,
+    pub damage_pixels: usize,
+    pub painted_pixels: usize,
+    pub scene_passes: usize,
     pub paint_mode: FramePaintMode,
+    pub paint_reason: FramePaintReason,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,7 +76,11 @@ struct PaintStats {
     workers: usize,
     dirty_regions: usize,
     dirty_jobs: usize,
+    damage_pixels: usize,
+    painted_pixels: usize,
+    scene_passes: usize,
     mode: FramePaintMode,
+    reason: FramePaintReason,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -523,7 +543,11 @@ where
         render_workers: initial_paint_stats.workers,
         dirty_regions: initial_paint_stats.dirty_regions,
         dirty_jobs: initial_paint_stats.dirty_jobs,
+        damage_pixels: initial_paint_stats.damage_pixels,
+        painted_pixels: initial_paint_stats.painted_pixels,
+        scene_passes: initial_paint_stats.scene_passes,
         paint_mode: initial_paint_stats.mode,
+        paint_reason: initial_paint_stats.reason,
         ..FrameTimingStats::default()
     });
 
@@ -697,7 +721,11 @@ where
             frame_stats.render_workers = paint_stats.workers;
             frame_stats.dirty_regions = paint_stats.dirty_regions;
             frame_stats.dirty_jobs = paint_stats.dirty_jobs;
+            frame_stats.damage_pixels = paint_stats.damage_pixels;
+            frame_stats.painted_pixels = paint_stats.painted_pixels;
+            frame_stats.scene_passes = paint_stats.scene_passes;
             frame_stats.paint_mode = paint_stats.mode;
+            frame_stats.paint_reason = paint_stats.reason;
 
             let present_start = Instant::now();
             redraw_auto_scroll_indicator_regions(
@@ -763,8 +791,12 @@ fn render_to_buffer_internal(
     PaintStats {
         workers: worker_count.max(1),
         dirty_regions: 0,
-        dirty_jobs: worker_count.max(1),
+        dirty_jobs: 0,
+        damage_pixels: width.saturating_mul(height),
+        painted_pixels: width.saturating_mul(height),
+        scene_passes: worker_count.max(1),
         mode: FramePaintMode::Full,
+        reason: FramePaintReason::FullRedraw,
     }
 }
 
@@ -870,15 +902,8 @@ fn render_scene_update_internal(
     }
 
     coalesce_dirty_regions(&mut dirty_regions);
-    if should_full_redraw(&dirty_regions, width, height) {
-        let mut stats = render_to_buffer_internal(scene, buffer, width, height, clear_color);
-        stats.dirty_regions = dirty_regions.len();
-        return stats;
-    }
-
-    let dirty_region_count = dirty_regions.len();
     let full_clip = ClipRect::full(width as f32, height as f32);
-    let snapped_dirty_regions = dirty_regions
+    let mut snapped_dirty_regions = dirty_regions
         .into_iter()
         .filter_map(|dirty_region| {
             dirty_region
@@ -886,11 +911,38 @@ fn render_scene_update_internal(
                 .and_then(|clip| snap_clip_to_pixel_grid(clip, width, height))
         })
         .collect::<Vec<_>>();
-    let cached_bounds = cache_scene_subtree_bounds(scene);
+    if snapped_dirty_regions.is_empty() {
+        return PaintStats::default();
+    }
 
-    let dirty_jobs = build_incremental_render_jobs(&snapped_dirty_regions, width, height);
-    let worker_count = incremental_render_worker_count(&dirty_jobs);
-    if worker_count > 1 {
+    coalesce_dirty_regions(&mut snapped_dirty_regions);
+    let dirty_region_count = snapped_dirty_regions.len();
+    let dirty_pixels = clip_rects_pixel_count(&snapped_dirty_regions, width, height);
+    let planned_dirty_jobs = build_incremental_render_jobs(&snapped_dirty_regions, width, height);
+    let incremental_worker_count = incremental_render_worker_count(&planned_dirty_jobs);
+    let incremental_dirty_jobs = incremental_scene_pass_count(
+        dirty_region_count,
+        planned_dirty_jobs.len(),
+        incremental_worker_count,
+    );
+    if let Some(reason) = should_full_redraw(
+        dirty_region_count,
+        dirty_pixels,
+        count_scene_nodes(scene),
+        incremental_dirty_jobs,
+        width,
+        height,
+    ) {
+        let mut stats = render_to_buffer_internal(scene, buffer, width, height, clear_color);
+        stats.dirty_regions = dirty_region_count;
+        stats.dirty_jobs = incremental_dirty_jobs;
+        stats.damage_pixels = dirty_pixels;
+        stats.reason = reason;
+        return stats;
+    }
+
+    let cached_bounds = cache_scene_subtree_bounds(scene);
+    if incremental_worker_count > 1 {
         render_scene_update_parallel(
             scene,
             &cached_bounds,
@@ -898,14 +950,18 @@ fn render_scene_update_internal(
             width,
             height,
             clear_color,
-            &dirty_jobs,
-            worker_count,
+            &planned_dirty_jobs,
+            incremental_worker_count,
         );
         return PaintStats {
-            workers: worker_count,
+            workers: incremental_worker_count,
             dirty_regions: dirty_region_count,
-            dirty_jobs: dirty_jobs.len(),
+            dirty_jobs: incremental_dirty_jobs,
+            damage_pixels: dirty_pixels,
+            painted_pixels: dirty_pixels,
+            scene_passes: incremental_dirty_jobs,
             mode: FramePaintMode::Incremental,
+            reason: FramePaintReason::IncrementalDamage,
         };
     }
 
@@ -919,8 +975,12 @@ fn render_scene_update_internal(
     PaintStats {
         workers: 1,
         dirty_regions: dirty_region_count,
-        dirty_jobs: dirty_region_count,
+        dirty_jobs: incremental_dirty_jobs,
+        damage_pixels: dirty_pixels,
+        painted_pixels: dirty_pixels,
+        scene_passes: incremental_dirty_jobs,
         mode: FramePaintMode::Incremental,
+        reason: FramePaintReason::IncrementalDamage,
     }
 }
 
@@ -1089,6 +1149,18 @@ fn incremental_render_worker_count(dirty_jobs: &[DirtyRenderJob]) -> usize {
         .min(dirty_jobs.len())
         .min(max_workers_from_pixels)
         .max(1)
+}
+
+fn incremental_scene_pass_count(
+    dirty_region_count: usize,
+    dirty_job_count: usize,
+    worker_count: usize,
+) -> usize {
+    if worker_count > 1 {
+        dirty_job_count.max(1)
+    } else {
+        dirty_region_count.max(1)
+    }
 }
 
 fn should_present_scene(
@@ -1730,7 +1802,14 @@ fn draw_shadow_mask(
                 continue;
             }
 
-            blend_prepared_pixel(buffer, width, height, x, y, prepared_color.with_alpha(alpha));
+            blend_prepared_pixel(
+                buffer,
+                width,
+                height,
+                x,
+                y,
+                prepared_color.with_alpha(alpha),
+            );
         }
     }
 }
@@ -1898,7 +1977,11 @@ fn draw_radial_gradient(
                 let normalized_distance = ((dx * dx) * inverse_radius_x_squared
                     + (dy * dy) * inverse_radius_y_squared)
                     .sqrt();
-                sample_prepared_gradient(prepared_unit_gradient, normalized_distance, gradient.repeating)
+                sample_prepared_gradient(
+                    prepared_unit_gradient,
+                    normalized_distance,
+                    gradient.repeating,
+                )
             } else {
                 let distance = (dx * dx + dy * dy).sqrt();
                 let ray_length = radial_ray_length(dx, dy, resolved_shape);
@@ -2334,19 +2417,53 @@ fn should_merge_dirty_regions(left: ClipRect, right: ClipRect) -> bool {
     union.area() <= combined_area * DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO
 }
 
-fn should_full_redraw(dirty_regions: &[ClipRect], width: usize, height: usize) -> bool {
-    if dirty_regions.len() > MAX_INCREMENTAL_DIRTY_REGIONS {
-        return true;
+fn should_full_redraw(
+    dirty_region_count: usize,
+    dirty_pixels: usize,
+    scene_node_count: usize,
+    incremental_scene_passes: usize,
+    width: usize,
+    height: usize,
+) -> Option<FramePaintReason> {
+    if dirty_region_count > MAX_INCREMENTAL_DIRTY_REGIONS {
+        return Some(FramePaintReason::DirtyRegionLimit);
     }
 
-    let full_clip = ClipRect::full(width as f32, height as f32);
-    let dirty_area: f32 = dirty_regions
-        .iter()
-        .filter_map(|region| region.intersect(full_clip))
-        .map(ClipRect::area)
-        .sum();
+    let full_pixels = width.saturating_mul(height);
+    if dirty_pixels > (full_pixels as f32 * MAX_INCREMENTAL_DIRTY_AREA_RATIO) as usize {
+        return Some(FramePaintReason::DirtyAreaLimit);
+    }
 
-    dirty_area > full_clip.area() * MAX_INCREMENTAL_DIRTY_AREA_RATIO
+    let traversal_cost = scene_node_count
+        .max(1)
+        .saturating_mul(SCENE_TRAVERSAL_COST_PER_NODE);
+    let incremental_cost = dirty_pixels
+        .saturating_mul(2)
+        .saturating_add(traversal_cost.saturating_mul(incremental_scene_passes.max(1)));
+    let full_cost = full_pixels.saturating_mul(2).saturating_add(
+        traversal_cost.saturating_mul(full_redraw_worker_count(width, height).max(1)),
+    );
+    if incremental_cost >= full_cost {
+        return Some(FramePaintReason::FragmentedDamage);
+    }
+
+    None
+}
+
+fn clip_rects_pixel_count(clips: &[ClipRect], width: usize, height: usize) -> usize {
+    clips
+        .iter()
+        .filter_map(|clip| clip_pixel_bounds(*clip, width, height))
+        .map(|(x0, y0, x1, y1)| (x1 - x0).max(0).saturating_mul((y1 - y0).max(0)) as usize)
+        .sum()
+}
+
+fn count_scene_nodes(scene: &[RenderNode]) -> usize {
+    scene.iter().map(count_render_node).sum()
+}
+
+fn count_render_node(node: &RenderNode) -> usize {
+    1 + node.children.iter().map(count_render_node).sum::<usize>()
 }
 
 fn subtree_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
@@ -2888,14 +3005,7 @@ fn blend_linear_pixel(
         return;
     }
 
-    blend_linear_over(
-        buffer,
-        index,
-        LinearRgba {
-            a: alpha,
-            ..color
-        },
-    );
+    blend_linear_over(buffer, index, LinearRgba { a: alpha, ..color });
 }
 
 fn buffer_pixel_index(width: usize, height: usize, x: i32, y: i32) -> Option<usize> {
@@ -2973,12 +3083,12 @@ mod tests {
     };
 
     use crate::{
-        ClipRect, DirtyRenderJob, FramePaintMode, ViewportSize, WindowConfig, blend_pixel,
-        build_incremental_render_jobs, coalesce_dirty_regions, dirty_regions_between_scenes,
-        dispatch_click, distribute_dirty_render_jobs, drawable_viewport_size,
-        hit_test_element_path, pack_rgb, render_scene_update, render_scene_update_internal,
-        render_to_buffer, resize_buffer, scenes_match_visuals, should_present_frame,
-        should_present_scene, should_suspend_updates, window_options,
+        ClipRect, DirtyRenderJob, FramePaintMode, FramePaintReason, ViewportSize, WindowConfig,
+        blend_pixel, build_incremental_render_jobs, coalesce_dirty_regions,
+        dirty_regions_between_scenes, dispatch_click, distribute_dirty_render_jobs,
+        drawable_viewport_size, hit_test_element_path, pack_rgb, render_scene_update,
+        render_scene_update_internal, render_to_buffer, resize_buffer, scenes_match_visuals,
+        should_present_frame, should_present_scene, should_suspend_updates, window_options,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -4250,6 +4360,10 @@ mod tests {
 
         assert_eq!(incremental, full);
         assert_eq!(stats.mode, FramePaintMode::Incremental);
+        assert_eq!(stats.reason, FramePaintReason::IncrementalDamage);
+        assert_eq!(stats.damage_pixels, stats.painted_pixels);
+        assert!(stats.damage_pixels > 0);
+        assert_eq!(stats.scene_passes, stats.dirty_jobs);
         if thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1)
@@ -4257,6 +4371,69 @@ mod tests {
         {
             assert!(stats.workers > 1);
         }
+    }
+
+    #[test]
+    fn fragmented_sparse_damage_can_fall_back_to_a_full_redraw() {
+        let background =
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 480.0, 640.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(15, 23, 42)),
+                ..VisualStyle::default()
+            });
+        let mut previous = vec![background.clone()];
+        let mut next = vec![background];
+
+        for index in 0..180 {
+            let column = index % 12;
+            let row = index / 12;
+            let x = 260.0 + column as f32 * 16.0;
+            let y = 12.0 + row as f32 * 18.0;
+            let node =
+                RenderNode::container(LayoutBox::new(x, y, 8.0, 8.0)).with_style(VisualStyle {
+                    background: Some(Color::rgb(30, 41, 59)),
+                    ..VisualStyle::default()
+                });
+            previous.push(node.clone());
+            next.push(node);
+        }
+
+        for index in 0..20 {
+            let x = 8.0 + index as f32 * 12.0;
+            previous.push(
+                RenderNode::container(LayoutBox::new(x, 0.0, 6.0, 640.0)).with_style(VisualStyle {
+                    background: Some(Color::rgb(37, 99, 235)),
+                    ..VisualStyle::default()
+                }),
+            );
+            next.push(
+                RenderNode::container(LayoutBox::new(x, 0.0, 6.0, 640.0)).with_style(VisualStyle {
+                    background: Some(Color::rgb(249, 115, 22)),
+                    ..VisualStyle::default()
+                }),
+            );
+        }
+
+        let mut incremental = vec![0_u32; 480 * 640];
+        let mut full = vec![0_u32; 480 * 640];
+
+        render_to_buffer(&previous, &mut incremental, 480, 640, Color::WHITE);
+        let stats = render_scene_update_internal(
+            &previous,
+            &next,
+            &mut incremental,
+            480,
+            640,
+            Color::WHITE,
+        );
+        render_to_buffer(&next, &mut full, 480, 640, Color::WHITE);
+
+        assert_eq!(incremental, full);
+        assert_eq!(stats.mode, FramePaintMode::Full);
+        assert_eq!(stats.reason, FramePaintReason::FragmentedDamage);
+        assert_eq!(stats.dirty_regions, 20);
+        assert!(stats.dirty_jobs >= stats.dirty_regions);
+        assert!(stats.damage_pixels < stats.painted_pixels);
+        assert_eq!(stats.scene_passes, stats.workers);
     }
 
     #[test]

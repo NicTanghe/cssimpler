@@ -6,7 +6,8 @@ use anyhow::Result;
 use cssimpler::app::{App, Invalidation, Refresh, RuntimeStats, latest_runtime_stats};
 use cssimpler::core::Node;
 use cssimpler::renderer::{
-    FrameInfo, FramePaintMode, FrameTimingStats, WindowConfig, latest_frame_timing_stats,
+    FrameInfo, FramePaintMode, FramePaintReason, FrameTimingStats, WindowConfig,
+    latest_frame_timing_stats,
 };
 use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
@@ -134,7 +135,9 @@ pub fn apply_frame(state: &mut EffectStressState, frame: FrameInfo, actions: u64
     }
 
     if actions & ACTION_REMOVE_ANIMATED_TILES != 0 {
-        state.animated_tile_window = state.animated_tile_window.saturating_sub(ANIMATED_TILE_STEP);
+        state.animated_tile_window = state
+            .animated_tile_window
+            .saturating_sub(ANIMATED_TILE_STEP);
         invalidation = invalidation.max(Invalidation::Paint);
     }
 
@@ -186,7 +189,7 @@ pub fn maybe_log_perf(state: &mut EffectStressState, actions: u64) {
     }
 
     eprintln!(
-        "[gui_effect_pressure] anim={} phase={} tiles={} live_window={} passes={} dt={}ms tree={} paint={} present={} total={} mode={} dirty={} jobs={} workers={}",
+        "[gui_effect_pressure] anim={} phase={} tiles={} live_window={} passes={} dt={}ms tree={} paint={} present={} total={} mode={} reason={} dirty={} jobs={} damage={} painted={} scene_passes={} workers={}",
         animation_label(state),
         phase_label(state.phase),
         state.tile_count,
@@ -198,8 +201,12 @@ pub fn maybe_log_perf(state: &mut EffectStressState, actions: u64) {
         format_us(state.renderer_stats.present_us),
         format_us(state.renderer_stats.total_us),
         paint_mode_label(state.renderer_stats),
+        paint_reason_label(state.renderer_stats.paint_reason),
         state.renderer_stats.dirty_regions,
         state.renderer_stats.dirty_jobs,
+        format_pixels(state.renderer_stats.damage_pixels),
+        format_pixels(state.renderer_stats.painted_pixels),
+        state.renderer_stats.scene_passes,
         state.renderer_stats.render_workers,
     );
 }
@@ -238,8 +245,12 @@ fn build_metric_row(state: &EffectStressState) -> Node {
             {stat_chip("present", format_us(state.renderer_stats.present_us))}
             {stat_chip("frame total", format_us(state.renderer_stats.total_us))}
             {stat_chip("paint mode", paint_mode_label(state.renderer_stats))}
+            {stat_chip("paint reason", paint_reason_label(state.renderer_stats.paint_reason).to_string())}
             {stat_chip("dirty regions", state.renderer_stats.dirty_regions.to_string())}
             {stat_chip("dirty jobs", state.renderer_stats.dirty_jobs.to_string())}
+            {stat_chip("damage", format_pixels(state.renderer_stats.damage_pixels))}
+            {stat_chip("painted", format_pixels(state.renderer_stats.painted_pixels))}
+            {stat_chip("scene passes", state.renderer_stats.scene_passes.to_string())}
             {stat_chip("workers", state.renderer_stats.render_workers.to_string())}
         </div>
     }
@@ -483,11 +494,29 @@ fn paint_mode_label(stats: FrameTimingStats) -> String {
             }
         }
         FramePaintMode::Incremental => {
-            format!(
-                "incremental {} -> {}",
-                stats.dirty_regions, stats.dirty_jobs
-            )
+            format!("incremental {}r/{}j", stats.dirty_regions, stats.dirty_jobs)
         }
+    }
+}
+
+fn paint_reason_label(reason: FramePaintReason) -> &'static str {
+    match reason {
+        FramePaintReason::Idle => "idle",
+        FramePaintReason::FullRedraw => "full redraw",
+        FramePaintReason::DirtyRegionLimit => "dirty-region limit",
+        FramePaintReason::DirtyAreaLimit => "dirty-area limit",
+        FramePaintReason::FragmentedDamage => "fragmented damage",
+        FramePaintReason::IncrementalDamage => "small damage",
+    }
+}
+
+fn format_pixels(pixels: usize) -> String {
+    if pixels >= 1_000_000 {
+        format!("{:.2}M px", pixels as f64 / 1_000_000.0)
+    } else if pixels >= 1_000 {
+        format!("{:.1}K px", pixels as f64 / 1_000.0)
+    } else {
+        format!("{pixels} px")
     }
 }
 
@@ -549,7 +578,8 @@ fn animation_band_contains(
         return false;
     }
 
-    (0..tile_count.min(animated_tile_window)).any(|offset| (band_start + offset) % tile_count == index)
+    (0..tile_count.min(animated_tile_window))
+        .any(|offset| (band_start + offset) % tile_count == index)
 }
 
 fn elapsed_tick_count(elapsed: Duration) -> usize {
@@ -885,11 +915,11 @@ mod tests {
         let refresh = super::apply_frame(&mut state, frame(1), ACTION_ADD_ANIMATED_TILES);
 
         assert_eq!(refresh, Invalidation::Paint);
+        assert_eq!(state.animated_tile_window, DEFAULT_ANIMATED_TILE_WINDOW + 1);
         assert_eq!(
-            state.animated_tile_window,
+            super::animated_tile_count(&state),
             DEFAULT_ANIMATED_TILE_WINDOW + 1
         );
-        assert_eq!(super::animated_tile_count(&state), DEFAULT_ANIMATED_TILE_WINDOW + 1);
     }
 
     #[test]

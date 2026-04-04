@@ -151,8 +151,7 @@ fn srgb_channel_to_linear(channel: u8) -> f32 {
 
 fn linear_channel_to_srgb(value: f32) -> u8 {
     let value = value.clamp(0.0, 1.0) as f64;
-    linear_to_srgb_boundaries()
-        .partition_point(|boundary| *boundary <= value) as u8
+    linear_to_srgb_boundaries().partition_point(|boundary| *boundary <= value) as u8
 }
 
 fn srgb_to_linear_table() -> &'static [f32; SRGB_CHANNEL_COUNT] {
@@ -199,7 +198,9 @@ fn srgb_unit_to_linear_f64(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, GradientInterpolation, LinearRgba, linear_channel_to_srgb, srgb_channel_to_linear};
+    use super::{
+        Color, GradientInterpolation, LinearRgba, linear_channel_to_srgb, srgb_channel_to_linear,
+    };
 
     #[test]
     fn linear_rgba_interpolates_in_oklab_by_default() {
@@ -230,7 +231,10 @@ mod tests {
     #[test]
     fn srgb_lookup_round_trips_all_byte_values() {
         for channel in 0_u16..=255 {
-            assert_eq!(linear_channel_to_srgb(srgb_channel_to_linear(channel as u8)), channel as u8);
+            assert_eq!(
+                linear_channel_to_srgb(srgb_channel_to_linear(channel as u8)),
+                channel as u8
+            );
         }
     }
 
@@ -238,7 +242,10 @@ mod tests {
     fn linear_lookup_matches_reference_curve() {
         for step in 0_u32..=65_536 {
             let value = step as f32 / 65_536.0;
-            assert_eq!(linear_channel_to_srgb(value), reference_linear_channel_to_srgb(value));
+            assert_eq!(
+                linear_channel_to_srgb(value),
+                reference_linear_channel_to_srgb(value)
+            );
         }
     }
 
