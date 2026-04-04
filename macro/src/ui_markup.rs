@@ -154,27 +154,16 @@ impl Parse for AttributeName {
 }
 
 fn parse_attributes(input: ParseStream<'_>) -> Result<Vec<Attribute>> {
-    // Pre-allocating avoids multiple reallocations as the Vec grows.
-    // 8 is a common heuristic for attribute counts.
     let mut attributes = Vec::with_capacity(8);
 
-    // Using loop + explicit breaks is slightly faster than while !peek && !(peek && peek2)
-    // because it allows us to consolidate the lookahead logic.
     loop {
-        // Optimization: Check for '>' first as it is the most common terminator.
-        if input.peek(Token![>]) {
-            break;
-        }
-
-        // Peek for '/' only if '>' wasn't found.
-        if input.peek(Token![/]) && input.peek2(Token![>]) {
+        if input.peek(Token![>]) || (input.peek(Token![/]) && input.peek2(Token![>])) {
             break;
         }
 
         let name = input.parse::<AttributeName>()?;
         input.parse::<Token![=]>()?;
 
-        // We use a single peek for the most likely case (String literal).
         let value = if input.peek(LitStr) {
             AttributeValue::String(input.parse()?)
         } else if input.peek(syn::token::Brace) {
@@ -203,9 +192,16 @@ fn expand_element(element: &Element) -> Result<TokenStream2> {
         builder = expand_attribute(builder, attribute)?;
     }
 
-    for child in &element.children {
-        let child = expand_child(child)?;
-        builder = quote!(#builder.with_child(#child));
+    if !element.children.is_empty() {
+        let children = element
+            .children
+            .iter()
+            .map(|c| expand_child(c))
+            .collect::<Result<Vec<_>>>()?;
+        builder = quote! {
+            #builder
+            #( .with_child(#children) )*
+        };
     }
 
     Ok(quote!(::cssimpler_core::Node::from(#builder)))
@@ -220,39 +216,43 @@ fn expand_child(child: &Child) -> Result<TokenStream2> {
 
 fn expand_attribute(builder: TokenStream2, attribute: &Attribute) -> Result<TokenStream2> {
     let name = attribute.name.as_string();
+    let name_str = name.as_str();
 
-    match (name.as_str(), &attribute.value) {
-        ("id", AttributeValue::String(value)) => Ok(quote!(#builder.with_id(#value))),
-        ("id", AttributeValue::Expression(value)) => Ok(quote!(#builder.with_id(#value))),
-        ("class", AttributeValue::String(value)) => {
-            let classes: Vec<_> = value
-                .value()
-                .split_whitespace()
-                .map(str::to_string)
-                .collect();
-            let mut builder = builder;
+    match name_str {
+        "id" => match &attribute.value {
+            AttributeValue::String(v) => Ok(quote!(#builder.with_id(#v))),
+            AttributeValue::Expression(v) => Ok(quote!(#builder.with_id(#v))),
+        },
 
-            for class_name in classes {
-                builder = quote!(#builder.with_class(#class_name));
+        "class" => match &attribute.value {
+            AttributeValue::String(v) => {
+                let val = v.value();
+                if !val.contains(' ') {
+                    Ok(quote!(#builder.with_class(#val)))
+                } else {
+                    let classes = val.split_whitespace();
+                    Ok(quote!(#builder #( .with_class(#classes) )* ))
+                }
             }
+            AttributeValue::Expression(v) => Ok(quote!(#builder.with_class(#v))),
+        },
 
-            Ok(builder)
-        }
-        ("class", AttributeValue::Expression(value)) => Ok(quote!(#builder.with_class(#value))),
-        ("onclick", AttributeValue::Expression(value)) => Ok(quote!(#builder.on_click(#value))),
-        ("onclick", AttributeValue::String(value)) => Err(Error::new(
-            value.span(),
-            "onclick expects a Rust expression like onclick={handler}",
-        )),
-        _ if name.starts_with("on") => Err(Error::new(
-            attribute.name.span(),
-            format!("unsupported event attribute `{name}`"),
-        )),
-        (_, AttributeValue::String(value)) => Ok(quote!(#builder.with_attribute(#name, #value))),
-        (_, AttributeValue::Expression(value)) => Err(Error::new(
-            value.span(),
-            format!("`{name}` expects a string literal like {name}=\"value\""),
-        )),
+        _ if name_str.starts_with("on") => match &attribute.value {
+            AttributeValue::Expression(v) => {
+                let snake_name = format!("on_{}", &name_str[2..]);
+                let method = quote::format_ident!("{}", snake_name);
+                Ok(quote!(#builder.#method(#v)))
+            }
+            AttributeValue::String(v) => Err(Error::new(
+                v.span(),
+                format!("{name_str} expects a {{expression}}"),
+            )),
+        },
+
+        _ => match &attribute.value {
+            AttributeValue::String(v) => Ok(quote!(#builder.with_attribute(#name_str, #v))),
+            AttributeValue::Expression(v) => Ok(quote!(#builder.with_attribute(#name_str, #v))),
+        },
     }
 }
 
