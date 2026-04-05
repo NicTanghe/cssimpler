@@ -2,12 +2,11 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
+    fonts::{TextStyle, TextTransform},
     Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, LayoutStyle,
     OverflowMode, ScrollbarWidth, Style, TransitionPropertyName, TransitionTimingFunction,
-    fonts::{TextStyle, TextTransform},
 };
 use lightningcss::declaration::DeclarationBlock;
-use lightningcss::properties::Property;
 use lightningcss::properties::align::{
     AlignContent as CssAlignContent, AlignItems as CssAlignItems, AlignSelf as CssAlignSelf,
     ContentDistribution, ContentPosition, GapValue, JustifyContent as CssJustifyContent,
@@ -22,6 +21,7 @@ use lightningcss::properties::grid::{
 use lightningcss::properties::overflow::OverflowKeyword as CssOverflowKeyword;
 use lightningcss::properties::position::Position as CssPosition;
 use lightningcss::properties::size::Size as CssSize;
+use lightningcss::properties::Property;
 use lightningcss::rules::CssRule;
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto};
@@ -48,8 +48,8 @@ mod visual;
 
 use self::attributes::{parse_content_text_source, reject_unsupported_attr_usage};
 use self::fonts::{
-    FontSizeDeclaration, FontWeightDeclaration, LineHeightDeclaration, apply_font_declaration,
-    extract_property as extract_font_property,
+    apply_font_declaration, extract_property as extract_font_property, FontSizeDeclaration,
+    FontWeightDeclaration, LineHeightDeclaration,
 };
 use self::selectors::extract_selector;
 #[cfg(test)]
@@ -61,7 +61,7 @@ pub use render_tree::{
     build_render_tree_with_interaction_at_root, rebuild_render_tree_with_cached_layout,
 };
 
-pub use attributes::{AttributeTextSource, parse_attribute_text_source};
+pub use attributes::{parse_attribute_text_source, AttributeTextSource};
 pub use invalidation::StyleInvalidation;
 pub use selectors::{
     AncestorSelector, CompoundSelector, ElementRef, PseudoElementKind, Selector,
@@ -991,10 +991,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use cssimpler_core::{
-        AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient,
-        GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
-        LengthPercentageValue, LinearGradient, Node, RadialShape, ScrollbarWidth, ShapeExtent,
-        TransitionPropertyName, TransitionTimingFunction, fonts::TextTransform,
+        fonts::TextTransform, AnglePercentageValue, BackgroundLayer, CircleRadius, Color,
+        ConicGradient, GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint,
+        GradientStop, LengthPercentageValue, LinearGradient, Node, RadialShape, ScrollbarWidth,
+        ShapeExtent, TransitionPropertyName, TransitionTimingFunction,
     };
     use taffy::prelude::{
         AlignItems as TaffyAlignItems, Dimension, Display as TaffyDisplay,
@@ -1004,9 +1004,9 @@ mod tests {
     };
 
     use super::{
-        Declaration, ElementRef, Selector, ShadowDeclaration, StyleError, StyleRule, Stylesheet,
         build_render_tree, build_render_tree_in_viewport, parse_stylesheet,
         rebuild_render_tree_with_cached_layout, resolve_element_tree, resolve_style, to_taffy,
+        Declaration, ElementRef, Selector, ShadowDeclaration, StyleError, StyleRule, Stylesheet,
     };
 
     #[test]
@@ -1044,18 +1044,14 @@ mod tests {
         .expect("bootstrap stylesheet should parse");
 
         assert_eq!(stylesheet.rules.len(), 2);
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::Background(Color::rgb(226, 232, 240)))
-        );
-        assert!(
-            stylesheet.rules[1]
-                .declarations
-                .contains(&Declaration::InsetLeft(TaffyLengthPercentageAuto::Length(
-                    160.0
-                ),))
-        );
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::Background(Color::rgb(226, 232, 240))));
+        assert!(stylesheet.rules[1]
+            .declarations
+            .contains(&Declaration::InsetLeft(TaffyLengthPercentageAuto::Length(
+                160.0
+            ),)));
     }
 
     #[test]
@@ -1090,16 +1086,12 @@ mod tests {
             parse_stylesheet(".label { letter-spacing: 2px; text-transform: uppercase; }")
                 .expect("text presentation stylesheet should parse");
 
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::LetterSpacing(2.0))
-        );
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::TextTransform(TextTransform::Uppercase))
-        );
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::LetterSpacing(2.0)));
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::TextTransform(TextTransform::Uppercase)));
     }
 
     #[test]
@@ -1146,38 +1138,30 @@ mod tests {
         )
         .expect("text effect stylesheet should parse");
 
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::TextStrokeWidth(2.0))
-        );
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::TextStrokeColor(Some(Color::rgb(255, 102, 0))))
-        );
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::TextShadows(vec![ShadowDeclaration {
-                    color: Some(Color::rgba(15, 23, 42, 128)),
-                    offset_x: 1.0,
-                    offset_y: 2.0,
-                    blur_radius: 3.0,
-                    spread: 0.0,
-                }]))
-        );
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::FilterDropShadows(vec![ShadowDeclaration {
-                    color: Some(Color::rgb(17, 34, 51)),
-                    offset_x: 4.0,
-                    offset_y: 5.0,
-                    blur_radius: 6.0,
-                    spread: 0.0,
-                }]))
-        );
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::TextStrokeWidth(2.0)));
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::TextStrokeColor(Some(Color::rgb(255, 102, 0)))));
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::TextShadows(vec![ShadowDeclaration {
+                color: Some(Color::rgba(15, 23, 42, 128)),
+                offset_x: 1.0,
+                offset_y: 2.0,
+                blur_radius: 3.0,
+                spread: 0.0,
+            }])));
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::FilterDropShadows(vec![ShadowDeclaration {
+                color: Some(Color::rgb(17, 34, 51)),
+                offset_x: 4.0,
+                offset_y: 5.0,
+                blur_radius: 6.0,
+                spread: 0.0,
+            }])));
     }
 
     #[test]
@@ -1187,19 +1171,15 @@ mod tests {
         )
         .expect("transition stylesheet should parse");
 
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::TransitionProperties(vec![
-                    TransitionPropertyName::Property("color".to_string()),
-                    TransitionPropertyName::Property("width".to_string()),
-                ]))
-        );
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::TransitionDurations(vec![0.18, 0.32]))
-        );
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::TransitionProperties(vec![
+                TransitionPropertyName::Property("color".to_string()),
+                TransitionPropertyName::Property("width".to_string()),
+            ])));
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::TransitionDurations(vec![0.18, 0.32])));
         assert!(stylesheet.rules[0].declarations.contains(
             &Declaration::TransitionTimingFunctions(vec![
                 TransitionTimingFunction::Linear,
@@ -1227,11 +1207,9 @@ mod tests {
 
         assert_eq!(stylesheet.rules.len(), 1);
         assert_eq!(stylesheet.rules[0].selector, Selector::tag("button"));
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::Width(Dimension::Length(120.0)))
-        );
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::Width(Dimension::Length(120.0))));
     }
 
     #[test]
@@ -1297,19 +1275,15 @@ mod tests {
         )
         .expect("scrollbar stylesheet should parse");
 
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::ScrollbarWidth(ScrollbarWidth::Thin))
-        );
-        assert!(
-            stylesheet.rules[0]
-                .declarations
-                .contains(&Declaration::ScrollbarColors(
-                    Some(Color::rgb(17, 34, 51)),
-                    Some(Color::rgb(221, 238, 255)),
-                ))
-        );
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::ScrollbarWidth(ScrollbarWidth::Thin)));
+        assert!(stylesheet.rules[0]
+            .declarations
+            .contains(&Declaration::ScrollbarColors(
+                Some(Color::rgb(17, 34, 51)),
+                Some(Color::rgb(221, 238, 255)),
+            )));
     }
 
     #[test]
@@ -1666,7 +1640,7 @@ mod tests {
             .into();
         let scene = build_render_tree(&tree, &stylesheet);
 
-        assert!(scene.on_click.is_some());
+        assert!(scene.handlers.click.is_some());
         assert_eq!(scene.layout.width, 90.0);
         assert!(matches!(scene.kind, cssimpler_core::RenderKind::Text(_)));
     }
@@ -1783,16 +1757,14 @@ mod tests {
             .into();
         let scene = build_render_tree(&base.into(), &stylesheet);
 
-        assert!(
-            rebuild_render_tree_with_cached_layout(
-                &next,
-                &stylesheet,
-                &cssimpler_core::ElementInteractionState::default(),
-                &cssimpler_core::ElementPath::root(0).with_child(0),
-                &scene.children[0],
-            )
-            .is_none()
-        );
+        assert!(rebuild_render_tree_with_cached_layout(
+            &next,
+            &stylesheet,
+            &cssimpler_core::ElementInteractionState::default(),
+            &cssimpler_core::ElementPath::root(0).with_child(0),
+            &scene.children[0],
+        )
+        .is_none());
     }
 
     fn text_nodes(node: &cssimpler_core::RenderNode) -> Vec<String> {

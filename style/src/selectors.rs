@@ -348,29 +348,27 @@ impl<'a> From<&'a ElementNode> for ElementRef<'a> {
 
 pub fn extract_selector(selector: &LightningSelector<'_>) -> Result<Selector, StyleError> {
     let components = selector.iter_raw_match_order().as_slice();
+
     let compounds = components
         .split(|component| {
             matches!(
                 component,
-                Component::Combinator(combinator)
-                    if *combinator != LightningCombinator::PseudoElement
+                Component::Combinator(combinator) if *combinator != LightningCombinator::PseudoElement
             )
         })
         .map(|compound| extract_compound_selector(selector, compound))
         .collect::<Result<Vec<_>, _>>()?;
+
     let mut pseudo_element = None;
     let mut compound_selectors = Vec::with_capacity(compounds.len());
+
     for (index, (compound, compound_pseudo)) in compounds.into_iter().enumerate() {
-        if index > 0 && compound_pseudo.is_some() {
+        if compound_pseudo.is_some_and(|p| index > 0 || pseudo_element.replace(p).is_some()) {
             return Err(unsupported_selector(selector));
-        }
-        if let Some(compound_pseudo) = compound_pseudo {
-            if pseudo_element.replace(compound_pseudo).is_some() {
-                return Err(unsupported_selector(selector));
-            }
         }
         compound_selectors.push(compound);
     }
+
     let combinators = components
         .iter()
         .filter_map(|component| match component {
@@ -381,12 +379,12 @@ pub fn extract_selector(selector: &LightningSelector<'_>) -> Result<Selector, St
         .map(|combinator| extract_combinator(selector, combinator))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let Some((rightmost, ancestors)) = compound_selectors.split_first() else {
+    let Some((rightmost, ancestors)) = compound_selectors
+        .split_first()
+        .filter(|(_, ancestors)| ancestors.len() == combinators.len())
+    else {
         return Err(unsupported_selector(selector));
     };
-    if ancestors.len() != combinators.len() {
-        return Err(unsupported_selector(selector));
-    }
 
     Ok(Selector::complex(
         rightmost.clone(),
@@ -405,19 +403,17 @@ fn extract_compound_selector(
     compound: &[Component<'_>],
 ) -> Result<(CompoundSelector, Option<PseudoElementKind>), StyleError> {
     let mut pseudo_element = None;
+
     let simple_selectors = compound
         .iter()
         .map(|component| {
-            extract_simple_selector(selector, component).map(
-                |(simple_selector, component_pseudo)| {
-                    if let Some(component_pseudo) = component_pseudo {
-                        if pseudo_element.replace(component_pseudo).is_some() {
-                            return Err(unsupported_selector(selector));
-                        }
-                    }
-                    Ok(simple_selector)
-                },
-            )?
+            let (simple_selector, component_pseudo) = extract_simple_selector(selector, component)?;
+
+            if component_pseudo.is_some_and(|p| pseudo_element.replace(p).is_some()) {
+                return Err(unsupported_selector(selector));
+            }
+
+            Ok(simple_selector)
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -556,7 +552,7 @@ mod tests {
 
     use cssimpler_core::{Color, ElementInteractionState, ElementPath, Node};
 
-    use crate::{StyleError, parse_stylesheet, resolve_style, resolve_style_with_interaction};
+    use crate::{parse_stylesheet, resolve_style, resolve_style_with_interaction, StyleError};
 
     use super::{
         AncestorSelector, CompoundSelector, ElementRef, PseudoElementKind, Selector,
@@ -591,21 +587,17 @@ mod tests {
             attributes: &attributes,
         };
 
-        assert!(
-            Selector::compound(vec![
-                SimpleSelector::Tag("button".to_string()),
-                SimpleSelector::Class("button".to_string()),
-                SimpleSelector::Class("primary".to_string()),
-            ])
-            .matches(element)
-        );
-        assert!(
-            !Selector::compound(vec![
-                SimpleSelector::Tag("button".to_string()),
-                SimpleSelector::Class("ghost".to_string()),
-            ])
-            .matches(element)
-        );
+        assert!(Selector::compound(vec![
+            SimpleSelector::Tag("button".to_string()),
+            SimpleSelector::Class("button".to_string()),
+            SimpleSelector::Class("primary".to_string()),
+        ])
+        .matches(element));
+        assert!(!Selector::compound(vec![
+            SimpleSelector::Tag("button".to_string()),
+            SimpleSelector::Class("ghost".to_string()),
+        ])
+        .matches(element));
     }
 
     #[test]
@@ -663,20 +655,16 @@ mod tests {
         let element_ref = ElementRef::from(&element);
 
         assert!(SimpleSelector::AttributeExists("data-text".to_string()).matches(element_ref));
-        assert!(
-            SimpleSelector::AttributeEquals {
-                name: "aria-hidden".to_string(),
-                value: "true".to_string(),
-            }
-            .matches(element_ref)
-        );
-        assert!(
-            !SimpleSelector::AttributeEquals {
-                name: "aria-hidden".to_string(),
-                value: "false".to_string(),
-            }
-            .matches(element_ref)
-        );
+        assert!(SimpleSelector::AttributeEquals {
+            name: "aria-hidden".to_string(),
+            value: "true".to_string(),
+        }
+        .matches(element_ref));
+        assert!(!SimpleSelector::AttributeEquals {
+            name: "aria-hidden".to_string(),
+            value: "false".to_string(),
+        }
+        .matches(element_ref));
     }
 
     #[test]

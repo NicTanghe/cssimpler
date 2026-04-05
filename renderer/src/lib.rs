@@ -1,27 +1,36 @@
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod color;
 mod fonts;
+mod gradient;
+mod shadow;
+mod shapes;
 mod scrollbar;
 
-use crate::color::{
-    length_stops_use_fraction_only, prepare_length_gradient, prepare_resolved_gradient,
-    resolve_angle_stops, resolve_length_stops, sample_prepared_gradient,
-    sample_prepared_length_gradient,
+use self::{
+    gradient::draw_background_layer,
+    shadow::{draw_shadow, draw_shadow_effect, shadow_bounds, shadow_effect_bounds, text_stroke_bounds},
+    shapes::{
+        clip_pixel_bounds, draw_axis_aligned_opaque_rect, draw_axis_aligned_opaque_ring,
+        draw_rounded_rect, draw_rounded_ring, inset_corner_radius, inset_layout, layout_clip,
+        non_empty_layout_clip, offset_layout, snap_clip_to_pixel_grid, union_optional_bounds,
+    },
 };
 use cssimpler_core::{
-    BackgroundLayer, CircleRadius, Color, ConicGradient, CornerRadius, ElementInteractionState,
-    ElementPath, EllipseRadius, EventHandler, GradientDirection, GradientHorizontal, GradientPoint,
-    GradientVertical, Insets, LayoutBox, LinearGradient, LinearRgba, RadialGradient, RadialShape,
-    RenderKind, RenderNode, ShapeExtent,
+    Color, ElementInteractionState, ElementPath, EventHandler, LayoutBox, LinearRgba, RenderKind,
+    RenderNode,
 };
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
+
+#[cfg(test)]
+use self::{
+    shadow::cached_shadow_mask,
+    shapes::{expand_corner_radius, expand_layout},
+};
 
 const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 32;
 const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.85;
@@ -32,8 +41,8 @@ const MIN_PARALLEL_RENDER_PIXELS: usize = 640 * 480;
 const MIN_INCREMENTAL_PIXELS_PER_WORKER: usize = 160 * 160;
 const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 80;
 const MAX_RENDER_WORKERS: usize = 12;
-const MAX_SHADOW_MASK_CACHE_ENTRIES: usize = 256;
 const SCENE_TRAVERSAL_COST_PER_NODE: usize = 96;
+const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FramePaintMode {
@@ -89,47 +98,6 @@ struct DirtyRenderJob {
     pixel_count: usize,
 }
 
-#[derive(Clone)]
-struct ShadowMask {
-    origin_x: i32,
-    origin_y: i32,
-    width: usize,
-    height: usize,
-    alpha: Vec<u8>,
-}
-
-impl ShadowMask {
-    fn new(origin_x: i32, origin_y: i32, width: i32, height: i32) -> Self {
-        let width = width.max(0) as usize;
-        let height = height.max(0) as usize;
-        Self {
-            origin_x,
-            origin_y,
-            width,
-            height,
-            alpha: vec![0; width.saturating_mul(height)],
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ShadowMaskCacheKey {
-    x_bits: u32,
-    y_bits: u32,
-    width_bits: u32,
-    height_bits: u32,
-    top_left_bits: u32,
-    top_right_bits: u32,
-    bottom_right_bits: u32,
-    bottom_left_bits: u32,
-    blur_bits: u32,
-}
-
-#[derive(Default)]
-struct ShadowMaskCache {
-    masks: HashMap<ShadowMaskCacheKey, Arc<ShadowMask>>,
-}
-
 static FRAME_TIMING_STATS: OnceLock<Mutex<FrameTimingStats>> = OnceLock::new();
 static WORKER_BUFFER_POOL: OnceLock<Mutex<Vec<Vec<u32>>>> = OnceLock::new();
 
@@ -160,8 +128,9 @@ impl BufferRows {
     }
 }
 
+
 thread_local! {
-    static RENDER_BUFFER_ROWS: Cell<BufferRows> = Cell::new(BufferRows::full());
+    static RENDER_BUFFER_ROWS: Cell<BufferRows> = const { Cell::new(BufferRows::full()) };
 }
 
 pub fn latest_frame_timing_stats() -> FrameTimingStats {
@@ -241,80 +210,9 @@ fn dirty_job_group_rows(jobs: &[DirtyRenderJob]) -> Option<BufferRows> {
     (start < end).then_some(BufferRows::new(start, end))
 }
 
-fn shadow_mask_cache() -> &'static Mutex<ShadowMaskCache> {
-    static CACHE: OnceLock<Mutex<ShadowMaskCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(ShadowMaskCache::default()))
-}
-
 #[cfg(test)]
 fn clear_shadow_mask_cache_for_tests() {
-    let mut cache = shadow_mask_cache()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    cache.masks.clear();
-}
-
-fn split_layout_for_shadow_cache(layout: LayoutBox) -> (LayoutBox, i32, i32) {
-    let offset_x = layout.x.floor() as i32;
-    let offset_y = layout.y.floor() as i32;
-    (
-        LayoutBox::new(
-            layout.x - offset_x as f32,
-            layout.y - offset_y as f32,
-            layout.width,
-            layout.height,
-        ),
-        offset_x,
-        offset_y,
-    )
-}
-
-fn shadow_mask_cache_key(
-    layout: LayoutBox,
-    radius: CornerRadius,
-    blur_radius: f32,
-) -> ShadowMaskCacheKey {
-    ShadowMaskCacheKey {
-        x_bits: layout.x.to_bits(),
-        y_bits: layout.y.to_bits(),
-        width_bits: layout.width.to_bits(),
-        height_bits: layout.height.to_bits(),
-        top_left_bits: radius.top_left.to_bits(),
-        top_right_bits: radius.top_right.to_bits(),
-        bottom_right_bits: radius.bottom_right.to_bits(),
-        bottom_left_bits: radius.bottom_left.to_bits(),
-        blur_bits: blur_radius.to_bits(),
-    }
-}
-
-fn cached_shadow_mask(
-    layout: LayoutBox,
-    radius: CornerRadius,
-    blur_radius: f32,
-) -> (Arc<ShadowMask>, i32, i32) {
-    let blur_radius = blur_radius.max(0.0);
-    let (relative_layout, offset_x, offset_y) = split_layout_for_shadow_cache(layout);
-    let key = shadow_mask_cache_key(relative_layout, radius, blur_radius);
-
-    if let Some(mask) = shadow_mask_cache()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .masks
-        .get(&key)
-        .cloned()
-    {
-        return (mask, offset_x, offset_y);
-    }
-
-    let mask = Arc::new(rasterize_shadow_mask(relative_layout, radius, blur_radius));
-    let mut cache = shadow_mask_cache()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if cache.masks.len() >= MAX_SHADOW_MASK_CACHE_ENTRIES {
-        cache.masks.clear();
-    }
-    cache.masks.insert(key, mask.clone());
-    (mask, offset_x, offset_y)
+    shadow::clear_shadow_mask_cache_for_tests();
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -554,8 +452,12 @@ where
     let mut last_frame = Instant::now();
     let mut frame_index = 1_u64;
     let mut previous_left_down = false;
+    let mut previous_right_down = false;
     let mut previous_middle_down = false;
+    let mut previous_mouse_position = None;
     let mut suppress_left_pointer_until_release = false;
+    let mut left_press_target: Option<ElementPath> = None;
+    let mut last_click: Option<(Instant, ElementPath)> = None;
     let mut element_interaction = ElementInteractionState::default();
     let mut previous_presented_scene: Option<Vec<RenderNode>> = Some(initial_scene);
     let mut previous_presented_indicator: Option<scrollbar::AutoScrollIndicator> =
@@ -569,6 +471,7 @@ where
         last_frame = now;
 
         let left_down = window.get_mouse_down(MouseButton::Left);
+        let right_down = window.get_mouse_down(MouseButton::Right);
         let middle_down = window.get_mouse_down(MouseButton::Middle);
         let suppress_pointer_for_system_drag = should_suspend_updates(
             left_down,
@@ -589,7 +492,10 @@ where
             let _ = scrollbar_controller.cancel_middle_button_auto_scroll();
             suppress_left_pointer_until_release = false;
             previous_left_down = false;
+            previous_right_down = false;
             previous_middle_down = false;
+            previous_mouse_position = None;
+            left_press_target = None;
             window.update();
             continue;
         };
@@ -603,7 +509,9 @@ where
         let mut scene = scene_provider.capture_scene();
         scrollbar_controller.apply_to_scene(&mut scene);
         let mouse_position = window.get_mouse_pos(MouseMode::Clamp);
+        let previous_hovered = element_interaction.hovered.clone();
         let click_started = interactive_left_down && !previous_left_down;
+        let right_press_started = right_down && !previous_right_down;
         let middle_click_started = middle_down && !previous_middle_down;
         let auto_scroll_canceled_click =
             click_started && scrollbar_controller.cancel_middle_button_auto_scroll();
@@ -637,17 +545,83 @@ where
             &mut element_interaction,
         );
 
-        let click_triggered_rerender = if normal_click_started {
-            if let Some((mouse_x, mouse_y)) = mouse_position {
-                dispatch_click(&scene, mouse_x, mouse_y)
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        let current_hovered = element_interaction.hovered.clone();
+        let mouse_moved = mouse_position != previous_mouse_position;
+        let mut event_triggered_rerender = dispatch_hover_transition_events(
+            &scene,
+            previous_hovered.as_ref(),
+            current_hovered.as_ref(),
+        );
 
-        if click_triggered_rerender {
+        if mouse_moved
+            && let Some((mouse_x, mouse_y)) = mouse_position
+        {
+            event_triggered_rerender |=
+                dispatch_mouse_event(&scene, mouse_x, mouse_y, MouseEventKind::MouseMove);
+        }
+
+        if normal_click_started {
+            left_press_target = current_hovered.clone();
+            if let Some((mouse_x, mouse_y)) = mouse_position {
+                event_triggered_rerender |=
+                    dispatch_mouse_event(&scene, mouse_x, mouse_y, MouseEventKind::MouseDown);
+            }
+        } else if click_started {
+            left_press_target = None;
+        }
+
+        if previous_left_down && !interactive_left_down {
+            if let Some((mouse_x, mouse_y)) = mouse_position {
+                event_triggered_rerender |=
+                    dispatch_mouse_event(&scene, mouse_x, mouse_y, MouseEventKind::MouseUp);
+            }
+
+            let release_target = current_hovered.clone();
+            if let Some(click_target) = left_press_target.take() {
+                if release_target.as_ref() == Some(&click_target) {
+                    if let Some((mouse_x, mouse_y)) = mouse_position {
+                        event_triggered_rerender |=
+                            dispatch_mouse_event(&scene, mouse_x, mouse_y, MouseEventKind::Click);
+                        let is_double_click = last_click.as_ref().is_some_and(
+                            |(instant, previous_target)| {
+                                *previous_target == click_target
+                                    && now.saturating_duration_since(*instant)
+                                        <= DOUBLE_CLICK_THRESHOLD
+                            },
+                        );
+                        if is_double_click {
+                            event_triggered_rerender |= dispatch_mouse_event(
+                                &scene,
+                                mouse_x,
+                                mouse_y,
+                                MouseEventKind::DblClick,
+                            );
+                        }
+                    }
+                    last_click = Some((now, click_target));
+                } else {
+                    last_click = None;
+                }
+            }
+        }
+
+        if right_press_started
+            && let Some((mouse_x, mouse_y)) = mouse_position
+        {
+            event_triggered_rerender |=
+                dispatch_mouse_event(&scene, mouse_x, mouse_y, MouseEventKind::MouseDown);
+            event_triggered_rerender |=
+                dispatch_mouse_event(&scene, mouse_x, mouse_y, MouseEventKind::ContextMenu);
+        }
+
+        if previous_right_down && !right_down
+            && let Some((mouse_x, mouse_y)) = mouse_position
+        {
+            event_triggered_rerender |=
+                dispatch_mouse_event(&scene, mouse_x, mouse_y, MouseEventKind::MouseUp);
+        }
+
+        if event_triggered_rerender {
             let rerender_start = Instant::now();
             scene_provider.update(frame);
             frame_stats.update_us += duration_to_us(rerender_start.elapsed());
@@ -748,7 +722,9 @@ where
         }
 
         previous_left_down = interactive_left_down;
+        previous_right_down = right_down;
         previous_middle_down = middle_down;
+        previous_mouse_position = mouse_position;
         frame_stats.total_us = duration_to_us(frame_begin.elapsed());
         record_frame_timing_stats(frame_stats);
         frame_index += 1;
@@ -1460,8 +1436,27 @@ fn node_intersects_clip(node: &RenderNode, clip: ClipRect, cull_mode: CullMode) 
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseEventKind {
+    Click,
+    ContextMenu,
+    DblClick,
+    MouseDown,
+    MouseEnter,
+    MouseLeave,
+    MouseMove,
+    MouseOut,
+    MouseOver,
+    MouseUp,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn dispatch_click(scene: &[RenderNode], x: f32, y: f32) -> bool {
-    let Some(handler) = hit_test_scene(scene, x, y) else {
+    dispatch_mouse_event(scene, x, y, MouseEventKind::Click)
+}
+
+fn dispatch_mouse_event(scene: &[RenderNode], x: f32, y: f32, event: MouseEventKind) -> bool {
+    let Some(handler) = hit_test_scene_for_event(scene, x, y, event) else {
         return false;
     };
 
@@ -1469,11 +1464,60 @@ fn dispatch_click(scene: &[RenderNode], x: f32, y: f32) -> bool {
     true
 }
 
-fn hit_test_scene(scene: &[RenderNode], x: f32, y: f32) -> Option<EventHandler> {
+fn dispatch_mouse_event_at_path(
+    scene: &[RenderNode],
+    path: &ElementPath,
+    event: MouseEventKind,
+) -> bool {
+    let Some(handler) = find_handler_for_path(scene, path, event) else {
+        return false;
+    };
+
+    handler();
+    true
+}
+
+fn dispatch_hover_transition_events(
+    scene: &[RenderNode],
+    previous_hovered: Option<&ElementPath>,
+    hovered: Option<&ElementPath>,
+) -> bool {
+    if previous_hovered == hovered {
+        return false;
+    }
+
+    let previous_chain = previous_hovered.map(element_path_chain).unwrap_or_default();
+    let hovered_chain = hovered.map(element_path_chain).unwrap_or_default();
+    let shared_prefix_len = shared_path_prefix_len(&previous_chain, &hovered_chain);
+    let mut triggered = false;
+
+    if let Some(previous_hovered) = previous_hovered {
+        triggered |= dispatch_mouse_event_at_path(scene, previous_hovered, MouseEventKind::MouseOut);
+    }
+    for path in previous_chain[shared_prefix_len..].iter().rev() {
+        triggered |= dispatch_mouse_event_at_path(scene, path, MouseEventKind::MouseLeave);
+    }
+
+    if let Some(hovered) = hovered {
+        triggered |= dispatch_mouse_event_at_path(scene, hovered, MouseEventKind::MouseOver);
+    }
+    for path in &hovered_chain[shared_prefix_len..] {
+        triggered |= dispatch_mouse_event_at_path(scene, path, MouseEventKind::MouseEnter);
+    }
+
+    triggered
+}
+
+fn hit_test_scene_for_event(
+    scene: &[RenderNode],
+    x: f32,
+    y: f32,
+    event: MouseEventKind,
+) -> Option<EventHandler> {
     scene
         .iter()
         .rev()
-        .find_map(|node| hit_test_node(node, x, y, ClipRect::unbounded()))
+        .find_map(|node| hit_test_node_for_event(node, x, y, ClipRect::unbounded(), event))
 }
 
 fn hit_test_element_path(scene: &[RenderNode], x: f32, y: f32) -> Option<ElementPath> {
@@ -1492,7 +1536,13 @@ fn hit_test_element_path(scene: &[RenderNode], x: f32, y: f32) -> Option<Element
         })
 }
 
-fn hit_test_node(node: &RenderNode, x: f32, y: f32, clip: ClipRect) -> Option<EventHandler> {
+fn hit_test_node_for_event(
+    node: &RenderNode,
+    x: f32,
+    y: f32,
+    clip: ClipRect,
+    event: MouseEventKind,
+) -> Option<EventHandler> {
     if !clip.contains(x, y) || !layout_contains(node.layout, x, y) {
         return None;
     }
@@ -1504,12 +1554,72 @@ fn hit_test_node(node: &RenderNode, x: f32, y: f32, clip: ClipRect) -> Option<Ev
     };
 
     for child in node.children.iter().rev() {
-        if let Some(handler) = hit_test_node(child, x, y, child_clip) {
+        if let Some(handler) = hit_test_node_for_event(child, x, y, child_clip, event) {
             return Some(handler);
         }
     }
 
-    node.on_click
+    event_handler(node, event)
+}
+
+fn find_handler_for_path(
+    scene: &[RenderNode],
+    path: &ElementPath,
+    event: MouseEventKind,
+) -> Option<EventHandler> {
+    scene.iter()
+        .find_map(|node| find_handler_for_path_node(node, path, event))
+}
+
+fn find_handler_for_path_node(
+    node: &RenderNode,
+    path: &ElementPath,
+    event: MouseEventKind,
+) -> Option<EventHandler> {
+    if node.element_path.as_ref() == Some(path)
+        && let Some(handler) = event_handler(node, event)
+    {
+        return Some(handler);
+    }
+
+    node.children
+        .iter()
+        .find_map(|child| find_handler_for_path_node(child, path, event))
+}
+
+fn event_handler(node: &RenderNode, event: MouseEventKind) -> Option<EventHandler> {
+    match event {
+        MouseEventKind::Click => node.handlers.click,
+        MouseEventKind::ContextMenu => node.handlers.contextmenu,
+        MouseEventKind::DblClick => node.handlers.dblclick,
+        MouseEventKind::MouseDown => node.handlers.mousedown,
+        MouseEventKind::MouseEnter => node.handlers.mouseenter,
+        MouseEventKind::MouseLeave => node.handlers.mouseleave,
+        MouseEventKind::MouseMove => node.handlers.mousemove,
+        MouseEventKind::MouseOut => node.handlers.mouseout,
+        MouseEventKind::MouseOver => node.handlers.mouseover,
+        MouseEventKind::MouseUp => node.handlers.mouseup,
+    }
+}
+
+fn element_path_chain(path: &ElementPath) -> Vec<ElementPath> {
+    let mut chain = Vec::with_capacity(path.children.len() + 1);
+    let mut current = ElementPath::root(path.root);
+    chain.push(current.clone());
+
+    for &child_index in &path.children {
+        current = current.with_child(child_index);
+        chain.push(current.clone());
+    }
+
+    chain
+}
+
+fn shared_path_prefix_len(left: &[ElementPath], right: &[ElementPath]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 fn hit_test_element_path_node(
@@ -1670,726 +1780,6 @@ fn draw_background_and_border(
     for layer in node.style.background_layers.iter().rev() {
         draw_background_layer(buffer, width, height, fill_layout, fill_radius, layer, clip);
     }
-}
-
-fn draw_shadow(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    layout: LayoutBox,
-    radius: CornerRadius,
-    shadow: cssimpler_core::BoxShadow,
-    clip: ClipRect,
-) {
-    let base_layout = offset_layout(
-        expand_layout(layout, shadow.spread),
-        shadow.offset_x,
-        shadow.offset_y,
-    );
-    let base_radius = expand_corner_radius(radius, shadow.spread);
-    let blur_radius = shadow.blur_radius.max(0.0);
-
-    if blur_radius <= 0.0 {
-        draw_rounded_rect(
-            buffer,
-            width,
-            height,
-            base_layout,
-            base_radius,
-            shadow.color,
-            clip,
-        );
-        return;
-    }
-
-    let (mask, offset_x, offset_y) = cached_shadow_mask(base_layout, base_radius, blur_radius);
-    draw_shadow_mask(
-        buffer,
-        width,
-        height,
-        &mask,
-        shadow.color,
-        offset_x,
-        offset_y,
-        clip,
-    );
-}
-
-fn draw_shadow_effect(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    layout: LayoutBox,
-    radius: CornerRadius,
-    shadow: cssimpler_core::ShadowEffect,
-    fallback_color: Color,
-    clip: ClipRect,
-) {
-    draw_shadow(
-        buffer,
-        width,
-        height,
-        layout,
-        radius,
-        cssimpler_core::BoxShadow {
-            color: shadow.color.unwrap_or(fallback_color),
-            offset_x: shadow.offset_x,
-            offset_y: shadow.offset_y,
-            blur_radius: shadow.blur_radius,
-            spread: shadow.spread,
-        },
-        clip,
-    );
-}
-
-fn rasterize_shadow_mask(layout: LayoutBox, radius: CornerRadius, blur_radius: f32) -> ShadowMask {
-    let blurred_bounds = expand_layout(layout, blur_radius);
-    let x0 = blurred_bounds.x.floor() as i32;
-    let y0 = blurred_bounds.y.floor() as i32;
-    let x1 = (blurred_bounds.x + blurred_bounds.width).ceil() as i32;
-    let y1 = (blurred_bounds.y + blurred_bounds.height).ceil() as i32;
-    let mut mask = ShadowMask::new(x0, y0, x1 - x0, y1 - y0);
-
-    if mask.width == 0 || mask.height == 0 {
-        return mask;
-    }
-
-    for y in y0..y1 {
-        let local_row_start = (y - y0) as usize * mask.width;
-        for x in x0..x1 {
-            let alpha = shadow_alpha(
-                x as f32 + 0.5,
-                y as f32 + 0.5,
-                layout,
-                radius,
-                blur_radius,
-                u8::MAX,
-            );
-            if alpha == 0 {
-                continue;
-            }
-
-            let index = local_row_start + (x - x0) as usize;
-            mask.alpha[index] = alpha;
-        }
-    }
-
-    mask
-}
-
-fn draw_shadow_mask(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    mask: &ShadowMask,
-    color: Color,
-    offset_x: i32,
-    offset_y: i32,
-    clip: ClipRect,
-) {
-    if color.a == 0 || mask.width == 0 || mask.height == 0 {
-        return;
-    }
-
-    let Some((clip_x0, clip_y0, clip_x1, clip_y1)) = clip_pixel_bounds(clip, width, height) else {
-        return;
-    };
-    let mask_x0 = mask.origin_x + offset_x;
-    let mask_y0 = mask.origin_y + offset_y;
-    let mask_x1 = mask_x0 + mask.width as i32;
-    let mask_y1 = mask_y0 + mask.height as i32;
-    let draw_x0 = mask_x0.max(clip_x0);
-    let draw_y0 = mask_y0.max(clip_y0);
-    let draw_x1 = mask_x1.min(clip_x1);
-    let draw_y1 = mask_y1.min(clip_y1);
-
-    if draw_x0 >= draw_x1 || draw_y0 >= draw_y1 {
-        return;
-    }
-
-    let prepared_color = PreparedBlendColor::new(color);
-    for y in draw_y0..draw_y1 {
-        let local_y = (y - mask_y0) as usize;
-        let row_start = local_y * mask.width;
-        for x in draw_x0..draw_x1 {
-            let coverage = mask.alpha[row_start + (x - mask_x0) as usize];
-            if coverage == 0 {
-                continue;
-            }
-
-            let alpha = scale_alpha(coverage, color.a);
-            if alpha == 0 {
-                continue;
-            }
-
-            blend_prepared_pixel(
-                buffer,
-                width,
-                height,
-                x,
-                y,
-                prepared_color.with_alpha(alpha),
-            );
-        }
-    }
-}
-
-fn draw_rounded_rect(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    layout: LayoutBox,
-    radius: CornerRadius,
-    color: Color,
-    clip: ClipRect,
-) {
-    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
-        return;
-    };
-
-    let prepared_color = PreparedBlendColor::new(color);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            if point_in_rounded_rect(x as f32 + 0.5, y as f32 + 0.5, layout, radius) {
-                blend_prepared_pixel(buffer, width, height, x, y, prepared_color);
-            }
-        }
-    }
-}
-
-fn draw_axis_aligned_opaque_rect(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    layout: LayoutBox,
-    radius: CornerRadius,
-    color: Color,
-    clip: ClipRect,
-) -> bool {
-    if color.a != u8::MAX || !corner_radius_is_zero(layout, radius) {
-        return false;
-    }
-
-    let Some((x0, y0, x1, y1)) = opaque_fill_pixel_bounds(layout, clip, width, height) else {
-        return true;
-    };
-    fill_opaque_span_rows(buffer, width, x0, x1, y0, y1, pack_rgb(color));
-    true
-}
-
-#[derive(Clone, Copy)]
-struct ResolvedRadialShape {
-    radius_x: f32,
-    radius_y: f32,
-}
-
-fn draw_background_layer(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    layout: LayoutBox,
-    radius: CornerRadius,
-    layer: &BackgroundLayer,
-    clip: ClipRect,
-) {
-    match layer {
-        BackgroundLayer::LinearGradient(gradient) => {
-            draw_linear_gradient(buffer, width, height, layout, radius, gradient, clip);
-        }
-        BackgroundLayer::RadialGradient(gradient) => {
-            draw_radial_gradient(buffer, width, height, layout, radius, gradient, clip);
-        }
-        BackgroundLayer::ConicGradient(gradient) => {
-            draw_conic_gradient(buffer, width, height, layout, radius, gradient, clip);
-        }
-    }
-}
-
-fn draw_linear_gradient(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    layout: LayoutBox,
-    radius: CornerRadius,
-    gradient: &LinearGradient,
-    clip: ClipRect,
-) {
-    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
-        return;
-    };
-
-    let Some(first_stop) = gradient.stops.first() else {
-        return;
-    };
-    let direction = gradient_direction_vector(gradient.direction, layout);
-    let center_x = layout.x + layout.width * 0.5;
-    let center_y = layout.y + layout.height * 0.5;
-    let (min_projection, max_projection) =
-        gradient_projection_bounds(layout, center_x, center_y, direction);
-    let projection_span = max_projection - min_projection;
-
-    if projection_span.abs() <= f32::EPSILON {
-        draw_rounded_rect(
-            buffer,
-            width,
-            height,
-            layout,
-            radius,
-            first_stop.color,
-            clip,
-        );
-        return;
-    }
-
-    let stops = resolve_length_stops(&gradient.stops, projection_span, min_projection);
-    let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
-    let projection_step = direction.0;
-    for y in y0..y1 {
-        let py = y as f32 + 0.5;
-        let mut projection =
-            ((x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            if !point_in_rounded_rect(px, py, layout, radius) {
-                projection += projection_step;
-                continue;
-            }
-
-            let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
-            blend_linear_pixel(buffer, width, height, x, y, color);
-            projection += projection_step;
-        }
-    }
-}
-
-fn draw_radial_gradient(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    layout: LayoutBox,
-    radius: CornerRadius,
-    gradient: &RadialGradient,
-    clip: ClipRect,
-) {
-    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
-        return;
-    };
-
-    let Some(first_stop) = gradient.stops.first() else {
-        return;
-    };
-
-    let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
-    let resolved_shape = resolve_radial_shape(gradient.shape, layout, center_x, center_y);
-    if resolved_shape.radius_x <= f32::EPSILON || resolved_shape.radius_y <= f32::EPSILON {
-        draw_rounded_rect(
-            buffer,
-            width,
-            height,
-            layout,
-            radius,
-            first_stop.color,
-            clip,
-        );
-        return;
-    }
-
-    let prepared_length_gradient = prepare_length_gradient(&gradient.stops, gradient.interpolation);
-    let fraction_only = length_stops_use_fraction_only(&gradient.stops);
-    let prepared_unit_gradient = fraction_only.then(|| {
-        let unit_stops = resolve_length_stops(&gradient.stops, 1.0, 0.0);
-        prepare_resolved_gradient(&unit_stops, gradient.interpolation)
-    });
-    let inverse_radius_x_squared = 1.0 / (resolved_shape.radius_x * resolved_shape.radius_x);
-    let inverse_radius_y_squared = 1.0 / (resolved_shape.radius_y * resolved_shape.radius_y);
-
-    for y in y0..y1 {
-        let py = y as f32 + 0.5;
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            if !point_in_rounded_rect(px, py, layout, radius) {
-                continue;
-            }
-
-            let dx = px - center_x;
-            let dy = py - center_y;
-            let color = if let Some(prepared_unit_gradient) = &prepared_unit_gradient {
-                let normalized_distance = ((dx * dx) * inverse_radius_x_squared
-                    + (dy * dy) * inverse_radius_y_squared)
-                    .sqrt();
-                sample_prepared_gradient(
-                    prepared_unit_gradient,
-                    normalized_distance,
-                    gradient.repeating,
-                )
-            } else {
-                let distance = (dx * dx + dy * dy).sqrt();
-                let ray_length = radial_ray_length(dx, dy, resolved_shape);
-                sample_prepared_length_gradient(
-                    &prepared_length_gradient,
-                    ray_length,
-                    0.0,
-                    distance,
-                    gradient.repeating,
-                )
-            };
-            blend_linear_pixel(buffer, width, height, x, y, color);
-        }
-    }
-}
-
-fn draw_conic_gradient(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    layout: LayoutBox,
-    radius: CornerRadius,
-    gradient: &ConicGradient,
-    clip: ClipRect,
-) {
-    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
-        return;
-    };
-
-    let Some(_first_stop) = gradient.stops.first() else {
-        return;
-    };
-
-    let stops = resolve_angle_stops(&gradient.stops);
-    let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
-    let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
-
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            if !point_in_rounded_rect(px, py, layout, radius) {
-                continue;
-            }
-
-            let dx = px - center_x;
-            let dy = py - center_y;
-            let angle = if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
-                0.0
-            } else {
-                dx.atan2(-dy).to_degrees().rem_euclid(360.0)
-            };
-            let position = (angle - gradient.angle).rem_euclid(360.0);
-            let color = sample_prepared_gradient(&prepared, position, gradient.repeating);
-            blend_linear_pixel(buffer, width, height, x, y, color);
-        }
-    }
-}
-
-fn gradient_direction_vector(direction: GradientDirection, layout: LayoutBox) -> (f32, f32) {
-    match direction {
-        GradientDirection::Angle(degrees) => {
-            let radians = degrees.to_radians();
-            (radians.sin(), -radians.cos())
-        }
-        GradientDirection::Horizontal(GradientHorizontal::Left) => (-1.0, 0.0),
-        GradientDirection::Horizontal(GradientHorizontal::Right) => (1.0, 0.0),
-        GradientDirection::Vertical(GradientVertical::Top) => (0.0, -1.0),
-        GradientDirection::Vertical(GradientVertical::Bottom) => (0.0, 1.0),
-        GradientDirection::Corner {
-            horizontal,
-            vertical,
-        } => {
-            let dx = match horizontal {
-                GradientHorizontal::Left => -layout.width.max(1.0),
-                GradientHorizontal::Right => layout.width.max(1.0),
-            };
-            let dy = match vertical {
-                GradientVertical::Top => -layout.height.max(1.0),
-                GradientVertical::Bottom => layout.height.max(1.0),
-            };
-            normalize_vector(dx, dy)
-        }
-    }
-}
-
-fn normalize_vector(x: f32, y: f32) -> (f32, f32) {
-    let length = (x * x + y * y).sqrt();
-    if length <= f32::EPSILON {
-        (0.0, 1.0)
-    } else {
-        (x / length, y / length)
-    }
-}
-
-fn gradient_projection_bounds(
-    layout: LayoutBox,
-    center_x: f32,
-    center_y: f32,
-    direction: (f32, f32),
-) -> (f32, f32) {
-    let corners = [
-        (layout.x, layout.y),
-        (layout.x + layout.width, layout.y),
-        (layout.x, layout.y + layout.height),
-        (layout.x + layout.width, layout.y + layout.height),
-    ];
-    let mut min_projection = f32::INFINITY;
-    let mut max_projection = f32::NEG_INFINITY;
-
-    for (x, y) in corners {
-        let projection = ((x - center_x) * direction.0) + ((y - center_y) * direction.1);
-        min_projection = min_projection.min(projection);
-        max_projection = max_projection.max(projection);
-    }
-
-    (min_projection, max_projection)
-}
-
-fn resolve_gradient_point(point: GradientPoint, layout: LayoutBox) -> (f32, f32) {
-    (
-        layout.x + point.x.resolve(layout.width),
-        layout.y + point.y.resolve(layout.height),
-    )
-}
-
-fn resolve_radial_shape(
-    shape: RadialShape,
-    layout: LayoutBox,
-    center_x: f32,
-    center_y: f32,
-) -> ResolvedRadialShape {
-    match shape {
-        RadialShape::Circle(radius) => {
-            let radius = match radius {
-                CircleRadius::Explicit(radius) => radius.max(0.0),
-                CircleRadius::Extent(extent) => {
-                    resolve_circle_extent(extent, layout, center_x, center_y)
-                }
-            };
-            ResolvedRadialShape {
-                radius_x: radius,
-                radius_y: radius,
-            }
-        }
-        RadialShape::Ellipse(radius) => match radius {
-            EllipseRadius::Explicit { x, y } => ResolvedRadialShape {
-                radius_x: x.resolve(layout.width).max(0.0),
-                radius_y: y.resolve(layout.height).max(0.0),
-            },
-            EllipseRadius::Extent(extent) => {
-                resolve_ellipse_extent(extent, layout, center_x, center_y)
-            }
-        },
-    }
-}
-
-fn resolve_circle_extent(
-    extent: ShapeExtent,
-    layout: LayoutBox,
-    center_x: f32,
-    center_y: f32,
-) -> f32 {
-    let (left, right, top, bottom) = side_distances(layout, center_x, center_y);
-    let corners = corner_offsets(left, right, top, bottom);
-
-    match extent {
-        ShapeExtent::ClosestSide => left.min(right).min(top).min(bottom),
-        ShapeExtent::FarthestSide => left.max(right).max(top).max(bottom),
-        ShapeExtent::ClosestCorner => corners
-            .iter()
-            .map(|(dx, dy)| (dx * dx + dy * dy).sqrt())
-            .fold(f32::INFINITY, f32::min),
-        ShapeExtent::FarthestCorner => corners
-            .iter()
-            .map(|(dx, dy)| (dx * dx + dy * dy).sqrt())
-            .fold(0.0, f32::max),
-    }
-}
-
-fn resolve_ellipse_extent(
-    extent: ShapeExtent,
-    layout: LayoutBox,
-    center_x: f32,
-    center_y: f32,
-) -> ResolvedRadialShape {
-    let (left, right, top, bottom) = side_distances(layout, center_x, center_y);
-    let corners = corner_offsets(left, right, top, bottom);
-
-    match extent {
-        ShapeExtent::ClosestSide => ResolvedRadialShape {
-            radius_x: left.min(right),
-            radius_y: top.min(bottom),
-        },
-        ShapeExtent::FarthestSide => ResolvedRadialShape {
-            radius_x: left.max(right),
-            radius_y: top.max(bottom),
-        },
-        ShapeExtent::ClosestCorner => {
-            scale_ellipse_to_corner(left.min(right), top.min(bottom), &corners, false)
-        }
-        ShapeExtent::FarthestCorner => {
-            scale_ellipse_to_corner(left.max(right), top.max(bottom), &corners, true)
-        }
-    }
-}
-
-fn scale_ellipse_to_corner(
-    base_radius_x: f32,
-    base_radius_y: f32,
-    corners: &[(f32, f32); 4],
-    farthest: bool,
-) -> ResolvedRadialShape {
-    if base_radius_x <= f32::EPSILON || base_radius_y <= f32::EPSILON {
-        return ResolvedRadialShape {
-            radius_x: 0.0,
-            radius_y: 0.0,
-        };
-    }
-
-    let mut scale = if farthest { 0.0 } else { f32::INFINITY };
-    for &(dx, dy) in corners {
-        let factor = ((dx / base_radius_x).powi(2) + (dy / base_radius_y).powi(2)).sqrt();
-        if farthest {
-            scale = scale.max(factor);
-        } else {
-            scale = scale.min(factor);
-        }
-    }
-
-    ResolvedRadialShape {
-        radius_x: base_radius_x * scale,
-        radius_y: base_radius_y * scale,
-    }
-}
-
-fn side_distances(layout: LayoutBox, center_x: f32, center_y: f32) -> (f32, f32, f32, f32) {
-    (
-        (center_x - layout.x).abs(),
-        (layout.x + layout.width - center_x).abs(),
-        (center_y - layout.y).abs(),
-        (layout.y + layout.height - center_y).abs(),
-    )
-}
-
-fn corner_offsets(left: f32, right: f32, top: f32, bottom: f32) -> [(f32, f32); 4] {
-    [(left, top), (right, top), (left, bottom), (right, bottom)]
-}
-
-fn radial_ray_length(dx: f32, dy: f32, shape: ResolvedRadialShape) -> f32 {
-    if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
-        return 0.0;
-    }
-
-    let radius_x = shape.radius_x.max(f32::EPSILON);
-    let radius_y = shape.radius_y.max(f32::EPSILON);
-    let denominator =
-        ((dx * dx) / (radius_x * radius_x) + (dy * dy) / (radius_y * radius_y)).sqrt();
-    if denominator <= f32::EPSILON {
-        0.0
-    } else {
-        (dx * dx + dy * dy).sqrt() / denominator
-    }
-}
-
-fn draw_rounded_ring(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    outer_layout: LayoutBox,
-    outer_radius: CornerRadius,
-    inner: Option<(LayoutBox, CornerRadius)>,
-    color: Color,
-    clip: ClipRect,
-) {
-    let Some((x0, y0, x1, y1)) = pixel_bounds(outer_layout, clip, width, height) else {
-        return;
-    };
-
-    let prepared_color = PreparedBlendColor::new(color);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            if !point_in_rounded_rect(px, py, outer_layout, outer_radius) {
-                continue;
-            }
-
-            if let Some((inner_layout, inner_radius)) = inner
-                && point_in_rounded_rect(px, py, inner_layout, inner_radius)
-            {
-                continue;
-            }
-
-            blend_prepared_pixel(buffer, width, height, x, y, prepared_color);
-        }
-    }
-}
-
-fn draw_axis_aligned_opaque_ring(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    outer_layout: LayoutBox,
-    outer_radius: CornerRadius,
-    inner: Option<(LayoutBox, CornerRadius)>,
-    color: Color,
-    clip: ClipRect,
-) -> bool {
-    if color.a != u8::MAX || !corner_radius_is_zero(outer_layout, outer_radius) {
-        return false;
-    }
-    if let Some((inner_layout, inner_radius)) = inner
-        && !corner_radius_is_zero(inner_layout, inner_radius)
-    {
-        return false;
-    }
-
-    let Some((outer_x0, outer_y0, outer_x1, outer_y1)) =
-        opaque_fill_pixel_bounds(outer_layout, clip, width, height)
-    else {
-        return true;
-    };
-    let packed = pack_rgb(color);
-
-    let Some((inner_layout, _)) = inner else {
-        fill_opaque_span_rows(
-            buffer, width, outer_x0, outer_x1, outer_y0, outer_y1, packed,
-        );
-        return true;
-    };
-
-    let Some((inner_x0, inner_y0, inner_x1, inner_y1)) =
-        center_pixel_bounds(inner_layout, width, height)
-    else {
-        fill_opaque_span_rows(
-            buffer, width, outer_x0, outer_x1, outer_y0, outer_y1, packed,
-        );
-        return true;
-    };
-
-    fill_opaque_span_rows(
-        buffer,
-        width,
-        outer_x0,
-        outer_x1,
-        outer_y0,
-        inner_y0.min(outer_y1),
-        packed,
-    );
-    fill_opaque_span_rows(
-        buffer,
-        width,
-        outer_x0,
-        outer_x1,
-        inner_y1.max(outer_y0),
-        outer_y1,
-        packed,
-    );
-
-    let middle_y0 = inner_y0.max(outer_y0);
-    let middle_y1 = inner_y1.min(outer_y1);
-    if middle_y0 < middle_y1 {
-        fill_opaque_span_rows(buffer, width, outer_x0, inner_x0.min(outer_x1), middle_y0, middle_y1, packed);
-        fill_opaque_span_rows(buffer, width, inner_x1.max(outer_x0), outer_x1, middle_y0, middle_y1, packed);
-    }
-
-    true
 }
 
 fn dirty_regions_between_scenes(
@@ -2658,56 +2048,6 @@ fn node_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
     bounds
 }
 
-fn shadow_bounds(layout: LayoutBox, shadow: cssimpler_core::BoxShadow) -> Option<ClipRect> {
-    let shadow_layout = offset_layout(
-        expand_layout(layout, shadow.spread),
-        shadow.offset_x,
-        shadow.offset_y,
-    );
-    non_empty_layout_clip(expand_layout(shadow_layout, shadow.blur_radius.max(0.0)))
-}
-
-fn shadow_effect_bounds(
-    layout: LayoutBox,
-    shadow: cssimpler_core::ShadowEffect,
-) -> Option<ClipRect> {
-    shadow_bounds(
-        layout,
-        cssimpler_core::BoxShadow {
-            color: shadow.color.unwrap_or(Color::BLACK),
-            offset_x: shadow.offset_x,
-            offset_y: shadow.offset_y,
-            blur_radius: shadow.blur_radius,
-            spread: shadow.spread,
-        },
-    )
-}
-
-fn text_stroke_bounds(
-    layout: LayoutBox,
-    stroke: cssimpler_core::TextStrokeStyle,
-) -> Option<ClipRect> {
-    if stroke.width <= 0.0 {
-        return None;
-    }
-
-    non_empty_layout_clip(expand_layout(layout, stroke.width.ceil().max(0.0)))
-}
-
-fn non_empty_layout_clip(layout: LayoutBox) -> Option<ClipRect> {
-    let clip = layout_clip(layout);
-    (!clip.is_empty()).then_some(clip)
-}
-
-fn union_optional_bounds(left: Option<ClipRect>, right: Option<ClipRect>) -> Option<ClipRect> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.union(right)),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
-}
-
 fn clear_clip(buffer: &mut [u32], width: usize, height: usize, clip: ClipRect, clear_color: Color) {
     clear_clip_packed(buffer, width, height, clip, pack_rgb(clear_color));
 }
@@ -2765,348 +2105,6 @@ fn full_redraw_worker_count(width: usize, height: usize) -> usize {
 
 fn duration_to_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
-}
-
-fn layout_clip(layout: LayoutBox) -> ClipRect {
-    ClipRect {
-        x0: layout.x,
-        y0: layout.y,
-        x1: layout.x + layout.width,
-        y1: layout.y + layout.height,
-    }
-}
-
-fn pixel_bounds(
-    layout: LayoutBox,
-    clip: ClipRect,
-    width: usize,
-    height: usize,
-) -> Option<(i32, i32, i32, i32)> {
-    let clip = clip.intersect(ClipRect::full(width as f32, height as f32))?;
-    let x0 = layout.x.max(clip.x0).floor().max(0.0) as i32;
-    let y0 = layout.y.max(clip.y0).floor().max(0.0) as i32;
-    let x1 = (layout.x + layout.width)
-        .min(clip.x1)
-        .ceil()
-        .min(width as f32) as i32;
-    let y1 = (layout.y + layout.height)
-        .min(clip.y1)
-        .ceil()
-        .min(height as f32) as i32;
-    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
-}
-
-fn opaque_fill_pixel_bounds(
-    layout: LayoutBox,
-    clip: ClipRect,
-    width: usize,
-    height: usize,
-) -> Option<(i32, i32, i32, i32)> {
-    let clip = clip.intersect(ClipRect::full(width as f32, height as f32))?;
-    let x0 = layout.x.max(clip.x0).floor().max(0.0) as i32;
-    let y0 = layout.y.max(clip.y0).floor().max(0.0) as i32;
-    let x1 = (layout.x + layout.width)
-        .min(clip.x1)
-        .ceil()
-        .min(width as f32) as i32;
-    let y1 = (layout.y + layout.height)
-        .min(clip.y1)
-        .ceil()
-        .min(height as f32) as i32;
-    let center_x0 = (layout.x - 0.5).ceil().max(0.0) as i32;
-    let center_y0 = (layout.y - 0.5).ceil().max(0.0) as i32;
-    let center_x1 = ((layout.x + layout.width) - 0.5)
-        .ceil()
-        .min(width as f32) as i32;
-    let center_y1 = ((layout.y + layout.height) - 0.5)
-        .ceil()
-        .min(height as f32) as i32;
-    let x0 = x0.max(center_x0);
-    let y0 = y0.max(center_y0);
-    let x1 = x1.min(center_x1);
-    let y1 = y1.min(center_y1);
-    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
-}
-
-fn center_pixel_bounds(
-    layout: LayoutBox,
-    width: usize,
-    height: usize,
-) -> Option<(i32, i32, i32, i32)> {
-    let x0 = (layout.x - 0.5).ceil().max(0.0) as i32;
-    let y0 = (layout.y - 0.5).ceil().max(0.0) as i32;
-    let x1 = ((layout.x + layout.width) - 0.5)
-        .ceil()
-        .min(width as f32) as i32;
-    let y1 = ((layout.y + layout.height) - 0.5)
-        .ceil()
-        .min(height as f32) as i32;
-    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
-}
-
-fn clip_pixel_bounds(clip: ClipRect, width: usize, height: usize) -> Option<(i32, i32, i32, i32)> {
-    let clip = clip.intersect(ClipRect::full(width as f32, height as f32))?;
-    let x0 = clip.x0.floor().max(0.0) as i32;
-    let y0 = clip.y0.floor().max(0.0) as i32;
-    let x1 = clip.x1.ceil().min(width as f32) as i32;
-    let y1 = clip.y1.ceil().min(height as f32) as i32;
-    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
-}
-
-fn snap_clip_to_pixel_grid(clip: ClipRect, width: usize, height: usize) -> Option<ClipRect> {
-    let (x0, y0, x1, y1) = clip_pixel_bounds(clip, width, height)?;
-    Some(ClipRect {
-        x0: x0 as f32,
-        y0: y0 as f32,
-        x1: x1 as f32,
-        y1: y1 as f32,
-    })
-}
-
-fn fill_opaque_span_rows(
-    buffer: &mut [u32],
-    width: usize,
-    x0: i32,
-    x1: i32,
-    y0: i32,
-    y1: i32,
-    packed: u32,
-) {
-    if x0 >= x1 || y0 >= y1 {
-        return;
-    }
-
-    let rows = current_render_buffer_rows();
-    for y in y0 as usize..y1 as usize {
-        if y < rows.start || y >= rows.end {
-            continue;
-        }
-        let row_start = (y - rows.start) * width;
-        buffer[row_start + x0 as usize..row_start + x1 as usize].fill(packed);
-    }
-}
-
-fn point_in_rounded_rect(x: f32, y: f32, layout: LayoutBox, radius: CornerRadius) -> bool {
-    if !layout_contains(layout, x, y) {
-        return false;
-    }
-
-    let radius = clamp_corner_radius(radius, layout.width, layout.height);
-    if radius.top_left == 0.0
-        && radius.top_right == 0.0
-        && radius.bottom_right == 0.0
-        && radius.bottom_left == 0.0
-    {
-        return true;
-    }
-
-    if x < layout.x + radius.top_left && y < layout.y + radius.top_left {
-        return point_in_corner(
-            x,
-            y,
-            layout.x + radius.top_left,
-            layout.y + radius.top_left,
-            radius.top_left,
-        );
-    }
-
-    if x > layout.x + layout.width - radius.top_right && y < layout.y + radius.top_right {
-        return point_in_corner(
-            x,
-            y,
-            layout.x + layout.width - radius.top_right,
-            layout.y + radius.top_right,
-            radius.top_right,
-        );
-    }
-
-    if x > layout.x + layout.width - radius.bottom_right
-        && y > layout.y + layout.height - radius.bottom_right
-    {
-        return point_in_corner(
-            x,
-            y,
-            layout.x + layout.width - radius.bottom_right,
-            layout.y + layout.height - radius.bottom_right,
-            radius.bottom_right,
-        );
-    }
-
-    if x < layout.x + radius.bottom_left && y > layout.y + layout.height - radius.bottom_left {
-        return point_in_corner(
-            x,
-            y,
-            layout.x + radius.bottom_left,
-            layout.y + layout.height - radius.bottom_left,
-            radius.bottom_left,
-        );
-    }
-
-    true
-}
-
-fn corner_radius_is_zero(layout: LayoutBox, radius: CornerRadius) -> bool {
-    let radius = clamp_corner_radius(radius, layout.width, layout.height);
-    radius.top_left == 0.0
-        && radius.top_right == 0.0
-        && radius.bottom_right == 0.0
-        && radius.bottom_left == 0.0
-}
-
-fn point_in_corner(x: f32, y: f32, center_x: f32, center_y: f32, radius: f32) -> bool {
-    if radius <= 0.0 {
-        return true;
-    }
-
-    let dx = x - center_x;
-    let dy = y - center_y;
-    (dx * dx) + (dy * dy) <= radius * radius
-}
-
-fn shadow_alpha(
-    x: f32,
-    y: f32,
-    layout: LayoutBox,
-    radius: CornerRadius,
-    blur_radius: f32,
-    max_alpha: u8,
-) -> u8 {
-    if point_in_rounded_rect(x, y, layout, radius) {
-        return max_alpha;
-    }
-
-    let distance = distance_to_rounded_rect(x, y, layout, radius);
-    if distance >= blur_radius {
-        return 0;
-    }
-
-    let falloff = 1.0 - (distance / blur_radius);
-    ((max_alpha as f32) * falloff * falloff).round() as u8
-}
-
-fn distance_to_rounded_rect(x: f32, y: f32, layout: LayoutBox, radius: CornerRadius) -> f32 {
-    let radius = clamp_corner_radius(radius, layout.width, layout.height);
-    let left = layout.x;
-    let top = layout.y;
-    let right = layout.x + layout.width;
-    let bottom = layout.y + layout.height;
-
-    if x < left + radius.top_left && y < top + radius.top_left {
-        return distance_to_corner(
-            x,
-            y,
-            left + radius.top_left,
-            top + radius.top_left,
-            radius.top_left,
-        );
-    }
-
-    if x > right - radius.top_right && y < top + radius.top_right {
-        return distance_to_corner(
-            x,
-            y,
-            right - radius.top_right,
-            top + radius.top_right,
-            radius.top_right,
-        );
-    }
-
-    if x > right - radius.bottom_right && y > bottom - radius.bottom_right {
-        return distance_to_corner(
-            x,
-            y,
-            right - radius.bottom_right,
-            bottom - radius.bottom_right,
-            radius.bottom_right,
-        );
-    }
-
-    if x < left + radius.bottom_left && y > bottom - radius.bottom_left {
-        return distance_to_corner(
-            x,
-            y,
-            left + radius.bottom_left,
-            bottom - radius.bottom_left,
-            radius.bottom_left,
-        );
-    }
-
-    let dx = if x < left {
-        left - x
-    } else if x > right {
-        x - right
-    } else {
-        0.0
-    };
-    let dy = if y < top {
-        top - y
-    } else if y > bottom {
-        y - bottom
-    } else {
-        0.0
-    };
-
-    if dx > 0.0 || dy > 0.0 {
-        (dx * dx + dy * dy).sqrt()
-    } else {
-        0.0
-    }
-}
-
-fn distance_to_corner(x: f32, y: f32, center_x: f32, center_y: f32, radius: f32) -> f32 {
-    if radius <= 0.0 {
-        let dx = x - center_x;
-        let dy = y - center_y;
-        return (dx * dx + dy * dy).sqrt();
-    }
-
-    let dx = x - center_x;
-    let dy = y - center_y;
-    ((dx * dx + dy * dy).sqrt() - radius).max(0.0)
-}
-
-fn clamp_corner_radius(radius: CornerRadius, width: f32, height: f32) -> CornerRadius {
-    let max_radius = 0.5 * width.min(height).max(0.0);
-    CornerRadius {
-        top_left: radius.top_left.min(max_radius).max(0.0),
-        top_right: radius.top_right.min(max_radius).max(0.0),
-        bottom_right: radius.bottom_right.min(max_radius).max(0.0),
-        bottom_left: radius.bottom_left.min(max_radius).max(0.0),
-    }
-}
-
-fn inset_layout(layout: LayoutBox, insets: Insets) -> LayoutBox {
-    let width = (layout.width - insets.left - insets.right).max(0.0);
-    let height = (layout.height - insets.top - insets.bottom).max(0.0);
-    LayoutBox::new(layout.x + insets.left, layout.y + insets.top, width, height)
-}
-
-fn inset_corner_radius(radius: CornerRadius, insets: Insets) -> CornerRadius {
-    CornerRadius {
-        top_left: (radius.top_left - insets.top.max(insets.left)).max(0.0),
-        top_right: (radius.top_right - insets.top.max(insets.right)).max(0.0),
-        bottom_right: (radius.bottom_right - insets.bottom.max(insets.right)).max(0.0),
-        bottom_left: (radius.bottom_left - insets.bottom.max(insets.left)).max(0.0),
-    }
-}
-
-fn expand_layout(layout: LayoutBox, amount: f32) -> LayoutBox {
-    let width = (layout.width + amount * 2.0).max(0.0);
-    let height = (layout.height + amount * 2.0).max(0.0);
-    LayoutBox::new(layout.x - amount, layout.y - amount, width, height)
-}
-
-fn offset_layout(layout: LayoutBox, x: f32, y: f32) -> LayoutBox {
-    LayoutBox::new(layout.x + x, layout.y + y, layout.width, layout.height)
-}
-
-fn expand_corner_radius(radius: CornerRadius, amount: f32) -> CornerRadius {
-    CornerRadius {
-        top_left: (radius.top_left + amount).max(0.0),
-        top_right: (radius.top_right + amount).max(0.0),
-        bottom_right: (radius.bottom_right + amount).max(0.0),
-        bottom_left: (radius.bottom_left + amount).max(0.0),
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -3274,9 +2272,10 @@ mod tests {
     };
 
     use crate::{
-        ClipRect, DirtyRenderJob, FramePaintMode, FramePaintReason, ViewportSize, WindowConfig,
-        blend_pixel, build_incremental_render_jobs, coalesce_dirty_regions,
-        dirty_regions_between_scenes, dispatch_click, distribute_dirty_render_jobs,
+        ClipRect, DirtyRenderJob, FramePaintMode, FramePaintReason, MouseEventKind,
+        ViewportSize, WindowConfig, blend_pixel, build_incremental_render_jobs,
+        coalesce_dirty_regions, dirty_regions_between_scenes, dispatch_click,
+        dispatch_hover_transition_events, dispatch_mouse_event, distribute_dirty_render_jobs,
         drawable_viewport_size, hit_test_element_path, pack_rgb, render_scene_update,
         render_scene_update_internal, render_to_buffer, resize_buffer, scenes_match_visuals,
         should_present_frame, should_present_scene, should_suspend_updates, window_options,
@@ -3284,6 +2283,18 @@ mod tests {
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
     static CLICK_TARGET: AtomicUsize = AtomicUsize::new(0);
+    static EVENT_FLAGS: AtomicUsize = AtomicUsize::new(0);
+    const FLAG_PARENT_ENTER: usize = 1 << 0;
+    const FLAG_CHILD_ENTER: usize = 1 << 1;
+    const FLAG_CHILD_OVER: usize = 1 << 2;
+    const FLAG_CHILD_OUT: usize = 1 << 3;
+    const FLAG_CHILD_LEAVE: usize = 1 << 4;
+    const FLAG_PARENT_LEAVE: usize = 1 << 5;
+    const FLAG_MOUSE_MOVE: usize = 1 << 6;
+    const FLAG_MOUSE_DOWN: usize = 1 << 7;
+    const FLAG_MOUSE_UP: usize = 1 << 8;
+    const FLAG_CONTEXT_MENU: usize = 1 << 9;
+    const FLAG_DBLCLICK: usize = 1 << 10;
 
     fn increment_click_count() {
         CLICK_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -3299,6 +2310,50 @@ mod tests {
 
     fn alternate_click_handler() {
         CLICK_COUNT.fetch_add(10, Ordering::SeqCst);
+    }
+
+    fn mark_parent_enter() {
+        EVENT_FLAGS.fetch_or(FLAG_PARENT_ENTER, Ordering::SeqCst);
+    }
+
+    fn mark_child_enter() {
+        EVENT_FLAGS.fetch_or(FLAG_CHILD_ENTER, Ordering::SeqCst);
+    }
+
+    fn mark_child_over() {
+        EVENT_FLAGS.fetch_or(FLAG_CHILD_OVER, Ordering::SeqCst);
+    }
+
+    fn mark_child_out() {
+        EVENT_FLAGS.fetch_or(FLAG_CHILD_OUT, Ordering::SeqCst);
+    }
+
+    fn mark_child_leave() {
+        EVENT_FLAGS.fetch_or(FLAG_CHILD_LEAVE, Ordering::SeqCst);
+    }
+
+    fn mark_parent_leave() {
+        EVENT_FLAGS.fetch_or(FLAG_PARENT_LEAVE, Ordering::SeqCst);
+    }
+
+    fn mark_mouse_move() {
+        EVENT_FLAGS.fetch_or(FLAG_MOUSE_MOVE, Ordering::SeqCst);
+    }
+
+    fn mark_mouse_down() {
+        EVENT_FLAGS.fetch_or(FLAG_MOUSE_DOWN, Ordering::SeqCst);
+    }
+
+    fn mark_mouse_up() {
+        EVENT_FLAGS.fetch_or(FLAG_MOUSE_UP, Ordering::SeqCst);
+    }
+
+    fn mark_context_menu() {
+        EVENT_FLAGS.fetch_or(FLAG_CONTEXT_MENU, Ordering::SeqCst);
+    }
+
+    fn mark_dblclick() {
+        EVENT_FLAGS.fetch_or(FLAG_DBLCLICK, Ordering::SeqCst);
     }
 
     fn bundled_font_family() -> String {
@@ -4202,6 +3257,104 @@ mod tests {
         assert!(dispatch_click(&scene, 12.0, 12.0));
         assert_eq!(CLICK_COUNT.load(Ordering::SeqCst), 1);
         assert!(!dispatch_click(&scene, 28.0, 28.0));
+    }
+
+    #[test]
+    fn dispatch_mouse_event_supports_requested_handlers() {
+        EVENT_FLAGS.store(0, Ordering::SeqCst);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0))
+                .on_contextmenu(mark_context_menu)
+                .on_dblclick(mark_dblclick)
+                .on_mousedown(mark_mouse_down)
+                .on_mousemove(mark_mouse_move)
+                .on_mouseup(mark_mouse_up),
+        ];
+
+        assert!(dispatch_mouse_event(
+            &scene,
+            12.0,
+            12.0,
+            MouseEventKind::ContextMenu
+        ));
+        assert!(dispatch_mouse_event(
+            &scene,
+            12.0,
+            12.0,
+            MouseEventKind::DblClick
+        ));
+        assert!(dispatch_mouse_event(
+            &scene,
+            12.0,
+            12.0,
+            MouseEventKind::MouseDown
+        ));
+        assert!(dispatch_mouse_event(
+            &scene,
+            12.0,
+            12.0,
+            MouseEventKind::MouseMove
+        ));
+        assert!(dispatch_mouse_event(
+            &scene,
+            12.0,
+            12.0,
+            MouseEventKind::MouseUp
+        ));
+        assert_eq!(
+            EVENT_FLAGS.load(Ordering::SeqCst),
+            FLAG_CONTEXT_MENU | FLAG_DBLCLICK | FLAG_MOUSE_DOWN | FLAG_MOUSE_MOVE | FLAG_MOUSE_UP
+        );
+    }
+
+    #[test]
+    fn hover_transition_dispatches_enter_leave_and_over_out_handlers() {
+        EVENT_FLAGS.store(0, Ordering::SeqCst);
+        let root_path = ElementPath::root(0);
+        let child_path = root_path.with_child(0);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 80.0, 60.0))
+                .with_element_path(root_path.clone())
+                .on_mouseenter(mark_parent_enter)
+                .on_mouseleave(mark_parent_leave)
+                .with_child(
+                    RenderNode::container(LayoutBox::new(12.0, 10.0, 30.0, 20.0))
+                        .with_element_path(child_path.clone())
+                        .on_mouseenter(mark_child_enter)
+                        .on_mouseover(mark_child_over)
+                        .on_mouseout(mark_child_out)
+                        .on_mouseleave(mark_child_leave),
+                ),
+        ];
+
+        assert!(dispatch_hover_transition_events(
+            &scene,
+            None,
+            Some(&child_path)
+        ));
+        assert_eq!(
+            EVENT_FLAGS.load(Ordering::SeqCst),
+            FLAG_PARENT_ENTER | FLAG_CHILD_ENTER | FLAG_CHILD_OVER
+        );
+
+        EVENT_FLAGS.store(0, Ordering::SeqCst);
+        assert!(dispatch_hover_transition_events(
+            &scene,
+            Some(&child_path),
+            Some(&root_path)
+        ));
+        assert_eq!(
+            EVENT_FLAGS.load(Ordering::SeqCst),
+            FLAG_CHILD_OUT | FLAG_CHILD_LEAVE
+        );
+
+        EVENT_FLAGS.store(0, Ordering::SeqCst);
+        assert!(dispatch_hover_transition_events(
+            &scene,
+            Some(&root_path),
+            None
+        ));
+        assert_eq!(EVENT_FLAGS.load(Ordering::SeqCst), FLAG_PARENT_LEAVE);
     }
 
     #[test]

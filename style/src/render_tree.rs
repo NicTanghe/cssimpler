@@ -1,6 +1,6 @@
 use cssimpler_core::{
-    CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandler, LayoutBox,
-    Node, RenderNode, ScrollbarData, Style, TransitionStyle,
+    CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandlers,
+    LayoutBox, Node, RenderNode, ScrollbarData, Style, TransitionStyle,
     fonts::{TextStyle, layout_text_block},
 };
 use taffy::geometry::Size as TaffySize;
@@ -17,7 +17,7 @@ pub(crate) struct ResolvedElement {
     pub(crate) style: Style,
     pub(crate) text: String,
     pub(crate) element_path: ElementPath,
-    pub(crate) on_click: Option<EventHandler>,
+    pub(crate) handlers: EventHandlers,
     pub(crate) children: Vec<ResolvedElement>,
 }
 
@@ -28,7 +28,7 @@ struct LayoutTree {
     style: Style,
     text: String,
     element_path: ElementPath,
-    on_click: Option<EventHandler>,
+    handlers: EventHandlers,
     children: Vec<LayoutTree>,
 }
 
@@ -188,7 +188,7 @@ pub(crate) fn resolve_element_tree(
             style,
             text: direct_text,
             element_path: element_path.clone(),
-            on_click: element.on_click,
+            handlers: element.handlers,
             children: Vec::new(),
         };
     }
@@ -229,7 +229,7 @@ pub(crate) fn resolve_element_tree(
         style,
         text: String::new(),
         element_path: element_path.clone(),
-        on_click: element.on_click,
+        handlers: element.handlers,
         children,
     }
 }
@@ -316,7 +316,7 @@ fn build_layout_tree(
         style: resolved.style.clone(),
         text: resolved.text.clone(),
         element_path: resolved.element_path.clone(),
-        on_click: resolved.on_click,
+        handlers: resolved.handlers,
         children,
     }
 }
@@ -367,10 +367,7 @@ fn render_node_from_layout(
         if let Some(scrollbars) = scrollbars {
             node = node.with_scrollbars(scrollbars);
         }
-        if let Some(handler) = tree.on_click {
-            node = node.on_click(handler);
-        }
-        node
+        apply_layout_tree_handlers(node, tree)
     } else {
         let mut node = RenderNode::container(layout_box)
             .with_style(tree.style.visual.clone())
@@ -384,10 +381,7 @@ fn render_node_from_layout(
         if let Some(scrollbars) = scrollbars {
             node = node.with_scrollbars(scrollbars);
         }
-        if let Some(handler) = tree.on_click {
-            node = node.on_click(handler);
-        }
-        node
+        apply_layout_tree_handlers(node, tree)
     }
 }
 
@@ -424,7 +418,7 @@ fn resolve_pseudo_element_tree(
         style,
         text,
         element_path: element_path.clone(),
-        on_click: None,
+        handlers: EventHandlers::default(),
         children: Vec::new(),
     })
 }
@@ -454,7 +448,7 @@ fn flush_text_child(
         style: text_child_style(parent_style),
         text: std::mem::take(pending_text),
         element_path: element_path.clone(),
-        on_click: None,
+        handlers: EventHandlers::default(),
         children: Vec::new(),
     });
 }
@@ -491,10 +485,7 @@ fn render_node_with_cached_layout(
         if let Some(scrollbars) = scrollbars {
             node = node.with_scrollbars(scrollbars);
         }
-        if let Some(handler) = resolved.on_click {
-            node = node.on_click(handler);
-        }
-        return Some(node);
+        return Some(apply_resolved_handlers(node, resolved));
     }
 
     if !matches!(template.kind, cssimpler_core::RenderKind::Container) {
@@ -523,10 +514,7 @@ fn render_node_with_cached_layout(
     if let Some(scrollbars) = scrollbars {
         node = node.with_scrollbars(scrollbars);
     }
-    if let Some(handler) = resolved.on_click {
-        node = node.on_click(handler);
-    }
-    Some(node)
+    Some(apply_resolved_handlers(node, resolved))
 }
 
 fn scrollbars_with_cached_metrics(
@@ -559,6 +547,14 @@ fn text_child_style(parent_style: &Style) -> Style {
     style.visual.text_shadows = parent_style.visual.text_shadows.clone();
     style.visual.filter_drop_shadows = parent_style.visual.filter_drop_shadows.clone();
     style
+}
+
+fn apply_layout_tree_handlers(node: RenderNode, tree: &LayoutTree) -> RenderNode {
+    node.with_handlers(tree.handlers)
+}
+
+fn apply_resolved_handlers(node: RenderNode, resolved: &ResolvedElement) -> RenderNode {
+    node.with_handlers(resolved.handlers)
 }
 
 fn measure_text(

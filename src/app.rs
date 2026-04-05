@@ -9,8 +9,8 @@ use self::scene_transition::SceneTransition;
 use crate::core::{ElementInteractionState, ElementPath, Node, RenderNode};
 use crate::renderer::{self, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
 use crate::style::{
-    Stylesheet, build_render_tree_in_viewport_with_interaction_at_root,
-    build_render_tree_with_interaction_at_root, rebuild_render_tree_with_cached_layout,
+    build_render_tree_in_viewport_with_interaction_at_root,
+    build_render_tree_with_interaction_at_root, rebuild_render_tree_with_cached_layout, Stylesheet,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -449,18 +449,21 @@ where
     }
 
     fn replace_scene(&mut self, scene: Vec<RenderNode>) {
-        if let Some(previous) = self.cached_scene.take() {
-            if SceneTransition::should_create(&previous, &scene) {
-                let transition = SceneTransition::new(previous, scene)
-                    .expect("scene transition should exist after precheck");
+        let previous = self.cached_scene.take();
+
+        match previous {
+            Some(p) if SceneTransition::should_create(&p, &scene) => {
+                let transition = SceneTransition::new(p, scene)
+                    .expect("SceneTransition::new failed despite should_create check");
+
                 self.cached_scene = Some(transition.sample());
                 self.scene_transition = Some(transition);
-                return;
+            }
+            _ => {
+                self.cached_scene = Some(scene);
+                self.scene_transition = None;
             }
         }
-
-        self.cached_scene = Some(scene);
-        self.scene_transition = None;
     }
 
     fn advance_scene_transition(&mut self, delta: Duration, stats: &mut RuntimeStats) {
@@ -1016,7 +1019,7 @@ mod tests {
 
     use super::{App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode};
     use crate::renderer::{FrameInfo, SceneProvider, ViewportSize};
-    use crate::style::{Stylesheet, parse_stylesheet};
+    use crate::style::{parse_stylesheet, Stylesheet};
 
     #[test]
     fn initial_frame_builds_the_scene() {

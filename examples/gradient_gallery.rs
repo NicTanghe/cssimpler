@@ -254,7 +254,7 @@ mod tests {
     }
 
     fn find_clickable_node(node: &RenderNode) -> Option<&RenderNode> {
-        if node.on_click.is_some() {
+        if node.handlers.click.is_some() {
             return Some(node);
         }
 

@@ -1,10 +1,10 @@
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation, RenderMode};
 use cssimpler::renderer::{FrameInfo, WindowConfig};
-use cssimpler::style::{Stylesheet, parse_stylesheet};
+use cssimpler::style::{parse_stylesheet, Stylesheet};
 use cssimpler::ui;
 
 #[derive(Debug, Default)]
@@ -19,7 +19,8 @@ static CLICK_COUNT: AtomicU64 = AtomicU64::new(0);
 fn main() -> Result<()> {
     let config = WindowConfig::new("cssimpler", 960, 540);
     App::new(DemoState::default(), stylesheet(), update, build_ui)
-        .with_render_mode(RenderMode::EveryFrame)
+        //weirdly whith OnInvalifation it is still rendereing out at 60fps
+        .with_render_mode(RenderMode::OnInvalidation)
         .run(config)
         .map_err(Into::into)
 }

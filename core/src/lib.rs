@@ -12,7 +12,7 @@ use taffy::Style as TaffyStyle;
 
 pub use color::{Color, GradientInterpolation, LinearRgba};
 pub use custom_properties::CustomProperties;
-pub use dom::{ElementNode, EventHandler, IntoNode, Node, into_node};
+pub use dom::{ElementNode, EventHandler, EventHandlers, IntoNode, Node, into_node};
 pub use generated_content::GeneratedTextSource;
 pub use interaction::{ElementInteractionState, ElementPath};
 pub use scrollbar::{
@@ -408,7 +408,7 @@ pub struct RenderNode {
     pub element_path: Option<ElementPath>,
     pub content_inset: Insets,
     pub scrollbars: Option<ScrollbarData>,
-    pub on_click: Option<EventHandler>,
+    pub handlers: EventHandlers,
     pub children: Vec<RenderNode>,
 }
 
@@ -423,7 +423,7 @@ impl RenderNode {
             element_path: None,
             content_inset: Insets::ZERO,
             scrollbars: None,
-            on_click: None,
+            handlers: EventHandlers::default(),
             children: Vec::new(),
         }
     }
@@ -438,7 +438,7 @@ impl RenderNode {
             element_path: None,
             content_inset: Insets::ZERO,
             scrollbars: None,
-            on_click: None,
+            handlers: EventHandlers::default(),
             children: Vec::new(),
         }
     }
@@ -473,8 +473,58 @@ impl RenderNode {
         self
     }
 
+    pub fn with_handlers(mut self, handlers: EventHandlers) -> Self {
+        self.handlers = handlers;
+        self
+    }
+
     pub fn on_click(mut self, handler: EventHandler) -> Self {
-        self.on_click = Some(handler);
+        self.handlers.click = Some(handler);
+        self
+    }
+
+    pub fn on_contextmenu(mut self, handler: EventHandler) -> Self {
+        self.handlers.contextmenu = Some(handler);
+        self
+    }
+
+    pub fn on_dblclick(mut self, handler: EventHandler) -> Self {
+        self.handlers.dblclick = Some(handler);
+        self
+    }
+
+    pub fn on_mousedown(mut self, handler: EventHandler) -> Self {
+        self.handlers.mousedown = Some(handler);
+        self
+    }
+
+    pub fn on_mouseenter(mut self, handler: EventHandler) -> Self {
+        self.handlers.mouseenter = Some(handler);
+        self
+    }
+
+    pub fn on_mouseleave(mut self, handler: EventHandler) -> Self {
+        self.handlers.mouseleave = Some(handler);
+        self
+    }
+
+    pub fn on_mousemove(mut self, handler: EventHandler) -> Self {
+        self.handlers.mousemove = Some(handler);
+        self
+    }
+
+    pub fn on_mouseout(mut self, handler: EventHandler) -> Self {
+        self.handlers.mouseout = Some(handler);
+        self
+    }
+
+    pub fn on_mouseover(mut self, handler: EventHandler) -> Self {
+        self.handlers.mouseover = Some(handler);
+        self
+    }
+
+    pub fn on_mouseup(mut self, handler: EventHandler) -> Self {
+        self.handlers.mouseup = Some(handler);
         self
     }
 

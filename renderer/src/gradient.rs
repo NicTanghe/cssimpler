@@ -1,6 +1,12 @@
 use cssimpler_core::{
-    AnglePercentageValue, GradientInterpolation, GradientStop, LengthPercentageValue, LinearRgba,
+    AnglePercentageValue, BackgroundLayer, CircleRadius, ConicGradient, CornerRadius,
+    EllipseRadius, GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint,
+    GradientStop, GradientVertical, LayoutBox, LengthPercentageValue, LinearGradient, LinearRgba,
+    RadialGradient, RadialShape, ShapeExtent,
 };
+
+use super::shapes::{draw_rounded_rect, pixel_bounds, point_in_rounded_rect};
+use super::{blend_linear_pixel, ClipRect};
 
 #[derive(Clone, Copy)]
 pub(crate) struct ResolvedGradientStop {
@@ -50,6 +56,210 @@ struct Oklab {
     l: f32,
     a: f32,
     b: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedRadialShape {
+    radius_x: f32,
+    radius_y: f32,
+}
+
+pub(crate) fn draw_background_layer(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    layer: &BackgroundLayer,
+    clip: ClipRect,
+) {
+    match layer {
+        BackgroundLayer::LinearGradient(gradient) => {
+            draw_linear_gradient(buffer, width, height, layout, radius, gradient, clip);
+        }
+        BackgroundLayer::RadialGradient(gradient) => {
+            draw_radial_gradient(buffer, width, height, layout, radius, gradient, clip);
+        }
+        BackgroundLayer::ConicGradient(gradient) => {
+            draw_conic_gradient(buffer, width, height, layout, radius, gradient, clip);
+        }
+    }
+}
+
+fn draw_linear_gradient(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    gradient: &LinearGradient,
+    clip: ClipRect,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
+        return;
+    };
+
+    let Some(first_stop) = gradient.stops.first() else {
+        return;
+    };
+    let direction = gradient_direction_vector(gradient.direction, layout);
+    let center_x = layout.x + layout.width * 0.5;
+    let center_y = layout.y + layout.height * 0.5;
+    let (min_projection, max_projection) =
+        gradient_projection_bounds(layout, center_x, center_y, direction);
+    let projection_span = max_projection - min_projection;
+
+    if projection_span.abs() <= f32::EPSILON {
+        draw_rounded_rect(
+            buffer,
+            width,
+            height,
+            layout,
+            radius,
+            first_stop.color,
+            clip,
+        );
+        return;
+    }
+
+    let stops = resolve_length_stops(&gradient.stops, projection_span, min_projection);
+    let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
+    let projection_step = direction.0;
+    for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        let mut projection =
+            ((x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            if !point_in_rounded_rect(px, py, layout, radius) {
+                projection += projection_step;
+                continue;
+            }
+
+            let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
+            blend_linear_pixel(buffer, width, height, x, y, color);
+            projection += projection_step;
+        }
+    }
+}
+
+fn draw_radial_gradient(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    gradient: &RadialGradient,
+    clip: ClipRect,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
+        return;
+    };
+
+    let Some(first_stop) = gradient.stops.first() else {
+        return;
+    };
+
+    let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
+    let resolved_shape = resolve_radial_shape(gradient.shape, layout, center_x, center_y);
+    if resolved_shape.radius_x <= f32::EPSILON || resolved_shape.radius_y <= f32::EPSILON {
+        draw_rounded_rect(
+            buffer,
+            width,
+            height,
+            layout,
+            radius,
+            first_stop.color,
+            clip,
+        );
+        return;
+    }
+
+    let prepared_length_gradient = prepare_length_gradient(&gradient.stops, gradient.interpolation);
+    let fraction_only = length_stops_use_fraction_only(&gradient.stops);
+    let prepared_unit_gradient = fraction_only.then(|| {
+        let unit_stops = resolve_length_stops(&gradient.stops, 1.0, 0.0);
+        prepare_resolved_gradient(&unit_stops, gradient.interpolation)
+    });
+    let inverse_radius_x_squared = 1.0 / (resolved_shape.radius_x * resolved_shape.radius_x);
+    let inverse_radius_y_squared = 1.0 / (resolved_shape.radius_y * resolved_shape.radius_y);
+
+    for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            if !point_in_rounded_rect(px, py, layout, radius) {
+                continue;
+            }
+
+            let dx = px - center_x;
+            let dy = py - center_y;
+            let color = if let Some(prepared_unit_gradient) = &prepared_unit_gradient {
+                let normalized_distance = ((dx * dx) * inverse_radius_x_squared
+                    + (dy * dy) * inverse_radius_y_squared)
+                    .sqrt();
+                sample_prepared_gradient(
+                    prepared_unit_gradient,
+                    normalized_distance,
+                    gradient.repeating,
+                )
+            } else {
+                let distance = (dx * dx + dy * dy).sqrt();
+                let ray_length = radial_ray_length(dx, dy, resolved_shape);
+                sample_prepared_length_gradient(
+                    &prepared_length_gradient,
+                    ray_length,
+                    0.0,
+                    distance,
+                    gradient.repeating,
+                )
+            };
+            blend_linear_pixel(buffer, width, height, x, y, color);
+        }
+    }
+}
+
+fn draw_conic_gradient(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    gradient: &ConicGradient,
+    clip: ClipRect,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
+        return;
+    };
+
+    let Some(_first_stop) = gradient.stops.first() else {
+        return;
+    };
+
+    let stops = resolve_angle_stops(&gradient.stops);
+    let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
+    let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
+
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            if !point_in_rounded_rect(px, py, layout, radius) {
+                continue;
+            }
+
+            let dx = px - center_x;
+            let dy = py - center_y;
+            let angle = if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
+                0.0
+            } else {
+                dx.atan2(-dy).to_degrees().rem_euclid(360.0)
+            };
+            let position = (angle - gradient.angle).rem_euclid(360.0);
+            let color = sample_prepared_gradient(&prepared, position, gradient.repeating);
+            blend_linear_pixel(buffer, width, height, x, y, color);
+        }
+    }
 }
 
 pub(crate) fn resolve_length_stops(
@@ -230,6 +440,212 @@ pub(crate) fn length_stops_use_fraction_only(
         .all(|stop| stop.position.px.abs() <= f32::EPSILON)
 }
 
+fn gradient_direction_vector(direction: GradientDirection, layout: LayoutBox) -> (f32, f32) {
+    match direction {
+        GradientDirection::Angle(degrees) => {
+            let radians = degrees.to_radians();
+            (radians.sin(), -radians.cos())
+        }
+        GradientDirection::Horizontal(GradientHorizontal::Left) => (-1.0, 0.0),
+        GradientDirection::Horizontal(GradientHorizontal::Right) => (1.0, 0.0),
+        GradientDirection::Vertical(GradientVertical::Top) => (0.0, -1.0),
+        GradientDirection::Vertical(GradientVertical::Bottom) => (0.0, 1.0),
+        GradientDirection::Corner {
+            horizontal,
+            vertical,
+        } => {
+            let dx = match horizontal {
+                GradientHorizontal::Left => -layout.width.max(1.0),
+                GradientHorizontal::Right => layout.width.max(1.0),
+            };
+            let dy = match vertical {
+                GradientVertical::Top => -layout.height.max(1.0),
+                GradientVertical::Bottom => layout.height.max(1.0),
+            };
+            normalize_vector(dx, dy)
+        }
+    }
+}
+
+fn normalize_vector(x: f32, y: f32) -> (f32, f32) {
+    let length = (x * x + y * y).sqrt();
+    if length <= f32::EPSILON {
+        (0.0, 1.0)
+    } else {
+        (x / length, y / length)
+    }
+}
+
+fn gradient_projection_bounds(
+    layout: LayoutBox,
+    center_x: f32,
+    center_y: f32,
+    direction: (f32, f32),
+) -> (f32, f32) {
+    let corners = [
+        (layout.x, layout.y),
+        (layout.x + layout.width, layout.y),
+        (layout.x, layout.y + layout.height),
+        (layout.x + layout.width, layout.y + layout.height),
+    ];
+    let mut min_projection = f32::INFINITY;
+    let mut max_projection = f32::NEG_INFINITY;
+
+    for (x, y) in corners {
+        let projection = ((x - center_x) * direction.0) + ((y - center_y) * direction.1);
+        min_projection = min_projection.min(projection);
+        max_projection = max_projection.max(projection);
+    }
+
+    (min_projection, max_projection)
+}
+
+fn resolve_gradient_point(point: GradientPoint, layout: LayoutBox) -> (f32, f32) {
+    (
+        layout.x + point.x.resolve(layout.width),
+        layout.y + point.y.resolve(layout.height),
+    )
+}
+
+fn resolve_radial_shape(
+    shape: RadialShape,
+    layout: LayoutBox,
+    center_x: f32,
+    center_y: f32,
+) -> ResolvedRadialShape {
+    match shape {
+        RadialShape::Circle(radius) => {
+            let radius = match radius {
+                CircleRadius::Explicit(radius) => radius.max(0.0),
+                CircleRadius::Extent(extent) => {
+                    resolve_circle_extent(extent, layout, center_x, center_y)
+                }
+            };
+            ResolvedRadialShape {
+                radius_x: radius,
+                radius_y: radius,
+            }
+        }
+        RadialShape::Ellipse(radius) => match radius {
+            EllipseRadius::Explicit { x, y } => ResolvedRadialShape {
+                radius_x: x.resolve(layout.width).max(0.0),
+                radius_y: y.resolve(layout.height).max(0.0),
+            },
+            EllipseRadius::Extent(extent) => {
+                resolve_ellipse_extent(extent, layout, center_x, center_y)
+            }
+        },
+    }
+}
+
+fn resolve_circle_extent(
+    extent: ShapeExtent,
+    layout: LayoutBox,
+    center_x: f32,
+    center_y: f32,
+) -> f32 {
+    let (left, right, top, bottom) = side_distances(layout, center_x, center_y);
+    let corners = corner_offsets(left, right, top, bottom);
+
+    match extent {
+        ShapeExtent::ClosestSide => left.min(right).min(top).min(bottom),
+        ShapeExtent::FarthestSide => left.max(right).max(top).max(bottom),
+        ShapeExtent::ClosestCorner => corners
+            .iter()
+            .map(|(dx, dy)| (dx * dx + dy * dy).sqrt())
+            .fold(f32::INFINITY, f32::min),
+        ShapeExtent::FarthestCorner => corners
+            .iter()
+            .map(|(dx, dy)| (dx * dx + dy * dy).sqrt())
+            .fold(0.0, f32::max),
+    }
+}
+
+fn resolve_ellipse_extent(
+    extent: ShapeExtent,
+    layout: LayoutBox,
+    center_x: f32,
+    center_y: f32,
+) -> ResolvedRadialShape {
+    let (left, right, top, bottom) = side_distances(layout, center_x, center_y);
+    let corners = corner_offsets(left, right, top, bottom);
+
+    match extent {
+        ShapeExtent::ClosestSide => ResolvedRadialShape {
+            radius_x: left.min(right),
+            radius_y: top.min(bottom),
+        },
+        ShapeExtent::FarthestSide => ResolvedRadialShape {
+            radius_x: left.max(right),
+            radius_y: top.max(bottom),
+        },
+        ShapeExtent::ClosestCorner => {
+            scale_ellipse_to_corner(left.min(right), top.min(bottom), &corners, false)
+        }
+        ShapeExtent::FarthestCorner => {
+            scale_ellipse_to_corner(left.max(right), top.max(bottom), &corners, true)
+        }
+    }
+}
+
+fn scale_ellipse_to_corner(
+    base_radius_x: f32,
+    base_radius_y: f32,
+    corners: &[(f32, f32); 4],
+    farthest: bool,
+) -> ResolvedRadialShape {
+    if base_radius_x <= f32::EPSILON || base_radius_y <= f32::EPSILON {
+        return ResolvedRadialShape {
+            radius_x: 0.0,
+            radius_y: 0.0,
+        };
+    }
+
+    let mut scale = if farthest { 0.0 } else { f32::INFINITY };
+    for &(dx, dy) in corners {
+        let factor = ((dx / base_radius_x).powi(2) + (dy / base_radius_y).powi(2)).sqrt();
+        if farthest {
+            scale = scale.max(factor);
+        } else {
+            scale = scale.min(factor);
+        }
+    }
+
+    ResolvedRadialShape {
+        radius_x: base_radius_x * scale,
+        radius_y: base_radius_y * scale,
+    }
+}
+
+fn side_distances(layout: LayoutBox, center_x: f32, center_y: f32) -> (f32, f32, f32, f32) {
+    (
+        (center_x - layout.x).abs(),
+        (layout.x + layout.width - center_x).abs(),
+        (center_y - layout.y).abs(),
+        (layout.y + layout.height - center_y).abs(),
+    )
+}
+
+fn corner_offsets(left: f32, right: f32, top: f32, bottom: f32) -> [(f32, f32); 4] {
+    [(left, top), (right, top), (left, bottom), (right, bottom)]
+}
+
+fn radial_ray_length(dx: f32, dy: f32, shape: ResolvedRadialShape) -> f32 {
+    if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
+        return 0.0;
+    }
+
+    let radius_x = shape.radius_x.max(f32::EPSILON);
+    let radius_y = shape.radius_y.max(f32::EPSILON);
+    let denominator =
+        ((dx * dx) / (radius_x * radius_x) + (dy * dy) / (radius_y * radius_y)).sqrt();
+    if denominator <= f32::EPSILON {
+        0.0
+    } else {
+        (dx * dx + dy * dy).sqrt() / denominator
+    }
+}
+
 fn clamp_resolved_stop_positions(stops: &mut [ResolvedGradientStop]) {
     let mut last_position = f32::NEG_INFINITY;
     for stop in stops {
@@ -403,9 +819,9 @@ mod tests {
     use cssimpler_core::{Color, GradientInterpolation};
 
     use super::{
-        PreparedLengthGradient, ResolvedGradientStop, length_stops_use_fraction_only,
-        prepare_length_gradient, prepare_resolved_gradient, resolve_length_stops, sample_gradient,
-        sample_prepared_gradient, sample_prepared_length_gradient,
+        length_stops_use_fraction_only, prepare_length_gradient, prepare_resolved_gradient,
+        resolve_length_stops, sample_gradient, sample_prepared_gradient,
+        sample_prepared_length_gradient, PreparedLengthGradient, ResolvedGradientStop,
     };
 
     fn assert_close(left: cssimpler_core::LinearRgba, right: cssimpler_core::LinearRgba) {

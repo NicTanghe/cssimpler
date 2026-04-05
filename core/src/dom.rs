@@ -4,6 +4,21 @@ use crate::Style;
 
 pub type EventHandler = fn();
 
+//revisit warning it if profiling shows DOM memory/build cost is a real bottleneck.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EventHandlers {
+    pub click: Option<EventHandler>,
+    pub contextmenu: Option<EventHandler>,
+    pub dblclick: Option<EventHandler>,
+    pub mousedown: Option<EventHandler>,
+    pub mouseenter: Option<EventHandler>,
+    pub mouseleave: Option<EventHandler>,
+    pub mousemove: Option<EventHandler>,
+    pub mouseout: Option<EventHandler>,
+    pub mouseover: Option<EventHandler>,
+    pub mouseup: Option<EventHandler>,
+}
+
 pub trait IntoNode {
     fn into_node(self) -> Node;
 }
@@ -36,7 +51,7 @@ pub struct ElementNode {
     pub attributes: BTreeMap<String, String>,
     pub style: Style,
     pub children: Vec<Node>,
-    pub on_click: Option<EventHandler>,
+    pub handlers: EventHandlers,
 }
 
 impl ElementNode {
@@ -48,7 +63,7 @@ impl ElementNode {
             attributes: BTreeMap::new(),
             style: Style::default(),
             children: Vec::new(),
-            on_click: None,
+            handlers: EventHandlers::default(),
         }
     }
 
@@ -86,7 +101,52 @@ impl ElementNode {
     }
 
     pub fn on_click(mut self, handler: EventHandler) -> Self {
-        self.on_click = Some(handler);
+        self.handlers.click = Some(handler);
+        self
+    }
+
+    pub fn on_contextmenu(mut self, handler: EventHandler) -> Self {
+        self.handlers.contextmenu = Some(handler);
+        self
+    }
+
+    pub fn on_dblclick(mut self, handler: EventHandler) -> Self {
+        self.handlers.dblclick = Some(handler);
+        self
+    }
+
+    pub fn on_mousedown(mut self, handler: EventHandler) -> Self {
+        self.handlers.mousedown = Some(handler);
+        self
+    }
+
+    pub fn on_mouseenter(mut self, handler: EventHandler) -> Self {
+        self.handlers.mouseenter = Some(handler);
+        self
+    }
+
+    pub fn on_mouseleave(mut self, handler: EventHandler) -> Self {
+        self.handlers.mouseleave = Some(handler);
+        self
+    }
+
+    pub fn on_mousemove(mut self, handler: EventHandler) -> Self {
+        self.handlers.mousemove = Some(handler);
+        self
+    }
+
+    pub fn on_mouseout(mut self, handler: EventHandler) -> Self {
+        self.handlers.mouseout = Some(handler);
+        self
+    }
+
+    pub fn on_mouseover(mut self, handler: EventHandler) -> Self {
+        self.handlers.mouseover = Some(handler);
+        self
+    }
+
+    pub fn on_mouseup(mut self, handler: EventHandler) -> Self {
+        self.handlers.mouseup = Some(handler);
         self
     }
 

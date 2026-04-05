@@ -1,10 +1,9 @@
 use proc_macro::TokenStream;
 
-use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
-use syn::spanned::Spanned;
 use syn::{braced, parse_macro_input, Error, Expr, Ident, LitStr, Result, Token};
 
 pub fn expand_ui(input: TokenStream) -> TokenStream {
@@ -125,13 +124,6 @@ impl AttributeName {
             .collect::<Vec<_>>()
             .join("-")
     }
-
-    fn span(&self) -> Span {
-        self.segments
-            .first()
-            .map(Ident::span)
-            .unwrap_or_else(Span::call_site)
-    }
 }
 
 impl Parse for AttributeName {
@@ -196,7 +188,7 @@ fn expand_element(element: &Element) -> Result<TokenStream2> {
         let children = element
             .children
             .iter()
-            .map(|c| expand_child(c))
+            .map(expand_child)
             .collect::<Result<Vec<_>>>()?;
         builder = quote! {
             #builder
@@ -293,16 +285,15 @@ mod tests {
     }
 
     #[test]
-    fn generic_attributes_reject_expression_values_with_a_clear_error() {
+    fn generic_attributes_accept_expression_values() {
         let attribute = Attribute {
             name: parse_str::<AttributeName>("data-text").expect("attribute name should parse"),
             value: AttributeValue::Expression(parse_quote!(dynamic_value)),
         };
-        let error = expand_attribute(quote!(builder), &attribute).expect_err("should fail");
+        let expanded = expand_attribute(quote!(builder), &attribute)
+            .expect("generic expression attributes should expand")
+            .to_string();
 
-        assert_eq!(
-            error.to_string(),
-            "`data-text` expects a string literal like data-text=\"value\""
-        );
+        assert!(expanded.contains(". with_attribute (\"data-text\" , dynamic_value)"));
     }
 }
