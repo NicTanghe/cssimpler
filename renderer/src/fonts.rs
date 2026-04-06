@@ -13,6 +13,7 @@ use font8x8::{BASIC_FONTS, UnicodeFonts};
 
 use crate::{
     ClipRect, PreparedBlendColor, blend_mask_row, clip_pixel_bounds, current_render_buffer_rows,
+    transform::{AffineTransform, ClipState, transform_clip_rect},
 };
 
 const BITMAP_LINE_HEIGHT_PX: f32 = 20.0;
@@ -73,6 +74,85 @@ pub(crate) fn draw_text(
         raster.offset_x,
         raster.offset_y,
         clip,
+    );
+}
+
+pub(crate) fn draw_text_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    text: &str,
+    prepared_text_layout: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let Some(raster) = cached_text_mask(layout, text, &style.text, prepared_text_layout) else {
+        return;
+    };
+
+    for shadow in style
+        .filter_drop_shadows
+        .iter()
+        .chain(style.text_shadows.iter())
+    {
+        let mask = if shadow.spread > 0.0 || shadow.blur_radius > 0.0 {
+            cached_text_effect_mask(
+                &raster,
+                TextEffectCacheKind::Shadow {
+                    spread_bits: shadow.spread.to_bits(),
+                    blur_bits: shadow.blur_radius.to_bits(),
+                },
+                |base| shadow_mask_from_raster(base, *shadow),
+            )
+        } else {
+            raster.mask.clone()
+        };
+        draw_mask_transformed(
+            buffer,
+            width,
+            height,
+            &mask,
+            shadow.color.unwrap_or(style.foreground),
+            raster.offset_x + shadow.offset_x.round() as i32,
+            raster.offset_y + shadow.offset_y.round() as i32,
+            matrix,
+            clip_state,
+        );
+    }
+
+    if style.text_stroke.width > 0.0 {
+        let outline = cached_text_effect_mask(
+            &raster,
+            TextEffectCacheKind::Stroke {
+                width_bits: style.text_stroke.width.to_bits(),
+            },
+            |base| stroke_mask_from_raster(base, style.text_stroke.width),
+        );
+        draw_mask_transformed(
+            buffer,
+            width,
+            height,
+            &outline,
+            style.text_stroke.color.unwrap_or(style.foreground),
+            raster.offset_x,
+            raster.offset_y,
+            matrix,
+            clip_state,
+        );
+    }
+
+    draw_mask_transformed(
+        buffer,
+        width,
+        height,
+        &raster.mask,
+        style.foreground,
+        raster.offset_x,
+        raster.offset_y,
+        matrix,
+        clip_state,
     );
 }
 
@@ -185,6 +265,77 @@ fn draw_mask(
             prepared_color,
             color.a,
         );
+    }
+}
+
+fn draw_mask_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    mask: &AlphaMask,
+    color: Color,
+    offset_x: i32,
+    offset_y: i32,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    if color.a == 0 || mask.width == 0 || mask.height == 0 {
+        return;
+    }
+
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+    let source_bounds = ClipRect {
+        x0: (mask.origin_x + offset_x) as f32,
+        y0: (mask.origin_y + offset_y) as f32,
+        x1: (mask.origin_x + offset_x + mask.width as i32) as f32,
+        y1: (mask.origin_y + offset_y + mask.height as i32) as f32,
+    };
+    let Some(bounds) = transform_clip_rect(source_bounds, matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+    let prepared_color = PreparedBlendColor::new(color);
+    let rows = current_render_buffer_rows();
+    let row_start = rows.start.min(height) as i32;
+    let row_end = rows.end.min(height) as i32;
+    for y in y0.max(row_start)..y1.min(row_end) {
+        for x in x0..x1 {
+            let screen_x = x as f32 + 0.5;
+            let screen_y = y as f32 + 0.5;
+            if !clip_state.contains(screen_x, screen_y) {
+                continue;
+            }
+
+            let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+            let local_x = (source_x - (mask.origin_x + offset_x) as f32).floor() as i32;
+            let local_y = (source_y - (mask.origin_y + offset_y) as f32).floor() as i32;
+            if local_x < 0
+                || local_y < 0
+                || local_x >= mask.width as i32
+                || local_y >= mask.height as i32
+            {
+                continue;
+            }
+
+            let alpha = mask.alpha[local_x as usize + local_y as usize * mask.width];
+            if alpha == 0 {
+                continue;
+            }
+
+            let row_start = (y as usize - rows.start) * width;
+            blend_mask_row(
+                &mut buffer[row_start + x as usize..row_start + x as usize + 1],
+                &[alpha],
+                prepared_color,
+                color.a,
+            );
+        }
     }
 }
 

@@ -10,6 +10,7 @@ mod gradient;
 mod scrollbar;
 mod shadow;
 mod shapes;
+mod transform;
 
 use self::{
     gradient::draw_background_layer,
@@ -19,7 +20,12 @@ use self::{
     shapes::{
         clip_pixel_bounds, draw_axis_aligned_opaque_rect, draw_axis_aligned_opaque_ring,
         draw_rounded_rect, draw_rounded_ring, inset_corner_radius, inset_layout, layout_clip,
-        non_empty_layout_clip, offset_layout, snap_clip_to_pixel_grid, union_optional_bounds,
+        non_empty_layout_clip, offset_layout, point_in_rounded_rect, snap_clip_to_pixel_grid,
+        union_optional_bounds,
+    },
+    transform::{
+        AffineTransform, ClipState, node_transform_matrix, transform_clip_rect,
+        transform_layout_bounds,
     },
 };
 use cssimpler_core::{
@@ -1478,6 +1484,18 @@ fn draw_node_contents(
     clip: ClipRect,
     cull_mode: CullMode,
 ) {
+    if !node.style.transform.is_identity() {
+        draw_node_transformed(
+            node,
+            buffer,
+            width,
+            height,
+            AffineTransform::IDENTITY,
+            &ClipState::new(clip),
+        );
+        return;
+    }
+
     for shadow in &node.style.shadows {
         draw_shadow(
             buffer,
@@ -1534,11 +1552,40 @@ fn draw_node_contents(
 
     if let Some(cached_bounds) = cached_bounds {
         for (child, child_bounds) in node.children.iter().zip(&cached_bounds.children) {
-            draw_node_with_cached_bounds(child, child_bounds, buffer, width, height, child_clip);
+            if child.style.transform.is_identity() {
+                draw_node_with_cached_bounds(
+                    child,
+                    child_bounds,
+                    buffer,
+                    width,
+                    height,
+                    child_clip,
+                );
+            } else {
+                draw_node_transformed(
+                    child,
+                    buffer,
+                    width,
+                    height,
+                    AffineTransform::IDENTITY,
+                    &ClipState::new(child_clip),
+                );
+            }
         }
     } else {
         for child in &node.children {
-            draw_node(child, buffer, width, height, child_clip, cull_mode);
+            if child.style.transform.is_identity() {
+                draw_node(child, buffer, width, height, child_clip, cull_mode);
+            } else {
+                draw_node_transformed(
+                    child,
+                    buffer,
+                    width,
+                    height,
+                    AffineTransform::IDENTITY,
+                    &ClipState::new(child_clip),
+                );
+            }
         }
     }
 
@@ -1633,10 +1680,20 @@ fn hit_test_scene_for_event(
     y: f32,
     event: MouseEventKind,
 ) -> Option<EventHandler> {
-    scene
-        .iter()
-        .rev()
-        .find_map(|node| hit_test_node_for_event(node, x, y, ClipRect::unbounded(), event))
+    scene.iter().rev().find_map(|node| {
+        if node.style.transform.is_identity() {
+            hit_test_node_for_event(node, x, y, ClipRect::unbounded(), event)
+        } else {
+            hit_test_node_for_event_transformed(
+                node,
+                x,
+                y,
+                &ClipState::new(ClipRect::unbounded()),
+                AffineTransform::IDENTITY,
+                event,
+            )
+        }
+    })
 }
 
 fn hit_test_element_path(scene: &[RenderNode], x: f32, y: f32) -> Option<ElementPath> {
@@ -1645,13 +1702,19 @@ fn hit_test_element_path(scene: &[RenderNode], x: f32, y: f32) -> Option<Element
         .enumerate()
         .rev()
         .find_map(|(root_index, node)| {
-            hit_test_element_path_node(
-                node,
-                x,
-                y,
-                ClipRect::unbounded(),
-                &ElementPath::root(root_index),
-            )
+            let root_path = ElementPath::root(root_index);
+            if node.style.transform.is_identity() {
+                hit_test_element_path_node(node, x, y, ClipRect::unbounded(), &root_path)
+            } else {
+                hit_test_element_path_node_transformed(
+                    node,
+                    x,
+                    y,
+                    &ClipState::new(ClipRect::unbounded()),
+                    AffineTransform::IDENTITY,
+                    &root_path,
+                )
+            }
         })
 }
 
@@ -1673,7 +1736,19 @@ fn hit_test_node_for_event(
     };
 
     for child in node.children.iter().rev() {
-        if let Some(handler) = hit_test_node_for_event(child, x, y, child_clip, event) {
+        let hit = if child.style.transform.is_identity() {
+            hit_test_node_for_event(child, x, y, child_clip, event)
+        } else {
+            hit_test_node_for_event_transformed(
+                child,
+                x,
+                y,
+                &ClipState::new(child_clip),
+                AffineTransform::IDENTITY,
+                event,
+            )
+        };
+        if let Some(handler) = hit {
             return Some(handler);
         }
     }
@@ -1761,7 +1836,99 @@ fn hit_test_element_path_node(
 
     for (index, child) in node.children.iter().enumerate().rev() {
         let child_path = path.with_child(index);
-        if let Some(hit) = hit_test_element_path_node(child, x, y, child_clip, &child_path) {
+        let hit = if child.style.transform.is_identity() {
+            hit_test_element_path_node(child, x, y, child_clip, &child_path)
+        } else {
+            hit_test_element_path_node_transformed(
+                child,
+                x,
+                y,
+                &ClipState::new(child_clip),
+                AffineTransform::IDENTITY,
+                &child_path,
+            )
+        };
+        if let Some(hit) = hit {
+            return Some(hit);
+        }
+    }
+
+    node.element_path.clone().or_else(|| Some(path.clone()))
+}
+
+fn hit_test_node_for_event_transformed(
+    node: &RenderNode,
+    x: f32,
+    y: f32,
+    clip_state: &ClipState,
+    parent_matrix: AffineTransform,
+    event: MouseEventKind,
+) -> Option<EventHandler> {
+    if !clip_state.contains(x, y) {
+        return None;
+    }
+
+    let local_matrix = node_transform_matrix(node.layout, &node.style.transform)?;
+    let matrix = parent_matrix.multiply(local_matrix);
+    let inverse = matrix.invert()?;
+    let (local_x, local_y) = inverse.transform_point(x, y);
+    if !layout_contains(node.layout, local_x, local_y) {
+        return None;
+    }
+
+    let child_clip_state = if node.style.overflow.clips_any_axis() {
+        clip_state.push_layout_clip(node.layout, matrix)?
+    } else {
+        clip_state.clone()
+    };
+
+    for child in node.children.iter().rev() {
+        if let Some(handler) =
+            hit_test_node_for_event_transformed(child, x, y, &child_clip_state, matrix, event)
+        {
+            return Some(handler);
+        }
+    }
+
+    event_handler(node, event)
+}
+
+fn hit_test_element_path_node_transformed(
+    node: &RenderNode,
+    x: f32,
+    y: f32,
+    clip_state: &ClipState,
+    parent_matrix: AffineTransform,
+    path: &ElementPath,
+) -> Option<ElementPath> {
+    if !clip_state.contains(x, y) {
+        return None;
+    }
+
+    let local_matrix = node_transform_matrix(node.layout, &node.style.transform)?;
+    let matrix = parent_matrix.multiply(local_matrix);
+    let inverse = matrix.invert()?;
+    let (local_x, local_y) = inverse.transform_point(x, y);
+    if !layout_contains(node.layout, local_x, local_y) {
+        return None;
+    }
+
+    let child_clip_state = if node.style.overflow.clips_any_axis() {
+        clip_state.push_layout_clip(node.layout, matrix)?
+    } else {
+        clip_state.clone()
+    };
+
+    for (index, child) in node.children.iter().enumerate().rev() {
+        let child_path = path.with_child(index);
+        if let Some(hit) = hit_test_element_path_node_transformed(
+            child,
+            x,
+            y,
+            &child_clip_state,
+            matrix,
+            &child_path,
+        ) {
             return Some(hit);
         }
     }
@@ -1829,6 +1996,92 @@ fn next_element_interaction_state(
 
 fn layout_contains(layout: LayoutBox, x: f32, y: f32) -> bool {
     x >= layout.x && y >= layout.y && x < layout.x + layout.width && y < layout.y + layout.height
+}
+
+fn draw_node_transformed(
+    node: &RenderNode,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    parent_matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let Some(local_matrix) = node_transform_matrix(node.layout, &node.style.transform) else {
+        return;
+    };
+    let matrix = parent_matrix.multiply(local_matrix);
+
+    for shadow in &node.style.shadows {
+        shadow::draw_shadow_transformed(
+            buffer,
+            width,
+            height,
+            node.layout,
+            node.style.corner_radius,
+            *shadow,
+            matrix,
+            clip_state,
+        );
+    }
+
+    if !matches!(node.kind, RenderKind::Text(_)) {
+        for shadow in &node.style.filter_drop_shadows {
+            shadow::draw_shadow_effect_transformed(
+                buffer,
+                width,
+                height,
+                node.layout,
+                node.style.corner_radius,
+                *shadow,
+                node.style.foreground,
+                matrix,
+                clip_state,
+            );
+        }
+    }
+
+    draw_background_and_border_transformed(node, buffer, width, height, matrix, clip_state);
+
+    if let RenderKind::Text(content) = &node.kind {
+        let text_layout = scrollbar::text_layout(node);
+        let text_clip_state = if node.style.overflow.clips_any_axis() || node.scrollbars.is_some() {
+            let viewport = scrollbar::text_viewport(node);
+            let Some(state) = clip_state.push_layout_clip(viewport, matrix) else {
+                return;
+            };
+            state
+        } else {
+            clip_state.clone()
+        };
+        fonts::draw_text_transformed(
+            buffer,
+            width,
+            height,
+            text_layout,
+            content,
+            node.text_layout.as_ref(),
+            &node.style,
+            matrix,
+            &text_clip_state,
+        );
+    }
+
+    let child_clip_state = if node.style.overflow.clips_any_axis() {
+        let Some(state) = clip_state.push_layout_clip(node.layout, matrix) else {
+            return;
+        };
+        state
+    } else {
+        clip_state.clone()
+    };
+
+    for child in &node.children {
+        draw_node_transformed(child, buffer, width, height, matrix, &child_clip_state);
+    }
+
+    if matrix.is_identity() {
+        scrollbar::draw_scrollbars(node, buffer, width, height, clip_state.coarse);
+    }
 }
 
 fn draw_background_and_border(
@@ -1899,6 +2152,166 @@ fn draw_background_and_border(
 
     for layer in node.style.background_layers.iter().rev() {
         draw_background_layer(buffer, width, height, fill_layout, fill_radius, layer, clip);
+    }
+}
+
+fn draw_background_and_border_transformed(
+    node: &RenderNode,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    if !node.style.border.widths.is_zero() {
+        let inner_layout = inset_layout(node.layout, node.style.border.widths);
+        let inner_radius = inset_corner_radius(node.style.corner_radius, node.style.border.widths);
+        draw_transformed_rounded_ring(
+            buffer,
+            width,
+            height,
+            node.layout,
+            node.style.corner_radius,
+            Some((inner_layout, inner_radius)),
+            node.style.border.color,
+            matrix,
+            clip_state,
+        );
+    }
+
+    let fill_layout = if node.style.border.widths.is_zero() {
+        node.layout
+    } else {
+        inset_layout(node.layout, node.style.border.widths)
+    };
+    let fill_radius = if node.style.border.widths.is_zero() {
+        node.style.corner_radius
+    } else {
+        inset_corner_radius(node.style.corner_radius, node.style.border.widths)
+    };
+
+    if let Some(background) = node.style.background {
+        draw_transformed_rounded_rect(
+            buffer,
+            width,
+            height,
+            fill_layout,
+            fill_radius,
+            background,
+            matrix,
+            clip_state,
+        );
+    }
+
+    for layer in node.style.background_layers.iter().rev() {
+        gradient::draw_background_layer_transformed(
+            buffer,
+            width,
+            height,
+            fill_layout,
+            fill_radius,
+            layer,
+            matrix,
+            clip_state,
+        );
+    }
+}
+
+fn draw_transformed_rounded_rect(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: cssimpler_core::CornerRadius,
+    color: Color,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    if color.a == 0 {
+        return;
+    }
+
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+    let Some(bounds) = transform_layout_bounds(layout, matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+    let prepared = PreparedBlendColor::new(color);
+    let rows = current_render_buffer_rows();
+    let row_start = rows.start.min(height) as i32;
+    let row_end = rows.end.min(height) as i32;
+    for y in y0.max(row_start)..y1.min(row_end) {
+        for x in x0..x1 {
+            let screen_x = x as f32 + 0.5;
+            let screen_y = y as f32 + 0.5;
+            if !clip_state.contains(screen_x, screen_y) {
+                continue;
+            }
+
+            let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+            if !point_in_rounded_rect(source_x, source_y, layout, radius) {
+                continue;
+            }
+            blend_prepared_pixel(buffer, width, height, x, y, prepared);
+        }
+    }
+}
+
+fn draw_transformed_rounded_ring(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    outer_layout: LayoutBox,
+    outer_radius: cssimpler_core::CornerRadius,
+    inner: Option<(LayoutBox, cssimpler_core::CornerRadius)>,
+    color: Color,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    if color.a == 0 {
+        return;
+    }
+
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+    let Some(bounds) = transform_layout_bounds(outer_layout, matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+    let prepared = PreparedBlendColor::new(color);
+    let rows = current_render_buffer_rows();
+    let row_start = rows.start.min(height) as i32;
+    let row_end = rows.end.min(height) as i32;
+    for y in y0.max(row_start)..y1.min(row_end) {
+        for x in x0..x1 {
+            let screen_x = x as f32 + 0.5;
+            let screen_y = y as f32 + 0.5;
+            if !clip_state.contains(screen_x, screen_y) {
+                continue;
+            }
+
+            let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+            if !point_in_rounded_rect(source_x, source_y, outer_layout, outer_radius) {
+                continue;
+            }
+            if let Some((inner_layout, inner_radius)) = inner
+                && point_in_rounded_rect(source_x, source_y, inner_layout, inner_radius)
+            {
+                continue;
+            }
+            blend_prepared_pixel(buffer, width, height, x, y, prepared);
+        }
     }
 }
 
@@ -1980,6 +2393,14 @@ fn collect_node_dirty_regions(
     current_bounds: &CachedSubtreeBounds,
     dirty_regions: &mut Vec<ClipRect>,
 ) -> bool {
+    if !previous.style.transform.is_identity() || !current.style.transform.is_identity() {
+        push_dirty_region(
+            union_optional_bounds(previous_bounds.bounds, current_bounds.bounds),
+            dirty_regions,
+        );
+        return false;
+    }
+
     let own_matches = render_nodes_match_own_visuals(previous, current);
     let can_tighten_own_dirty = can_tighten_own_dirty_region(previous, current);
 
@@ -2168,7 +2589,7 @@ fn clip_rects_pixel_count(clips: &[ClipRect], width: usize, height: usize) -> us
 }
 
 fn subtree_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
-    let mut bounds = node_visual_bounds(node);
+    let mut local_bounds = node_own_visual_bounds_untransformed(node);
     let parent_clip = non_empty_layout_clip(node.layout);
 
     for child in &node.children {
@@ -2186,10 +2607,10 @@ fn subtree_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
             child_bounds = clipped_bounds;
         }
 
-        bounds = union_optional_bounds(bounds, Some(child_bounds));
+        local_bounds = union_optional_bounds(local_bounds, Some(child_bounds));
     }
 
-    bounds
+    apply_node_transform_to_bounds(node, local_bounds)
 }
 
 fn cache_scene_subtree_bounds(scene: &[RenderNode]) -> CachedSceneBounds {
@@ -2203,8 +2624,8 @@ fn cache_scene_subtree_bounds(scene: &[RenderNode]) -> CachedSceneBounds {
 
 fn cache_subtree_bounds(node: &RenderNode, node_count: &mut usize) -> CachedSubtreeBounds {
     *node_count = node_count.saturating_add(1);
-    let own_bounds = node_visual_bounds(node);
-    let mut bounds = own_bounds;
+    let own_local_bounds = node_own_visual_bounds_untransformed(node);
+    let mut local_bounds = own_local_bounds;
     let parent_clip = non_empty_layout_clip(node.layout);
     let mut children = Vec::with_capacity(node.children.len());
 
@@ -2215,9 +2636,12 @@ fn cache_subtree_bounds(node: &RenderNode, node_count: &mut usize) -> CachedSubt
                 .bounds
                 .and_then(|child_bounds| parent_clip.and_then(|clip| child_bounds.intersect(clip)));
         }
-        bounds = union_optional_bounds(bounds, cached_child.bounds);
+        local_bounds = union_optional_bounds(local_bounds, cached_child.bounds);
         children.push(cached_child);
     }
+
+    let own_bounds = apply_node_transform_to_bounds(node, own_local_bounds);
+    let bounds = apply_node_transform_to_bounds(node, local_bounds);
 
     CachedSubtreeBounds {
         own_bounds,
@@ -2226,7 +2650,12 @@ fn cache_subtree_bounds(node: &RenderNode, node_count: &mut usize) -> CachedSubt
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn node_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
+    apply_node_transform_to_bounds(node, node_own_visual_bounds_untransformed(node))
+}
+
+fn node_own_visual_bounds_untransformed(node: &RenderNode) -> Option<ClipRect> {
     let mut bounds = non_empty_layout_clip(node.layout);
 
     if matches!(node.kind, RenderKind::Text(_)) && node.style.text_stroke.width > 0.0 {
@@ -2257,6 +2686,15 @@ fn node_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
     }
 
     bounds
+}
+
+fn apply_node_transform_to_bounds(node: &RenderNode, bounds: Option<ClipRect>) -> Option<ClipRect> {
+    if node.style.transform.is_identity() {
+        return bounds;
+    }
+
+    let matrix = node_transform_matrix(node.layout, &node.style.transform)?;
+    bounds.and_then(|bounds| transform_clip_rect(bounds, matrix))
 }
 
 fn clear_clip(buffer: &mut [u32], width: usize, height: usize, clip: ClipRect, clear_color: Color) {
@@ -2650,7 +3088,7 @@ mod tests {
         CornerRadius, ElementPath, GradientDirection, GradientHorizontal, GradientInterpolation,
         GradientPoint, GradientStop, Insets, LayoutBox, LengthPercentageValue, LinearGradient,
         Overflow, RadialGradient, RadialShape, RenderNode, ShadowEffect, TextStrokeStyle,
-        VisualStyle,
+        Transform2D, TransformOperation, VisualStyle,
     };
 
     use crate::{
@@ -3839,6 +4277,59 @@ mod tests {
             })
         );
         assert_eq!(hit_test_element_path(&scene, 28.0, 28.0), None);
+    }
+
+    #[test]
+    fn translated_nodes_paint_at_their_transformed_screen_position() {
+        let node =
+            RenderNode::container(LayoutBox::new(8.0, 10.0, 8.0, 6.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(40, 120, 220)),
+                transform: Transform2D {
+                    operations: vec![TransformOperation::Translate {
+                        x: LengthPercentageValue::from_px(24.0),
+                        y: LengthPercentageValue::ZERO,
+                    }],
+                    ..Transform2D::default()
+                },
+                ..VisualStyle::default()
+            });
+        let scene = vec![node.clone()];
+        let mut buffer = vec![0_u32; 48 * 32];
+
+        render_to_buffer(&scene, &mut buffer, 48, 32, Color::WHITE);
+
+        let accent = pack_rgb(Color::rgb(40, 120, 220));
+
+        assert_eq!(
+            super::node_visual_bounds(&node),
+            Some(ClipRect {
+                x0: 32.0,
+                y0: 10.0,
+                x1: 40.0,
+                y1: 16.0,
+            })
+        );
+        assert_eq!(buffer[12 * 48 + 12], pack_rgb(Color::WHITE));
+        assert_eq!(buffer[12 * 48 + 34], accent);
+    }
+
+    #[test]
+    fn hit_testing_uses_inverse_rotation_for_transformed_nodes() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(20.0, 20.0, 20.0, 20.0)).with_style(VisualStyle {
+                transform: Transform2D {
+                    operations: vec![TransformOperation::Rotate { degrees: 45.0 }],
+                    ..Transform2D::default()
+                },
+                ..VisualStyle::default()
+            }),
+        ];
+
+        assert_eq!(
+            hit_test_element_path(&scene, 30.0, 17.0),
+            Some(ElementPath::root(0))
+        );
+        assert_eq!(hit_test_element_path(&scene, 30.0, 14.0), None);
     }
 
     #[test]

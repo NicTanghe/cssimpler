@@ -515,12 +515,17 @@ pub(crate) fn text_layout(node: &RenderNode) -> LayoutBox {
     layout
 }
 
-pub(crate) fn text_clip(node: &RenderNode, clip: ClipRect) -> ClipRect {
+pub(crate) fn text_viewport(node: &RenderNode) -> LayoutBox {
     let mut viewport = inset_layout(node.layout, node.content_inset);
     if let Some(scrollbars) = node.scrollbars {
         viewport.width = (viewport.width - scrollbars.metrics.reserved_width).max(0.0);
         viewport.height = (viewport.height - scrollbars.metrics.reserved_height).max(0.0);
     }
+    viewport
+}
+
+pub(crate) fn text_clip(node: &RenderNode, clip: ClipRect) -> ClipRect {
+    let viewport = text_viewport(node);
 
     if node.style.overflow.clips_any_axis() || node.scrollbars.is_some() {
         clip.intersect(layout_clip(viewport))

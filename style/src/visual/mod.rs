@@ -3,6 +3,7 @@ mod color;
 mod gradient;
 mod scrollbar;
 mod shadow;
+mod transform;
 
 pub use gradient::BackgroundLayerDeclaration;
 pub use shadow::ShadowDeclaration;
@@ -70,6 +71,13 @@ pub(crate) fn extract_property(
         }
         Property::TextShadow(shadows) => Some(shadow::text_shadow_declarations(shadows.as_slice())),
         Property::Filter(filters, _) => Some(shadow::filter_drop_shadow_declarations(filters)),
+        Property::Transform(value, _) => Some(transform::transform_declarations(value)),
+        Property::TransformOrigin(value, _) => {
+            Some(transform::transform_origin_declarations(value))
+        }
+        Property::Translate(value) => Some(transform::translate_declarations(value)),
+        Property::Rotate(value) => Some(transform::rotate_declarations(value)),
+        Property::Scale(value) => Some(transform::scale_declarations(value)),
         _ => None,
     }
 }
@@ -142,6 +150,14 @@ pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) ->
         }
         Declaration::TextStrokeColor(color) => {
             shadow::apply_text_stroke_color(style, *color);
+            true
+        }
+        Declaration::TransformOperations(operations) => {
+            transform::apply_transform_operations(style, operations);
+            true
+        }
+        Declaration::TransformOrigin(origin) => {
+            transform::apply_transform_origin(style, *origin);
             true
         }
         Declaration::ScrollbarWidth(width) => {

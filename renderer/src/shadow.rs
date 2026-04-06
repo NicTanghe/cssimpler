@@ -8,7 +8,10 @@ use super::shapes::{
     clip_pixel_bounds, draw_rounded_rect, expand_corner_radius, expand_layout,
     non_empty_layout_clip, offset_layout, point_in_rounded_rect,
 };
-use super::{ClipRect, PreparedBlendColor, blend_mask_row, current_render_buffer_rows};
+use super::{
+    ClipRect, PreparedBlendColor, blend_mask_row, current_render_buffer_rows,
+    transform::{AffineTransform, ClipState, transform_clip_rect},
+};
 
 const MAX_SHADOW_MASK_CACHE_ENTRIES: usize = 256;
 
@@ -249,6 +252,37 @@ pub(crate) fn draw_shadow(
     );
 }
 
+pub(crate) fn draw_shadow_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    shadow: cssimpler_core::BoxShadow,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let base_layout = offset_layout(
+        expand_layout(layout, shadow.spread),
+        shadow.offset_x,
+        shadow.offset_y,
+    );
+    let base_radius = expand_corner_radius(radius, shadow.spread);
+    let blur_radius = shadow.blur_radius.max(0.0);
+    let (mask, offset_x, offset_y) = cached_shadow_mask(base_layout, base_radius, blur_radius);
+    draw_shadow_mask_transformed(
+        buffer,
+        width,
+        height,
+        &mask,
+        shadow.color,
+        offset_x,
+        offset_y,
+        matrix,
+        clip_state,
+    );
+}
+
 pub(crate) fn draw_shadow_effect(
     buffer: &mut [u32],
     width: usize,
@@ -273,6 +307,35 @@ pub(crate) fn draw_shadow_effect(
             spread: shadow.spread,
         },
         clip,
+    );
+}
+
+pub(crate) fn draw_shadow_effect_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    shadow: cssimpler_core::ShadowEffect,
+    fallback_color: Color,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    draw_shadow_transformed(
+        buffer,
+        width,
+        height,
+        layout,
+        radius,
+        cssimpler_core::BoxShadow {
+            color: shadow.color.unwrap_or(fallback_color),
+            offset_x: shadow.offset_x,
+            offset_y: shadow.offset_y,
+            blur_radius: shadow.blur_radius,
+            spread: shadow.spread,
+        },
+        matrix,
+        clip_state,
     );
 }
 
@@ -395,6 +458,77 @@ fn draw_shadow_mask(
             prepared_color,
             color.a,
         );
+    }
+}
+
+fn draw_shadow_mask_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    mask: &ShadowMask,
+    color: Color,
+    offset_x: i32,
+    offset_y: i32,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    if color.a == 0 || mask.width == 0 || mask.height == 0 {
+        return;
+    }
+
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+    let source_bounds = ClipRect {
+        x0: (mask.origin_x + offset_x) as f32,
+        y0: (mask.origin_y + offset_y) as f32,
+        x1: (mask.origin_x + offset_x + mask.width as i32) as f32,
+        y1: (mask.origin_y + offset_y + mask.height as i32) as f32,
+    };
+    let Some(bounds) = transform_clip_rect(source_bounds, matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+    let prepared_color = PreparedBlendColor::new(color);
+    let rows = current_render_buffer_rows();
+    let row_start = rows.start.min(height) as i32;
+    let row_end = rows.end.min(height) as i32;
+    for y in y0.max(row_start)..y1.min(row_end) {
+        for x in x0..x1 {
+            let screen_x = x as f32 + 0.5;
+            let screen_y = y as f32 + 0.5;
+            if !clip_state.contains(screen_x, screen_y) {
+                continue;
+            }
+
+            let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+            let local_x = (source_x - (mask.origin_x + offset_x) as f32).floor() as i32;
+            let local_y = (source_y - (mask.origin_y + offset_y) as f32).floor() as i32;
+            if local_x < 0
+                || local_y < 0
+                || local_x >= mask.width as i32
+                || local_y >= mask.height as i32
+            {
+                continue;
+            }
+
+            let alpha = mask.alpha[local_x as usize + local_y as usize * mask.width];
+            if alpha == 0 {
+                continue;
+            }
+
+            let row_start = (y as usize - rows.start) * width;
+            blend_mask_row(
+                &mut buffer[row_start + x as usize..row_start + x as usize + 1],
+                &[alpha],
+                prepared_color,
+                color.a,
+            );
+        }
     }
 }
 

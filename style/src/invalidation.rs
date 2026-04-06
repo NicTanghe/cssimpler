@@ -97,6 +97,8 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::FilterDropShadows(_)
         | Declaration::TextStrokeWidth(_)
         | Declaration::TextStrokeColor(_)
+        | Declaration::TransformOperations(_)
+        | Declaration::TransformOrigin(_)
         | Declaration::ScrollbarColors(_, _) => StyleInvalidation::Paint,
         Declaration::FontFamilies(_)
         | Declaration::FontSize(_)
@@ -168,7 +170,12 @@ fn variable_property_invalidation(property_name: &str) -> StyleInvalidation {
         | "border-top-left-radius"
         | "border-top-right-radius"
         | "border-bottom-right-radius"
-        | "border-bottom-left-radius" => StyleInvalidation::Paint,
+        | "border-bottom-left-radius"
+        | "transform"
+        | "transform-origin"
+        | "translate"
+        | "rotate"
+        | "scale" => StyleInvalidation::Paint,
         "display" => StyleInvalidation::Structure,
         _ => StyleInvalidation::Layout,
     }

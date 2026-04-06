@@ -329,6 +329,52 @@ impl Overflow {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformOrigin {
+    pub x: LengthPercentageValue,
+    pub y: LengthPercentageValue,
+}
+
+impl TransformOrigin {
+    pub const CENTER: Self = Self {
+        x: LengthPercentageValue::from_fraction(0.5),
+        y: LengthPercentageValue::from_fraction(0.5),
+    };
+}
+
+impl Default for TransformOrigin {
+    fn default() -> Self {
+        Self::CENTER
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransformOperation {
+    Translate {
+        x: LengthPercentageValue,
+        y: LengthPercentageValue,
+    },
+    Scale {
+        x: f32,
+        y: f32,
+    },
+    Rotate {
+        degrees: f32,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Transform2D {
+    pub origin: TransformOrigin,
+    pub operations: Vec<TransformOperation>,
+}
+
+impl Transform2D {
+    pub fn is_identity(&self) -> bool {
+        self.operations.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisualStyle {
     pub background: Option<Color>,
@@ -342,6 +388,7 @@ pub struct VisualStyle {
     pub border: BorderStyle,
     pub shadows: Vec<BoxShadow>,
     pub overflow: Overflow,
+    pub transform: Transform2D,
     pub scrollbar: ScrollbarStyle,
 }
 
@@ -359,6 +406,7 @@ impl Default for VisualStyle {
             border: BorderStyle::default(),
             shadows: Vec::new(),
             overflow: Overflow::VISIBLE,
+            transform: Transform2D::default(),
             scrollbar: ScrollbarStyle::default(),
         }
     }

@@ -9,8 +9,11 @@ use cssimpler_core::{
     RadialGradient, RadialShape, ShapeExtent,
 };
 
-use super::shapes::{pixel_bounds, rounded_rect_row_span};
-use super::{ClipRect, blend_linear_over, current_render_buffer_rows, pack_linear_rgb};
+use super::shapes::{pixel_bounds, point_in_rounded_rect, rounded_rect_row_span};
+use super::{
+    ClipRect, blend_linear_over, clip_pixel_bounds, current_render_buffer_rows, pack_linear_rgb,
+    transform::{AffineTransform, ClipState, transform_layout_bounds},
+};
 
 const MAX_GRADIENT_LAYER_CACHE_ENTRIES: usize = 16;
 const MAX_GRADIENT_LAYER_CACHE_BYTES: usize = 4 * 1024 * 1024;
@@ -257,6 +260,174 @@ pub(crate) fn draw_background_layer(
         }
         BackgroundLayer::ConicGradient(gradient) => {
             draw_conic_gradient(buffer, width, height, layout, radius, gradient, clip);
+        }
+    }
+}
+
+pub(crate) fn draw_background_layer_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    layer: &BackgroundLayer,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+    let Some(bounds) = transform_layout_bounds(layout, matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+
+    match layer {
+        BackgroundLayer::LinearGradient(gradient) => {
+            let Some(first_stop) = gradient.stops.first() else {
+                return;
+            };
+            let direction = gradient_direction_vector(gradient.direction, layout);
+            let center_x = layout.x + layout.width * 0.5;
+            let center_y = layout.y + layout.height * 0.5;
+            let (min_projection, max_projection) =
+                gradient_projection_bounds(layout, center_x, center_y, direction);
+            let projection_span = max_projection - min_projection;
+            let prepared = (projection_span.abs() > f32::EPSILON).then(|| {
+                let stops = resolve_length_stops(&gradient.stops, projection_span, min_projection);
+                prepare_resolved_gradient(&stops, gradient.interpolation)
+            });
+
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let screen_x = x as f32 + 0.5;
+                    let screen_y = y as f32 + 0.5;
+                    if !clip_state.contains(screen_x, screen_y) {
+                        continue;
+                    }
+
+                    let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+                    if !point_in_rounded_rect(source_x, source_y, layout, radius) {
+                        continue;
+                    }
+
+                    let color = if let Some(prepared) = &prepared {
+                        let projection = ((source_x - center_x) * direction.0)
+                            + ((source_y - center_y) * direction.1);
+                        sample_prepared_gradient(prepared, projection, gradient.repeating)
+                    } else {
+                        first_stop.color.to_linear_rgba()
+                    };
+                    blend_gradient_sample(buffer, width, height, x, y, color);
+                }
+            }
+        }
+        BackgroundLayer::RadialGradient(gradient) => {
+            let Some(first_stop) = gradient.stops.first() else {
+                return;
+            };
+
+            let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
+            let resolved_shape = resolve_radial_shape(gradient.shape, layout, center_x, center_y);
+            let prepared_length_gradient =
+                prepare_length_gradient(&gradient.stops, gradient.interpolation);
+            let fraction_only = length_stops_use_fraction_only(&gradient.stops);
+            let prepared_unit_gradient = fraction_only.then(|| {
+                let unit_stops = resolve_length_stops(&gradient.stops, 1.0, 0.0);
+                prepare_resolved_gradient(&unit_stops, gradient.interpolation)
+            });
+            let inverse_radius_x_squared = if resolved_shape.radius_x.abs() <= f32::EPSILON {
+                0.0
+            } else {
+                1.0 / (resolved_shape.radius_x * resolved_shape.radius_x)
+            };
+            let inverse_radius_y_squared = if resolved_shape.radius_y.abs() <= f32::EPSILON {
+                0.0
+            } else {
+                1.0 / (resolved_shape.radius_y * resolved_shape.radius_y)
+            };
+
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let screen_x = x as f32 + 0.5;
+                    let screen_y = y as f32 + 0.5;
+                    if !clip_state.contains(screen_x, screen_y) {
+                        continue;
+                    }
+
+                    let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+                    if !point_in_rounded_rect(source_x, source_y, layout, radius) {
+                        continue;
+                    }
+
+                    let color = if resolved_shape.radius_x <= f32::EPSILON
+                        || resolved_shape.radius_y <= f32::EPSILON
+                    {
+                        first_stop.color.to_linear_rgba()
+                    } else {
+                        let dx = source_x - center_x;
+                        let dy = source_y - center_y;
+                        if let Some(prepared_unit_gradient) = &prepared_unit_gradient {
+                            let normalized_distance = ((dx * dx) * inverse_radius_x_squared
+                                + (dy * dy) * inverse_radius_y_squared)
+                                .sqrt();
+                            sample_prepared_gradient(
+                                prepared_unit_gradient,
+                                normalized_distance,
+                                gradient.repeating,
+                            )
+                        } else {
+                            let distance = (dx * dx + dy * dy).sqrt();
+                            let ray_length = radial_ray_length(dx, dy, resolved_shape);
+                            sample_prepared_length_gradient(
+                                &prepared_length_gradient,
+                                ray_length,
+                                0.0,
+                                distance,
+                                gradient.repeating,
+                            )
+                        }
+                    };
+                    blend_gradient_sample(buffer, width, height, x, y, color);
+                }
+            }
+        }
+        BackgroundLayer::ConicGradient(gradient) => {
+            let Some(_first_stop) = gradient.stops.first() else {
+                return;
+            };
+            let stops = resolve_angle_stops(&gradient.stops);
+            let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
+            let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let screen_x = x as f32 + 0.5;
+                    let screen_y = y as f32 + 0.5;
+                    if !clip_state.contains(screen_x, screen_y) {
+                        continue;
+                    }
+
+                    let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+                    if !point_in_rounded_rect(source_x, source_y, layout, radius) {
+                        continue;
+                    }
+
+                    let dx = source_x - center_x;
+                    let dy = source_y - center_y;
+                    let angle = if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
+                        0.0
+                    } else {
+                        dx.atan2(-dy).to_degrees().rem_euclid(360.0)
+                    };
+                    let position = (angle - gradient.angle).rem_euclid(360.0);
+                    let color = sample_prepared_gradient(&prepared, position, gradient.repeating);
+                    blend_gradient_sample(buffer, width, height, x, y, color);
+                }
+            }
         }
     }
 }

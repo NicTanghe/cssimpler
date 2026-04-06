@@ -4,7 +4,8 @@ use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
     Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, LayoutStyle,
-    OverflowMode, ScrollbarWidth, Style, TransitionPropertyName, TransitionTimingFunction,
+    OverflowMode, ScrollbarWidth, Style, TransformOperation, TransformOrigin,
+    TransitionPropertyName, TransitionTimingFunction,
     fonts::{TextStyle, TextTransform},
 };
 use lightningcss::declaration::DeclarationBlock;
@@ -369,6 +370,8 @@ pub enum Declaration {
     FilterDropShadows(Vec<ShadowDeclaration>),
     TextStrokeWidth(f32),
     TextStrokeColor(Option<Color>),
+    TransformOperations(Vec<TransformOperation>),
+    TransformOrigin(TransformOrigin),
     OverflowX(OverflowMode),
     OverflowY(OverflowMode),
     ScrollbarWidth(ScrollbarWidth),
@@ -1179,7 +1182,8 @@ mod tests {
         AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, ElementNode,
         GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
         LengthPercentageValue, LinearGradient, Node, RadialShape, ScrollbarWidth, ShapeExtent,
-        TransitionPropertyName, TransitionTimingFunction, fonts::TextTransform,
+        TransformOperation, TransformOrigin, TransitionPropertyName, TransitionTimingFunction,
+        fonts::TextTransform,
     };
     use taffy::prelude::{
         AlignItems as TaffyAlignItems, Dimension, Display as TaffyDisplay,
@@ -1308,6 +1312,77 @@ mod tests {
                 .declarations
                 .contains(&Declaration::TextTransform(TextTransform::Uppercase))
         );
+    }
+
+    #[test]
+    fn parser_supports_transform_controls() {
+        let stylesheet = parse_stylesheet(
+            ".card {
+                transform: translate(12px, 25%) rotate(45deg) scale(150%, 0.5);
+                transform-origin: right 10px bottom 20%;
+            }",
+        )
+        .expect("transform stylesheet should parse");
+
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TransformOperations(vec![
+                    TransformOperation::Translate {
+                        x: LengthPercentageValue::from_px(12.0),
+                        y: LengthPercentageValue::from_fraction(0.25),
+                    },
+                    TransformOperation::Rotate { degrees: 45.0 },
+                    TransformOperation::Scale { x: 1.5, y: 0.5 },
+                ]))
+        );
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TransformOrigin(TransformOrigin {
+                    x: LengthPercentageValue {
+                        px: -10.0,
+                        fraction: 1.0,
+                    },
+                    y: LengthPercentageValue {
+                        px: 0.0,
+                        fraction: 0.8,
+                    },
+                }))
+        );
+    }
+
+    #[test]
+    fn resolve_style_applies_transform_data_without_changing_layout_defaults() {
+        let stylesheet = parse_stylesheet(
+            ".card {
+                transform: translate(10px, 20px) rotate(90deg);
+                transform-origin: 25% 75%;
+            }",
+        )
+        .expect("transform stylesheet should parse");
+        let element = ElementNode::new("div").with_class("card");
+
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(
+            resolved.visual.transform.operations,
+            vec![
+                TransformOperation::Translate {
+                    x: LengthPercentageValue::from_px(10.0),
+                    y: LengthPercentageValue::from_px(20.0),
+                },
+                TransformOperation::Rotate { degrees: 90.0 },
+            ]
+        );
+        assert_eq!(
+            resolved.visual.transform.origin,
+            TransformOrigin {
+                x: LengthPercentageValue::from_fraction(0.25),
+                y: LengthPercentageValue::from_fraction(0.75),
+            }
+        );
+        assert_eq!(resolved.layout.taffy.position, TaffyPosition::Relative);
     }
 
     #[test]

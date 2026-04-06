@@ -1,0 +1,239 @@
+.uiverse-card-demo {
+  display: flex;
+  width: 100%;
+  justify-content: center;
+}
+
+.uiverse-card-demo .parent {
+  position: relative;
+  width: 290px;
+  height: 300px;
+  perspective: 1000px;
+}
+
+.uiverse-card-demo .card {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 50px;
+  background: linear-gradient(135deg, rgb(0, 255, 214) 0%, rgb(8, 226, 96) 100%);
+  transform-style: preserve-3d;
+  transition: transform 0.5s ease-in-out, box-shadow 0.5s ease-in-out;
+  box-shadow:
+    rgba(5, 71, 17, 0.0) 40px 50px 25px -40px,
+    rgba(5, 71, 17, 0.2) 0px 25px 25px -5px;
+}
+
+.uiverse-card-demo .parent:hover .card {
+  transform: rotateX(10deg) rotateY(-10deg) scale3d(1.02, 1.02, 1.02);
+  box-shadow:
+    rgba(5, 71, 17, 0.12) 16px 30px 26px -18px,
+    rgba(5, 71, 17, 0.28) 0px 28px 32px -10px;
+}
+
+.uiverse-card-demo .glass {
+  position: absolute;
+  inset: 8px;
+  border-radius: 55px;
+  border-top-right-radius: 100%;
+  border-left: 1px solid #ffffff;
+  border-bottom: 1px solid #ffffff;
+  background: linear-gradient(0deg, rgba(255, 255, 255, 0.35) 0%, rgba(255, 255, 255, 0.82) 100%);
+  transform: translate3d(0px, 0px, 25px);
+  transform-style: preserve-3d;
+  transition: transform 0.5s ease-in-out, border-top-right-radius 0.5s ease-in-out;
+}
+
+.uiverse-card-demo .parent:hover .glass {
+  transform: translate3d(0px, 0px, 36px);
+  border-top-right-radius: 80%;
+}
+
+.uiverse-card-demo .logo {
+  position: absolute;
+  top: 20px;
+  right: 18px;
+  width: 92px;
+  height: 92px;
+  transform-style: preserve-3d;
+  transform: translate3d(0px, 0px, 42px);
+}
+
+.uiverse-card-demo .circle {
+  position: absolute;
+  display: block;
+  border-radius: 999px;
+  transition: transform 0.5s ease-in-out, opacity 0.5s ease-in-out;
+}
+
+.uiverse-card-demo .circle1 {
+  inset: 0px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.uiverse-card-demo .circle2 {
+  inset: 10px;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.uiverse-card-demo .circle3 {
+  inset: 22px;
+  background: rgba(255, 255, 255, 0.24);
+}
+
+.uiverse-card-demo .circle4 {
+  inset: 34px;
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.uiverse-card-demo .circle5 {
+  left: 19px;
+  top: 19px;
+  width: 54px;
+  height: 54px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.65);
+  background: rgba(255, 255, 255, 0.88);
+  box-shadow: 0px 14px 28px -18px rgba(0, 101, 56, 0.55);
+}
+
+.uiverse-card-demo .logo .svg {
+  width: 24px;
+  height: 24px;
+  fill: #00894d;
+}
+
+.uiverse-card-demo .parent:hover .circle1 {
+  transform: translate3d(2px, -2px, 16px) scale(1.03);
+}
+
+.uiverse-card-demo .parent:hover .circle2 {
+  transform: translate3d(-4px, 2px, 22px) scale(1.04);
+}
+
+.uiverse-card-demo .parent:hover .circle3 {
+  transform: translate3d(3px, -4px, 28px) scale(1.05);
+}
+
+.uiverse-card-demo .parent:hover .circle4 {
+  transform: translate3d(-2px, 4px, 32px) scale(1.08);
+}
+
+.uiverse-card-demo .parent:hover .circle5 {
+  transform: translate3d(0px, -4px, 40px);
+}
+
+.uiverse-card-demo .content {
+  padding: 100px 60px 0px 30px;
+  transform: translate3d(0px, 0px, 26px);
+}
+
+.uiverse-card-demo .content .title {
+  display: block;
+  color: #00894d;
+  font-size: 20px;
+  font-weight: 900;
+  letter-spacing: 0.7px;
+}
+
+.uiverse-card-demo .content .text {
+  display: block;
+  margin-top: 20px;
+  color: rgba(0, 137, 78, 0.76);
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+.uiverse-card-demo .bottom {
+  position: absolute;
+  left: 20px;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  transform: translate3d(0px, 0px, 26px);
+  transform-style: preserve-3d;
+}
+
+.uiverse-card-demo .social-buttons-container {
+  display: flex;
+  gap: 10px;
+}
+
+.uiverse-card-demo .social-button {
+  width: 34px;
+  height: 34px;
+  padding: 0px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.28);
+  box-shadow: 0px 16px 22px -18px rgba(0, 82, 45, 0.85);
+  transition: transform 0.2s ease-in-out, background-color 0.2s ease-in-out;
+}
+
+.uiverse-card-demo .social-button .svg {
+  width: 14px;
+  height: 14px;
+}
+
+.uiverse-card-demo .social-button1 .svg {
+  fill: #d62976;
+}
+
+.uiverse-card-demo .social-button2 .svg {
+  fill: #1d9bf0;
+}
+
+.uiverse-card-demo .social-button3 .svg {
+  fill: #5865f2;
+}
+
+.uiverse-card-demo .social-button:hover {
+  transform: translate3d(0px, 0px, 10px);
+  background: rgba(255, 255, 255, 0.42);
+}
+
+.uiverse-card-demo .view-more {
+  display: flex;
+  width: 40%;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  transition: transform 0.2s ease-in-out;
+}
+
+.uiverse-card-demo .view-more:hover {
+  transform: translate3d(0px, 0px, 10px);
+}
+
+.uiverse-card-demo .view-more-button {
+  padding: 0px;
+  border: none;
+  background: none;
+  color: #00c37b;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.3px;
+}
+
+.uiverse-card-demo .view-more .svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: #00c37b;
+  stroke-width: 3px;
+  transition: transform 0.2s ease-in-out;
+}
+
+.uiverse-card-demo .parent:hover .view-more .svg {
+  transform: translate3d(0px, 2px, 8px);
+}
