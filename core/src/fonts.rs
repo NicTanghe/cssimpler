@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use ab_glyph::{Font, FontArc, FontVec, ScaleFont};
@@ -225,36 +226,48 @@ impl From<std::io::Error> for FontError {
     }
 }
 
-#[derive(Default)]
 struct FontRegistry {
-    database: fontdb::Database,
-    system_fonts_loaded: bool,
-    cache: HashMap<fontdb::ID, FontArc>,
+    database: RwLock<fontdb::Database>,
+    system_fonts_loaded: AtomicBool,
+    cache: RwLock<HashMap<fontdb::ID, FontArc>>,
 }
 
 impl FontRegistry {
-    fn ensure_system_fonts_loaded(&mut self) {
-        if !self.system_fonts_loaded {
-            self.database.load_system_fonts();
-            self.system_fonts_loaded = true;
+    fn ensure_system_fonts_loaded(&self) -> Result<(), FontError> {
+        if self.system_fonts_loaded.load(Ordering::Acquire) {
+            return Ok(());
         }
+
+        let mut database = self
+            .database
+            .write()
+            .map_err(|_| FontError::RegistryPoisoned)?;
+        if !self.system_fonts_loaded.load(Ordering::Relaxed) {
+            database.load_system_fonts();
+            self.system_fonts_loaded.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 
-    fn register_font_bytes(&mut self, data: Vec<u8>) -> Result<Vec<String>, FontError> {
-        let ids = self
+    fn register_font_bytes(&self, data: Vec<u8>) -> Result<Vec<String>, FontError> {
+        let mut database = self
             .database
-            .load_font_source(fontdb::Source::Binary(Arc::new(data)));
+            .write()
+            .map_err(|_| FontError::RegistryPoisoned)?;
+        let ids = database.load_font_source(fontdb::Source::Binary(Arc::new(data)));
         if ids.is_empty() {
             return Err(FontError::NoFacesLoaded);
         }
 
-        Ok(discovered_family_names(&self.database, ids.as_slice()))
+        Ok(discovered_family_names(&database, ids.as_slice()))
     }
 
-    fn register_font_file(&mut self, path: &Path) -> Result<Vec<String>, FontError> {
-        let ids = self
+    fn register_font_file(&self, path: &Path) -> Result<Vec<String>, FontError> {
+        let mut database = self
             .database
-            .load_font_source(fontdb::Source::File(path.to_path_buf()));
+            .write()
+            .map_err(|_| FontError::RegistryPoisoned)?;
+        let ids = database.load_font_source(fontdb::Source::File(path.to_path_buf()));
         if ids.is_empty() {
             return if path.exists() {
                 Err(FontError::NoFacesLoaded)
@@ -266,10 +279,11 @@ impl FontRegistry {
             };
         }
 
-        Ok(discovered_family_names(&self.database, ids.as_slice()))
+        Ok(discovered_family_names(&database, ids.as_slice()))
     }
 
     fn query_font_id(&self, style: &TextStyle) -> Option<fontdb::ID> {
+        self.ensure_system_fonts_loaded().ok()?;
         let query_families = query_families(style);
         let query = fontdb::Query {
             families: &query_families,
@@ -281,7 +295,8 @@ impl FontRegistry {
             },
             ..fontdb::Query::default()
         };
-        self.database.query(&query)
+        let database = self.database.read().ok()?;
+        database.query(&query)
     }
 
     fn build_resolved_font(font: FontArc, style: &TextStyle) -> ResolvedFont {
@@ -292,34 +307,44 @@ impl FontRegistry {
         }
     }
 
-    fn cached_font(&self, style: &TextStyle) -> Option<ResolvedFont> {
-        if self.cache.is_empty() && !self.system_fonts_loaded {
-            return None;
-        }
-        let font_id = self.query_font_id(style)?;
-        self.cache
+    fn cached_font_by_id(&self, font_id: fontdb::ID, style: &TextStyle) -> Option<ResolvedFont> {
+        let cache = self.cache.read().ok()?;
+        cache
             .get(&font_id)
             .cloned()
             .map(|font| Self::build_resolved_font(font, style))
     }
 
-    fn resolve_font(&mut self, style: &TextStyle) -> Option<ResolvedFont> {
-        self.ensure_system_fonts_loaded();
-        let font_id = self.query_font_id(style)?;
+    fn load_font_by_id(&self, font_id: fontdb::ID, style: &TextStyle) -> Option<ResolvedFont> {
+        if let Some(font) = self.cached_font_by_id(font_id, style) {
+            return Some(font);
+        }
 
-        let font = if let Some(existing) = self.cache.get(&font_id) {
-            existing.clone()
-        } else {
-            let loaded = self.database.with_face_data(font_id, |data, face_index| {
-                FontVec::try_from_vec_and_index(data.to_vec(), face_index)
-                    .map(FontArc::new)
-                    .ok()
-            })??;
-            self.cache.insert(font_id, loaded.clone());
-            loaded
-        };
+        let database = self.database.read().ok()?;
+        let loaded = database.with_face_data(font_id, |data, face_index| {
+            FontVec::try_from_vec_and_index(data.to_vec(), face_index)
+                .map(FontArc::new)
+                .ok()
+        })??;
+        drop(database);
+
+        let mut cache = self.cache.write().ok()?;
+        let font = cache
+            .entry(font_id)
+            .or_insert_with(|| loaded.clone())
+            .clone();
 
         Some(Self::build_resolved_font(font, style))
+    }
+}
+
+impl Default for FontRegistry {
+    fn default() -> Self {
+        Self {
+            database: RwLock::new(fontdb::Database::new()),
+            system_fonts_loaded: AtomicBool::new(false),
+            cache: RwLock::new(HashMap::new()),
+        }
     }
 }
 
@@ -382,33 +407,26 @@ fn query_families(style: &TextStyle) -> Vec<fontdb::Family<'_>> {
     families
 }
 
-fn registry() -> &'static RwLock<FontRegistry> {
-    static REGISTRY: OnceLock<RwLock<FontRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| RwLock::new(FontRegistry::default()))
+fn registry() -> &'static FontRegistry {
+    static REGISTRY: OnceLock<FontRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(FontRegistry::default)
 }
 
 pub fn register_font_bytes(data: Vec<u8>) -> Result<Vec<String>, FontError> {
-    let mut registry = registry()
-        .write()
-        .map_err(|_| FontError::RegistryPoisoned)?;
-    registry.register_font_bytes(data)
+    registry().register_font_bytes(data)
 }
 
 pub fn register_font_file(path: impl AsRef<Path>) -> Result<Vec<String>, FontError> {
-    let mut registry = registry()
-        .write()
-        .map_err(|_| FontError::RegistryPoisoned)?;
-    registry.register_font_file(path.as_ref())
+    registry().register_font_file(path.as_ref())
 }
 
 pub fn resolve_font(style: &TextStyle) -> Option<ResolvedFont> {
-    if let Ok(registry) = registry().read() {
-        if let Some(font) = registry.cached_font(style) {
-            return Some(font);
-        }
+    let registry = registry();
+    let font_id = registry.query_font_id(style)?;
+    if let Some(font) = registry.cached_font_by_id(font_id, style) {
+        return Some(font);
     }
-    let mut registry = registry().write().ok()?;
-    registry.resolve_font(style)
+    registry.load_font_by_id(font_id, style)
 }
 
 pub fn layout_text_block(text: &str, style: &TextStyle, wrap_width: Option<f32>) -> TextLayout {
@@ -671,10 +689,11 @@ fn capitalize_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::thread;
 
     use super::{
         FontFamily, GenericFontFamily, LineHeight, TextStyle, TextTransform, layout_text_block,
-        query_families, register_font_file,
+        query_families, register_font_file, resolve_font,
     };
 
     fn bundled_font_family() -> String {
@@ -795,5 +814,34 @@ mod tests {
         let spaced_layout = layout_text_block("ABCD", &spaced, None);
 
         assert!((spaced_layout.width - (baseline_layout.width + 6.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn resolve_font_supports_parallel_reads_after_registration() {
+        let bundled_family = bundled_font_family();
+        let style = TextStyle {
+            families: vec![FontFamily::Named(bundled_family)],
+            size_px: 24.0,
+            ..TextStyle::default()
+        };
+
+        let handles = (0..4)
+            .map(|_| {
+                let style = style.clone();
+                thread::spawn(move || {
+                    for _ in 0..8 {
+                        let font = resolve_font(&style)
+                            .expect("registered bundled font should resolve in parallel");
+                        assert_eq!(font.size_px(), 24.0);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("parallel font resolution should not panic");
+        }
     }
 }

@@ -15,6 +15,13 @@ pub(crate) struct InteractionDependencies {
     pub active: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SelectorAnchor {
+    Id(String),
+    Class(String),
+    Tag(String),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PseudoElementKind {
     Before,
@@ -318,6 +325,25 @@ impl Selector {
                 dependencies.merge(ancestor.compound.interaction_dependencies())
             },
         )
+    }
+
+    pub(crate) fn primary_anchor(&self) -> Option<SelectorAnchor> {
+        for selector in &self.rightmost.simple_selectors {
+            if let SimpleSelector::Id(name) = selector {
+                return Some(SelectorAnchor::Id(name.clone()));
+            }
+        }
+        for selector in &self.rightmost.simple_selectors {
+            if let SimpleSelector::Class(name) = selector {
+                return Some(SelectorAnchor::Class(name.clone()));
+            }
+        }
+        for selector in &self.rightmost.simple_selectors {
+            if let SimpleSelector::Tag(name) = selector {
+                return Some(SelectorAnchor::Tag(name.clone()));
+            }
+        }
+        None
     }
 }
 

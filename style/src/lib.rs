@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -67,15 +68,18 @@ pub use selectors::{
     AncestorSelector, CompoundSelector, ElementRef, PseudoElementKind, Selector,
     SelectorCombinator, SimpleSelector,
 };
+use selectors::{InteractionDependencies, SelectorAnchor};
 pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
     pub rules: Vec<StyleRule>,
+    index: StylesheetIndex,
 }
 
 impl Stylesheet {
     pub fn push(&mut self, rule: StyleRule) {
+        self.index.insert(self.rules.len(), &rule);
         self.rules.push(rule);
     }
 
@@ -122,19 +126,206 @@ impl Stylesheet {
             )
         })
     }
+
+    fn matching_rule_indices_with_context_and_pseudo<'a>(
+        &'a self,
+        element: ElementRef<'a>,
+        ancestors: &'a [ElementRef<'a>],
+        element_path: &'a ElementPath,
+        interaction: &'a ElementInteractionState,
+        pseudo_element: Option<PseudoElementKind>,
+    ) -> Vec<usize> {
+        let mut candidates = self
+            .index
+            .collect_candidate_rule_indices(element, interaction);
+        if candidates.is_empty() {
+            return candidates;
+        }
+
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.retain(|&index| {
+            let Some(rule) = self.rules.get(index) else {
+                return false;
+            };
+            rule.may_match_pseudo_and_interaction(pseudo_element, interaction)
+                && rule.selector.matches_with_ancestors_interaction_and_pseudo(
+                    element,
+                    ancestors,
+                    element_path,
+                    interaction,
+                    pseudo_element,
+                )
+        });
+        candidates
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct StylesheetIndex {
+    id_rules: HashMap<String, Vec<usize>>,
+    class_rules: HashMap<String, Vec<usize>>,
+    tag_rules: HashMap<String, Vec<usize>>,
+    interactive_only_hover_rules: Vec<usize>,
+    interactive_only_active_rules: Vec<usize>,
+    interactive_only_hover_active_rules: Vec<usize>,
+    unanchored_rules: Vec<usize>,
+    hover_rules: Vec<usize>,
+    active_rules: Vec<usize>,
+}
+
+impl StylesheetIndex {
+    fn insert(&mut self, index: usize, rule: &StyleRule) {
+        match rule.selector.primary_anchor() {
+            Some(SelectorAnchor::Id(name)) => {
+                self.id_rules.entry(name).or_default().push(index);
+            }
+            Some(SelectorAnchor::Class(name)) => {
+                self.class_rules.entry(name).or_default().push(index);
+            }
+            Some(SelectorAnchor::Tag(name)) => {
+                self.tag_rules.entry(name).or_default().push(index);
+            }
+            None if rule.interaction_dependencies().hover
+                && rule.interaction_dependencies().active =>
+            {
+                self.interactive_only_hover_active_rules.push(index);
+            }
+            None if rule.interaction_dependencies().hover => {
+                self.interactive_only_hover_rules.push(index);
+            }
+            None if rule.interaction_dependencies().active => {
+                self.interactive_only_active_rules.push(index);
+            }
+            None => self.unanchored_rules.push(index),
+        }
+
+        let dependencies = rule.interaction_dependencies();
+        if dependencies.hover {
+            self.hover_rules.push(index);
+        }
+        if dependencies.active {
+            self.active_rules.push(index);
+        }
+    }
+
+    fn collect_candidate_rule_indices(
+        &self,
+        element: ElementRef<'_>,
+        interaction: &ElementInteractionState,
+    ) -> Vec<usize> {
+        let mut capacity = self.unanchored_rules.len();
+        if let Some(id) = element.id {
+            capacity = capacity.saturating_add(self.id_rules.get(id).map_or(0, Vec::len));
+        }
+        for class_name in element.classes {
+            capacity =
+                capacity.saturating_add(self.class_rules.get(class_name).map_or(0, Vec::len));
+        }
+        capacity = capacity.saturating_add(self.tag_rules.get(element.tag).map_or(0, Vec::len));
+        if interaction.hovered.is_some() {
+            capacity = capacity
+                .saturating_add(self.interactive_only_hover_rules.len())
+                .saturating_add(self.interactive_only_hover_active_rules.len());
+        }
+        if interaction.active.is_some() {
+            capacity = capacity
+                .saturating_add(self.interactive_only_active_rules.len())
+                .saturating_add(self.interactive_only_hover_active_rules.len());
+        }
+
+        let mut candidates = Vec::with_capacity(capacity);
+        candidates.extend_from_slice(&self.unanchored_rules);
+        if let Some(id) = element.id
+            && let Some(indices) = self.id_rules.get(id)
+        {
+            candidates.extend_from_slice(indices);
+        }
+        for class_name in element.classes {
+            if let Some(indices) = self.class_rules.get(class_name) {
+                candidates.extend_from_slice(indices);
+            }
+        }
+        if let Some(indices) = self.tag_rules.get(element.tag) {
+            candidates.extend_from_slice(indices);
+        }
+        if interaction.hovered.is_some() {
+            candidates.extend_from_slice(&self.interactive_only_hover_rules);
+            candidates.extend_from_slice(&self.interactive_only_hover_active_rules);
+        }
+        if interaction.active.is_some() {
+            candidates.extend_from_slice(&self.interactive_only_active_rules);
+            candidates.extend_from_slice(&self.interactive_only_hover_active_rules);
+        }
+        candidates
+    }
+
+    fn collect_interaction_rule_indices(&self, changed: InteractionDependencies) -> Vec<usize> {
+        let mut candidates = Vec::new();
+        if changed.hover {
+            candidates.extend_from_slice(&self.hover_rules);
+        }
+        if changed.active {
+            candidates.extend_from_slice(&self.active_rules);
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct StyleRule {
     pub selector: Selector,
     pub declarations: Vec<Declaration>,
+    custom_declaration_indices: Vec<usize>,
+    other_declaration_indices: Vec<usize>,
+    interaction_dependencies: InteractionDependencies,
 }
 
 impl StyleRule {
     pub fn new(selector: Selector, declarations: Vec<Declaration>) -> Self {
+        let mut custom_declaration_indices = Vec::new();
+        let mut other_declaration_indices = Vec::new();
+        for (index, declaration) in declarations.iter().enumerate() {
+            if matches!(declaration, Declaration::CustomProperty { .. }) {
+                custom_declaration_indices.push(index);
+            } else {
+                other_declaration_indices.push(index);
+            }
+        }
         Self {
+            interaction_dependencies: selector.interaction_dependencies(),
             selector,
             declarations,
+            custom_declaration_indices,
+            other_declaration_indices,
+        }
+    }
+
+    fn interaction_dependencies(&self) -> InteractionDependencies {
+        self.interaction_dependencies
+    }
+
+    fn may_match_pseudo_and_interaction(
+        &self,
+        pseudo_element: Option<PseudoElementKind>,
+        interaction: &ElementInteractionState,
+    ) -> bool {
+        self.selector.pseudo_element == pseudo_element
+            && (!self.interaction_dependencies.hover || interaction.hovered.is_some())
+            && (!self.interaction_dependencies.active || interaction.active.is_some())
+    }
+
+    fn apply_custom_declarations(&self, style: &mut Style, position_explicit: &mut bool) {
+        for &index in &self.custom_declaration_indices {
+            apply_declaration(style, position_explicit, &self.declarations[index]);
+        }
+    }
+
+    fn apply_other_declarations(&self, style: &mut Style, position_explicit: &mut bool) {
+        for &index in &self.other_declaration_indices {
+            apply_declaration(style, position_explicit, &self.declarations[index]);
         }
     }
 }
@@ -320,29 +511,23 @@ fn resolve_style_target(
     }
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
     let element_ref = ElementRef::from(element);
-    let matching_rules = stylesheet
-        .matching_rules_with_context_and_pseudo(
-            element_ref,
-            ancestors,
-            element_path,
-            interaction,
-            pseudo_element,
-        )
-        .collect::<Vec<_>>();
+    let matching_rule_indices = stylesheet.matching_rule_indices_with_context_and_pseudo(
+        element_ref,
+        ancestors,
+        element_path,
+        interaction,
+        pseudo_element,
+    );
 
-    for rule in &matching_rules {
-        for declaration in &rule.declarations {
-            if matches!(declaration, Declaration::CustomProperty { .. }) {
-                apply_declaration(&mut resolved, &mut position_explicit, declaration);
-            }
+    for &rule_index in &matching_rule_indices {
+        if let Some(rule) = stylesheet.rules.get(rule_index) {
+            rule.apply_custom_declarations(&mut resolved, &mut position_explicit);
         }
     }
 
-    for rule in &matching_rules {
-        for declaration in &rule.declarations {
-            if !matches!(declaration, Declaration::CustomProperty { .. }) {
-                apply_declaration(&mut resolved, &mut position_explicit, declaration);
-            }
+    for &rule_index in &matching_rule_indices {
+        if let Some(rule) = stylesheet.rules.get(rule_index) {
+            rule.apply_other_declarations(&mut resolved, &mut position_explicit);
         }
     }
 
@@ -991,7 +1176,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use cssimpler_core::{
-        AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient,
+        AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, ElementNode,
         GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
         LengthPercentageValue, LinearGradient, Node, RadialShape, ScrollbarWidth, ShapeExtent,
         TransitionPropertyName, TransitionTimingFunction, fonts::TextTransform,
@@ -1033,6 +1218,29 @@ mod tests {
             .collect();
 
         assert_eq!(matching.len(), 1);
+    }
+
+    #[test]
+    fn indexed_style_resolution_preserves_anchor_and_custom_property_semantics() {
+        let stylesheet = parse_stylesheet(
+            ".unused { color: #ff0000; }
+             [data-role=\"cta\"] { height: 24px; }
+             .target { color: var(--accent); }
+             button { width: 120px; }
+             #hero { --accent: #2563eb; }",
+        )
+        .expect("stylesheet should parse");
+        let element = ElementNode::new("button")
+            .with_id("hero")
+            .with_class("target")
+            .with_attribute("data-role", "cta");
+
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.layout.taffy.size.width, Dimension::Length(120.0));
+        assert_eq!(resolved.layout.taffy.size.height, Dimension::Length(24.0));
+        assert_eq!(resolved.visual.foreground, Color::rgb(37, 99, 235));
+        assert_eq!(resolved.custom_properties.get("--accent"), Some("#2563eb"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::core::{
-    Color, LinearRgba, RenderNode, TransitionEntry, TransitionPropertyName,
+    Color, LinearRgba, RenderNode, TransitionPropertyName, TransitionStyle,
     TransitionTimingFunction,
 };
 
@@ -9,8 +9,31 @@ use crate::core::{
 pub(crate) struct SceneTransition {
     from: Vec<RenderNode>,
     to: Vec<RenderNode>,
+    plans: Vec<TransitionPlanNode>,
     elapsed_seconds: f32,
     duration_seconds: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TransitionPlanNode {
+    layout: Option<TransitionTimingPlan>,
+    foreground: Option<TransitionTimingPlan>,
+    background: Option<TransitionTimingPlan>,
+    border_color: Option<TransitionTimingPlan>,
+    children: Vec<TransitionPlanNode>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TransitionTimingPlan {
+    duration_seconds: f32,
+    delay_seconds: f32,
+    timing_function: TransitionTimingFunction,
+}
+
+impl TransitionTimingPlan {
+    fn end_time(self) -> f32 {
+        self.delay_seconds + self.duration_seconds
+    }
 }
 
 impl SceneTransition {
@@ -27,32 +50,42 @@ impl SceneTransition {
             return None;
         }
 
-        let duration_seconds = max_scene_transition_duration(&from, &to);
+        let (plans, duration_seconds) = build_scene_transition_plan(&from, &to);
 
         Some(Self {
             from,
             to,
+            plans,
             elapsed_seconds: 0.0,
             duration_seconds,
         })
     }
 
     pub(crate) fn sample(&self) -> Vec<RenderNode> {
-        self.from
-            .iter()
-            .zip(&self.to)
-            .map(|(from, to)| sample_render_node(from, to, self.elapsed_seconds, None))
-            .collect()
+        let mut sampled = self.to.clone();
+        self.sample_into(&mut sampled);
+        sampled
     }
 
-    pub(crate) fn advance(&mut self, delta: Duration) -> Vec<RenderNode> {
+    pub(crate) fn advance(&mut self, delta: Duration, sampled: &mut [RenderNode]) {
         self.elapsed_seconds =
             (self.elapsed_seconds + delta.as_secs_f32()).min(self.duration_seconds);
-        self.sample()
+        self.sample_into(sampled);
     }
 
     pub(crate) fn is_active(&self) -> bool {
         self.elapsed_seconds + f32::EPSILON < self.duration_seconds
+    }
+
+    fn sample_into(&self, sampled: &mut [RenderNode]) {
+        for (((sampled_node, from), to), plan) in sampled
+            .iter_mut()
+            .zip(&self.from)
+            .zip(&self.to)
+            .zip(&self.plans)
+        {
+            sample_render_node_in_place(sampled_node, from, to, plan, self.elapsed_seconds, None);
+        }
     }
 }
 
@@ -75,92 +108,44 @@ fn render_node_structure_matches(left: &RenderNode, right: &RenderNode) -> bool 
 }
 
 fn max_scene_transition_duration(from: &[RenderNode], to: &[RenderNode]) -> f32 {
-    from.iter()
-        .zip(to)
-        .map(|(from, to)| max_render_node_transition_duration(from, to))
-        .fold(0.0_f32, f32::max)
+    build_scene_transition_plan(from, to).1
 }
 
-fn max_render_node_transition_duration(from: &RenderNode, to: &RenderNode) -> f32 {
-    let own_duration = transition_end_time_for_node(from, to);
-    let child_duration = from
-        .children
-        .iter()
-        .zip(&to.children)
-        .map(|(from, to)| max_render_node_transition_duration(from, to))
-        .fold(0.0_f32, f32::max);
-    own_duration.max(child_duration)
-}
-
-fn transition_end_time_for_node(from: &RenderNode, to: &RenderNode) -> f32 {
-    let mut max_duration = 0.0_f32;
-
-    for property in ["color", "background-color", "background", "border-color"] {
-        if let Some(entry) = matching_transition_entry(to, property)
-            && property_transition_changes(from, to, property)
-            && transition_entry_is_animating(&entry)
-        {
-            max_duration = max_duration.max(entry.delay_seconds + entry.duration_seconds);
-        }
-    }
-
-    if layout_transition_for_node(from, to).is_some() {
-        max_duration = max_duration.max(
-            transition_entries_for(to)
-                .into_iter()
-                .filter(|entry| {
-                    is_layout_transition_name(&entry.property)
-                        && transition_entry_is_animating(entry)
-                })
-                .map(|entry| entry.delay_seconds + entry.duration_seconds)
-                .fold(0.0_f32, f32::max),
-        );
-    }
-
-    max_duration
-}
-
-fn property_transition_changes(from: &RenderNode, to: &RenderNode, property: &str) -> bool {
-    match property {
-        "color" => from.style.foreground != to.style.foreground,
-        "background-color" | "background" => from.style.background != to.style.background,
-        "border-color" => from.style.border.color != to.style.border.color,
-        _ => false,
-    }
-}
-
-fn sample_render_node(
+fn sample_render_node_in_place(
+    sampled: &mut RenderNode,
     from: &RenderNode,
     to: &RenderNode,
+    plan: &TransitionPlanNode,
     elapsed_seconds: f32,
     inherited_layout_progress: Option<f32>,
-) -> RenderNode {
-    let mut node = to.clone();
-    let layout_progress = layout_transition_for_node(from, to)
-        .and_then(|entry| transition_progress(&entry, elapsed_seconds))
+) {
+    let layout_progress = plan
+        .layout
+        .and_then(|entry| transition_progress(entry, elapsed_seconds))
         .or(inherited_layout_progress);
 
     if let Some(progress) = layout_progress {
-        node.layout.x = lerp(from.layout.x, to.layout.x, progress);
-        node.layout.y = lerp(from.layout.y, to.layout.y, progress);
-        node.layout.width = lerp(from.layout.width, to.layout.width, progress);
-        node.layout.height = lerp(from.layout.height, to.layout.height, progress);
+        sampled.layout.x = lerp(from.layout.x, to.layout.x, progress);
+        sampled.layout.y = lerp(from.layout.y, to.layout.y, progress);
+        sampled.layout.width = lerp(from.layout.width, to.layout.width, progress);
+        sampled.layout.height = lerp(from.layout.height, to.layout.height, progress);
+    } else {
+        sampled.layout = to.layout;
     }
 
-    if let Some(entry) = matching_transition_entry(to, "color")
-        && let Some(progress) = transition_progress(&entry, elapsed_seconds)
-        && from.style.foreground != to.style.foreground
+    if let Some(entry) = plan.foreground
+        && let Some(progress) = transition_progress(entry, elapsed_seconds)
     {
-        node.style.foreground =
+        sampled.style.foreground =
             interpolate_color(from.style.foreground, to.style.foreground, progress);
+    } else {
+        sampled.style.foreground = to.style.foreground;
     }
 
-    if let Some(entry) = matching_transition_entry(to, "background-color")
-        .or_else(|| matching_transition_entry(to, "background"))
-        && let Some(progress) = transition_progress(&entry, elapsed_seconds)
-        && from.style.background != to.style.background
+    if let Some(entry) = plan.background
+        && let Some(progress) = transition_progress(entry, elapsed_seconds)
     {
-        node.style.background = if progress <= f32::EPSILON {
+        sampled.style.background = if progress <= f32::EPSILON {
             from.style.background
         } else if progress >= 1.0 - f32::EPSILON {
             to.style.background
@@ -171,55 +156,167 @@ fn sample_render_node(
                 progress,
             ))
         };
+    } else {
+        sampled.style.background = to.style.background;
     }
 
-    if let Some(entry) = matching_transition_entry(to, "border-color")
-        && let Some(progress) = transition_progress(&entry, elapsed_seconds)
-        && from.style.border.color != to.style.border.color
+    if let Some(entry) = plan.border_color
+        && let Some(progress) = transition_progress(entry, elapsed_seconds)
     {
-        node.style.border.color =
+        sampled.style.border.color =
             interpolate_color(from.style.border.color, to.style.border.color, progress);
+    } else {
+        sampled.style.border.color = to.style.border.color;
     }
 
-    node.children = from
+    for (((sampled_child, from_child), to_child), child_plan) in sampled
         .children
-        .iter()
+        .iter_mut()
+        .zip(&from.children)
         .zip(&to.children)
-        .map(|(from, to)| sample_render_node(from, to, elapsed_seconds, layout_progress))
+        .zip(&plan.children)
+    {
+        sample_render_node_in_place(
+            sampled_child,
+            from_child,
+            to_child,
+            child_plan,
+            elapsed_seconds,
+            layout_progress,
+        );
+    }
+}
+
+fn build_scene_transition_plan(
+    from: &[RenderNode],
+    to: &[RenderNode],
+) -> (Vec<TransitionPlanNode>, f32) {
+    let mut max_duration = 0.0_f32;
+    let plans = from
+        .iter()
+        .zip(to)
+        .map(|(from, to)| {
+            let (plan, duration) = build_transition_plan_node(from, to);
+            max_duration = max_duration.max(duration);
+            plan
+        })
         .collect();
-    node
+    (plans, max_duration)
 }
 
-fn transition_entries_for(node: &RenderNode) -> Vec<TransitionEntry> {
-    node.transitions.entries()
-}
+fn build_transition_plan_node(from: &RenderNode, to: &RenderNode) -> (TransitionPlanNode, f32) {
+    let layout = (from.layout != to.layout)
+        .then(|| first_layout_transition_plan(&to.transitions))
+        .flatten();
+    let foreground = (from.style.foreground != to.style.foreground)
+        .then(|| first_transition_plan_for_property(&to.transitions, "color"))
+        .flatten();
+    let background = (from.style.background != to.style.background)
+        .then(|| {
+            first_transition_plan_for_property(&to.transitions, "background-color")
+                .or_else(|| first_transition_plan_for_property(&to.transitions, "background"))
+        })
+        .flatten();
+    let border_color = (from.style.border.color != to.style.border.color)
+        .then(|| first_transition_plan_for_property(&to.transitions, "border-color"))
+        .flatten();
 
-fn matching_transition_entry(node: &RenderNode, property: &str) -> Option<TransitionEntry> {
-    transition_entries_for(node)
+    let mut max_duration = 0.0_f32;
+    for plan in [layout, foreground, background, border_color]
         .into_iter()
-        .find(|entry| transition_entry_matches(entry, property))
+        .flatten()
+    {
+        max_duration = max_duration.max(plan.end_time());
+    }
+
+    let mut children = Vec::with_capacity(from.children.len());
+    for (from_child, to_child) in from.children.iter().zip(&to.children) {
+        let (child_plan, child_duration) = build_transition_plan_node(from_child, to_child);
+        children.push(child_plan);
+        max_duration = max_duration.max(child_duration);
+    }
+
+    (
+        TransitionPlanNode {
+            layout,
+            foreground,
+            background,
+            border_color,
+            children,
+        },
+        max_duration,
+    )
 }
 
-fn transition_entry_matches(entry: &TransitionEntry, property: &str) -> bool {
-    match &entry.property {
+fn first_transition_plan_for_property(
+    style: &TransitionStyle,
+    property: &str,
+) -> Option<TransitionTimingPlan> {
+    iter_transition_plans(style)
+        .find(|(entry_property, plan)| {
+            transition_property_matches(entry_property, property)
+                && transition_plan_is_animating(*plan)
+        })
+        .map(|(_, plan)| plan)
+}
+
+fn first_layout_transition_plan(style: &TransitionStyle) -> Option<TransitionTimingPlan> {
+    iter_transition_plans(style)
+        .find(|(property, plan)| {
+            is_layout_transition_name(property) && transition_plan_is_animating(*plan)
+        })
+        .map(|(_, plan)| plan)
+}
+
+fn iter_transition_plans(
+    style: &TransitionStyle,
+) -> impl Iterator<Item = (&TransitionPropertyName, TransitionTimingPlan)> {
+    let duration_count = style.durations_seconds.len().max(1);
+    let delay_count = style.delays_seconds.len().max(1);
+    let timing_count = style.timing_functions.len().max(1);
+
+    style
+        .properties
+        .iter()
+        .enumerate()
+        .map(move |(index, property)| {
+            let duration_seconds = style
+                .durations_seconds
+                .get(index % duration_count)
+                .copied()
+                .unwrap_or(0.0);
+            let delay_seconds = style
+                .delays_seconds
+                .get(index % delay_count)
+                .copied()
+                .unwrap_or(0.0);
+            let timing_function = style
+                .timing_functions
+                .get(index % timing_count)
+                .copied()
+                .unwrap_or(TransitionTimingFunction::Ease);
+
+            (
+                property,
+                TransitionTimingPlan {
+                    duration_seconds,
+                    delay_seconds,
+                    timing_function,
+                },
+            )
+        })
+}
+
+fn transition_property_matches(entry_property: &TransitionPropertyName, property: &str) -> bool {
+    match entry_property {
         TransitionPropertyName::All => true,
         TransitionPropertyName::Property(name) => name.eq_ignore_ascii_case(property),
     }
 }
 
-fn transition_entry_is_animating(entry: &TransitionEntry) -> bool {
+fn transition_plan_is_animating(entry: TransitionTimingPlan) -> bool {
     entry.duration_seconds > f32::EPSILON
         && !matches!(entry.timing_function, TransitionTimingFunction::Unsupported)
-}
-
-fn layout_transition_for_node(from: &RenderNode, to: &RenderNode) -> Option<TransitionEntry> {
-    if from.layout == to.layout {
-        return None;
-    }
-
-    transition_entries_for(to).into_iter().find(|entry| {
-        is_layout_transition_name(&entry.property) && transition_entry_is_animating(entry)
-    })
 }
 
 fn is_layout_transition_name(property: &TransitionPropertyName) -> bool {
@@ -251,8 +348,8 @@ fn is_layout_transition_name(property: &TransitionPropertyName) -> bool {
     }
 }
 
-fn transition_progress(entry: &TransitionEntry, elapsed_seconds: f32) -> Option<f32> {
-    if !transition_entry_is_animating(entry) {
+fn transition_progress(entry: TransitionTimingPlan, elapsed_seconds: f32) -> Option<f32> {
+    if !transition_plan_is_animating(entry) {
         return None;
     }
 
@@ -347,13 +444,15 @@ mod tests {
         )];
 
         let mut transition = SceneTransition::new(from, to).expect("color transition should exist");
-        let half = transition.advance(Duration::from_millis(500));
+        let mut half = transition.sample();
+        transition.advance(Duration::from_millis(500), &mut half);
         let current = half[0].style.foreground;
 
         assert_ne!(current, Color::BLACK);
         assert_ne!(current, Color::rgb(37, 99, 235));
 
-        let final_scene = transition.advance(Duration::from_millis(500));
+        transition.advance(Duration::from_millis(500), &mut half);
+        let final_scene = half;
         assert_eq!(final_scene[0].style.foreground, Color::rgb(37, 99, 235));
         assert!(!transition.is_active());
     }
@@ -379,9 +478,37 @@ mod tests {
 
         let mut scene_transition =
             SceneTransition::new(from, to).expect("layout transition should exist");
-        let scene = scene_transition.advance(Duration::from_millis(500));
+        let mut scene = scene_transition.sample();
+        scene_transition.advance(Duration::from_millis(500), &mut scene);
 
         assert!((scene[0].layout.width - 150.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn scene_transition_reuses_sampled_scene_storage_between_advances() {
+        let from = vec![text_node(
+            LayoutBox::new(0.0, 0.0, 100.0, 20.0),
+            Color::BLACK,
+            color_transition(1.0, TransitionTimingFunction::Linear),
+        )];
+        let to = vec![text_node(
+            LayoutBox::new(0.0, 0.0, 100.0, 20.0),
+            Color::rgb(37, 99, 235),
+            color_transition(1.0, TransitionTimingFunction::Linear),
+        )];
+
+        let mut transition = SceneTransition::new(from, to).expect("color transition should exist");
+        let mut sampled = transition.sample();
+        let root_ptr = sampled.as_ptr();
+
+        transition.advance(Duration::from_millis(250), &mut sampled);
+        let first_sample = sampled[0].style.foreground;
+        transition.advance(Duration::from_millis(250), &mut sampled);
+        let second_sample = sampled[0].style.foreground;
+
+        assert_eq!(sampled.as_ptr(), root_ptr);
+        assert_ne!(first_sample, Color::BLACK);
+        assert_ne!(second_sample, first_sample);
     }
 
     #[test]

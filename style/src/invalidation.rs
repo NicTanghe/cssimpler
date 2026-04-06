@@ -33,9 +33,13 @@ impl Stylesheet {
             return StyleInvalidation::Clean;
         }
 
-        self.rules
-            .iter()
-            .fold(StyleInvalidation::Clean, |invalidation, rule| {
+        self.index
+            .collect_interaction_rule_indices(changed)
+            .into_iter()
+            .fold(StyleInvalidation::Clean, |invalidation, index| {
+                let Some(rule) = self.rules.get(index) else {
+                    return invalidation;
+                };
                 invalidation.merge(rule.interaction_invalidation(changed))
             })
     }
@@ -43,8 +47,7 @@ impl Stylesheet {
 
 impl StyleRule {
     fn interaction_invalidation(&self, changed: InteractionDependencies) -> StyleInvalidation {
-        let dependencies = self.selector.interaction_dependencies();
-        if !dependencies.intersects(changed) {
+        if !self.interaction_dependencies().intersects(changed) {
             return StyleInvalidation::Clean;
         }
 

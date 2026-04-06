@@ -472,7 +472,9 @@ where
             return;
         };
         let sample_start = Instant::now();
-        self.cached_scene = Some(transition.advance(delta));
+        if let Some(scene) = self.cached_scene.as_mut() {
+            transition.advance(delta, scene);
+        }
         stats.transition_us = duration_to_us(sample_start.elapsed());
         if !transition.is_active() {
             self.scene_transition = None;
@@ -773,7 +775,9 @@ where
             return;
         };
         let sample_start = Instant::now();
-        self.cached_scene = Some(transition.advance(delta));
+        if let Some(scene) = self.cached_scene.as_mut() {
+            transition.advance(delta, scene);
+        }
         stats.transition_us = duration_to_us(sample_start.elapsed());
         if !transition.is_active() {
             self.scene_transition = None;
