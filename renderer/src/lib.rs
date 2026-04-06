@@ -7,13 +7,15 @@ use std::time::{Duration, Instant};
 
 mod fonts;
 mod gradient;
+mod scrollbar;
 mod shadow;
 mod shapes;
-mod scrollbar;
 
 use self::{
     gradient::draw_background_layer,
-    shadow::{draw_shadow, draw_shadow_effect, shadow_bounds, shadow_effect_bounds, text_stroke_bounds},
+    shadow::{
+        draw_shadow, draw_shadow_effect, shadow_bounds, shadow_effect_bounds, text_stroke_bounds,
+    },
     shapes::{
         clip_pixel_bounds, draw_axis_aligned_opaque_rect, draw_axis_aligned_opaque_ring,
         draw_rounded_rect, draw_rounded_ring, inset_corner_radius, inset_layout, layout_clip,
@@ -127,7 +129,6 @@ impl BufferRows {
         width.saturating_mul(self.len())
     }
 }
-
 
 thread_local! {
     static RENDER_BUFFER_ROWS: Cell<BufferRows> = const { Cell::new(BufferRows::full()) };
@@ -553,9 +554,7 @@ where
             current_hovered.as_ref(),
         );
 
-        if mouse_moved
-            && let Some((mouse_x, mouse_y)) = mouse_position
-        {
+        if mouse_moved && let Some((mouse_x, mouse_y)) = mouse_position {
             event_triggered_rerender |=
                 dispatch_mouse_event(&scene, mouse_x, mouse_y, MouseEventKind::MouseMove);
         }
@@ -582,13 +581,14 @@ where
                     if let Some((mouse_x, mouse_y)) = mouse_position {
                         event_triggered_rerender |=
                             dispatch_mouse_event(&scene, mouse_x, mouse_y, MouseEventKind::Click);
-                        let is_double_click = last_click.as_ref().is_some_and(
-                            |(instant, previous_target)| {
-                                *previous_target == click_target
-                                    && now.saturating_duration_since(*instant)
-                                        <= DOUBLE_CLICK_THRESHOLD
-                            },
-                        );
+                        let is_double_click =
+                            last_click
+                                .as_ref()
+                                .is_some_and(|(instant, previous_target)| {
+                                    *previous_target == click_target
+                                        && now.saturating_duration_since(*instant)
+                                            <= DOUBLE_CLICK_THRESHOLD
+                                });
                         if is_double_click {
                             event_triggered_rerender |= dispatch_mouse_event(
                                 &scene,
@@ -605,16 +605,15 @@ where
             }
         }
 
-        if right_press_started
-            && let Some((mouse_x, mouse_y)) = mouse_position
-        {
+        if right_press_started && let Some((mouse_x, mouse_y)) = mouse_position {
             event_triggered_rerender |=
                 dispatch_mouse_event(&scene, mouse_x, mouse_y, MouseEventKind::MouseDown);
             event_triggered_rerender |=
                 dispatch_mouse_event(&scene, mouse_x, mouse_y, MouseEventKind::ContextMenu);
         }
 
-        if previous_right_down && !right_down
+        if previous_right_down
+            && !right_down
             && let Some((mouse_x, mouse_y)) = mouse_position
         {
             event_triggered_rerender |=
@@ -1492,7 +1491,8 @@ fn dispatch_hover_transition_events(
     let mut triggered = false;
 
     if let Some(previous_hovered) = previous_hovered {
-        triggered |= dispatch_mouse_event_at_path(scene, previous_hovered, MouseEventKind::MouseOut);
+        triggered |=
+            dispatch_mouse_event_at_path(scene, previous_hovered, MouseEventKind::MouseOut);
     }
     for path in previous_chain[shared_prefix_len..].iter().rev() {
         triggered |= dispatch_mouse_event_at_path(scene, path, MouseEventKind::MouseLeave);
@@ -1567,7 +1567,8 @@ fn find_handler_for_path(
     path: &ElementPath,
     event: MouseEventKind,
 ) -> Option<EventHandler> {
-    scene.iter()
+    scene
+        .iter()
         .find_map(|node| find_handler_for_path_node(node, path, event))
 }
 
@@ -2172,30 +2173,6 @@ fn blend_prepared_pixel(
     blend_linear_over(buffer, index, color.linear);
 }
 
-fn blend_linear_pixel(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    x: i32,
-    y: i32,
-    color: LinearRgba,
-) {
-    let alpha = color.a.clamp(0.0, 1.0);
-    if alpha <= 0.0 {
-        return;
-    }
-
-    let Some(index) = buffer_pixel_index(width, height, x, y) else {
-        return;
-    };
-    if alpha >= 1.0 {
-        buffer[index] = pack_linear_rgb(color);
-        return;
-    }
-
-    blend_linear_over(buffer, index, LinearRgba { a: alpha, ..color });
-}
-
 fn buffer_pixel_index(width: usize, height: usize, x: i32, y: i32) -> Option<usize> {
     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
         return None;
@@ -2272,13 +2249,13 @@ mod tests {
     };
 
     use crate::{
-        ClipRect, DirtyRenderJob, FramePaintMode, FramePaintReason, MouseEventKind,
-        ViewportSize, WindowConfig, blend_pixel, build_incremental_render_jobs,
-        coalesce_dirty_regions, dirty_regions_between_scenes, dispatch_click,
-        dispatch_hover_transition_events, dispatch_mouse_event, distribute_dirty_render_jobs,
-        drawable_viewport_size, hit_test_element_path, pack_rgb, render_scene_update,
-        render_scene_update_internal, render_to_buffer, resize_buffer, scenes_match_visuals,
-        should_present_frame, should_present_scene, should_suspend_updates, window_options,
+        ClipRect, DirtyRenderJob, FramePaintMode, FramePaintReason, MouseEventKind, ViewportSize,
+        WindowConfig, blend_pixel, build_incremental_render_jobs, coalesce_dirty_regions,
+        dirty_regions_between_scenes, dispatch_click, dispatch_hover_transition_events,
+        dispatch_mouse_event, distribute_dirty_render_jobs, drawable_viewport_size,
+        hit_test_element_path, pack_rgb, render_scene_update, render_scene_update_internal,
+        render_to_buffer, resize_buffer, scenes_match_visuals, should_present_frame,
+        should_present_scene, should_suspend_updates, window_options,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -2536,12 +2513,15 @@ mod tests {
 
         let accent = pack_rgb(Color::rgb(40, 120, 220));
         let white = pack_rgb(Color::WHITE);
-        assert_eq!(buffer, vec![
-            white, accent, accent, white, //
-            white, accent, accent, white, //
-            white, white, white, white, //
-            white, white, white, white,
-        ]);
+        assert_eq!(
+            buffer,
+            vec![
+                white, accent, accent, white, //
+                white, accent, accent, white, //
+                white, white, white, white, //
+                white, white, white, white,
+            ]
+        );
     }
 
     #[test]
@@ -2567,10 +2547,13 @@ mod tests {
 
         let accent = pack_rgb(Color::rgb(40, 120, 220));
         let white = pack_rgb(Color::WHITE);
-        assert_eq!(buffer, vec![
-            white, accent, accent, accent, white, //
-            white, accent, accent, accent, white,
-        ]);
+        assert_eq!(
+            buffer,
+            vec![
+                white, accent, accent, accent, white, //
+                white, accent, accent, accent, white,
+            ]
+        );
     }
 
     #[test]
@@ -2590,15 +2573,18 @@ mod tests {
 
         let border = pack_rgb(Color::rgb(15, 23, 42));
         let white = pack_rgb(Color::WHITE);
-        assert_eq!(buffer, vec![
-            white, white, white, white, white, white, white, //
-            white, border, border, border, border, white, white, //
-            white, border, white, white, border, white, white, //
-            white, border, white, white, border, white, white, //
-            white, border, border, border, border, white, white, //
-            white, white, white, white, white, white, white, //
-            white, white, white, white, white, white, white,
-        ]);
+        assert_eq!(
+            buffer,
+            vec![
+                white, white, white, white, white, white, white, //
+                white, border, border, border, border, white, white, //
+                white, border, white, white, border, white, white, //
+                white, border, white, white, border, white, white, //
+                white, border, border, border, border, white, white, //
+                white, white, white, white, white, white, white, //
+                white, white, white, white, white, white, white,
+            ]
+        );
     }
 
     #[test]
@@ -2627,12 +2613,15 @@ mod tests {
 
         let border = pack_rgb(Color::rgb(15, 23, 42));
         let white = pack_rgb(Color::WHITE);
-        assert_eq!(buffer, vec![
-            white, border, border, border, white, //
-            white, white, white, border, white, //
-            white, white, white, border, white, //
-            white, border, border, border, white,
-        ]);
+        assert_eq!(
+            buffer,
+            vec![
+                white, border, border, border, white, //
+                white, white, white, border, white, //
+                white, white, white, border, white, //
+                white, border, border, border, white,
+            ]
+        );
     }
 
     #[test]
@@ -3927,6 +3916,146 @@ mod tests {
         render_to_buffer(&previous, &mut incremental, 20, 20, Color::WHITE);
         render_scene_update(&previous, &next, &mut incremental, 20, 20, Color::WHITE);
         render_to_buffer(&next, &mut full, 20, 20, Color::WHITE);
+
+        assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn incremental_render_matches_full_render_over_a_cached_gradient_background() {
+        let _cache_guard = crate::gradient::lock_gradient_cache_for_tests();
+        crate::gradient::clear_gradient_layer_cache_for_tests();
+
+        let background =
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 96.0, 64.0)).with_style(VisualStyle {
+                corner_radius: CornerRadius::all(12.0),
+                background_layers: vec![
+                    BackgroundLayer::RadialGradient(RadialGradient {
+                        shape: RadialShape::Circle(CircleRadius::Explicit(46.0)),
+                        center: GradientPoint::CENTER,
+                        interpolation: GradientInterpolation::Oklab,
+                        repeating: false,
+                        stops: vec![
+                            GradientStop {
+                                color: Color::rgba(255, 255, 255, 168),
+                                position: LengthPercentageValue::from_fraction(0.0),
+                            },
+                            GradientStop {
+                                color: Color::rgba(255, 255, 255, 0),
+                                position: LengthPercentageValue::from_fraction(1.0),
+                            },
+                        ],
+                    }),
+                    BackgroundLayer::LinearGradient(LinearGradient {
+                        direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                        interpolation: GradientInterpolation::Oklab,
+                        repeating: false,
+                        stops: vec![
+                            GradientStop {
+                                color: Color::rgb(15, 23, 42),
+                                position: LengthPercentageValue::from_fraction(0.0),
+                            },
+                            GradientStop {
+                                color: Color::rgb(59, 130, 246),
+                                position: LengthPercentageValue::from_fraction(1.0),
+                            },
+                        ],
+                    }),
+                ],
+                ..VisualStyle::default()
+            });
+        let previous = vec![
+            background.clone(),
+            RenderNode::container(LayoutBox::new(14.0, 18.0, 18.0, 18.0)).with_style(VisualStyle {
+                background: Some(Color::rgba(15, 23, 42, 220)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let next = vec![
+            background,
+            RenderNode::container(LayoutBox::new(58.0, 18.0, 18.0, 18.0)).with_style(VisualStyle {
+                background: Some(Color::rgba(15, 23, 42, 220)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut incremental = vec![0_u32; 96 * 64];
+        let mut full = vec![0_u32; 96 * 64];
+
+        render_to_buffer(&previous, &mut incremental, 96, 64, Color::WHITE);
+        render_scene_update(&previous, &next, &mut incremental, 96, 64, Color::WHITE);
+
+        crate::gradient::clear_gradient_layer_cache_for_tests();
+        render_to_buffer(&next, &mut full, 96, 64, Color::WHITE);
+
+        assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn incremental_render_matches_full_render_over_a_static_gradient_background() {
+        let _cache_guard = crate::gradient::lock_gradient_cache_for_tests();
+        crate::gradient::clear_gradient_layer_cache_for_tests();
+
+        let background =
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 600.0, 420.0)).with_style(VisualStyle {
+                corner_radius: CornerRadius::all(20.0),
+                background_layers: vec![
+                    BackgroundLayer::RadialGradient(RadialGradient {
+                        shape: RadialShape::Circle(CircleRadius::Explicit(240.0)),
+                        center: GradientPoint::CENTER,
+                        interpolation: GradientInterpolation::Oklab,
+                        repeating: false,
+                        stops: vec![
+                            GradientStop {
+                                color: Color::rgba(255, 255, 255, 156),
+                                position: LengthPercentageValue::from_fraction(0.0),
+                            },
+                            GradientStop {
+                                color: Color::rgba(255, 255, 255, 0),
+                                position: LengthPercentageValue::from_fraction(1.0),
+                            },
+                        ],
+                    }),
+                    BackgroundLayer::LinearGradient(LinearGradient {
+                        direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                        interpolation: GradientInterpolation::Oklab,
+                        repeating: false,
+                        stops: vec![
+                            GradientStop {
+                                color: Color::rgb(15, 23, 42),
+                                position: LengthPercentageValue::from_fraction(0.0),
+                            },
+                            GradientStop {
+                                color: Color::rgb(37, 99, 235),
+                                position: LengthPercentageValue::from_fraction(1.0),
+                            },
+                        ],
+                    }),
+                ],
+                ..VisualStyle::default()
+            });
+        let previous = vec![
+            background.clone(),
+            RenderNode::container(LayoutBox::new(64.0, 72.0, 72.0, 72.0)).with_style(VisualStyle {
+                background: Some(Color::rgba(15, 23, 42, 220)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let next = vec![
+            background,
+            RenderNode::container(LayoutBox::new(452.0, 72.0, 72.0, 72.0)).with_style(
+                VisualStyle {
+                    background: Some(Color::rgba(15, 23, 42, 220)),
+                    ..VisualStyle::default()
+                },
+            ),
+        ];
+        let mut incremental = vec![0_u32; 600 * 420];
+        let mut full = vec![0_u32; 600 * 420];
+
+        render_to_buffer(&previous, &mut incremental, 600, 420, Color::WHITE);
+        render_scene_update(&previous, &next, &mut incremental, 600, 420, Color::WHITE);
+
+        crate::gradient::clear_gradient_layer_cache_for_tests();
+        render_to_buffer(&next, &mut full, 600, 420, Color::WHITE);
 
         assert_eq!(incremental, full);
     }

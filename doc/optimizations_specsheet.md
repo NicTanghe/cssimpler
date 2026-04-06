@@ -45,7 +45,7 @@ The remaining cost is concentrated in repeated per-pixel math, repeated scene tr
 
 ## O1. Sparse moving damage can be slower than full repaint
 Depends: -  
-Status: in progress
+Status: done
 
 Purpose:
 
@@ -68,7 +68,7 @@ Acceptance
 
 ## O2. Pressure demo baseline and acceptance harness
 Depends: O1  
-Status: in progress
+Status: done
 
 Purpose:
 
@@ -85,7 +85,7 @@ Acceptance
 
 ## O3. Fast paths for simple opaque fills and borders
 Depends: O2  
-Status: in progress
+Status: done
 
 Purpose:
 
@@ -555,20 +555,21 @@ Acceptance
 1. O1 sparse-moving-damage regression investigation  
 2. O2 baseline and measurement discipline  
 3. O3 fast paths for simple fills and borders  
-4. O4 gradient caching and prerasterization, then O20 static gradient preraster cache  
-5. O6 cache stability and eviction, then O19 bounded LRU cache eviction  
-6. O7 blur and glow pass efficiency  
-7. O21 span-based alpha and rounded-shape raster batching  
-8. O23 SIMD mask blend acceleration after the scalar path is tight  
-9. O9 unified scene diff and dirty-region collection  
-10. O22 dirty-region tightening for self-only visual changes  
-11. O10 shared subtree bounds for all paint modes, then O18 full-redraw subtree bounds precomputation  
-12. O8 full and incremental paint traversal reduction  
-13. O5 text paint layout reuse  
-14. O12 hot-screen partitioning with `FragmentApp` where tree-build cost still dominates  
-15. O13 + O14 style-system reductions  
-16. O15 + O16 runtime cleanup around transitions and font resolution  
-17. O17 draw-list or spatial plan only if the earlier work still leaves meaningful paint bottlenecks
+4. O4 gradient caching and prerasterization,
+5. O20 static gradient preraster cache  
+6. O6 cache stability and eviction, then O19 bounded LRU cache eviction  
+7. O7 blur and glow pass efficiency  
+8. O21 span-based alpha and rounded-shape raster batching  
+9. O23 SIMD mask blend acceleration after the scalar path is tight  
+10. O9 unified scene diff and dirty-region collection  
+11. O22 dirty-region tightening for self-only visual changes  
+12. O10 shared subtree bounds for all paint modes, then O18 full-redraw subtree bounds precomputation  
+13. O8 full and incremental paint traversal reduction  
+14. O5 text paint layout reuse  
+15. O12 hot-screen partitioning with `FragmentApp` where tree-build cost still dominates  
+16. O13 + O14 style-system reductions  
+17. O15 + O16 runtime cleanup around transitions and font resolution  
+18. O17 draw-list or spatial plan only if the earlier work still leaves meaningful paint bottlenecks
 
 ---
 

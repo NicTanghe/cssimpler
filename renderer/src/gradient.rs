@@ -1,12 +1,157 @@
+use std::collections::HashMap;
+use std::mem::size_of;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use cssimpler_core::{
-    AnglePercentageValue, BackgroundLayer, CircleRadius, ConicGradient, CornerRadius,
+    AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, CornerRadius,
     EllipseRadius, GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint,
     GradientStop, GradientVertical, LayoutBox, LengthPercentageValue, LinearGradient, LinearRgba,
     RadialGradient, RadialShape, ShapeExtent,
 };
 
-use super::shapes::{draw_rounded_rect, pixel_bounds, point_in_rounded_rect};
-use super::{blend_linear_pixel, ClipRect};
+use super::shapes::{pixel_bounds, point_in_rounded_rect};
+use super::{ClipRect, blend_linear_over, current_render_buffer_rows, pack_linear_rgb};
+
+const MAX_GRADIENT_LAYER_CACHE_ENTRIES: usize = 16;
+const MAX_GRADIENT_LAYER_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SINGLE_GRADIENT_LAYER_CACHE_BYTES: usize = 256 * 1024;
+const MIN_GRADIENT_LAYER_CACHE_PIXELS: usize = 512;
+const MIN_GRADIENT_LAYER_CACHE_REUSES: u8 = 2;
+const MAX_STATIC_GRADIENT_LAYER_CACHE_ENTRIES: usize = 4;
+const MAX_STATIC_GRADIENT_LAYER_CACHE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_SINGLE_STATIC_GRADIENT_LAYER_CACHE_BYTES: usize = 6 * 1024 * 1024;
+const MIN_STATIC_GRADIENT_LAYER_CACHE_PIXELS: usize = 250_000;
+const MIN_STATIC_GRADIENT_LAYER_CACHE_REUSES: u8 = 2;
+const BINARY_ALPHA_PIXEL_FLAG: u32 = 1 << 24;
+
+#[derive(Clone)]
+struct CachedGradientLayer {
+    width: usize,
+    height: usize,
+    pixels: CachedGradientPixels,
+}
+
+#[derive(Clone)]
+enum CachedGradientPixels {
+    BinaryAlpha(Vec<u32>),
+    Linear(Vec<LinearRgba>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GradientLayerCacheKey {
+    layout: LayoutCacheKey,
+    radius: CornerRadiusCacheKey,
+    layer: BackgroundLayerCacheKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LayoutCacheKey {
+    x_bits: u32,
+    y_bits: u32,
+    width_bits: u32,
+    height_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CornerRadiusCacheKey {
+    top_left_bits: u32,
+    top_right_bits: u32,
+    bottom_right_bits: u32,
+    bottom_left_bits: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum BackgroundLayerCacheKey {
+    Linear(LinearGradientCacheKey),
+    Radial(RadialGradientCacheKey),
+    Conic(ConicGradientCacheKey),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LinearGradientCacheKey {
+    direction: GradientDirectionCacheKey,
+    interpolation: u8,
+    repeating: bool,
+    stops: Vec<GradientStopCacheKey<LengthPercentageCacheKey>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RadialGradientCacheKey {
+    shape: RadialShapeCacheKey,
+    center: GradientPointCacheKey,
+    interpolation: u8,
+    repeating: bool,
+    stops: Vec<GradientStopCacheKey<LengthPercentageCacheKey>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ConicGradientCacheKey {
+    angle_bits: u32,
+    center: GradientPointCacheKey,
+    interpolation: u8,
+    repeating: bool,
+    stops: Vec<GradientStopCacheKey<AnglePercentageCacheKey>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum GradientDirectionCacheKey {
+    Angle(u32),
+    Horizontal(u8),
+    Vertical(u8),
+    Corner { horizontal: u8, vertical: u8 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GradientPointCacheKey {
+    x: LengthPercentageCacheKey,
+    y: LengthPercentageCacheKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LengthPercentageCacheKey {
+    px_bits: u32,
+    fraction_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct AnglePercentageCacheKey {
+    degrees_bits: u32,
+    turns_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GradientStopCacheKey<P> {
+    color_rgba: u32,
+    position: P,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RadialShapeCacheKey {
+    Circle(CircleRadiusCacheKey),
+    Ellipse(EllipseRadiusCacheKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum CircleRadiusCacheKey {
+    Explicit(u32),
+    Extent(u8),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EllipseRadiusCacheKey {
+    Explicit {
+        x: LengthPercentageCacheKey,
+        y: LengthPercentageCacheKey,
+    },
+    Extent(u8),
+}
+
+#[derive(Default)]
+struct GradientLayerCache {
+    total_bytes: usize,
+    layers: HashMap<GradientLayerCacheKey, Arc<CachedGradientLayer>>,
+    seen_counts: HashMap<GradientLayerCacheKey, u8>,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ResolvedGradientStop {
@@ -73,6 +218,36 @@ pub(crate) fn draw_background_layer(
     layer: &BackgroundLayer,
     clip: ClipRect,
 ) {
+    if let Some((cached_layer, offset_x, offset_y)) =
+        cached_static_gradient_layer(layout, radius, layer)
+    {
+        draw_cached_gradient_layer(
+            buffer,
+            width,
+            height,
+            layout,
+            clip,
+            cached_layer.as_ref(),
+            offset_x,
+            offset_y,
+        );
+        return;
+    }
+
+    if let Some((cached_layer, offset_x, offset_y)) = cached_gradient_layer(layout, radius, layer) {
+        draw_cached_gradient_layer(
+            buffer,
+            width,
+            height,
+            layout,
+            clip,
+            cached_layer.as_ref(),
+            offset_x,
+            offset_y,
+        );
+        return;
+    }
+
     match layer {
         BackgroundLayer::LinearGradient(gradient) => {
             draw_linear_gradient(buffer, width, height, layout, radius, gradient, clip);
@@ -82,6 +257,494 @@ pub(crate) fn draw_background_layer(
         }
         BackgroundLayer::ConicGradient(gradient) => {
             draw_conic_gradient(buffer, width, height, layout, radius, gradient, clip);
+        }
+    }
+}
+
+fn gradient_layer_cache() -> &'static Mutex<GradientLayerCache> {
+    static CACHE: OnceLock<Mutex<GradientLayerCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(GradientLayerCache::default()))
+}
+
+fn static_gradient_layer_cache() -> &'static Mutex<GradientLayerCache> {
+    static CACHE: OnceLock<Mutex<GradientLayerCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(GradientLayerCache::default()))
+}
+
+#[cfg(test)]
+fn reset_gradient_layer_cache(cache: &mut GradientLayerCache) {
+    cache.total_bytes = 0;
+    cache.layers.clear();
+    cache.seen_counts.clear();
+}
+
+#[cfg(test)]
+pub(crate) fn clear_gradient_layer_cache_for_tests() {
+    let mut cache = gradient_layer_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    reset_gradient_layer_cache(&mut cache);
+    drop(cache);
+
+    let mut static_cache = static_gradient_layer_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    reset_gradient_layer_cache(&mut static_cache);
+}
+
+#[cfg(test)]
+pub(crate) fn lock_gradient_cache_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn cached_gradient_layer(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    layer: &BackgroundLayer,
+) -> Option<(Arc<CachedGradientLayer>, i32, i32)> {
+    cached_gradient_layer_with_policy(
+        gradient_layer_cache(),
+        layout,
+        radius,
+        layer,
+        MIN_GRADIENT_LAYER_CACHE_REUSES,
+        MAX_GRADIENT_LAYER_CACHE_ENTRIES,
+        MAX_GRADIENT_LAYER_CACHE_BYTES,
+        MAX_SINGLE_GRADIENT_LAYER_CACHE_BYTES,
+        should_prerasterize_gradient_layer,
+        rasterize_gradient_layer,
+    )
+}
+
+fn cached_static_gradient_layer(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    layer: &BackgroundLayer,
+) -> Option<(Arc<CachedGradientLayer>, i32, i32)> {
+    cached_gradient_layer_with_policy(
+        static_gradient_layer_cache(),
+        layout,
+        radius,
+        layer,
+        MIN_STATIC_GRADIENT_LAYER_CACHE_REUSES,
+        MAX_STATIC_GRADIENT_LAYER_CACHE_ENTRIES,
+        MAX_STATIC_GRADIENT_LAYER_CACHE_BYTES,
+        MAX_SINGLE_STATIC_GRADIENT_LAYER_CACHE_BYTES,
+        should_prerasterize_static_gradient_layer,
+        rasterize_static_gradient_layer,
+    )
+}
+
+fn cached_gradient_layer_with_policy(
+    cache: &'static Mutex<GradientLayerCache>,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    layer: &BackgroundLayer,
+    min_reuses: u8,
+    max_entries: usize,
+    max_total_bytes: usize,
+    max_raster_bytes: usize,
+    should_prerasterize: fn(LayoutBox) -> bool,
+    rasterize: fn(LayoutBox, CornerRadius, &BackgroundLayer) -> Option<CachedGradientLayer>,
+) -> Option<(Arc<CachedGradientLayer>, i32, i32)> {
+    let (relative_layout, offset_x, offset_y) = split_layout_for_gradient_cache(layout);
+    let key = GradientLayerCacheKey {
+        layout: layout_cache_key(relative_layout),
+        radius: corner_radius_cache_key(radius),
+        layer: background_layer_cache_key(layer),
+    };
+
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .layers
+        .get(&key)
+        .cloned()
+    {
+        return Some((cached, offset_x, offset_y));
+    }
+
+    if !should_prerasterize(relative_layout) {
+        return None;
+    }
+
+    let seen_enough = {
+        let mut cache_guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+        let seen = cache_guard.seen_counts.entry(key.clone()).or_insert(0);
+        *seen = seen.saturating_add(1);
+        *seen >= min_reuses
+    };
+    if !seen_enough {
+        return None;
+    }
+
+    let raster = Arc::new(rasterize(relative_layout, radius, layer)?);
+    let raster_bytes = raster.byte_len();
+    if raster_bytes > max_raster_bytes {
+        return None;
+    }
+    let mut cache_guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(cached) = cache_guard.layers.get(&key).cloned() {
+        return Some((cached, offset_x, offset_y));
+    }
+
+    if cache_guard.layers.len() >= max_entries
+        || cache_guard.total_bytes.saturating_add(raster_bytes) > max_total_bytes
+    {
+        return None;
+    }
+    cache_guard.total_bytes = cache_guard.total_bytes.saturating_add(raster_bytes);
+    cache_guard.layers.insert(key, raster.clone());
+    Some((raster, offset_x, offset_y))
+}
+
+fn gradient_layer_dimensions(layout: LayoutBox) -> (usize, usize) {
+    (
+        ((layout.x + layout.width).ceil() - layout.x.floor()).max(0.0) as usize,
+        ((layout.y + layout.height).ceil() - layout.y.floor()).max(0.0) as usize,
+    )
+}
+
+fn should_prerasterize_gradient_layer(layout: LayoutBox) -> bool {
+    let (width, height) = gradient_layer_dimensions(layout);
+    let pixel_count = width.saturating_mul(height);
+    pixel_count >= MIN_GRADIENT_LAYER_CACHE_PIXELS
+        && pixel_count.saturating_mul(size_of::<LinearRgba>())
+            <= MAX_SINGLE_GRADIENT_LAYER_CACHE_BYTES
+}
+
+fn should_prerasterize_static_gradient_layer(layout: LayoutBox) -> bool {
+    let (width, height) = gradient_layer_dimensions(layout);
+    let pixel_count = width.saturating_mul(height);
+    pixel_count >= MIN_STATIC_GRADIENT_LAYER_CACHE_PIXELS
+        && pixel_count.saturating_mul(size_of::<LinearRgba>())
+            <= MAX_SINGLE_STATIC_GRADIENT_LAYER_CACHE_BYTES
+}
+
+fn split_layout_for_gradient_cache(layout: LayoutBox) -> (LayoutBox, i32, i32) {
+    let offset_x = layout.x.floor() as i32;
+    let offset_y = layout.y.floor() as i32;
+    (
+        LayoutBox::new(
+            layout.x - offset_x as f32,
+            layout.y - offset_y as f32,
+            layout.width,
+            layout.height,
+        ),
+        offset_x,
+        offset_y,
+    )
+}
+
+fn layout_cache_key(layout: LayoutBox) -> LayoutCacheKey {
+    LayoutCacheKey {
+        x_bits: layout.x.to_bits(),
+        y_bits: layout.y.to_bits(),
+        width_bits: layout.width.to_bits(),
+        height_bits: layout.height.to_bits(),
+    }
+}
+
+fn corner_radius_cache_key(radius: CornerRadius) -> CornerRadiusCacheKey {
+    CornerRadiusCacheKey {
+        top_left_bits: radius.top_left.to_bits(),
+        top_right_bits: radius.top_right.to_bits(),
+        bottom_right_bits: radius.bottom_right.to_bits(),
+        bottom_left_bits: radius.bottom_left.to_bits(),
+    }
+}
+
+fn background_layer_cache_key(layer: &BackgroundLayer) -> BackgroundLayerCacheKey {
+    match layer {
+        BackgroundLayer::LinearGradient(gradient) => {
+            BackgroundLayerCacheKey::Linear(LinearGradientCacheKey {
+                direction: gradient_direction_cache_key(gradient.direction),
+                interpolation: interpolation_cache_key(gradient.interpolation),
+                repeating: gradient.repeating,
+                stops: gradient
+                    .stops
+                    .iter()
+                    .map(|stop| GradientStopCacheKey {
+                        color_rgba: color_rgba_key(stop.color),
+                        position: length_percentage_cache_key(stop.position),
+                    })
+                    .collect(),
+            })
+        }
+        BackgroundLayer::RadialGradient(gradient) => {
+            BackgroundLayerCacheKey::Radial(RadialGradientCacheKey {
+                shape: radial_shape_cache_key(gradient.shape),
+                center: gradient_point_cache_key(gradient.center),
+                interpolation: interpolation_cache_key(gradient.interpolation),
+                repeating: gradient.repeating,
+                stops: gradient
+                    .stops
+                    .iter()
+                    .map(|stop| GradientStopCacheKey {
+                        color_rgba: color_rgba_key(stop.color),
+                        position: length_percentage_cache_key(stop.position),
+                    })
+                    .collect(),
+            })
+        }
+        BackgroundLayer::ConicGradient(gradient) => {
+            BackgroundLayerCacheKey::Conic(ConicGradientCacheKey {
+                angle_bits: gradient.angle.to_bits(),
+                center: gradient_point_cache_key(gradient.center),
+                interpolation: interpolation_cache_key(gradient.interpolation),
+                repeating: gradient.repeating,
+                stops: gradient
+                    .stops
+                    .iter()
+                    .map(|stop| GradientStopCacheKey {
+                        color_rgba: color_rgba_key(stop.color),
+                        position: angle_percentage_cache_key(stop.position),
+                    })
+                    .collect(),
+            })
+        }
+    }
+}
+
+fn interpolation_cache_key(interpolation: GradientInterpolation) -> u8 {
+    match interpolation {
+        GradientInterpolation::LinearSrgb => 0,
+        GradientInterpolation::Oklab => 1,
+    }
+}
+
+fn color_rgba_key(color: Color) -> u32 {
+    (u32::from(color.r) << 24)
+        | (u32::from(color.g) << 16)
+        | (u32::from(color.b) << 8)
+        | u32::from(color.a)
+}
+
+fn gradient_direction_cache_key(direction: GradientDirection) -> GradientDirectionCacheKey {
+    match direction {
+        GradientDirection::Angle(degrees) => GradientDirectionCacheKey::Angle(degrees.to_bits()),
+        GradientDirection::Horizontal(horizontal) => {
+            GradientDirectionCacheKey::Horizontal(horizontal_cache_key(horizontal))
+        }
+        GradientDirection::Vertical(vertical) => {
+            GradientDirectionCacheKey::Vertical(vertical_cache_key(vertical))
+        }
+        GradientDirection::Corner {
+            horizontal,
+            vertical,
+        } => GradientDirectionCacheKey::Corner {
+            horizontal: horizontal_cache_key(horizontal),
+            vertical: vertical_cache_key(vertical),
+        },
+    }
+}
+
+fn gradient_point_cache_key(point: GradientPoint) -> GradientPointCacheKey {
+    GradientPointCacheKey {
+        x: length_percentage_cache_key(point.x),
+        y: length_percentage_cache_key(point.y),
+    }
+}
+
+fn length_percentage_cache_key(value: LengthPercentageValue) -> LengthPercentageCacheKey {
+    LengthPercentageCacheKey {
+        px_bits: value.px.to_bits(),
+        fraction_bits: value.fraction.to_bits(),
+    }
+}
+
+fn angle_percentage_cache_key(value: AnglePercentageValue) -> AnglePercentageCacheKey {
+    AnglePercentageCacheKey {
+        degrees_bits: value.degrees.to_bits(),
+        turns_bits: value.turns.to_bits(),
+    }
+}
+
+fn radial_shape_cache_key(shape: RadialShape) -> RadialShapeCacheKey {
+    match shape {
+        RadialShape::Circle(radius) => RadialShapeCacheKey::Circle(circle_radius_cache_key(radius)),
+        RadialShape::Ellipse(radius) => {
+            RadialShapeCacheKey::Ellipse(ellipse_radius_cache_key(radius))
+        }
+    }
+}
+
+fn circle_radius_cache_key(radius: CircleRadius) -> CircleRadiusCacheKey {
+    match radius {
+        CircleRadius::Explicit(radius) => CircleRadiusCacheKey::Explicit(radius.to_bits()),
+        CircleRadius::Extent(extent) => {
+            CircleRadiusCacheKey::Extent(shape_extent_cache_key(extent))
+        }
+    }
+}
+
+fn ellipse_radius_cache_key(radius: EllipseRadius) -> EllipseRadiusCacheKey {
+    match radius {
+        EllipseRadius::Explicit { x, y } => EllipseRadiusCacheKey::Explicit {
+            x: length_percentage_cache_key(x),
+            y: length_percentage_cache_key(y),
+        },
+        EllipseRadius::Extent(extent) => {
+            EllipseRadiusCacheKey::Extent(shape_extent_cache_key(extent))
+        }
+    }
+}
+
+fn horizontal_cache_key(horizontal: GradientHorizontal) -> u8 {
+    match horizontal {
+        GradientHorizontal::Left => 0,
+        GradientHorizontal::Right => 1,
+    }
+}
+
+fn vertical_cache_key(vertical: GradientVertical) -> u8 {
+    match vertical {
+        GradientVertical::Top => 0,
+        GradientVertical::Bottom => 1,
+    }
+}
+
+fn shape_extent_cache_key(extent: ShapeExtent) -> u8 {
+    match extent {
+        ShapeExtent::ClosestSide => 0,
+        ShapeExtent::FarthestSide => 1,
+        ShapeExtent::ClosestCorner => 2,
+        ShapeExtent::FarthestCorner => 3,
+    }
+}
+
+impl CachedGradientLayer {
+    fn new(width: usize, height: usize, pixels: Vec<LinearRgba>) -> Self {
+        let binary_alpha = pixels
+            .iter()
+            .all(|pixel| pixel.a <= f32::EPSILON || pixel.a >= 1.0 - f32::EPSILON);
+        let pixels = if binary_alpha {
+            CachedGradientPixels::BinaryAlpha(
+                pixels
+                    .into_iter()
+                    .map(pack_binary_alpha_pixel)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            CachedGradientPixels::Linear(pixels)
+        };
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    fn byte_len(&self) -> usize {
+        match &self.pixels {
+            CachedGradientPixels::BinaryAlpha(pixels) => pixels.len() * size_of::<u32>(),
+            CachedGradientPixels::Linear(pixels) => pixels.len() * size_of::<LinearRgba>(),
+        }
+    }
+}
+
+fn pack_binary_alpha_pixel(color: LinearRgba) -> u32 {
+    if color.a <= f32::EPSILON {
+        0
+    } else {
+        BINARY_ALPHA_PIXEL_FLAG | pack_linear_rgb(LinearRgba { a: 1.0, ..color })
+    }
+}
+
+fn rasterize_gradient_layer(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    layer: &BackgroundLayer,
+) -> Option<CachedGradientLayer> {
+    let (width, height) = gradient_layer_dimensions(layout);
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let mut pixels = vec![LinearRgba::TRANSPARENT; width.saturating_mul(height)];
+    match layer {
+        BackgroundLayer::LinearGradient(gradient) => {
+            rasterize_linear_gradient(&mut pixels, width, height, layout, radius, gradient)
+        }
+        BackgroundLayer::RadialGradient(gradient) => {
+            rasterize_radial_gradient(&mut pixels, width, height, layout, radius, gradient)
+        }
+        BackgroundLayer::ConicGradient(gradient) => {
+            rasterize_conic_gradient(&mut pixels, width, height, layout, radius, gradient)
+        }
+    }
+    Some(CachedGradientLayer::new(width, height, pixels))
+}
+
+fn rasterize_static_gradient_layer(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    layer: &BackgroundLayer,
+) -> Option<CachedGradientLayer> {
+    rasterize_gradient_layer(layout, radius, layer)
+}
+
+fn draw_cached_gradient_layer(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    clip: ClipRect,
+    cached: &CachedGradientLayer,
+    offset_x: i32,
+    offset_y: i32,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
+        return;
+    };
+    let rows = current_render_buffer_rows();
+    let draw_y0 = rows.start.max(y0 as usize);
+    let draw_y1 = rows.end.min(y1 as usize);
+    if x0 >= x1 || draw_y0 >= draw_y1 {
+        return;
+    }
+
+    match &cached.pixels {
+        CachedGradientPixels::BinaryAlpha(pixels) => {
+            for y in draw_y0..draw_y1 {
+                let global_y = y as i32;
+                let dest_row_start = (y - rows.start) * width;
+                let src_y = (global_y - offset_y) as usize;
+                let src_row_start = src_y * cached.width;
+                debug_assert!(src_y < cached.height);
+                for x in x0..x1 {
+                    let source = pixels[src_row_start + (x - offset_x) as usize];
+                    if source == 0 {
+                        continue;
+                    }
+                    buffer[dest_row_start + x as usize] = source & 0x00FF_FFFF;
+                }
+            }
+        }
+        CachedGradientPixels::Linear(pixels) => {
+            for y in draw_y0..draw_y1 {
+                let global_y = y as i32;
+                let dest_row_start = (y - rows.start) * width;
+                let src_y = (global_y - offset_y) as usize;
+                let src_row_start = src_y * cached.width;
+                debug_assert!(src_y < cached.height);
+                for x in x0..x1 {
+                    let source = pixels[src_row_start + (x - offset_x) as usize];
+                    let alpha = source.a.clamp(0.0, 1.0);
+                    if alpha <= f32::EPSILON {
+                        continue;
+                    }
+                    let buffer_index = dest_row_start + x as usize;
+                    if alpha >= 1.0 - f32::EPSILON {
+                        buffer[buffer_index] = pack_linear_rgb(LinearRgba { a: 1.0, ..source });
+                    } else {
+                        blend_linear_over(buffer, buffer_index, LinearRgba { a: alpha, ..source });
+                    }
+                }
+            }
         }
     }
 }
@@ -110,13 +773,13 @@ fn draw_linear_gradient(
     let projection_span = max_projection - min_projection;
 
     if projection_span.abs() <= f32::EPSILON {
-        draw_rounded_rect(
+        fill_gradient_rounded_rect(
             buffer,
             width,
             height,
             layout,
             radius,
-            first_stop.color,
+            first_stop.color.to_linear_rgba(),
             clip,
         );
         return;
@@ -137,7 +800,67 @@ fn draw_linear_gradient(
             }
 
             let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
-            blend_linear_pixel(buffer, width, height, x, y, color);
+            blend_gradient_sample(buffer, width, height, x, y, color);
+            projection += projection_step;
+        }
+    }
+}
+
+fn rasterize_linear_gradient(
+    pixels: &mut [LinearRgba],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    gradient: &LinearGradient,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(
+        layout,
+        ClipRect::full(width as f32, height as f32),
+        width,
+        height,
+    ) else {
+        return;
+    };
+
+    let Some(first_stop) = gradient.stops.first() else {
+        return;
+    };
+    let direction = gradient_direction_vector(gradient.direction, layout);
+    let center_x = layout.x + layout.width * 0.5;
+    let center_y = layout.y + layout.height * 0.5;
+    let (min_projection, max_projection) =
+        gradient_projection_bounds(layout, center_x, center_y, direction);
+    let projection_span = max_projection - min_projection;
+
+    if projection_span.abs() <= f32::EPSILON {
+        fill_rasterized_rounded_rect(
+            pixels,
+            width,
+            height,
+            layout,
+            radius,
+            first_stop.color.to_linear_rgba(),
+        );
+        return;
+    }
+
+    let stops = resolve_length_stops(&gradient.stops, projection_span, min_projection);
+    let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
+    let projection_step = direction.0;
+    for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        let mut projection =
+            ((x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            if !point_in_rounded_rect(px, py, layout, radius) {
+                projection += projection_step;
+                continue;
+            }
+
+            let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
+            write_raster_pixel(pixels, width, x, y, color);
             projection += projection_step;
         }
     }
@@ -163,13 +886,13 @@ fn draw_radial_gradient(
     let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
     let resolved_shape = resolve_radial_shape(gradient.shape, layout, center_x, center_y);
     if resolved_shape.radius_x <= f32::EPSILON || resolved_shape.radius_y <= f32::EPSILON {
-        draw_rounded_rect(
+        fill_gradient_rounded_rect(
             buffer,
             width,
             height,
             layout,
             radius,
-            first_stop.color,
+            first_stop.color.to_linear_rgba(),
             clip,
         );
         return;
@@ -214,7 +937,86 @@ fn draw_radial_gradient(
                     gradient.repeating,
                 )
             };
-            blend_linear_pixel(buffer, width, height, x, y, color);
+            blend_gradient_sample(buffer, width, height, x, y, color);
+        }
+    }
+}
+
+fn rasterize_radial_gradient(
+    pixels: &mut [LinearRgba],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    gradient: &RadialGradient,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(
+        layout,
+        ClipRect::full(width as f32, height as f32),
+        width,
+        height,
+    ) else {
+        return;
+    };
+
+    let Some(first_stop) = gradient.stops.first() else {
+        return;
+    };
+
+    let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
+    let resolved_shape = resolve_radial_shape(gradient.shape, layout, center_x, center_y);
+    if resolved_shape.radius_x <= f32::EPSILON || resolved_shape.radius_y <= f32::EPSILON {
+        fill_rasterized_rounded_rect(
+            pixels,
+            width,
+            height,
+            layout,
+            radius,
+            first_stop.color.to_linear_rgba(),
+        );
+        return;
+    }
+
+    let prepared_length_gradient = prepare_length_gradient(&gradient.stops, gradient.interpolation);
+    let fraction_only = length_stops_use_fraction_only(&gradient.stops);
+    let prepared_unit_gradient = fraction_only.then(|| {
+        let unit_stops = resolve_length_stops(&gradient.stops, 1.0, 0.0);
+        prepare_resolved_gradient(&unit_stops, gradient.interpolation)
+    });
+    let inverse_radius_x_squared = 1.0 / (resolved_shape.radius_x * resolved_shape.radius_x);
+    let inverse_radius_y_squared = 1.0 / (resolved_shape.radius_y * resolved_shape.radius_y);
+
+    for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            if !point_in_rounded_rect(px, py, layout, radius) {
+                continue;
+            }
+
+            let dx = px - center_x;
+            let dy = py - center_y;
+            let color = if let Some(prepared_unit_gradient) = &prepared_unit_gradient {
+                let normalized_distance = ((dx * dx) * inverse_radius_x_squared
+                    + (dy * dy) * inverse_radius_y_squared)
+                    .sqrt();
+                sample_prepared_gradient(
+                    prepared_unit_gradient,
+                    normalized_distance,
+                    gradient.repeating,
+                )
+            } else {
+                let distance = (dx * dx + dy * dy).sqrt();
+                let ray_length = radial_ray_length(dx, dy, resolved_shape);
+                sample_prepared_length_gradient(
+                    &prepared_length_gradient,
+                    ray_length,
+                    0.0,
+                    distance,
+                    gradient.repeating,
+                )
+            };
+            write_raster_pixel(pixels, width, x, y, color);
         }
     }
 }
@@ -257,8 +1059,137 @@ fn draw_conic_gradient(
             };
             let position = (angle - gradient.angle).rem_euclid(360.0);
             let color = sample_prepared_gradient(&prepared, position, gradient.repeating);
-            blend_linear_pixel(buffer, width, height, x, y, color);
+            blend_gradient_sample(buffer, width, height, x, y, color);
         }
+    }
+}
+
+fn rasterize_conic_gradient(
+    pixels: &mut [LinearRgba],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    gradient: &ConicGradient,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(
+        layout,
+        ClipRect::full(width as f32, height as f32),
+        width,
+        height,
+    ) else {
+        return;
+    };
+
+    let Some(_first_stop) = gradient.stops.first() else {
+        return;
+    };
+
+    let stops = resolve_angle_stops(&gradient.stops);
+    let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
+    let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
+
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            if !point_in_rounded_rect(px, py, layout, radius) {
+                continue;
+            }
+
+            let dx = px - center_x;
+            let dy = py - center_y;
+            let angle = if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
+                0.0
+            } else {
+                dx.atan2(-dy).to_degrees().rem_euclid(360.0)
+            };
+            let position = (angle - gradient.angle).rem_euclid(360.0);
+            let color = sample_prepared_gradient(&prepared, position, gradient.repeating);
+            write_raster_pixel(pixels, width, x, y, color);
+        }
+    }
+}
+
+fn fill_gradient_rounded_rect(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    color: LinearRgba,
+    clip: ClipRect,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
+        return;
+    };
+    for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            if point_in_rounded_rect(px, py, layout, radius) {
+                blend_gradient_sample(buffer, width, height, x, y, color);
+            }
+        }
+    }
+}
+
+fn fill_rasterized_rounded_rect(
+    pixels: &mut [LinearRgba],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    color: LinearRgba,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(
+        layout,
+        ClipRect::full(width as f32, height as f32),
+        width,
+        height,
+    ) else {
+        return;
+    };
+    for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            if point_in_rounded_rect(px, py, layout, radius) {
+                write_raster_pixel(pixels, width, x, y, color);
+            }
+        }
+    }
+}
+
+fn write_raster_pixel(pixels: &mut [LinearRgba], width: usize, x: i32, y: i32, color: LinearRgba) {
+    let index = y as usize * width + x as usize;
+    pixels[index] = color;
+}
+
+fn blend_gradient_sample(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    color: LinearRgba,
+) {
+    let alpha = color.a.clamp(0.0, 1.0);
+    if alpha <= f32::EPSILON || x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return;
+    }
+
+    let rows = current_render_buffer_rows();
+    let y = y as usize;
+    if y < rows.start || y >= rows.end {
+        return;
+    }
+
+    let index = (y - rows.start) * width + x as usize;
+    if alpha >= 1.0 - f32::EPSILON {
+        buffer[index] = pack_linear_rgb(LinearRgba { a: 1.0, ..color });
+    } else {
+        blend_linear_over(buffer, index, LinearRgba { a: alpha, ..color });
     }
 }
 
@@ -816,12 +1747,20 @@ fn mix(start: f32, end: f32, t: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use cssimpler_core::{Color, GradientInterpolation};
+    use std::sync::Arc;
+
+    use cssimpler_core::{
+        AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, CornerRadius,
+        GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
+        LayoutBox, LengthPercentageValue, LinearGradient, RadialGradient, RadialShape,
+    };
 
     use super::{
-        length_stops_use_fraction_only, prepare_length_gradient, prepare_resolved_gradient,
-        resolve_length_stops, sample_gradient, sample_prepared_gradient,
-        sample_prepared_length_gradient, PreparedLengthGradient, ResolvedGradientStop,
+        PreparedLengthGradient, ResolvedGradientStop, cached_gradient_layer,
+        cached_static_gradient_layer, clear_gradient_layer_cache_for_tests,
+        length_stops_use_fraction_only, lock_gradient_cache_for_tests, prepare_length_gradient,
+        prepare_resolved_gradient, resolve_length_stops, sample_gradient, sample_prepared_gradient,
+        sample_prepared_length_gradient,
     };
 
     fn assert_close(left: cssimpler_core::LinearRgba, right: cssimpler_core::LinearRgba) {
@@ -883,6 +1822,264 @@ mod tests {
             assert_close(
                 sample_gradient(&resolved, sample, false, GradientInterpolation::LinearSrgb),
                 sample_prepared_length_gradient(&prepared, 200.0, 0.0, sample, false),
+            );
+        }
+    }
+
+    fn linear_gradient_layer() -> BackgroundLayer {
+        BackgroundLayer::LinearGradient(LinearGradient {
+            direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+            interpolation: GradientInterpolation::Oklab,
+            repeating: false,
+            stops: vec![
+                GradientStop {
+                    color: Color::rgb(14, 165, 233),
+                    position: LengthPercentageValue::from_fraction(0.0),
+                },
+                GradientStop {
+                    color: Color::rgb(244, 114, 182),
+                    position: LengthPercentageValue::from_fraction(1.0),
+                },
+            ],
+        })
+    }
+
+    fn radial_gradient_layer() -> BackgroundLayer {
+        BackgroundLayer::RadialGradient(RadialGradient {
+            shape: RadialShape::Circle(CircleRadius::Explicit(36.0)),
+            center: GradientPoint::CENTER,
+            interpolation: GradientInterpolation::Oklab,
+            repeating: false,
+            stops: vec![
+                GradientStop {
+                    color: Color::rgb(251, 191, 36),
+                    position: LengthPercentageValue::from_fraction(0.0),
+                },
+                GradientStop {
+                    color: Color::rgba(15, 23, 42, 0),
+                    position: LengthPercentageValue::from_fraction(1.0),
+                },
+            ],
+        })
+    }
+
+    fn conic_gradient_layer() -> BackgroundLayer {
+        BackgroundLayer::ConicGradient(ConicGradient {
+            angle: 20.0,
+            center: GradientPoint::CENTER,
+            interpolation: GradientInterpolation::Oklab,
+            repeating: false,
+            stops: vec![
+                GradientStop {
+                    color: Color::rgb(45, 212, 191),
+                    position: AnglePercentageValue::from_degrees(0.0),
+                },
+                GradientStop {
+                    color: Color::rgb(99, 102, 241),
+                    position: AnglePercentageValue::from_degrees(180.0),
+                },
+                GradientStop {
+                    color: Color::rgb(244, 114, 182),
+                    position: AnglePercentageValue::from_degrees(360.0),
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn linear_gradient_cache_reuses_rasters_for_integer_translation() {
+        let _cache_guard = lock_gradient_cache_for_tests();
+        clear_gradient_layer_cache_for_tests();
+        let layer = linear_gradient_layer();
+        let radius = CornerRadius::all(12.0);
+
+        assert!(
+            cached_gradient_layer(LayoutBox::new(10.25, 20.75, 96.0, 48.0), radius, &layer)
+                .is_none()
+        );
+        let (first, first_offset_x, first_offset_y) =
+            cached_gradient_layer(LayoutBox::new(10.25, 20.75, 96.0, 48.0), radius, &layer)
+                .expect("linear gradient raster should cache");
+        let (second, second_offset_x, second_offset_y) =
+            cached_gradient_layer(LayoutBox::new(74.25, 44.75, 96.0, 48.0), radius, &layer)
+                .expect("translated linear gradient raster should cache");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_ne!(
+            (first_offset_x, first_offset_y),
+            (second_offset_x, second_offset_y)
+        );
+    }
+
+    #[test]
+    fn radial_gradient_cache_reuses_rasters_for_integer_translation() {
+        let _cache_guard = lock_gradient_cache_for_tests();
+        clear_gradient_layer_cache_for_tests();
+        let layer = radial_gradient_layer();
+        let radius = CornerRadius::all(16.0);
+
+        assert!(
+            cached_gradient_layer(LayoutBox::new(18.5, 28.25, 72.0, 72.0), radius, &layer)
+                .is_none()
+        );
+        let (first, _, _) =
+            cached_gradient_layer(LayoutBox::new(18.5, 28.25, 72.0, 72.0), radius, &layer)
+                .expect("radial gradient raster should cache");
+        let (second, _, _) =
+            cached_gradient_layer(LayoutBox::new(82.5, 60.25, 72.0, 72.0), radius, &layer)
+                .expect("translated radial gradient raster should cache");
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn conic_gradient_cache_reuses_rasters_for_integer_translation() {
+        let _cache_guard = lock_gradient_cache_for_tests();
+        clear_gradient_layer_cache_for_tests();
+        let layer = conic_gradient_layer();
+
+        assert!(
+            cached_gradient_layer(
+                LayoutBox::new(24.25, 12.5, 88.0, 88.0),
+                CornerRadius::ZERO,
+                &layer
+            )
+            .is_none()
+        );
+        let (first, _, _) = cached_gradient_layer(
+            LayoutBox::new(24.25, 12.5, 88.0, 88.0),
+            CornerRadius::ZERO,
+            &layer,
+        )
+        .expect("conic gradient raster should cache");
+        let (second, _, _) = cached_gradient_layer(
+            LayoutBox::new(88.25, 36.5, 88.0, 88.0),
+            CornerRadius::ZERO,
+            &layer,
+        )
+        .expect("translated conic gradient raster should cache");
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn gradient_cache_invalidates_when_size_or_gradient_changes() {
+        let _cache_guard = lock_gradient_cache_for_tests();
+        clear_gradient_layer_cache_for_tests();
+        let radius = CornerRadius::all(10.0);
+        let base_layer = linear_gradient_layer();
+
+        assert!(
+            cached_gradient_layer(
+                LayoutBox::new(10.25, 12.75, 96.0, 40.0),
+                radius,
+                &base_layer
+            )
+            .is_none()
+        );
+        let (base, _, _) = cached_gradient_layer(
+            LayoutBox::new(10.25, 12.75, 96.0, 40.0),
+            radius,
+            &base_layer,
+        )
+        .expect("base gradient raster should cache");
+        assert!(
+            cached_gradient_layer(
+                LayoutBox::new(10.25, 12.75, 120.0, 40.0),
+                radius,
+                &base_layer
+            )
+            .is_none()
+        );
+        let (resized, _, _) = cached_gradient_layer(
+            LayoutBox::new(10.25, 12.75, 120.0, 40.0),
+            radius,
+            &base_layer,
+        )
+        .expect("resized gradient raster should cache");
+        let changed_layer = BackgroundLayer::LinearGradient(LinearGradient {
+            direction: GradientDirection::Angle(45.0),
+            ..match base_layer {
+                BackgroundLayer::LinearGradient(ref gradient) => gradient.clone(),
+                _ => unreachable!(),
+            }
+        });
+        assert!(
+            cached_gradient_layer(
+                LayoutBox::new(10.25, 12.75, 96.0, 40.0),
+                radius,
+                &changed_layer
+            )
+            .is_none()
+        );
+        let (changed, _, _) = cached_gradient_layer(
+            LayoutBox::new(10.25, 12.75, 96.0, 40.0),
+            radius,
+            &changed_layer,
+        )
+        .expect("changed gradient raster should cache");
+
+        assert!(!Arc::ptr_eq(&base, &resized));
+        assert!(!Arc::ptr_eq(&base, &changed));
+    }
+
+    #[test]
+    fn oversized_gradient_layers_skip_preraster_cache() {
+        let _cache_guard = lock_gradient_cache_for_tests();
+        clear_gradient_layer_cache_for_tests();
+        let layer = linear_gradient_layer();
+
+        for _ in 0..4 {
+            assert!(
+                cached_gradient_layer(
+                    LayoutBox::new(0.0, 0.0, 308.0, 272.0),
+                    CornerRadius::all(18.0),
+                    &layer
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn large_gradient_layers_use_static_preraster_cache_after_reuse() {
+        let _cache_guard = lock_gradient_cache_for_tests();
+        clear_gradient_layer_cache_for_tests();
+        let layer = radial_gradient_layer();
+        let radius = CornerRadius::all(20.0);
+
+        assert!(
+            cached_static_gradient_layer(LayoutBox::new(12.5, 18.25, 512.0, 512.0), radius, &layer)
+                .is_none()
+        );
+        let (first, first_offset_x, first_offset_y) =
+            cached_static_gradient_layer(LayoutBox::new(12.5, 18.25, 512.0, 512.0), radius, &layer)
+                .expect("large gradient raster should enter the static cache");
+        let (second, second_offset_x, second_offset_y) =
+            cached_static_gradient_layer(LayoutBox::new(76.5, 50.25, 512.0, 512.0), radius, &layer)
+                .expect("translated large gradient raster should reuse the static cache");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_ne!(
+            (first_offset_x, first_offset_y),
+            (second_offset_x, second_offset_y)
+        );
+    }
+
+    #[test]
+    fn oversized_static_gradient_layers_skip_preraster_cache() {
+        let _cache_guard = lock_gradient_cache_for_tests();
+        clear_gradient_layer_cache_for_tests();
+        let layer = radial_gradient_layer();
+
+        for _ in 0..4 {
+            assert!(
+                cached_static_gradient_layer(
+                    LayoutBox::new(0.0, 0.0, 2048.0, 1024.0),
+                    CornerRadius::all(24.0),
+                    &layer
+                )
+                .is_none()
             );
         }
     }
