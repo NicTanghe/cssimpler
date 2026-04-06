@@ -402,22 +402,173 @@ Acceptance
 
 ---
 
+## O18. Full-redraw subtree bounds precomputation
+Depends: O8, O10  
+Status: planned
+
+Purpose:
+
+- Eliminate repeated subtree-bounds rebuilding during parallel full redraw
+
+Support:
+
+- precompute a bounds tree that full redraw workers can reuse instead of recomputing subtree bounds on demand
+- target the current `CullMode::Subtree` path where `node_intersects_clip()` can end up rebuilding `subtree_visual_bounds(node)` repeatedly per worker band
+- preserve the same overflow, shadow, and clip semantics as the current recursive bounds model
+
+Acceptance
+
+- Parallel full redraw no longer rebuilds subtree bounds repeatedly for the same scene across worker bands
+- `paint_us` improves on large scenes that trigger multi-worker full redraw
+- Bounds reuse remains correct around clipped subtrees and shadow expansion
+
+Notes:
+
+- Current hotspot reference: `renderer/src/lib.rs:1533`
+
+---
+
+## O19. Bounded LRU eviction for paint caches
+Depends: O6  
+Status: planned
+
+Purpose:
+
+- Replace abrupt whole-cache flushes with smoother bounded eviction behavior
+
+Support:
+
+- swap the current "clear the whole cache when full" behavior in shadow and text-related caches for LRU-style eviction
+- keep cache size bounded and deterministic
+- avoid performance cliffs caused by synchronized full-cache churn
+
+Acceptance
+
+- Shadow, text raster, and text effect caches evict incrementally instead of clearing wholesale at capacity
+- Varied scenes no longer show obvious frame spikes when caches hit their size limit
+- Cache bookkeeping stays cheap enough that eviction policy does not erase the benefit
+
+Notes:
+
+- Current hotspot references: `renderer/src/lib.rs:314`, `renderer/src/fonts.rs:272`
+
+---
+
+## O20. Static gradient layer preraster cache
+Depends: O4  
+Status: planned
+
+Purpose:
+
+- Avoid repeated per-pixel gradient resampling for stable large surfaces
+
+Support:
+
+- cache rasterized gradient layers for static nodes when layout, radius, and gradient parameters are unchanged
+- favor large or frequently repainted gradients first, especially in animated scenes where only neighboring content changes
+- preserve correctness when clip, transform, opacity, or gradient inputs change
+
+Acceptance
+
+- Large static gradient-backed surfaces do not resample every pixel every frame
+- Animated scenes with stable backgrounds show lower `paint_us`
+- Cache invalidation remains deterministic and visually correct
+
+Notes:
+
+- This is the explicit renderer-level spin-out of the broader O4 gradient caching work
+
+---
+
+## O21. Span-based alpha and rounded-shape raster batching
+Depends: O3, O7  
+Status: planned
+
+Purpose:
+
+- Reduce per-pixel loop overhead in mask-heavy and rounded-shape paint paths
+
+Support:
+
+- add more row-span based filling for alpha masks, rounded rectangles, rings, and related shape fills where coverage can be batched safely
+- reduce repeated bounds checks, indexing work, and branch-heavy inner loops in the software rasterizer
+- keep conservative fallbacks for shapes that do not admit safe span batching
+
+Acceptance
+
+- Hot mask and rounded-shape loops spend less time in per-pixel bookkeeping
+- Output remains identical to the existing generic raster path
+- Effect-heavy scenes show lower `paint_us` without regressions at fractional edges
+
+---
+
+## O22. Dirty-region tightening for self-only visual changes
+Depends: O1, O9  
+Status: planned
+
+Purpose:
+
+- Shrink safe-but-overbroad damage when only a node's own visuals change and its children stay stable
+
+Support:
+
+- refine the current dirty-region rule that can mark the union of previous and current subtree bounds when a node-level visual mismatch is detected
+- distinguish self-visual changes from child-subtree changes where possible
+- preserve the existing correctness-first fallback when the narrower damage cannot be proven safe
+
+Acceptance
+
+- Nodes whose own visuals changed but whose children did not can repaint a tighter region than the full subtree union
+- Dirty-region output remains deterministic
+- Incremental repaint does not miss pixels around shadows, borders, or clipped descendants
+
+Notes:
+
+- Current hotspot reference: `renderer/src/lib.rs:2645`
+
+---
+
+## O23. SIMD acceleration for mask blend loops
+Depends: O7, O21  
+Status: planned
+
+Purpose:
+
+- Accelerate the hottest alpha-mask blend loops once scalar algorithmic wins are in place
+
+Support:
+
+- target text-mask, text-shadow, and shadow-mask blend loops that currently process pixels one-by-one
+- use SIMD conservatively behind feature or platform gating where needed
+- preserve scalar fallbacks and bit-exact or visually identical output expectations
+
+Acceptance
+
+- Mask blend throughput improves on supported CPUs without changing visual output
+- Unsupported targets continue to use the scalar path cleanly
+- SIMD complexity stays isolated to a small set of hot loops
+
+---
+
 # Suggested implementation order
 
 1. O1 sparse-moving-damage regression investigation  
 2. O2 baseline and measurement discipline  
 3. O3 fast paths for simple fills and borders  
-4. O4 gradient caching and prerasterization  
-5. O6 cache stability and eviction  
+4. O4 gradient caching and prerasterization, then O20 static gradient preraster cache  
+5. O6 cache stability and eviction, then O19 bounded LRU cache eviction  
 6. O7 blur and glow pass efficiency  
-7. O9 unified scene diff and dirty-region collection  
-8. O10 shared subtree bounds for all paint modes  
-9. O8 full and incremental paint traversal reduction  
-10. O5 text paint layout reuse  
-11. O12 hot-screen partitioning with `FragmentApp` where tree-build cost still dominates  
-12. O13 + O14 style-system reductions  
-13. O15 + O16 runtime cleanup around transitions and font resolution  
-14. O17 draw-list or spatial plan only if the earlier work still leaves meaningful paint bottlenecks
+7. O21 span-based alpha and rounded-shape raster batching  
+8. O23 SIMD mask blend acceleration after the scalar path is tight  
+9. O9 unified scene diff and dirty-region collection  
+10. O22 dirty-region tightening for self-only visual changes  
+11. O10 shared subtree bounds for all paint modes, then O18 full-redraw subtree bounds precomputation  
+12. O8 full and incremental paint traversal reduction  
+13. O5 text paint layout reuse  
+14. O12 hot-screen partitioning with `FragmentApp` where tree-build cost still dominates  
+15. O13 + O14 style-system reductions  
+16. O15 + O16 runtime cleanup around transitions and font resolution  
+17. O17 draw-list or spatial plan only if the earlier work still leaves meaningful paint bottlenecks
 
 ---
 
