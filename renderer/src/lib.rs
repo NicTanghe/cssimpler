@@ -756,11 +756,30 @@ fn render_to_buffer_internal(
     height: usize,
     clear_color: Color,
 ) -> PaintStats {
+    render_to_buffer_internal_with_cached_bounds(scene, None, buffer, width, height, clear_color)
+}
+
+fn render_to_buffer_internal_with_cached_bounds(
+    scene: &[RenderNode],
+    cached_bounds: Option<&CachedSceneBounds>,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+) -> PaintStats {
     let worker_count = full_redraw_worker_count(width, height);
     if worker_count <= 1 {
         render_to_buffer_serial(scene, buffer, width, height, clear_color);
     } else {
-        render_to_buffer_parallel(scene, buffer, width, height, clear_color, worker_count);
+        render_to_buffer_parallel(
+            scene,
+            cached_bounds,
+            buffer,
+            width,
+            height,
+            clear_color,
+            worker_count,
+        );
     }
 
     PaintStats {
@@ -792,12 +811,20 @@ fn render_to_buffer_serial(
 
 fn render_to_buffer_parallel(
     scene: &[RenderNode],
+    cached_bounds: Option<&CachedSceneBounds>,
     buffer: &mut [u32],
     width: usize,
     height: usize,
     clear_color: Color,
     worker_count: usize,
 ) {
+    let owned_bounds;
+    let cached_bounds = if let Some(cached_bounds) = cached_bounds {
+        cached_bounds
+    } else {
+        owned_bounds = cache_scene_subtree_bounds(scene);
+        &owned_bounds
+    };
     let clear = pack_rgb(clear_color);
     let band_count = worker_count.max(1).min(height.max(1));
     let rows_per_worker = height.div_ceil(band_count);
@@ -823,14 +850,14 @@ fn render_to_buffer_parallel(
             handles.push(scope.spawn(move || {
                 with_render_buffer_rows(rows, || {
                     worker_buffer.fill(clear);
-                    for node in scene {
-                        draw_node(
+                    for (node, bounds) in scene.iter().zip(&cached_bounds.roots) {
+                        draw_node_with_cached_bounds(
                             node,
+                            bounds,
                             worker_buffer,
                             width,
                             height,
                             band_clip,
-                            CullMode::Subtree,
                         );
                     }
                 });
@@ -871,7 +898,8 @@ fn render_scene_update_internal(
     height: usize,
     clear_color: Color,
 ) -> PaintStats {
-    let mut dirty_regions = dirty_regions_between_scenes(previous_scene, scene);
+    let scene_diff = prepare_scene_diff(previous_scene, scene);
+    let mut dirty_regions = scene_diff.dirty_regions;
     if dirty_regions.is_empty() {
         return PaintStats::default();
     }
@@ -903,12 +931,19 @@ fn render_scene_update_internal(
     if let Some(reason) = should_full_redraw(
         dirty_region_count,
         dirty_pixels,
-        count_scene_nodes(scene),
+        scene_diff.current_bounds.node_count,
         incremental_dirty_jobs,
         width,
         height,
     ) {
-        let mut stats = render_to_buffer_internal(scene, buffer, width, height, clear_color);
+        let mut stats = render_to_buffer_internal_with_cached_bounds(
+            scene,
+            Some(&scene_diff.current_bounds),
+            buffer,
+            width,
+            height,
+            clear_color,
+        );
         stats.dirty_regions = dirty_region_count;
         stats.dirty_jobs = incremental_dirty_jobs;
         stats.damage_pixels = dirty_pixels;
@@ -916,11 +951,10 @@ fn render_scene_update_internal(
         return stats;
     }
 
-    let cached_bounds = cache_scene_subtree_bounds(scene);
     if incremental_worker_count > 1 {
         render_scene_update_parallel(
             scene,
-            &cached_bounds,
+            &scene_diff.current_bounds.roots,
             buffer,
             width,
             height,
@@ -942,7 +976,7 @@ fn render_scene_update_internal(
 
     for dirty_region in snapped_dirty_regions {
         clear_clip(buffer, width, height, dirty_region, clear_color);
-        for (node, bounds) in scene.iter().zip(&cached_bounds) {
+        for (node, bounds) in scene.iter().zip(&scene_diff.current_bounds.roots) {
             draw_node_with_cached_bounds(node, bounds, buffer, width, height, dirty_region);
         }
     }
@@ -1235,12 +1269,19 @@ enum CullMode {
 }
 
 #[derive(Clone, Debug)]
+struct CachedSceneBounds {
+    roots: Vec<CachedSubtreeBounds>,
+    node_count: usize,
+}
+
+#[derive(Clone, Debug)]
 struct CachedSubtreeBounds {
+    own_bounds: Option<ClipRect>,
     bounds: Option<ClipRect>,
     children: Vec<CachedSubtreeBounds>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct ClipRect {
     x0: f32,
     y0: f32,
@@ -1783,61 +1824,152 @@ fn draw_background_and_border(
     }
 }
 
+struct SceneDiff {
+    dirty_regions: Vec<ClipRect>,
+    current_bounds: CachedSceneBounds,
+}
+
+fn prepare_scene_diff(previous_scene: &[RenderNode], scene: &[RenderNode]) -> SceneDiff {
+    let previous_bounds = cache_scene_subtree_bounds(previous_scene);
+    let current_bounds = cache_scene_subtree_bounds(scene);
+    let mut dirty_regions = Vec::new();
+    let _ = collect_scene_dirty_regions(
+        previous_scene,
+        &previous_bounds.roots,
+        scene,
+        &current_bounds.roots,
+        &mut dirty_regions,
+    );
+    SceneDiff {
+        dirty_regions,
+        current_bounds,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn dirty_regions_between_scenes(
     previous_scene: &[RenderNode],
     scene: &[RenderNode],
 ) -> Vec<ClipRect> {
-    let mut dirty_regions = Vec::new();
-    collect_scene_dirty_regions(previous_scene, scene, &mut dirty_regions);
-    dirty_regions
+    prepare_scene_diff(previous_scene, scene).dirty_regions
 }
 
 fn collect_scene_dirty_regions(
     previous_scene: &[RenderNode],
+    previous_bounds: &[CachedSubtreeBounds],
     scene: &[RenderNode],
+    current_bounds: &[CachedSubtreeBounds],
     dirty_regions: &mut Vec<ClipRect>,
-) {
+) -> bool {
     let count = previous_scene.len().max(scene.len());
+    let mut matched = previous_scene.len() == scene.len();
 
     for index in 0..count {
-        match (previous_scene.get(index), scene.get(index)) {
-            (Some(previous), Some(current)) => {
-                collect_node_dirty_regions(previous, current, dirty_regions);
+        match (
+            previous_scene.get(index),
+            previous_bounds.get(index),
+            scene.get(index),
+            current_bounds.get(index),
+        ) {
+            (Some(previous), Some(previous_bounds), Some(current), Some(current_bounds)) => {
+                matched &= collect_node_dirty_regions(
+                    previous,
+                    previous_bounds,
+                    current,
+                    current_bounds,
+                    dirty_regions,
+                );
             }
-            (Some(previous), None) => push_subtree_dirty_region(previous, dirty_regions),
-            (None, Some(current)) => push_subtree_dirty_region(current, dirty_regions),
-            (None, None) => {}
+            (Some(_previous), Some(previous_bounds), None, None) => {
+                push_cached_subtree_dirty_region(previous_bounds, dirty_regions);
+                matched = false;
+            }
+            (None, None, Some(_current), Some(current_bounds)) => {
+                push_cached_subtree_dirty_region(current_bounds, dirty_regions);
+                matched = false;
+            }
+            _ => matched = false,
         }
     }
+
+    matched
 }
 
 fn collect_node_dirty_regions(
     previous: &RenderNode,
+    previous_bounds: &CachedSubtreeBounds,
     current: &RenderNode,
+    current_bounds: &CachedSubtreeBounds,
     dirty_regions: &mut Vec<ClipRect>,
-) {
-    if render_nodes_match_visuals(previous, current) {
-        return;
-    }
+) -> bool {
+    let own_matches = render_nodes_match_own_visuals(previous, current);
+    let can_tighten_own_dirty = can_tighten_own_dirty_region(previous, current);
 
-    if !render_nodes_match_own_visuals(previous, current) {
-        push_dirty_region(
-            union_optional_bounds(
-                subtree_visual_bounds(previous),
-                subtree_visual_bounds(current),
-            ),
+    if own_matches {
+        let start_len = dirty_regions.len();
+        let children_match = collect_scene_dirty_regions(
+            &previous.children,
+            &previous_bounds.children,
+            &current.children,
+            &current_bounds.children,
             dirty_regions,
         );
-        return;
+        if children_match {
+            return true;
+        }
+        maybe_collapse_branch_dirty_regions(
+            previous_bounds.bounds,
+            current_bounds.bounds,
+            dirty_regions,
+            start_len,
+        );
+        return false;
+    }
+
+    if !can_tighten_own_dirty {
+        push_dirty_region(
+            union_optional_bounds(previous_bounds.bounds, current_bounds.bounds),
+            dirty_regions,
+        );
+        return false;
     }
 
     let start_len = dirty_regions.len();
-    collect_scene_dirty_regions(&previous.children, &current.children, dirty_regions);
-    maybe_collapse_branch_dirty_regions(previous, current, dirty_regions, start_len);
+    let children_match = collect_scene_dirty_regions(
+        &previous.children,
+        &previous_bounds.children,
+        &current.children,
+        &current_bounds.children,
+        dirty_regions,
+    );
+    push_dirty_region(
+        union_optional_bounds(previous_bounds.own_bounds, current_bounds.own_bounds),
+        dirty_regions,
+    );
+    if !children_match {
+        maybe_collapse_branch_dirty_regions(
+            previous_bounds.bounds,
+            current_bounds.bounds,
+            dirty_regions,
+            start_len,
+        );
+    }
+    false
 }
 
-fn push_subtree_dirty_region(node: &RenderNode, dirty_regions: &mut Vec<ClipRect>) {
-    push_dirty_region(subtree_visual_bounds(node), dirty_regions);
+fn push_cached_subtree_dirty_region(
+    cached_bounds: &CachedSubtreeBounds,
+    dirty_regions: &mut Vec<ClipRect>,
+) {
+    push_dirty_region(cached_bounds.bounds, dirty_regions);
+}
+
+fn can_tighten_own_dirty_region(previous: &RenderNode, current: &RenderNode) -> bool {
+    previous.kind == current.kind
+        && previous.layout == current.layout
+        && previous.content_inset == current.content_inset
+        && previous.scrollbars == current.scrollbars
+        && previous.style.overflow == current.style.overflow
 }
 
 fn push_dirty_region(region: Option<ClipRect>, dirty_regions: &mut Vec<ClipRect>) {
@@ -1849,8 +1981,8 @@ fn push_dirty_region(region: Option<ClipRect>, dirty_regions: &mut Vec<ClipRect>
 }
 
 fn maybe_collapse_branch_dirty_regions(
-    previous: &RenderNode,
-    current: &RenderNode,
+    previous_bounds: Option<ClipRect>,
+    current_bounds: Option<ClipRect>,
     dirty_regions: &mut Vec<ClipRect>,
     start_len: usize,
 ) {
@@ -1859,10 +1991,7 @@ fn maybe_collapse_branch_dirty_regions(
         return;
     }
 
-    let Some(branch_bounds) = union_optional_bounds(
-        subtree_visual_bounds(previous),
-        subtree_visual_bounds(current),
-    ) else {
+    let Some(branch_bounds) = union_optional_bounds(previous_bounds, current_bounds) else {
         return;
     };
 
@@ -1960,14 +2089,6 @@ fn clip_rects_pixel_count(clips: &[ClipRect], width: usize, height: usize) -> us
         .sum()
 }
 
-fn count_scene_nodes(scene: &[RenderNode]) -> usize {
-    scene.iter().map(count_render_node).sum()
-}
-
-fn count_render_node(node: &RenderNode) -> usize {
-    1 + node.children.iter().map(count_render_node).sum::<usize>()
-}
-
 fn subtree_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
     let mut bounds = node_visual_bounds(node);
     let parent_clip = non_empty_layout_clip(node.layout);
@@ -1993,17 +2114,24 @@ fn subtree_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
     bounds
 }
 
-fn cache_scene_subtree_bounds(scene: &[RenderNode]) -> Vec<CachedSubtreeBounds> {
-    scene.iter().map(cache_subtree_bounds).collect()
+fn cache_scene_subtree_bounds(scene: &[RenderNode]) -> CachedSceneBounds {
+    let mut node_count = 0;
+    let roots = scene
+        .iter()
+        .map(|node| cache_subtree_bounds(node, &mut node_count))
+        .collect();
+    CachedSceneBounds { roots, node_count }
 }
 
-fn cache_subtree_bounds(node: &RenderNode) -> CachedSubtreeBounds {
-    let mut bounds = node_visual_bounds(node);
+fn cache_subtree_bounds(node: &RenderNode, node_count: &mut usize) -> CachedSubtreeBounds {
+    *node_count = node_count.saturating_add(1);
+    let own_bounds = node_visual_bounds(node);
+    let mut bounds = own_bounds;
     let parent_clip = non_empty_layout_clip(node.layout);
     let mut children = Vec::with_capacity(node.children.len());
 
     for child in &node.children {
-        let mut cached_child = cache_subtree_bounds(child);
+        let mut cached_child = cache_subtree_bounds(child, node_count);
         if node.style.overflow.clips_any_axis() {
             cached_child.bounds = cached_child
                 .bounds
@@ -2013,7 +2141,11 @@ fn cache_subtree_bounds(node: &RenderNode) -> CachedSubtreeBounds {
         children.push(cached_child);
     }
 
-    CachedSubtreeBounds { bounds, children }
+    CachedSubtreeBounds {
+        own_bounds,
+        bounds,
+        children,
+    }
 }
 
 fn node_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
@@ -2629,7 +2761,7 @@ mod tests {
         let mut threaded = vec![0_u32; 128 * 96];
 
         super::render_to_buffer_serial(&scene, &mut single, 128, 96, Color::BLACK);
-        super::render_to_buffer_parallel(&scene, &mut threaded, 128, 96, Color::BLACK, 4);
+        super::render_to_buffer_parallel(&scene, None, &mut threaded, 128, 96, Color::BLACK, 4);
 
         assert_eq!(single, threaded);
     }
@@ -3896,6 +4028,101 @@ mod tests {
         let dirty_regions = dirty_regions_between_scenes(&previous, &next);
 
         assert_eq!(dirty_regions.len(), 3);
+    }
+
+    #[test]
+    fn self_only_visual_changes_can_tighten_dirty_regions_to_own_bounds() {
+        let previous = vec![
+            RenderNode::container(LayoutBox::new(20.0, 20.0, 80.0, 60.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(20, 20, 20)),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(140.0, 0.0, 40.0, 40.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(40, 120, 220)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let next = vec![
+            RenderNode::container(LayoutBox::new(20.0, 20.0, 80.0, 60.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(220, 80, 80)),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(140.0, 0.0, 40.0, 40.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(40, 120, 220)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+
+        let dirty_regions = dirty_regions_between_scenes(&previous, &next);
+
+        assert_eq!(dirty_regions.len(), 1);
+        assert_eq!(
+            dirty_regions[0],
+            ClipRect {
+                x0: 20.0,
+                y0: 20.0,
+                x1: 100.0,
+                y1: 80.0,
+            }
+        );
+    }
+
+    #[test]
+    fn overflow_changes_keep_dirty_regions_at_the_subtree_union() {
+        let previous = vec![
+            RenderNode::container(LayoutBox::new(20.0, 20.0, 80.0, 60.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(20, 20, 20)),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(140.0, 0.0, 40.0, 40.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(40, 120, 220)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let next = vec![
+            RenderNode::container(LayoutBox::new(20.0, 20.0, 80.0, 60.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(20, 20, 20)),
+                    overflow: Overflow::CLIP,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(140.0, 0.0, 40.0, 40.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(40, 120, 220)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+
+        let dirty_regions = dirty_regions_between_scenes(&previous, &next);
+
+        assert_eq!(dirty_regions.len(), 1);
+        assert_eq!(
+            dirty_regions[0],
+            ClipRect {
+                x0: 20.0,
+                y0: 0.0,
+                x1: 180.0,
+                y1: 80.0,
+            }
+        );
     }
 
     #[test]
