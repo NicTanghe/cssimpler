@@ -2121,16 +2121,6 @@ impl PreparedBlendColor {
             linear: color.to_linear_rgba(),
         }
     }
-
-    fn with_alpha(self, alpha: u8) -> Self {
-        Self {
-            linear: LinearRgba {
-                a: alpha as f32 / 255.0,
-                ..self.linear
-            },
-            ..self
-        }
-    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2171,6 +2161,211 @@ fn blend_prepared_pixel(
     }
 
     blend_linear_over(buffer, index, color.linear);
+}
+
+fn blend_mask_row(
+    buffer_row: &mut [u32],
+    coverages: &[u8],
+    color: PreparedBlendColor,
+    base_alpha: u8,
+) {
+    let len = buffer_row.len().min(coverages.len());
+    if base_alpha == 0 || len == 0 {
+        return;
+    }
+
+    let buffer_row = &mut buffer_row[..len];
+    let coverages = &coverages[..len];
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("sse2") {
+            // SAFETY: The call is gated behind a runtime SSE2 feature check.
+            unsafe {
+                blend_mask_row_sse2(buffer_row, coverages, color, base_alpha);
+            }
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the AArch64 baseline ISA.
+        unsafe {
+            blend_mask_row_neon(buffer_row, coverages, color, base_alpha);
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "arm")]
+    {
+        if std::arch::is_arm_feature_detected!("neon") {
+            // SAFETY: The call is gated behind a runtime NEON feature check.
+            unsafe {
+                blend_mask_row_neon(buffer_row, coverages, color, base_alpha);
+            }
+            return;
+        }
+    }
+
+    blend_mask_row_scalar(buffer_row, coverages, color, base_alpha);
+}
+
+fn blend_mask_row_scalar(
+    buffer_row: &mut [u32],
+    coverages: &[u8],
+    color: PreparedBlendColor,
+    base_alpha: u8,
+) {
+    for (pixel, &coverage) in buffer_row.iter_mut().zip(coverages) {
+        let alpha = scale_alpha(coverage, base_alpha);
+        if alpha == 0 {
+            continue;
+        }
+        if alpha == u8::MAX {
+            *pixel = color.packed;
+            continue;
+        }
+
+        let alpha = alpha as f32 / 255.0;
+        let inverse_alpha = 1.0 - alpha;
+        let destination = unpack_rgb(*pixel).to_linear_rgba();
+        *pixel = pack_linear_rgb(LinearRgba {
+            r: color.linear.r * alpha + destination.r * inverse_alpha,
+            g: color.linear.g * alpha + destination.g * inverse_alpha,
+            b: color.linear.b * alpha + destination.b * inverse_alpha,
+            a: 1.0,
+        });
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn blend_mask_row_sse2(
+    buffer_row: &mut [u32],
+    coverages: &[u8],
+    color: PreparedBlendColor,
+    base_alpha: u8,
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_setzero_si128};
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_setzero_si128,
+    };
+
+    let mut index = 0;
+    let zero = unsafe { _mm_setzero_si128() };
+    while index + 16 <= coverages.len() {
+        let chunk = unsafe { _mm_loadu_si128(coverages.as_ptr().add(index).cast()) };
+        let zero_mask = unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, zero)) };
+        if zero_mask == 0xFFFF {
+            index += 16;
+            continue;
+        }
+
+        let chunk_end = index + 16;
+        blend_mask_row_scalar(
+            &mut buffer_row[index..chunk_end],
+            &coverages[index..chunk_end],
+            color,
+            base_alpha,
+        );
+        index = chunk_end;
+    }
+
+    if index < coverages.len() {
+        blend_mask_row_scalar(
+            &mut buffer_row[index..],
+            &coverages[index..],
+            color,
+            base_alpha,
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn blend_mask_row_neon(
+    buffer_row: &mut [u32],
+    coverages: &[u8],
+    color: PreparedBlendColor,
+    base_alpha: u8,
+) {
+    use std::arch::aarch64::{
+        vceqq_u8, vdupq_n_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8,
+    };
+
+    let mut index = 0;
+    let zero = unsafe { vdupq_n_u8(0) };
+    while index + 16 <= coverages.len() {
+        let chunk = unsafe { vld1q_u8(coverages.as_ptr().add(index)) };
+        let zero_mask = unsafe { vreinterpretq_u64_u8(vceqq_u8(chunk, zero)) };
+        let low = unsafe { vgetq_lane_u64(zero_mask, 0) };
+        let high = unsafe { vgetq_lane_u64(zero_mask, 1) };
+        if low == u64::MAX && high == u64::MAX {
+            index += 16;
+            continue;
+        }
+
+        let chunk_end = index + 16;
+        blend_mask_row_scalar(
+            &mut buffer_row[index..chunk_end],
+            &coverages[index..chunk_end],
+            color,
+            base_alpha,
+        );
+        index = chunk_end;
+    }
+
+    if index < coverages.len() {
+        blend_mask_row_scalar(
+            &mut buffer_row[index..],
+            &coverages[index..],
+            color,
+            base_alpha,
+        );
+    }
+}
+
+#[cfg(target_arch = "arm")]
+#[target_feature(enable = "neon")]
+unsafe fn blend_mask_row_neon(
+    buffer_row: &mut [u32],
+    coverages: &[u8],
+    color: PreparedBlendColor,
+    base_alpha: u8,
+) {
+    use std::arch::arm::{vceqq_u8, vdupq_n_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8};
+
+    let mut index = 0;
+    let zero = unsafe { vdupq_n_u8(0) };
+    while index + 16 <= coverages.len() {
+        let chunk = unsafe { vld1q_u8(coverages.as_ptr().add(index)) };
+        let zero_mask = unsafe { vreinterpretq_u64_u8(vceqq_u8(chunk, zero)) };
+        let low = unsafe { vgetq_lane_u64(zero_mask, 0) };
+        let high = unsafe { vgetq_lane_u64(zero_mask, 1) };
+        if low == u64::MAX && high == u64::MAX {
+            index += 16;
+            continue;
+        }
+
+        let chunk_end = index + 16;
+        blend_mask_row_scalar(
+            &mut buffer_row[index..chunk_end],
+            &coverages[index..chunk_end],
+            color,
+            base_alpha,
+        );
+        index = chunk_end;
+    }
+
+    if index < coverages.len() {
+        blend_mask_row_scalar(
+            &mut buffer_row[index..],
+            &coverages[index..],
+            color,
+            base_alpha,
+        );
+    }
 }
 
 fn buffer_pixel_index(width: usize, height: usize, x: i32, y: i32) -> Option<usize> {
@@ -2384,6 +2579,7 @@ mod tests {
 
     #[test]
     fn multithreaded_full_redraw_matches_the_single_threaded_result() {
+        let _shadow_cache_guard = super::shadow::lock_shadow_mask_cache_for_tests();
         let scene = vec![
             RenderNode::container(LayoutBox::new(8.0, 8.0, 96.0, 72.0))
                 .with_style(VisualStyle {
@@ -2440,6 +2636,7 @@ mod tests {
 
     #[test]
     fn identical_box_shadow_masks_are_reused_across_integer_position_changes() {
+        let _cache_guard = super::shadow::lock_shadow_mask_cache_for_tests();
         super::clear_shadow_mask_cache_for_tests();
         let shadow = BoxShadow {
             color: Color::rgba(15, 23, 42, 120),
@@ -2480,6 +2677,41 @@ mod tests {
 
         assert_eq!(buffer[1], pack_rgb(Color::rgb(40, 120, 220)));
         assert_eq!(buffer[5], pack_rgb(Color::rgb(220, 38, 38)));
+    }
+
+    #[test]
+    fn blend_mask_row_matches_scalar_reference() {
+        let mut accelerated = vec![
+            pack_rgb(Color::rgb(15, 23, 42)),
+            pack_rgb(Color::rgb(226, 232, 240)),
+            pack_rgb(Color::rgb(30, 41, 59)),
+            pack_rgb(Color::rgb(148, 163, 184)),
+            pack_rgb(Color::rgb(8, 47, 73)),
+            pack_rgb(Color::rgb(125, 211, 252)),
+            pack_rgb(Color::rgb(15, 118, 110)),
+            pack_rgb(Color::rgb(244, 114, 182)),
+            pack_rgb(Color::rgb(24, 24, 27)),
+            pack_rgb(Color::rgb(244, 244, 245)),
+            pack_rgb(Color::rgb(76, 29, 149)),
+            pack_rgb(Color::rgb(251, 191, 36)),
+            pack_rgb(Color::rgb(63, 63, 70)),
+            pack_rgb(Color::rgb(214, 211, 209)),
+            pack_rgb(Color::rgb(17, 24, 39)),
+            pack_rgb(Color::rgb(187, 247, 208)),
+            pack_rgb(Color::rgb(67, 56, 202)),
+            pack_rgb(Color::rgb(254, 215, 170)),
+            pack_rgb(Color::rgb(2, 6, 23)),
+        ];
+        let mut expected = accelerated.clone();
+        let coverages = [
+            0, 0, 8, 0, 24, 96, 0, 160, 0, 255, 0, 64, 0, 0, 192, 0, 32, 0, 255,
+        ];
+        let color = super::PreparedBlendColor::new(Color::rgba(56, 189, 248, 212));
+
+        super::blend_mask_row_scalar(&mut expected, &coverages, color, 180);
+        super::blend_mask_row(&mut accelerated, &coverages, color, 180);
+
+        assert_eq!(accelerated, expected);
     }
 
     #[test]
@@ -2931,6 +3163,7 @@ mod tests {
 
     #[test]
     fn box_shadow_renders_behind_the_element() {
+        let _shadow_cache_guard = super::shadow::lock_shadow_mask_cache_for_tests();
         let scene = vec![
             RenderNode::container(LayoutBox::new(6.0, 6.0, 6.0, 6.0)).with_style(VisualStyle {
                 shadows: vec![BoxShadow {
@@ -2961,6 +3194,7 @@ mod tests {
 
     #[test]
     fn rendered_text_pixels_change_when_font_family_changes() {
+        let _text_cache_guard = super::fonts::lock_text_mask_cache_for_tests();
         let bundled_family = bundled_font_family();
         let baseline_style = TextStyle {
             size_px: 28.0,
@@ -2997,6 +3231,7 @@ mod tests {
 
     #[test]
     fn text_transform_renders_the_same_pixels_as_pretransformed_content() {
+        let _text_cache_guard = super::fonts::lock_text_mask_cache_for_tests();
         let transformed_scene = text_scene_with_content(
             TextStyle {
                 text_transform: TextTransform::Uppercase,
@@ -3022,6 +3257,7 @@ mod tests {
 
     #[test]
     fn text_stroke_renders_outline_pixels_without_extra_nodes() {
+        let _text_cache_guard = super::fonts::lock_text_mask_cache_for_tests();
         let stroked_scene = vec![
             RenderNode::container(LayoutBox::new(0.0, 0.0, 320.0, 120.0))
                 .with_style(VisualStyle {
@@ -3080,6 +3316,7 @@ mod tests {
 
     #[test]
     fn text_shadow_renders_glow_outside_text_bounds() {
+        let _text_cache_guard = super::fonts::lock_text_mask_cache_for_tests();
         let scene = vec![
             RenderNode::container(LayoutBox::new(0.0, 0.0, 320.0, 120.0))
                 .with_style(VisualStyle {
@@ -3112,6 +3349,7 @@ mod tests {
 
     #[test]
     fn visible_overflow_text_shadow_can_paint_beyond_the_text_layout_box() {
+        let _text_cache_guard = super::fonts::lock_text_mask_cache_for_tests();
         let background = Color::rgb(245, 247, 250);
         let scene = vec![
             RenderNode::container(LayoutBox::new(0.0, 0.0, 240.0, 120.0))
@@ -3145,6 +3383,7 @@ mod tests {
 
     #[test]
     fn clipped_text_shadow_stays_inside_the_text_layout_box() {
+        let _text_cache_guard = super::fonts::lock_text_mask_cache_for_tests();
         let background = Color::rgb(245, 247, 250);
         let scene = vec![
             RenderNode::container(LayoutBox::new(0.0, 0.0, 240.0, 120.0))
@@ -3179,6 +3418,7 @@ mod tests {
 
     #[test]
     fn filter_drop_shadow_renders_for_supported_container_layers() {
+        let _shadow_cache_guard = super::shadow::lock_shadow_mask_cache_for_tests();
         let scene = vec![
             RenderNode::container(LayoutBox::new(48.0, 32.0, 72.0, 44.0)).with_style(VisualStyle {
                 background: Some(Color::rgb(241, 245, 249)),
@@ -3753,6 +3993,7 @@ mod tests {
 
     #[test]
     fn incremental_render_can_parallelize_a_single_large_dirty_region() {
+        let _shadow_cache_guard = super::shadow::lock_shadow_mask_cache_for_tests();
         let background =
             RenderNode::container(LayoutBox::new(0.0, 0.0, 400.0, 400.0)).with_style(VisualStyle {
                 background: Some(Color::rgb(18, 24, 38)),
@@ -3884,6 +4125,7 @@ mod tests {
 
     #[test]
     fn incremental_render_clears_shadow_pixels_and_redraws_the_background() {
+        let _shadow_cache_guard = super::shadow::lock_shadow_mask_cache_for_tests();
         let background =
             RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_style(VisualStyle {
                 background: Some(Color::rgb(226, 232, 240)),
@@ -4094,6 +4336,7 @@ mod tests {
 
     #[test]
     fn incremental_render_matches_full_render_for_fractional_dirty_regions_over_text() {
+        let _text_cache_guard = super::fonts::lock_text_mask_cache_for_tests();
         let background =
             RenderNode::container(LayoutBox::new(0.0, 0.0, 160.0, 80.0)).with_style(VisualStyle {
                 background: Some(Color::rgb(245, 247, 250)),
@@ -4135,6 +4378,7 @@ mod tests {
 
     #[test]
     fn incremental_render_does_not_leave_stripes_after_a_fractional_reveal_sweeps_over_text() {
+        let _text_cache_guard = super::fonts::lock_text_mask_cache_for_tests();
         fn scene(reveal_width: f32) -> Vec<RenderNode> {
             vec![
                 RenderNode::container(LayoutBox::new(0.0, 0.0, 200.0, 96.0)).with_style(

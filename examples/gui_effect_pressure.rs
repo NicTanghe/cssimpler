@@ -183,11 +183,15 @@ impl BaselineAccumulator {
         self.scene_prep_us_total = self
             .scene_prep_us_total
             .saturating_add(state.renderer_stats.scene_prep_us);
-        self.paint_us_total = self.paint_us_total.saturating_add(state.renderer_stats.paint_us);
+        self.paint_us_total = self
+            .paint_us_total
+            .saturating_add(state.renderer_stats.paint_us);
         self.present_us_total = self
             .present_us_total
             .saturating_add(state.renderer_stats.present_us);
-        self.total_us_total = self.total_us_total.saturating_add(state.renderer_stats.total_us);
+        self.total_us_total = self
+            .total_us_total
+            .saturating_add(state.renderer_stats.total_us);
         self.max_paint_us = self.max_paint_us.max(state.renderer_stats.paint_us);
         self.max_total_us = self.max_total_us.max(state.renderer_stats.total_us);
         match state.renderer_stats.paint_mode {
@@ -449,7 +453,10 @@ fn advance_baseline_harness(state: &mut EffectStressState) -> Invalidation {
     Invalidation::Clean
 }
 
-fn apply_baseline_scenario(state: &mut EffectStressState, scenario: BaselineScenario) -> Invalidation {
+fn apply_baseline_scenario(
+    state: &mut EffectStressState,
+    scenario: BaselineScenario,
+) -> Invalidation {
     let previous_tile_count = state.tile_count;
     let previous_passes_per_tile = state.passes_per_tile;
     let previous_animated_tile_window = state.animated_tile_window;
@@ -510,10 +517,7 @@ fn log_baseline_completion(summary: &BaselineSummary) {
         .join(",");
     eprintln!(
         "[gui_effect_pressure_baseline] status=complete preset={}t/{}p/{}live scenarios={}",
-        summary.tile_count,
-        summary.passes_per_tile,
-        summary.animated_tile_window,
-        scenarios,
+        summary.tile_count, summary.passes_per_tile, summary.animated_tile_window, scenarios,
     );
 }
 
@@ -900,9 +904,7 @@ fn baseline_status_label(state: &EffectStressState) -> String {
     } else {
         format!(
             "ready {}t/{}p/{}live",
-            BASELINE_TILE_COUNT,
-            BASELINE_PASSES_PER_TILE,
-            BASELINE_ANIMATED_TILE_WINDOW
+            BASELINE_TILE_COUNT, BASELINE_PASSES_PER_TILE, BASELINE_ANIMATED_TILE_WINDOW
         )
     }
 }
@@ -1251,9 +1253,9 @@ mod tests {
         ACTION_REMOVE_ANIMATED_TILES, ACTION_REMOVE_TILES, ACTION_RESET, ACTION_SPIKE,
         ACTION_TOGGLE_ANIMATION, ACTION_TOGGLE_BASELINE, ACTION_TOGGLE_PULSE,
         BASELINE_ANIMATED_TILE_WINDOW, BASELINE_PASSES_PER_TILE, BASELINE_TILE_COUNT,
-        BaselineHarness, BaselineScenario, DEFAULT_ANIMATED_TILE_WINDOW,
-        DEFAULT_PASSES_PER_TILE, DEFAULT_TILE_COUNT, EffectStressState, animated_pod_count,
-        estimated_effect_nodes, normal_app_refresh, phase_label,
+        BaselineHarness, BaselineScenario, DEFAULT_ANIMATED_TILE_WINDOW, DEFAULT_PASSES_PER_TILE,
+        DEFAULT_TILE_COUNT, EffectStressState, animated_pod_count, estimated_effect_nodes,
+        normal_app_refresh, phase_label,
     };
     use cssimpler::app::{Invalidation, Refresh, RuntimeStats};
     use cssimpler::renderer::{FrameInfo, FramePaintMode, FrameTimingStats};
@@ -1473,7 +1475,10 @@ mod tests {
         assert!(!state.pulse_layout);
         assert!(state.baseline_harness.is_some());
         assert_eq!(
-            state.baseline_harness.as_ref().map(|harness| harness.scenario),
+            state
+                .baseline_harness
+                .as_ref()
+                .map(|harness| harness.scenario),
             Some(BaselineScenario::Idle)
         );
     }
@@ -1510,7 +1515,10 @@ mod tests {
         assert_eq!(summary.scenarios[0].scenario, BaselineScenario::Idle);
         assert_eq!(summary.scenarios[0].avg_paint_us, 0);
         assert_eq!(summary.scenarios[0].idle_frames, 2);
-        assert_eq!(summary.scenarios[1].scenario, BaselineScenario::AnimatedPaint);
+        assert_eq!(
+            summary.scenarios[1].scenario,
+            BaselineScenario::AnimatedPaint
+        );
         assert_eq!(summary.scenarios[1].avg_paint_us, 320);
         assert_eq!(summary.scenarios[1].incremental_frames, 2);
         assert_eq!(summary.scenarios[2].scenario, BaselineScenario::PulseLayout);

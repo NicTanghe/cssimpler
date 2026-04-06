@@ -1,13 +1,19 @@
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use ab_glyph::{Font, ScaleFont, point};
-use cssimpler_core::fonts::{ResolvedFont, TextLayout, TextStyle, layout_text_block, resolve_font};
+use cssimpler_core::fonts::{
+    FontFamily, FontStyle, GenericFontFamily, LineHeight, ResolvedFont, TextLayout, TextStyle,
+    TextTransform, layout_text_block, resolve_font,
+};
 use cssimpler_core::{Color, LayoutBox, ShadowEffect, TextStrokeStyle, VisualStyle};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 
-use crate::{ClipRect, PreparedBlendColor, blend_prepared_pixel, scale_alpha};
+use crate::{
+    ClipRect, PreparedBlendColor, blend_mask_row, clip_pixel_bounds, current_render_buffer_rows,
+};
 
 const BITMAP_LINE_HEIGHT_PX: f32 = 20.0;
 const MAX_TEXT_RASTER_CACHE_ENTRIES: usize = 256;
@@ -141,34 +147,53 @@ fn draw_mask(
     offset_y: i32,
     clip: ClipRect,
 ) {
+    if color.a == 0 || mask.width == 0 || mask.height == 0 {
+        return;
+    }
+
+    let Some((clip_x0, clip_y0, clip_x1, clip_y1)) = clip_pixel_bounds(clip, width, height) else {
+        return;
+    };
+    let rows = current_render_buffer_rows();
+    let row_start = rows.start.min(height) as i32;
+    let row_end = rows.end.min(height) as i32;
+    let mask_x0 = mask.origin_x + offset_x;
+    let mask_y0 = mask.origin_y + offset_y;
+    let mask_x1 = mask_x0 + mask.width as i32;
+    let mask_y1 = mask_y0 + mask.height as i32;
+    let draw_x0 = mask_x0.max(clip_x0);
+    let draw_y0 = mask_y0.max(clip_y0).max(row_start);
+    let draw_x1 = mask_x1.min(clip_x1);
+    let draw_y1 = mask_y1.min(clip_y1).min(row_end);
+    if draw_x0 >= draw_x1 || draw_y0 >= draw_y1 {
+        return;
+    }
+
     let prepared_color = PreparedBlendColor::new(color);
-    for y in 0..mask.height {
-        for x in 0..mask.width {
-            let alpha = mask.alpha[x + y * mask.width];
-            if alpha == 0 {
-                continue;
-            }
+    let local_x0 = (draw_x0 - mask_x0) as usize;
+    let local_x1 = (draw_x1 - mask_x0) as usize;
+    for y in draw_y0..draw_y1 {
+        let local_y = (y - mask_y0) as usize;
+        let mask_row_start = local_y * mask.width + local_x0;
+        let mask_row_end = local_y * mask.width + local_x1;
+        let buffer_row_start = (y as usize - rows.start) * width + draw_x0 as usize;
+        let buffer_row_end = buffer_row_start + (local_x1 - local_x0);
+        blend_mask_row(
+            &mut buffer[buffer_row_start..buffer_row_end],
+            &mask.alpha[mask_row_start..mask_row_end],
+            prepared_color,
+            color.a,
+        );
+    }
+}
 
-            let pixel_x = mask.origin_x + offset_x + x as i32;
-            let pixel_y = mask.origin_y + offset_y + y as i32;
-            if !clip.contains(pixel_x as f32 + 0.5, pixel_y as f32 + 0.5) {
-                continue;
-            }
-
-            let alpha = scale_alpha(alpha, color.a);
-            if alpha == 0 {
-                continue;
-            }
-
-            blend_prepared_pixel(
-                buffer,
-                width,
-                height,
-                pixel_x,
-                pixel_y,
-                prepared_color.with_alpha(alpha),
-            );
-        }
+fn alpha_mask_with_alpha(mask: &AlphaMask, alpha: Vec<u8>) -> AlphaMask {
+    AlphaMask {
+        origin_x: mask.origin_x,
+        origin_y: mask.origin_y,
+        width: mask.width,
+        height: mask.height,
+        alpha,
     }
 }
 
@@ -218,15 +243,9 @@ fn cached_text_mask(
     text_style: &TextStyle,
 ) -> Option<CachedTextMask> {
     let (relative_layout, offset_x, offset_y) = split_layout_for_cache(layout);
-    let key = TextRasterCacheKey {
-        text: text.to_string(),
-        style_signature: format!("{text_style:?}"),
-        width_bits: relative_layout.width.to_bits(),
-        origin_x_bits: relative_layout.x.to_bits(),
-        origin_y_bits: relative_layout.y.to_bits(),
-    };
+    let key = Arc::new(TextRasterCacheKey::new(text, text_style, relative_layout));
 
-    if let Some(mask) = cached_raster_mask(&key) {
+    if let Some(mask) = cached_raster_mask(key.as_ref()) {
         return Some(CachedTextMask {
             mask,
             key,
@@ -248,7 +267,7 @@ fn cached_text_mask(
     }?;
     let mask = Arc::new(mask);
 
-    insert_cached_raster_mask(key.clone(), mask.clone());
+    insert_cached_raster_mask(key.as_ref().clone(), mask.clone());
 
     Some(CachedTextMask {
         mask,
@@ -259,21 +278,25 @@ fn cached_text_mask(
 }
 
 fn cached_raster_mask(key: &TextRasterCacheKey) -> Option<Arc<AlphaMask>> {
-    let cache = text_mask_cache()
+    let mut cache = text_mask_cache()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    cache.rasters.get(key).cloned()
+    let last_used = next_cache_use(&mut cache.next_use);
+    cached_cache_entry(&mut cache.rasters, key, last_used)
 }
 
 fn insert_cached_raster_mask(key: TextRasterCacheKey, mask: Arc<AlphaMask>) {
     let mut cache = text_mask_cache()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    if cache.rasters.len() >= MAX_TEXT_RASTER_CACHE_ENTRIES {
-        cache.rasters.clear();
-        cache.effects.clear();
-    }
-    cache.rasters.insert(key, mask);
+    let last_used = next_cache_use(&mut cache.next_use);
+    insert_lru_cache_entry(
+        &mut cache.rasters,
+        key,
+        mask,
+        last_used,
+        MAX_TEXT_RASTER_CACHE_ENTRIES,
+    );
 }
 
 fn cached_text_effect_mask(
@@ -287,11 +310,12 @@ fn cached_text_effect_mask(
     };
 
     {
-        let cache = text_mask_cache()
+        let mut cache = text_mask_cache()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(mask) = cache.effects.get(&key) {
-            return mask.clone();
+        let last_used = next_cache_use(&mut cache.next_use);
+        if let Some(mask) = cached_cache_entry(&mut cache.effects, &key, last_used) {
+            return mask;
         }
     }
 
@@ -299,10 +323,17 @@ fn cached_text_effect_mask(
     let mut cache = text_mask_cache()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    if cache.effects.len() >= MAX_TEXT_EFFECT_CACHE_ENTRIES {
-        cache.effects.clear();
+    let last_used = next_cache_use(&mut cache.next_use);
+    if let Some(existing) = cached_cache_entry(&mut cache.effects, &key, last_used) {
+        return existing;
     }
-    cache.effects.insert(key, mask.clone());
+    insert_lru_cache_entry(
+        &mut cache.effects,
+        key,
+        mask.clone(),
+        last_used,
+        MAX_TEXT_EFFECT_CACHE_ENTRIES,
+    );
     mask
 }
 
@@ -632,19 +663,17 @@ fn blur_pass_radii(radius: usize) -> Vec<usize> {
 }
 
 fn blur_mask_horizontally(mask: &AlphaMask, radius: usize, worker_count: usize) -> AlphaMask {
-    let mut blurred = mask.clone();
     let worker_count = worker_count.max(1).min(mask.height.max(1));
 
     if worker_count == 1 {
-        blurred.alpha = blur_rows(mask, radius, 0, mask.height);
-        return blurred;
+        return alpha_mask_with_alpha(mask, blur_rows(mask, radius, 0, mask.height));
     }
 
     let rows_per_worker = mask.height.div_ceil(worker_count);
     let mut alpha = vec![0_u8; mask.width * mask.height];
 
     thread::scope(|scope| {
-        let mut handles = Vec::new();
+        let mut handles = Vec::with_capacity(worker_count);
         for row_start in (0..mask.height).step_by(rows_per_worker) {
             let row_end = (row_start + rows_per_worker).min(mask.height);
             handles.push(
@@ -662,17 +691,17 @@ fn blur_mask_horizontally(mask: &AlphaMask, radius: usize, worker_count: usize) 
         }
     });
 
-    blurred.alpha = alpha;
-    blurred
+    alpha_mask_with_alpha(mask, alpha)
 }
 
 fn blur_rows(mask: &AlphaMask, radius: usize, row_start: usize, row_end: usize) -> Vec<u8> {
     let mut alpha = vec![0_u8; (row_end - row_start) * mask.width];
+    let mut prefix = vec![0_u32; mask.width + 1];
 
     for y in row_start..row_end {
         let source_row_start = y * mask.width;
         let target_row_start = (y - row_start) * mask.width;
-        let mut prefix = vec![0_u32; mask.width + 1];
+        prefix[0] = 0;
         for x in 0..mask.width {
             prefix[x + 1] = prefix[x] + mask.alpha[source_row_start + x] as u32;
         }
@@ -690,19 +719,17 @@ fn blur_rows(mask: &AlphaMask, radius: usize, row_start: usize, row_end: usize) 
 }
 
 fn blur_mask_vertically(mask: &AlphaMask, radius: usize, worker_count: usize) -> AlphaMask {
-    let mut blurred = mask.clone();
     let worker_count = worker_count.max(1).min(mask.width.max(1));
 
     if worker_count == 1 {
-        blurred.alpha = blur_columns(mask, radius, 0, mask.width);
-        return blurred;
+        return alpha_mask_with_alpha(mask, blur_columns(mask, radius, 0, mask.width));
     }
 
     let columns_per_worker = mask.width.div_ceil(worker_count);
     let mut alpha = vec![0_u8; mask.width * mask.height];
 
     thread::scope(|scope| {
-        let mut handles = Vec::new();
+        let mut handles = Vec::with_capacity(worker_count);
         for column_start in (0..mask.width).step_by(columns_per_worker) {
             let column_end = (column_start + columns_per_worker).min(mask.width);
             handles.push(scope.spawn(move || {
@@ -729,8 +756,7 @@ fn blur_mask_vertically(mask: &AlphaMask, radius: usize, worker_count: usize) ->
         }
     });
 
-    blurred.alpha = alpha;
-    blurred
+    alpha_mask_with_alpha(mask, alpha)
 }
 
 fn blur_columns(
@@ -741,10 +767,11 @@ fn blur_columns(
 ) -> Vec<u8> {
     let chunk_width = column_end - column_start;
     let mut alpha = vec![0_u8; chunk_width * mask.height];
+    let mut prefix = vec![0_u32; mask.height + 1];
 
     for x in column_start..column_end {
         let local_x = x - column_start;
-        let mut prefix = vec![0_u32; mask.height + 1];
+        prefix[0] = 0;
         for y in 0..mask.height {
             prefix[y + 1] = prefix[y] + mask.alpha[x + y * mask.width] as u32;
         }
@@ -843,18 +870,72 @@ impl AlphaMask {
 #[derive(Clone)]
 struct CachedTextMask {
     mask: Arc<AlphaMask>,
-    key: TextRasterCacheKey,
+    key: Arc<TextRasterCacheKey>,
     offset_x: i32,
     offset_y: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TextRasterCacheKey {
-    text: String,
-    style_signature: String,
+    text: Arc<str>,
+    style: TextStyleCacheKey,
     width_bits: u32,
     origin_x_bits: u32,
     origin_y_bits: u32,
+}
+
+impl TextRasterCacheKey {
+    fn new(text: &str, style: &TextStyle, layout: LayoutBox) -> Self {
+        Self {
+            text: Arc::<str>::from(text),
+            style: TextStyleCacheKey::new(style),
+            width_bits: layout.width.to_bits(),
+            origin_x_bits: layout.x.to_bits(),
+            origin_y_bits: layout.y.to_bits(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TextStyleCacheKey {
+    families: Vec<FontFamilyCacheKey>,
+    size_bits: u32,
+    weight: u16,
+    style: u8,
+    line_height: LineHeightCacheKey,
+    letter_spacing_bits: u32,
+    text_transform: u8,
+}
+
+impl TextStyleCacheKey {
+    fn new(style: &TextStyle) -> Self {
+        Self {
+            families: style
+                .families
+                .iter()
+                .map(font_family_cache_key)
+                .collect::<Vec<_>>(),
+            size_bits: style.size_px.to_bits(),
+            weight: style.weight,
+            style: font_style_cache_key(style.style),
+            line_height: line_height_cache_key(&style.line_height),
+            letter_spacing_bits: style.letter_spacing_px.to_bits(),
+            text_transform: text_transform_cache_key(style.text_transform),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum FontFamilyCacheKey {
+    Named(String),
+    Generic(u8),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum LineHeightCacheKey {
+    Normal,
+    Px(u32),
+    Scale(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -865,14 +946,128 @@ enum TextEffectCacheKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TextEffectCacheKey {
-    raster: TextRasterCacheKey,
+    raster: Arc<TextRasterCacheKey>,
     kind: TextEffectCacheKind,
+}
+
+#[derive(Clone)]
+struct CacheEntry<T> {
+    value: T,
+    last_used: u64,
 }
 
 #[derive(Default)]
 struct TextMaskCache {
-    rasters: HashMap<TextRasterCacheKey, Arc<AlphaMask>>,
-    effects: HashMap<TextEffectCacheKey, Arc<AlphaMask>>,
+    next_use: u64,
+    rasters: HashMap<TextRasterCacheKey, CacheEntry<Arc<AlphaMask>>>,
+    effects: HashMap<TextEffectCacheKey, CacheEntry<Arc<AlphaMask>>>,
+}
+
+fn font_family_cache_key(family: &FontFamily) -> FontFamilyCacheKey {
+    match family {
+        FontFamily::Named(name) => FontFamilyCacheKey::Named(name.clone()),
+        FontFamily::Generic(generic) => {
+            FontFamilyCacheKey::Generic(generic_font_family_cache_key(generic.clone()))
+        }
+    }
+}
+
+fn generic_font_family_cache_key(family: GenericFontFamily) -> u8 {
+    match family {
+        GenericFontFamily::Serif => 0,
+        GenericFontFamily::SansSerif => 1,
+        GenericFontFamily::Cursive => 2,
+        GenericFontFamily::Fantasy => 3,
+        GenericFontFamily::Monospace => 4,
+        GenericFontFamily::SystemUi => 5,
+        GenericFontFamily::Emoji => 6,
+        GenericFontFamily::Math => 7,
+        GenericFontFamily::FangSong => 8,
+        GenericFontFamily::UiSerif => 9,
+        GenericFontFamily::UiSansSerif => 10,
+        GenericFontFamily::UiMonospace => 11,
+        GenericFontFamily::UiRounded => 12,
+    }
+}
+
+fn font_style_cache_key(style: FontStyle) -> u8 {
+    match style {
+        FontStyle::Normal => 0,
+        FontStyle::Italic => 1,
+        FontStyle::Oblique => 2,
+    }
+}
+
+fn line_height_cache_key(line_height: &LineHeight) -> LineHeightCacheKey {
+    match line_height {
+        LineHeight::Normal => LineHeightCacheKey::Normal,
+        LineHeight::Px(value) => LineHeightCacheKey::Px(value.to_bits()),
+        LineHeight::Scale(value) => LineHeightCacheKey::Scale(value.to_bits()),
+    }
+}
+
+fn text_transform_cache_key(text_transform: TextTransform) -> u8 {
+    match text_transform {
+        TextTransform::None => 0,
+        TextTransform::Uppercase => 1,
+        TextTransform::Lowercase => 2,
+        TextTransform::Capitalize => 3,
+    }
+}
+
+fn next_cache_use(next_use: &mut u64) -> u64 {
+    let last_used = *next_use;
+    *next_use = next_use.saturating_add(1);
+    last_used
+}
+
+fn cached_cache_entry<K, V>(
+    entries: &mut HashMap<K, CacheEntry<Arc<V>>>,
+    key: &K,
+    last_used: u64,
+) -> Option<Arc<V>>
+where
+    K: Eq + Hash,
+{
+    let entry = entries.get_mut(key)?;
+    entry.last_used = last_used;
+    Some(entry.value.clone())
+}
+
+fn insert_lru_cache_entry<K, V>(
+    entries: &mut HashMap<K, CacheEntry<Arc<V>>>,
+    key: K,
+    value: Arc<V>,
+    last_used: u64,
+    max_entries: usize,
+) where
+    K: Clone + Eq + Hash,
+{
+    if let Some(entry) = entries.get_mut(&key) {
+        entry.value = value;
+        entry.last_used = last_used;
+        return;
+    }
+    if max_entries == 0 {
+        return;
+    }
+    while entries.len() >= max_entries {
+        evict_lru_cache_entry(entries);
+    }
+    entries.insert(key, CacheEntry { value, last_used });
+}
+
+fn evict_lru_cache_entry<K, V>(entries: &mut HashMap<K, CacheEntry<Arc<V>>>)
+where
+    K: Clone + Eq + Hash,
+{
+    let lru_key = entries
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(key, _)| key.clone());
+    if let Some(key) = lru_key {
+        entries.remove(&key);
+    }
 }
 
 fn text_mask_cache() -> &'static Mutex<TextMaskCache> {
@@ -885,8 +1080,17 @@ fn clear_text_mask_cache_for_tests() {
     let mut cache = text_mask_cache()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
+    cache.next_use = 0;
     cache.rasters.clear();
     cache.effects.clear();
+}
+
+#[cfg(test)]
+pub(crate) fn lock_text_mask_cache_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 #[cfg(test)]
@@ -897,12 +1101,15 @@ mod tests {
     use cssimpler_core::{LayoutBox, ShadowEffect};
 
     use super::{
-        TextEffectCacheKind, blur_mask_with_workers, blur_pass_radii, cached_text_effect_mask,
-        cached_text_mask, clear_text_mask_cache_for_tests, shadow_mask_from_raster,
+        MAX_TEXT_EFFECT_CACHE_ENTRIES, MAX_TEXT_RASTER_CACHE_ENTRIES, TextEffectCacheKind,
+        blur_mask_with_workers, blur_pass_radii, cached_text_effect_mask, cached_text_mask,
+        clear_text_mask_cache_for_tests, lock_text_mask_cache_for_tests, shadow_mask_from_raster,
+        text_mask_cache,
     };
 
     #[test]
     fn identical_text_masks_are_reused_across_integer_position_changes() {
+        let _cache_guard = lock_text_mask_cache_for_tests();
         clear_text_mask_cache_for_tests();
         let style = TextStyle::default();
         let first = cached_text_mask(LayoutBox::new(10.25, 20.0, 160.0, 40.0), "Cache", &style)
@@ -917,6 +1124,7 @@ mod tests {
 
     #[test]
     fn identical_shadow_masks_are_reused_for_the_same_text_raster() {
+        let _cache_guard = lock_text_mask_cache_for_tests();
         clear_text_mask_cache_for_tests();
         let style = TextStyle::default();
         let raster = cached_text_mask(LayoutBox::new(12.0, 16.0, 160.0, 40.0), "Glow", &style)
@@ -946,6 +1154,98 @@ mod tests {
         );
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn text_raster_cache_evicts_lru_entries_without_clearing_everything() {
+        let _cache_guard = lock_text_mask_cache_for_tests();
+        clear_text_mask_cache_for_tests();
+        let style = TextStyle::default();
+        let layout = LayoutBox::new(10.25, 20.0, 160.0, 40.0);
+        let first =
+            cached_text_mask(layout, "Cache 0", &style).expect("first text mask should rasterize");
+        let retained =
+            cached_text_mask(layout, "Cache 1", &style).expect("second text mask should rasterize");
+        for index in 2..MAX_TEXT_RASTER_CACHE_ENTRIES {
+            cached_text_mask(layout, &format!("Cache {index}"), &style)
+                .expect("cache fill text mask should rasterize");
+        }
+
+        let retained_again =
+            cached_text_mask(layout, "Cache 1", &style).expect("retained text mask should cache");
+        let overflow_text = format!("Cache {}", MAX_TEXT_RASTER_CACHE_ENTRIES);
+        cached_text_mask(layout, &overflow_text, &style)
+            .expect("overflow text mask should rasterize");
+        let first_after =
+            cached_text_mask(layout, "Cache 0", &style).expect("evicted text mask should rebuild");
+
+        assert!(Arc::ptr_eq(&retained.mask, &retained_again.mask));
+        assert!(!Arc::ptr_eq(&first.mask, &first_after.mask));
+        let cache = text_mask_cache()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(cache.rasters.len(), MAX_TEXT_RASTER_CACHE_ENTRIES);
+    }
+
+    #[test]
+    fn text_effect_cache_evicts_lru_entries_without_clearing_everything() {
+        let _cache_guard = lock_text_mask_cache_for_tests();
+        clear_text_mask_cache_for_tests();
+        let style = TextStyle::default();
+        let raster = cached_text_mask(LayoutBox::new(12.0, 16.0, 160.0, 40.0), "Glow", &style)
+            .expect("text mask should rasterize");
+        let first = cached_text_effect_mask(
+            &raster,
+            TextEffectCacheKind::Stroke {
+                width_bits: 0.25_f32.to_bits(),
+            },
+            |base| base.clone(),
+        );
+        let retained = cached_text_effect_mask(
+            &raster,
+            TextEffectCacheKind::Stroke {
+                width_bits: 1.25_f32.to_bits(),
+            },
+            |base| base.clone(),
+        );
+        for index in 2..MAX_TEXT_EFFECT_CACHE_ENTRIES {
+            cached_text_effect_mask(
+                &raster,
+                TextEffectCacheKind::Stroke {
+                    width_bits: (index as f32 + 0.25).to_bits(),
+                },
+                |base| base.clone(),
+            );
+        }
+
+        let retained_again = cached_text_effect_mask(
+            &raster,
+            TextEffectCacheKind::Stroke {
+                width_bits: 1.25_f32.to_bits(),
+            },
+            |base| base.clone(),
+        );
+        cached_text_effect_mask(
+            &raster,
+            TextEffectCacheKind::Stroke {
+                width_bits: (MAX_TEXT_EFFECT_CACHE_ENTRIES as f32 + 0.25).to_bits(),
+            },
+            |base| base.clone(),
+        );
+        let first_after = cached_text_effect_mask(
+            &raster,
+            TextEffectCacheKind::Stroke {
+                width_bits: 0.25_f32.to_bits(),
+            },
+            |base| base.clone(),
+        );
+
+        assert!(Arc::ptr_eq(&retained, &retained_again));
+        assert!(!Arc::ptr_eq(&first, &first_after));
+        let cache = text_mask_cache()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(cache.effects.len(), MAX_TEXT_EFFECT_CACHE_ENTRIES);
     }
 
     #[test]

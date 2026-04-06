@@ -4,7 +4,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
-use syn::{braced, parse_macro_input, Error, Expr, Ident, LitStr, Result, Token};
+use syn::{Error, Expr, Ident, LitStr, Result, Token, braced, parse_macro_input};
 
 pub fn expand_ui(input: TokenStream) -> TokenStream {
     let root = parse_macro_input!(input as UiRoot);
@@ -254,7 +254,7 @@ mod tests {
     use syn::{parse_quote, parse_str};
 
     use super::{
-        expand_attribute, expand_element, Attribute, AttributeName, AttributeValue, UiRoot,
+        Attribute, AttributeName, AttributeValue, UiRoot, expand_attribute, expand_element,
     };
 
     #[test]

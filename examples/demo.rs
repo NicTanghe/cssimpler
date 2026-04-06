@@ -1,10 +1,10 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation, RenderMode};
 use cssimpler::renderer::{FrameInfo, WindowConfig};
-use cssimpler::style::{parse_stylesheet, Stylesheet};
+use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
 
 #[derive(Debug, Default)]

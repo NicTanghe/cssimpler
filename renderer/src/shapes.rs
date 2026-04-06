@@ -1,6 +1,8 @@
 use cssimpler_core::{Color, CornerRadius, Insets, LayoutBox};
 
-use super::{blend_prepared_pixel, current_render_buffer_rows, pack_rgb, ClipRect, PreparedBlendColor};
+use super::{
+    ClipRect, PreparedBlendColor, blend_prepared_pixel, current_render_buffer_rows, pack_rgb,
+};
 
 pub(crate) fn draw_rounded_rect(
     buffer: &mut [u32],
@@ -17,10 +19,8 @@ pub(crate) fn draw_rounded_rect(
 
     let prepared_color = PreparedBlendColor::new(color);
     for y in y0..y1 {
-        for x in x0..x1 {
-            if point_in_rounded_rect(x as f32 + 0.5, y as f32 + 0.5, layout, radius) {
-                blend_prepared_pixel(buffer, width, height, x, y, prepared_color);
-            }
+        if let Some((span_x0, span_x1)) = rounded_rect_row_span(layout, radius, y, x0, x1) {
+            blend_prepared_span_row(buffer, width, height, span_x0, span_x1, y, prepared_color);
         }
     }
 }
@@ -61,20 +61,50 @@ pub(crate) fn draw_rounded_ring(
 
     let prepared_color = PreparedBlendColor::new(color);
     for y in y0..y1 {
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            if !point_in_rounded_rect(px, py, outer_layout, outer_radius) {
-                continue;
-            }
+        let Some((outer_x0, outer_x1)) =
+            rounded_rect_row_span(outer_layout, outer_radius, y, x0, x1)
+        else {
+            continue;
+        };
 
-            if let Some((inner_layout, inner_radius)) = inner
-                && point_in_rounded_rect(px, py, inner_layout, inner_radius)
-            {
-                continue;
-            }
+        let Some((inner_layout, inner_radius)) = inner else {
+            blend_prepared_span_row(buffer, width, height, outer_x0, outer_x1, y, prepared_color);
+            continue;
+        };
 
-            blend_prepared_pixel(buffer, width, height, x, y, prepared_color);
+        let inner_span = rounded_rect_row_span(inner_layout, inner_radius, y, outer_x0, outer_x1);
+        match inner_span {
+            Some((inner_x0, inner_x1)) => {
+                blend_prepared_span_row(
+                    buffer,
+                    width,
+                    height,
+                    outer_x0,
+                    inner_x0,
+                    y,
+                    prepared_color,
+                );
+                blend_prepared_span_row(
+                    buffer,
+                    width,
+                    height,
+                    inner_x1,
+                    outer_x1,
+                    y,
+                    prepared_color,
+                );
+            }
+            None => {
+                blend_prepared_span_row(
+                    buffer,
+                    width,
+                    height,
+                    outer_x0,
+                    outer_x1,
+                    y,
+                    prepared_color,
+                );
+            }
         }
     }
 }
@@ -112,7 +142,8 @@ pub(crate) fn draw_axis_aligned_opaque_ring(
         return true;
     };
 
-    let Some((inner_x0, inner_y0, inner_x1, inner_y1)) = center_pixel_bounds(inner_layout, width, height)
+    let Some((inner_x0, inner_y0, inner_x1, inner_y1)) =
+        center_pixel_bounds(inner_layout, width, height)
     else {
         fill_opaque_span_rows(
             buffer, width, outer_x0, outer_x1, outer_y0, outer_y1, packed,
@@ -213,12 +244,8 @@ pub(crate) fn opaque_fill_pixel_bounds(
         .min(height as f32) as i32;
     let center_x0 = (layout.x - 0.5).ceil().max(0.0) as i32;
     let center_y0 = (layout.y - 0.5).ceil().max(0.0) as i32;
-    let center_x1 = ((layout.x + layout.width) - 0.5)
-        .ceil()
-        .min(width as f32) as i32;
-    let center_y1 = ((layout.y + layout.height) - 0.5)
-        .ceil()
-        .min(height as f32) as i32;
+    let center_x1 = ((layout.x + layout.width) - 0.5).ceil().min(width as f32) as i32;
+    let center_y1 = ((layout.y + layout.height) - 0.5).ceil().min(height as f32) as i32;
     let x0 = x0.max(center_x0);
     let y0 = y0.max(center_y0);
     let x1 = x1.min(center_x1);
@@ -233,12 +260,8 @@ pub(crate) fn center_pixel_bounds(
 ) -> Option<(i32, i32, i32, i32)> {
     let x0 = (layout.x - 0.5).ceil().max(0.0) as i32;
     let y0 = (layout.y - 0.5).ceil().max(0.0) as i32;
-    let x1 = ((layout.x + layout.width) - 0.5)
-        .ceil()
-        .min(width as f32) as i32;
-    let y1 = ((layout.y + layout.height) - 0.5)
-        .ceil()
-        .min(height as f32) as i32;
+    let x1 = ((layout.x + layout.width) - 0.5).ceil().min(width as f32) as i32;
+    let y1 = ((layout.y + layout.height) - 0.5).ceil().min(height as f32) as i32;
     (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
 }
 
@@ -255,7 +278,11 @@ pub(crate) fn clip_pixel_bounds(
     (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
 }
 
-pub(crate) fn snap_clip_to_pixel_grid(clip: ClipRect, width: usize, height: usize) -> Option<ClipRect> {
+pub(crate) fn snap_clip_to_pixel_grid(
+    clip: ClipRect,
+    width: usize,
+    height: usize,
+) -> Option<ClipRect> {
     let (x0, y0, x1, y1) = clip_pixel_bounds(clip, width, height)?;
     Some(ClipRect {
         x0: x0 as f32,
@@ -270,7 +297,10 @@ pub(crate) fn non_empty_layout_clip(layout: LayoutBox) -> Option<ClipRect> {
     (!clip.is_empty()).then_some(clip)
 }
 
-pub(crate) fn union_optional_bounds(left: Option<ClipRect>, right: Option<ClipRect>) -> Option<ClipRect> {
+pub(crate) fn union_optional_bounds(
+    left: Option<ClipRect>,
+    right: Option<ClipRect>,
+) -> Option<ClipRect> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.union(right)),
         (Some(left), None) => Some(left),
@@ -302,12 +332,95 @@ pub(crate) fn fill_opaque_span_rows(
     }
 }
 
-pub(crate) fn point_in_rounded_rect(x: f32, y: f32, layout: LayoutBox, radius: CornerRadius) -> bool {
+fn blend_prepared_span_row(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x0: i32,
+    x1: i32,
+    y: i32,
+    color: PreparedBlendColor,
+) {
+    if x0 >= x1 {
+        return;
+    }
+
+    if color.linear.a >= 1.0 {
+        fill_opaque_span_rows(buffer, width, x0, x1, y, y + 1, color.packed);
+        return;
+    }
+
+    for x in x0..x1 {
+        blend_prepared_pixel(buffer, width, height, x, y, color);
+    }
+}
+
+pub(crate) fn rounded_rect_row_span(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    y: i32,
+    x0: i32,
+    x1: i32,
+) -> Option<(i32, i32)> {
+    if x0 >= x1 {
+        return None;
+    }
+
+    let py = y as f32 + 0.5;
+    if py < layout.y || py >= layout.y + layout.height {
+        return None;
+    }
+
+    let clamped_radius = clamp_corner_radius(radius, layout.width, layout.height);
+    if clamped_radius.top_left == 0.0
+        && clamped_radius.top_right == 0.0
+        && clamped_radius.bottom_right == 0.0
+        && clamped_radius.bottom_left == 0.0
+    {
+        return Some((x0, x1));
+    }
+
+    let mut span_x0 = x0;
+    while span_x0 < x1
+        && !point_in_rounded_rect_with_radius(span_x0 as f32 + 0.5, py, layout, clamped_radius)
+    {
+        span_x0 += 1;
+    }
+
+    let mut span_x1 = x1;
+    while span_x1 > span_x0
+        && !point_in_rounded_rect_with_radius(span_x1 as f32 - 0.5, py, layout, clamped_radius)
+    {
+        span_x1 -= 1;
+    }
+
+    (span_x0 < span_x1).then_some((span_x0, span_x1))
+}
+
+pub(crate) fn point_in_rounded_rect(
+    x: f32,
+    y: f32,
+    layout: LayoutBox,
+    radius: CornerRadius,
+) -> bool {
+    point_in_rounded_rect_with_radius(
+        x,
+        y,
+        layout,
+        clamp_corner_radius(radius, layout.width, layout.height),
+    )
+}
+
+fn point_in_rounded_rect_with_radius(
+    x: f32,
+    y: f32,
+    layout: LayoutBox,
+    radius: CornerRadius,
+) -> bool {
     if !layout_contains(layout, x, y) {
         return false;
     }
 
-    let radius = clamp_corner_radius(radius, layout.width, layout.height);
     if radius.top_left == 0.0
         && radius.top_right == 0.0
         && radius.bottom_right == 0.0
@@ -425,4 +538,75 @@ fn point_in_corner(x: f32, y: f32, center_x: f32, center_y: f32, radius: f32) ->
     let dx = x - center_x;
     let dy = y - center_y;
     (dx * dx) + (dy * dy) <= radius * radius
+}
+
+#[cfg(test)]
+mod tests {
+    use cssimpler_core::{Color, CornerRadius, LayoutBox};
+
+    use super::{draw_rounded_ring, point_in_rounded_rect, rounded_rect_row_span};
+    use crate::{ClipRect, pack_rgb};
+
+    #[test]
+    fn rounded_rect_row_span_matches_point_sampling() {
+        let layout = LayoutBox::new(2.25, 1.75, 11.5, 9.5);
+        let radius = CornerRadius {
+            top_left: 3.5,
+            top_right: 2.0,
+            bottom_right: 4.0,
+            bottom_left: 1.5,
+        };
+
+        for y in 0..16 {
+            let span = rounded_rect_row_span(layout, radius, y, 0, 16);
+            let sampled = (0..16)
+                .filter(|&x| point_in_rounded_rect(x as f32 + 0.5, y as f32 + 0.5, layout, radius))
+                .collect::<Vec<_>>();
+
+            match span {
+                Some((x0, x1)) => {
+                    assert_eq!(sampled, (x0..x1).collect::<Vec<_>>());
+                }
+                None => assert!(sampled.is_empty()),
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_ring_span_batches_match_point_sampling() {
+        let outer_layout = LayoutBox::new(1.0, 1.0, 10.0, 10.0);
+        let outer_radius = CornerRadius::all(4.0);
+        let inner_layout = LayoutBox::new(3.0, 3.0, 6.0, 6.0);
+        let inner_radius = CornerRadius::all(2.0);
+        let mut buffer = vec![0_u32; 12 * 12];
+
+        draw_rounded_ring(
+            &mut buffer,
+            12,
+            12,
+            outer_layout,
+            outer_radius,
+            Some((inner_layout, inner_radius)),
+            Color::rgb(40, 120, 220),
+            ClipRect::full(12.0, 12.0),
+        );
+
+        let accent = pack_rgb(Color::rgb(40, 120, 220));
+        for y in 0..12 {
+            for x in 0..12 {
+                let expected = point_in_rounded_rect(
+                    x as f32 + 0.5,
+                    y as f32 + 0.5,
+                    outer_layout,
+                    outer_radius,
+                ) && !point_in_rounded_rect(
+                    x as f32 + 0.5,
+                    y as f32 + 0.5,
+                    inner_layout,
+                    inner_radius,
+                );
+                assert_eq!(buffer[y * 12 + x] == accent, expected);
+            }
+        }
+    }
 }

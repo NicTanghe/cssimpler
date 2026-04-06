@@ -1,6 +1,6 @@
 use cssimpler_core::{
-    CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandlers,
-    LayoutBox, Node, RenderNode, ScrollbarData, Style, TransitionStyle,
+    CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandlers, LayoutBox,
+    Node, RenderNode, ScrollbarData, Style, TransitionStyle,
     fonts::{TextStyle, layout_text_block},
 };
 use taffy::geometry::Size as TaffySize;

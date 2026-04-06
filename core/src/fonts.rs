@@ -253,9 +253,7 @@ impl FontRegistry {
         Ok(discovered_family_names(&self.database, ids.as_slice()))
     }
 
-    fn resolve_font(&mut self, style: &TextStyle) -> Option<ResolvedFont> {
-        self.ensure_system_fonts_loaded();
-
+    fn query_font_id(&self, style: &TextStyle) -> Option<fontdb::ID> {
         let query_families = query_families(style);
         let query = fontdb::Query {
             families: &query_families,
@@ -267,7 +265,31 @@ impl FontRegistry {
             },
             ..fontdb::Query::default()
         };
-        let font_id = self.database.query(&query)?;
+        self.database.query(&query)
+    }
+
+    fn build_resolved_font(font: FontArc, style: &TextStyle) -> ResolvedFont {
+        ResolvedFont {
+            font,
+            size_px: style.size_px.max(1.0),
+            line_height_px: style.resolved_line_height_px().max(style.size_px.max(1.0)),
+        }
+    }
+
+    fn cached_font(&self, style: &TextStyle) -> Option<ResolvedFont> {
+        if self.cache.is_empty() && !self.system_fonts_loaded {
+            return None;
+        }
+        let font_id = self.query_font_id(style)?;
+        self.cache
+            .get(&font_id)
+            .cloned()
+            .map(|font| Self::build_resolved_font(font, style))
+    }
+
+    fn resolve_font(&mut self, style: &TextStyle) -> Option<ResolvedFont> {
+        self.ensure_system_fonts_loaded();
+        let font_id = self.query_font_id(style)?;
 
         let font = if let Some(existing) = self.cache.get(&font_id) {
             existing.clone()
@@ -281,11 +303,7 @@ impl FontRegistry {
             loaded
         };
 
-        Some(ResolvedFont {
-            font,
-            size_px: style.size_px.max(1.0),
-            line_height_px: style.resolved_line_height_px().max(style.size_px.max(1.0)),
-        })
+        Some(Self::build_resolved_font(font, style))
     }
 }
 
@@ -368,6 +386,11 @@ pub fn register_font_file(path: impl AsRef<Path>) -> Result<Vec<String>, FontErr
 }
 
 pub fn resolve_font(style: &TextStyle) -> Option<ResolvedFont> {
+    if let Ok(registry) = registry().read() {
+        if let Some(font) = registry.cached_font(style) {
+            return Some(font);
+        }
+    }
     let mut registry = registry().write().ok()?;
     registry.resolve_font(style)
 }

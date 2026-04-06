@@ -552,7 +552,7 @@ mod tests {
 
     use cssimpler_core::{Color, ElementInteractionState, ElementPath, Node};
 
-    use crate::{parse_stylesheet, resolve_style, resolve_style_with_interaction, StyleError};
+    use crate::{StyleError, parse_stylesheet, resolve_style, resolve_style_with_interaction};
 
     use super::{
         AncestorSelector, CompoundSelector, ElementRef, PseudoElementKind, Selector,
@@ -587,17 +587,21 @@ mod tests {
             attributes: &attributes,
         };
 
-        assert!(Selector::compound(vec![
-            SimpleSelector::Tag("button".to_string()),
-            SimpleSelector::Class("button".to_string()),
-            SimpleSelector::Class("primary".to_string()),
-        ])
-        .matches(element));
-        assert!(!Selector::compound(vec![
-            SimpleSelector::Tag("button".to_string()),
-            SimpleSelector::Class("ghost".to_string()),
-        ])
-        .matches(element));
+        assert!(
+            Selector::compound(vec![
+                SimpleSelector::Tag("button".to_string()),
+                SimpleSelector::Class("button".to_string()),
+                SimpleSelector::Class("primary".to_string()),
+            ])
+            .matches(element)
+        );
+        assert!(
+            !Selector::compound(vec![
+                SimpleSelector::Tag("button".to_string()),
+                SimpleSelector::Class("ghost".to_string()),
+            ])
+            .matches(element)
+        );
     }
 
     #[test]
@@ -655,16 +659,20 @@ mod tests {
         let element_ref = ElementRef::from(&element);
 
         assert!(SimpleSelector::AttributeExists("data-text".to_string()).matches(element_ref));
-        assert!(SimpleSelector::AttributeEquals {
-            name: "aria-hidden".to_string(),
-            value: "true".to_string(),
-        }
-        .matches(element_ref));
-        assert!(!SimpleSelector::AttributeEquals {
-            name: "aria-hidden".to_string(),
-            value: "false".to_string(),
-        }
-        .matches(element_ref));
+        assert!(
+            SimpleSelector::AttributeEquals {
+                name: "aria-hidden".to_string(),
+                value: "true".to_string(),
+            }
+            .matches(element_ref)
+        );
+        assert!(
+            !SimpleSelector::AttributeEquals {
+                name: "aria-hidden".to_string(),
+                value: "false".to_string(),
+            }
+            .matches(element_ref)
+        );
     }
 
     #[test]

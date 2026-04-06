@@ -9,7 +9,7 @@ use cssimpler_core::{
     RadialGradient, RadialShape, ShapeExtent,
 };
 
-use super::shapes::{pixel_bounds, point_in_rounded_rect};
+use super::shapes::{pixel_bounds, rounded_rect_row_span};
 use super::{ClipRect, blend_linear_over, current_render_buffer_rows, pack_linear_rgb};
 
 const MAX_GRADIENT_LAYER_CACHE_ENTRIES: usize = 16;
@@ -789,16 +789,13 @@ fn draw_linear_gradient(
     let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
     let projection_step = direction.0;
     for y in y0..y1 {
+        let Some((span_x0, span_x1)) = rounded_rect_row_span(layout, radius, y, x0, x1) else {
+            continue;
+        };
         let py = y as f32 + 0.5;
         let mut projection =
-            ((x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            if !point_in_rounded_rect(px, py, layout, radius) {
-                projection += projection_step;
-                continue;
-            }
-
+            ((span_x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
+        for x in span_x0..span_x1 {
             let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
             blend_gradient_sample(buffer, width, height, x, y, color);
             projection += projection_step;
@@ -849,16 +846,13 @@ fn rasterize_linear_gradient(
     let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
     let projection_step = direction.0;
     for y in y0..y1 {
+        let Some((span_x0, span_x1)) = rounded_rect_row_span(layout, radius, y, x0, x1) else {
+            continue;
+        };
         let py = y as f32 + 0.5;
         let mut projection =
-            ((x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            if !point_in_rounded_rect(px, py, layout, radius) {
-                projection += projection_step;
-                continue;
-            }
-
+            ((span_x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
+        for x in span_x0..span_x1 {
             let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
             write_raster_pixel(pixels, width, x, y, color);
             projection += projection_step;
@@ -908,13 +902,12 @@ fn draw_radial_gradient(
     let inverse_radius_y_squared = 1.0 / (resolved_shape.radius_y * resolved_shape.radius_y);
 
     for y in y0..y1 {
+        let Some((span_x0, span_x1)) = rounded_rect_row_span(layout, radius, y, x0, x1) else {
+            continue;
+        };
         let py = y as f32 + 0.5;
-        for x in x0..x1 {
+        for x in span_x0..span_x1 {
             let px = x as f32 + 0.5;
-            if !point_in_rounded_rect(px, py, layout, radius) {
-                continue;
-            }
-
             let dx = px - center_x;
             let dy = py - center_y;
             let color = if let Some(prepared_unit_gradient) = &prepared_unit_gradient {
@@ -987,13 +980,12 @@ fn rasterize_radial_gradient(
     let inverse_radius_y_squared = 1.0 / (resolved_shape.radius_y * resolved_shape.radius_y);
 
     for y in y0..y1 {
+        let Some((span_x0, span_x1)) = rounded_rect_row_span(layout, radius, y, x0, x1) else {
+            continue;
+        };
         let py = y as f32 + 0.5;
-        for x in x0..x1 {
+        for x in span_x0..span_x1 {
             let px = x as f32 + 0.5;
-            if !point_in_rounded_rect(px, py, layout, radius) {
-                continue;
-            }
-
             let dx = px - center_x;
             let dy = py - center_y;
             let color = if let Some(prepared_unit_gradient) = &prepared_unit_gradient {
@@ -1043,13 +1035,12 @@ fn draw_conic_gradient(
     let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
 
     for y in y0..y1 {
-        for x in x0..x1 {
+        let Some((span_x0, span_x1)) = rounded_rect_row_span(layout, radius, y, x0, x1) else {
+            continue;
+        };
+        for x in span_x0..span_x1 {
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
-            if !point_in_rounded_rect(px, py, layout, radius) {
-                continue;
-            }
-
             let dx = px - center_x;
             let dy = py - center_y;
             let angle = if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
@@ -1090,13 +1081,12 @@ fn rasterize_conic_gradient(
     let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
 
     for y in y0..y1 {
-        for x in x0..x1 {
+        let Some((span_x0, span_x1)) = rounded_rect_row_span(layout, radius, y, x0, x1) else {
+            continue;
+        };
+        for x in span_x0..span_x1 {
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
-            if !point_in_rounded_rect(px, py, layout, radius) {
-                continue;
-            }
-
             let dx = px - center_x;
             let dy = py - center_y;
             let angle = if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
@@ -1124,12 +1114,11 @@ fn fill_gradient_rounded_rect(
         return;
     };
     for y in y0..y1 {
-        let py = y as f32 + 0.5;
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            if point_in_rounded_rect(px, py, layout, radius) {
-                blend_gradient_sample(buffer, width, height, x, y, color);
-            }
+        let Some((span_x0, span_x1)) = rounded_rect_row_span(layout, radius, y, x0, x1) else {
+            continue;
+        };
+        for x in span_x0..span_x1 {
+            blend_gradient_sample(buffer, width, height, x, y, color);
         }
     }
 }
@@ -1151,12 +1140,11 @@ fn fill_rasterized_rounded_rect(
         return;
     };
     for y in y0..y1 {
-        let py = y as f32 + 0.5;
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            if point_in_rounded_rect(px, py, layout, radius) {
-                write_raster_pixel(pixels, width, x, y, color);
-            }
+        let Some((span_x0, span_x1)) = rounded_rect_row_span(layout, radius, y, x0, x1) else {
+            continue;
+        };
+        for x in span_x0..span_x1 {
+            write_raster_pixel(pixels, width, x, y, color);
         }
     }
 }

@@ -9,8 +9,8 @@ use self::scene_transition::SceneTransition;
 use crate::core::{ElementInteractionState, ElementPath, Node, RenderNode};
 use crate::renderer::{self, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
 use crate::style::{
-    build_render_tree_in_viewport_with_interaction_at_root,
-    build_render_tree_with_interaction_at_root, rebuild_render_tree_with_cached_layout, Stylesheet,
+    Stylesheet, build_render_tree_in_viewport_with_interaction_at_root,
+    build_render_tree_with_interaction_at_root, rebuild_render_tree_with_cached_layout,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1019,7 +1019,7 @@ mod tests {
 
     use super::{App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode};
     use crate::renderer::{FrameInfo, SceneProvider, ViewportSize};
-    use crate::style::{parse_stylesheet, Stylesheet};
+    use crate::style::{Stylesheet, parse_stylesheet};
 
     #[test]
     fn initial_frame_builds_the_scene() {
