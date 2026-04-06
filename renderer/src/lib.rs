@@ -211,6 +211,14 @@ fn dirty_job_group_rows(jobs: &[DirtyRenderJob]) -> Option<BufferRows> {
     (start < end).then_some(BufferRows::new(start, end))
 }
 
+fn dirty_job_group_clip(jobs: &[DirtyRenderJob]) -> Option<ClipRect> {
+    let mut clip = jobs.first()?.clip;
+    for job in jobs.iter().skip(1) {
+        clip = clip.union(job.clip);
+    }
+    Some(clip)
+}
+
 #[cfg(test)]
 fn clear_shadow_mask_cache_for_tests() {
     shadow::clear_shadow_mask_cache_for_tests();
@@ -832,6 +840,20 @@ fn render_to_buffer_parallel(
         .step_by(rows_per_worker)
         .map(|row_start| BufferRows::new(row_start, (row_start + rows_per_worker).min(height)))
         .collect::<Vec<_>>();
+    let band_root_indices = bands
+        .iter()
+        .map(|rows| {
+            root_indices_intersecting_clip(
+                &cached_bounds.roots,
+                ClipRect {
+                    x0: 0.0,
+                    y0: rows.start as f32,
+                    x1: width as f32,
+                    y1: rows.end as f32,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     let worker_buffer_lengths = bands
         .iter()
         .map(|rows| rows.pixel_len(width))
@@ -840,7 +862,11 @@ fn render_to_buffer_parallel(
 
     thread::scope(|scope| {
         let mut handles = Vec::new();
-        for (worker_buffer, rows) in worker_buffers.iter_mut().zip(bands.iter().copied()) {
+        for ((worker_buffer, rows), root_indices) in worker_buffers
+            .iter_mut()
+            .zip(bands.iter().copied())
+            .zip(band_root_indices.iter())
+        {
             let band_clip = ClipRect {
                 x0: 0.0,
                 y0: rows.start as f32,
@@ -850,16 +876,15 @@ fn render_to_buffer_parallel(
             handles.push(scope.spawn(move || {
                 with_render_buffer_rows(rows, || {
                     worker_buffer.fill(clear);
-                    for (node, bounds) in scene.iter().zip(&cached_bounds.roots) {
-                        draw_node_with_cached_bounds(
-                            node,
-                            bounds,
-                            worker_buffer,
-                            width,
-                            height,
-                            band_clip,
-                        );
-                    }
+                    draw_cached_root_indices(
+                        scene,
+                        &cached_bounds.roots,
+                        root_indices,
+                        worker_buffer,
+                        width,
+                        height,
+                        band_clip,
+                    );
                 });
             }));
         }
@@ -976,9 +1001,17 @@ fn render_scene_update_internal(
 
     for dirty_region in snapped_dirty_regions {
         clear_clip(buffer, width, height, dirty_region, clear_color);
-        for (node, bounds) in scene.iter().zip(&scene_diff.current_bounds.roots) {
-            draw_node_with_cached_bounds(node, bounds, buffer, width, height, dirty_region);
-        }
+        let root_indices =
+            root_indices_intersecting_clip(&scene_diff.current_bounds.roots, dirty_region);
+        draw_cached_root_indices(
+            scene,
+            &scene_diff.current_bounds.roots,
+            &root_indices,
+            buffer,
+            width,
+            height,
+            dirty_region,
+        );
     }
 
     PaintStats {
@@ -1012,6 +1045,14 @@ fn render_scene_update_parallel(
                 .expect("dirty render groups should only contain non-empty row spans")
         })
         .collect::<Vec<_>>();
+    let group_root_indices = job_groups
+        .iter()
+        .map(|jobs| {
+            let clip = dirty_job_group_clip(jobs)
+                .expect("dirty render groups should only contain at least one clip");
+            root_indices_intersecting_clip(cached_bounds, clip)
+        })
+        .collect::<Vec<_>>();
     let clear = pack_rgb(clear_color);
     let worker_buffer_lengths = group_rows
         .iter()
@@ -1021,25 +1062,25 @@ fn render_scene_update_parallel(
 
     thread::scope(|scope| {
         let mut handles = Vec::new();
-        for ((worker_buffer, jobs), rows) in worker_buffers
+        for (((worker_buffer, jobs), rows), root_indices) in worker_buffers
             .iter_mut()
             .zip(job_groups.iter())
             .zip(group_rows.iter().copied())
+            .zip(group_root_indices.iter())
         {
             handles.push(scope.spawn(move || {
                 with_render_buffer_rows(rows, || {
                     for job in jobs {
                         clear_clip_packed(worker_buffer, width, height, job.clip, clear);
-                        for (node, bounds) in scene.iter().zip(cached_bounds) {
-                            draw_node_with_cached_bounds(
-                                node,
-                                bounds,
-                                worker_buffer,
-                                width,
-                                height,
-                                job.clip,
-                            );
-                        }
+                        draw_cached_root_indices(
+                            scene,
+                            cached_bounds,
+                            root_indices,
+                            worker_buffer,
+                            width,
+                            height,
+                            job.clip,
+                        );
                     }
                 });
             }));
@@ -1158,6 +1199,26 @@ fn incremental_render_worker_count(dirty_jobs: &[DirtyRenderJob]) -> usize {
         .min(dirty_jobs.len())
         .min(max_workers_from_pixels)
         .max(1)
+}
+
+fn draw_cached_root_indices(
+    scene: &[RenderNode],
+    cached_bounds: &[CachedSubtreeBounds],
+    root_indices: &[usize],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clip: ClipRect,
+) {
+    for &root_index in root_indices {
+        let Some(node) = scene.get(root_index) else {
+            continue;
+        };
+        let Some(bounds) = cached_bounds.get(root_index) else {
+            continue;
+        };
+        draw_node_with_cached_bounds(node, bounds, buffer, width, height, clip);
+    }
 }
 
 fn incremental_scene_pass_count(
@@ -1279,6 +1340,22 @@ struct CachedSubtreeBounds {
     own_bounds: Option<ClipRect>,
     bounds: Option<ClipRect>,
     children: Vec<CachedSubtreeBounds>,
+}
+
+fn root_indices_intersecting_clip(
+    cached_bounds: &[CachedSubtreeBounds],
+    clip: ClipRect,
+) -> Vec<usize> {
+    cached_bounds
+        .iter()
+        .enumerate()
+        .filter_map(|(index, bounds)| {
+            bounds
+                .bounds
+                .and_then(|node_bounds| clip.intersect(node_bounds))
+                .map(|_| index)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1439,6 +1516,7 @@ fn draw_node_contents(
             height,
             text_layout,
             content,
+            node.text_layout.as_ref(),
             &node.style,
             text_clip,
         );
@@ -4216,6 +4294,66 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert!(loads.iter().all(|&load| load >= 12800));
         assert!(loads.iter().all(|&load| load <= 16000));
+    }
+
+    #[test]
+    fn clip_plans_only_include_roots_that_intersect_their_damage() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 60.0, 60.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(220, 38, 38)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(80.0, 0.0, 60.0, 60.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(37, 99, 235)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(160.0, 0.0, 60.0, 60.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(22, 163, 74)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let cached_bounds = super::cache_scene_subtree_bounds(&scene);
+        let root_indices = super::root_indices_intersecting_clip(
+            &cached_bounds.roots,
+            ClipRect {
+                x0: 70.0,
+                y0: 0.0,
+                x1: 150.0,
+                y1: 80.0,
+            },
+        );
+        let group_clip = super::dirty_job_group_clip(&[
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 70.0,
+                    y0: 0.0,
+                    x1: 110.0,
+                    y1: 40.0,
+                },
+                pixel_count: 1600,
+            },
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 100.0,
+                    y0: 40.0,
+                    x1: 150.0,
+                    y1: 80.0,
+                },
+                pixel_count: 2000,
+            },
+        ])
+        .expect("dirty job groups should produce a union clip");
+
+        assert_eq!(root_indices, vec![1]);
+        assert_eq!(
+            group_clip,
+            ClipRect {
+                x0: 70.0,
+                y0: 0.0,
+                x1: 150.0,
+                y1: 80.0,
+            }
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ pub mod interaction;
 pub mod scrollbar;
 pub mod transitions;
 
-use crate::fonts::TextStyle;
+use crate::fonts::{PreparedTextLayout, TextStyle};
 use taffy::Style as TaffyStyle;
 
 pub use color::{Color, GradientInterpolation, LinearRgba};
@@ -404,6 +404,7 @@ pub struct RenderNode {
     pub layout: LayoutBox,
     pub style: VisualStyle,
     pub transitions: TransitionStyle,
+    pub text_layout: Option<PreparedTextLayout>,
     pub element_id: Option<String>,
     pub element_path: Option<ElementPath>,
     pub content_inset: Insets,
@@ -419,6 +420,7 @@ impl RenderNode {
             layout,
             style: VisualStyle::default(),
             transitions: TransitionStyle::default(),
+            text_layout: None,
             element_id: None,
             element_path: None,
             content_inset: Insets::ZERO,
@@ -434,6 +436,7 @@ impl RenderNode {
             layout,
             style: VisualStyle::default(),
             transitions: TransitionStyle::default(),
+            text_layout: None,
             element_id: None,
             element_path: None,
             content_inset: Insets::ZERO,
@@ -450,6 +453,11 @@ impl RenderNode {
 
     pub fn with_transitions(mut self, transitions: TransitionStyle) -> Self {
         self.transitions = transitions;
+        self
+    }
+
+    pub fn with_text_layout(mut self, text_layout: impl Into<Option<PreparedTextLayout>>) -> Self {
+        self.text_layout = text_layout.into();
         self
     }
 

@@ -1,5 +1,6 @@
 mod scene_transition;
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -557,6 +558,7 @@ pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     stylesheet: &'a Stylesheet,
     update: Update,
     fragments: Vec<Fragment<'a, State>>,
+    fragment_indices: HashMap<String, usize>,
     viewport: Option<ViewportSize>,
     interaction: ElementInteractionState,
     render_mode: RenderMode,
@@ -575,11 +577,13 @@ where
     where
         I: IntoIterator<Item = Fragment<'a, State>>,
     {
+        let fragments = fragments.into_iter().collect::<Vec<_>>();
         Self {
             state,
             stylesheet,
             update,
-            fragments: fragments.into_iter().collect(),
+            fragment_indices: build_fragment_indices(&fragments),
+            fragments,
             viewport: None,
             interaction: ElementInteractionState::default(),
             render_mode: RenderMode::OnInvalidation,
@@ -698,11 +702,7 @@ where
 
         let mut replacements = Vec::with_capacity(ids.len());
         for id in ids {
-            let Some(index) = self
-                .fragments
-                .iter()
-                .position(|fragment| fragment.id() == id)
-            else {
+            let Some(&index) = self.fragment_indices.get(id) else {
                 return false;
             };
             let node = self.fragments[index].render(&self.state);
@@ -865,6 +865,14 @@ fn push_unique_id(ids: &mut Vec<String>, candidate: String) {
     if !ids.iter().any(|existing| existing == &candidate) {
         ids.push(candidate);
     }
+}
+
+fn build_fragment_indices<State>(fragments: &[Fragment<'_, State>]) -> HashMap<String, usize> {
+    let mut indices = HashMap::with_capacity(fragments.len());
+    for (index, fragment) in fragments.iter().enumerate() {
+        indices.entry(fragment.id().to_string()).or_insert(index);
+    }
+    indices
 }
 
 fn interaction_roots(interaction: &ElementInteractionState) -> Vec<usize> {
@@ -1208,6 +1216,76 @@ mod tests {
             text_nodes(&third),
             vec!["left 7".to_string(), "right 10".to_string()]
         );
+    }
+
+    #[test]
+    fn fragment_app_can_refresh_multiple_targeted_fragments_in_one_pass() {
+        let stylesheet = Stylesheet::default();
+        let left_calls = Cell::new(0_u32);
+        let middle_calls = Cell::new(0_u32);
+        let right_calls = Cell::new(0_u32);
+        let mut app = FragmentApp::new(
+            (1_u32, 2_u32, 3_u32),
+            &stylesheet,
+            |state, frame| {
+                if frame.frame_index == 1 {
+                    state.0 = 10;
+                    state.2 = 30;
+                    Refresh::fragments(["right", "left"], Invalidation::Paint)
+                } else {
+                    Refresh::clean()
+                }
+            },
+            [
+                Fragment::new("left", |state: &(u32, u32, u32)| {
+                    left_calls.set(left_calls.get() + 1);
+                    ui! {
+                        <section id="left">
+                            <p>{format!("left {}", state.0)}</p>
+                        </section>
+                    }
+                }),
+                Fragment::new("middle", |state: &(u32, u32, u32)| {
+                    middle_calls.set(middle_calls.get() + 1);
+                    ui! {
+                        <section id="middle">
+                            <p>{format!("middle {}", state.1)}</p>
+                        </section>
+                    }
+                }),
+                Fragment::new("right", |state: &(u32, u32, u32)| {
+                    right_calls.set(right_calls.get() + 1);
+                    ui! {
+                        <section id="right">
+                            <p>{format!("right {}", state.2)}</p>
+                        </section>
+                    }
+                }),
+            ],
+        );
+
+        let first = app.frame(frame(0));
+        let second = app.frame(frame(1));
+
+        assert_eq!(
+            text_nodes(&first),
+            vec![
+                "left 1".to_string(),
+                "middle 2".to_string(),
+                "right 3".to_string()
+            ]
+        );
+        assert_eq!(
+            text_nodes(&second),
+            vec![
+                "left 10".to_string(),
+                "middle 2".to_string(),
+                "right 30".to_string()
+            ]
+        );
+        assert_eq!(left_calls.get(), 2);
+        assert_eq!(middle_calls.get(), 1);
+        assert_eq!(right_calls.get(), 2);
     }
 
     #[test]

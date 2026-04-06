@@ -131,6 +131,22 @@ pub struct TextLayout {
     pub line_height: f32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedTextLayout {
+    pub wrap_width: Option<f32>,
+    pub layout: TextLayout,
+}
+
+impl PreparedTextLayout {
+    pub fn new(wrap_width: Option<f32>, layout: TextLayout) -> Self {
+        Self { wrap_width, layout }
+    }
+
+    pub fn matches_wrap_width(&self, wrap_width: Option<f32>) -> bool {
+        wrap_width_bits(self.wrap_width) == wrap_width_bits(wrap_width)
+    }
+}
+
 #[derive(Clone)]
 pub struct ResolvedFont {
     font: FontArc,
@@ -425,6 +441,10 @@ pub fn layout_text_block(text: &str, style: &TextStyle, wrap_width: Option<f32>)
         height,
         line_height,
     }
+}
+
+fn wrap_width_bits(wrap_width: Option<f32>) -> Option<u32> {
+    wrap_width.map(f32::to_bits)
 }
 
 enum MeasurementBackend {

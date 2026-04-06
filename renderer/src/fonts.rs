@@ -5,8 +5,8 @@ use std::thread;
 
 use ab_glyph::{Font, ScaleFont, point};
 use cssimpler_core::fonts::{
-    FontFamily, FontStyle, GenericFontFamily, LineHeight, ResolvedFont, TextLayout, TextStyle,
-    TextTransform, layout_text_block, resolve_font,
+    FontFamily, FontStyle, GenericFontFamily, LineHeight, PreparedTextLayout, ResolvedFont,
+    TextLayout, TextStyle, TextTransform, layout_text_block, resolve_font,
 };
 use cssimpler_core::{Color, LayoutBox, ShadowEffect, TextStrokeStyle, VisualStyle};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
@@ -28,10 +28,11 @@ pub(crate) fn draw_text(
     height: usize,
     layout: LayoutBox,
     text: &str,
+    prepared_text_layout: Option<&PreparedTextLayout>,
     style: &VisualStyle,
     clip: ClipRect,
 ) {
-    let Some(raster) = cached_text_mask(layout, text, &style.text) else {
+    let Some(raster) = cached_text_mask(layout, text, &style.text, prepared_text_layout) else {
         return;
     };
 
@@ -241,6 +242,7 @@ fn cached_text_mask(
     layout: LayoutBox,
     text: &str,
     text_style: &TextStyle,
+    prepared_text_layout: Option<&PreparedTextLayout>,
 ) -> Option<CachedTextMask> {
     let (relative_layout, offset_x, offset_y) = split_layout_for_cache(layout);
     let key = Arc::new(TextRasterCacheKey::new(text, text_style, relative_layout));
@@ -254,7 +256,11 @@ fn cached_text_mask(
         });
     }
 
-    let wrapped = layout_text_block(text, text_style, Some(relative_layout.width.max(1.0)));
+    let wrap_width = Some(relative_layout.width.max(1.0));
+    let wrapped = prepared_text_layout
+        .filter(|prepared| prepared.matches_wrap_width(wrap_width))
+        .map(|prepared| prepared.layout.clone())
+        .unwrap_or_else(|| layout_text_block(text, text_style, wrap_width));
     let mask = if let Some(font) = resolve_font(text_style) {
         rasterize_resolved_text(
             relative_layout,
@@ -1112,10 +1118,20 @@ mod tests {
         let _cache_guard = lock_text_mask_cache_for_tests();
         clear_text_mask_cache_for_tests();
         let style = TextStyle::default();
-        let first = cached_text_mask(LayoutBox::new(10.25, 20.0, 160.0, 40.0), "Cache", &style)
-            .expect("first text mask should rasterize");
-        let second = cached_text_mask(LayoutBox::new(90.25, 44.0, 160.0, 40.0), "Cache", &style)
-            .expect("second text mask should rasterize");
+        let first = cached_text_mask(
+            LayoutBox::new(10.25, 20.0, 160.0, 40.0),
+            "Cache",
+            &style,
+            None,
+        )
+        .expect("first text mask should rasterize");
+        let second = cached_text_mask(
+            LayoutBox::new(90.25, 44.0, 160.0, 40.0),
+            "Cache",
+            &style,
+            None,
+        )
+        .expect("second text mask should rasterize");
 
         assert!(Arc::ptr_eq(&first.mask, &second.mask));
         assert_eq!(first.offset_x, 10);
@@ -1127,8 +1143,13 @@ mod tests {
         let _cache_guard = lock_text_mask_cache_for_tests();
         clear_text_mask_cache_for_tests();
         let style = TextStyle::default();
-        let raster = cached_text_mask(LayoutBox::new(12.0, 16.0, 160.0, 40.0), "Glow", &style)
-            .expect("text mask should rasterize");
+        let raster = cached_text_mask(
+            LayoutBox::new(12.0, 16.0, 160.0, 40.0),
+            "Glow",
+            &style,
+            None,
+        )
+        .expect("text mask should rasterize");
         let shadow = ShadowEffect {
             color: None,
             offset_x: 0.0,
@@ -1162,22 +1183,22 @@ mod tests {
         clear_text_mask_cache_for_tests();
         let style = TextStyle::default();
         let layout = LayoutBox::new(10.25, 20.0, 160.0, 40.0);
-        let first =
-            cached_text_mask(layout, "Cache 0", &style).expect("first text mask should rasterize");
-        let retained =
-            cached_text_mask(layout, "Cache 1", &style).expect("second text mask should rasterize");
+        let first = cached_text_mask(layout, "Cache 0", &style, None)
+            .expect("first text mask should rasterize");
+        let retained = cached_text_mask(layout, "Cache 1", &style, None)
+            .expect("second text mask should rasterize");
         for index in 2..MAX_TEXT_RASTER_CACHE_ENTRIES {
-            cached_text_mask(layout, &format!("Cache {index}"), &style)
+            cached_text_mask(layout, &format!("Cache {index}"), &style, None)
                 .expect("cache fill text mask should rasterize");
         }
 
-        let retained_again =
-            cached_text_mask(layout, "Cache 1", &style).expect("retained text mask should cache");
+        let retained_again = cached_text_mask(layout, "Cache 1", &style, None)
+            .expect("retained text mask should cache");
         let overflow_text = format!("Cache {}", MAX_TEXT_RASTER_CACHE_ENTRIES);
-        cached_text_mask(layout, &overflow_text, &style)
+        cached_text_mask(layout, &overflow_text, &style, None)
             .expect("overflow text mask should rasterize");
-        let first_after =
-            cached_text_mask(layout, "Cache 0", &style).expect("evicted text mask should rebuild");
+        let first_after = cached_text_mask(layout, "Cache 0", &style, None)
+            .expect("evicted text mask should rebuild");
 
         assert!(Arc::ptr_eq(&retained.mask, &retained_again.mask));
         assert!(!Arc::ptr_eq(&first.mask, &first_after.mask));
@@ -1192,8 +1213,13 @@ mod tests {
         let _cache_guard = lock_text_mask_cache_for_tests();
         clear_text_mask_cache_for_tests();
         let style = TextStyle::default();
-        let raster = cached_text_mask(LayoutBox::new(12.0, 16.0, 160.0, 40.0), "Glow", &style)
-            .expect("text mask should rasterize");
+        let raster = cached_text_mask(
+            LayoutBox::new(12.0, 16.0, 160.0, 40.0),
+            "Glow",
+            &style,
+            None,
+        )
+        .expect("text mask should rasterize");
         let first = cached_text_effect_mask(
             &raster,
             TextEffectCacheKind::Stroke {

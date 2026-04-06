@@ -1652,6 +1652,38 @@ mod tests {
     }
 
     #[test]
+    fn render_tree_carries_prepared_text_layout_for_paint() {
+        let stylesheet = parse_stylesheet(
+            ".button {
+                width: 90px;
+                height: 40px;
+                padding: 0 8px;
+                letter-spacing: 1px;
+            }",
+        )
+        .expect("stylesheet should parse");
+        let tree = Node::element("button")
+            .with_class("button")
+            .with_child(Node::text("wrap this text"))
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+        let prepared = scene
+            .text_layout
+            .as_ref()
+            .expect("text nodes should carry prepared paint layout");
+
+        assert_eq!(prepared.wrap_width, Some(74.0));
+        assert_eq!(
+            prepared.layout,
+            cssimpler_core::fonts::layout_text_block(
+                "wrap this text",
+                &scene.style.text,
+                prepared.wrap_width,
+            )
+        );
+    }
+
+    #[test]
     fn render_tree_preserves_click_handlers() {
         fn increment() {}
 
@@ -1761,6 +1793,7 @@ mod tests {
 
         assert_eq!(rerendered.layout, scene.children[0].layout);
         assert_eq!(rerendered.style.foreground, Color::rgb(37, 99, 235));
+        assert_eq!(rerendered.text_layout, scene.children[0].text_layout);
         assert_eq!(text_nodes(&rerendered), vec!["value".to_string()]);
     }
 

@@ -1,7 +1,7 @@
 use cssimpler_core::{
-    CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandlers, LayoutBox,
-    Node, RenderNode, ScrollbarData, Style, TransitionStyle,
-    fonts::{TextStyle, layout_text_block},
+    CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandlers, Insets,
+    LayoutBox, Node, RenderNode, ScrollbarData, Style, TransitionStyle,
+    fonts::{PreparedTextLayout, TextStyle, layout_text_block},
 };
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::{
@@ -36,6 +36,7 @@ struct LayoutTree {
 struct LeafMeasureContext {
     text: String,
     text_style: TextStyle,
+    text_layout: Option<PreparedTextLayout>,
 }
 
 pub fn build_render_tree(root: &Node, stylesheet: &Stylesheet) -> RenderNode {
@@ -263,25 +264,14 @@ fn build_render_tree_with_available_space(
             layout_tree.node_id,
             available_space,
             |known_dimensions, available_space, _, context, _| {
-                context.map_or(
-                    TaffySize {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                    |context| {
-                        measure_text(
-                            &context.text,
-                            &context.text_style,
-                            known_dimensions,
-                            available_space,
-                        )
-                    },
-                )
+                context.map_or(TaffySize::ZERO, |context| {
+                    measure_text(context, known_dimensions, available_space)
+                })
             },
         )
         .expect("resolved layout should be valid for taffy");
 
-    render_node_from_layout(&layout_tree, &taffy, 0.0, 0.0)
+    render_node_from_layout(&layout_tree, &mut taffy, 0.0, 0.0)
 }
 
 fn build_layout_tree(
@@ -301,6 +291,7 @@ fn build_layout_tree(
                 LeafMeasureContext {
                     text: resolved.text.clone(),
                     text_style: resolved.style.visual.text.clone(),
+                    text_layout: None,
                 },
             )
             .expect("leaf style should be accepted by taffy")
@@ -337,11 +328,11 @@ fn available_space_from_dimension(dimension: Dimension) -> AvailableSpace {
 
 fn render_node_from_layout(
     tree: &LayoutTree,
-    taffy: &TaffyTree<LeafMeasureContext>,
+    taffy: &mut TaffyTree<LeafMeasureContext>,
     parent_x: f32,
     parent_y: f32,
 ) -> RenderNode {
-    let layout = taffy
+    let layout = *taffy
         .layout(tree.node_id)
         .expect("computed layouts should be readable");
     let x = parent_x + layout.location.x;
@@ -353,12 +344,18 @@ fn render_node_from_layout(
         .map(|child| render_node_from_layout(child, taffy, x, y))
         .collect();
     let content_inset = content_inset_from_taffy(&tree.style.layout.taffy);
-    let scrollbars = crate::visual::scrollbars_from_layout(&tree.style, layout);
+    let scrollbars = crate::visual::scrollbars_from_layout(&tree.style, &layout);
 
     if child_nodes.is_empty() && !tree.text.is_empty() {
+        let text_layout = text_layout_from_measure_context(
+            taffy,
+            tree.node_id,
+            text_layout_wrap_width(layout_box, content_inset, scrollbars),
+        );
         let mut node = RenderNode::text(layout_box, tree.text.clone())
             .with_style(tree.style.visual.clone())
             .with_transitions(tree.style.transitions.clone())
+            .with_text_layout(text_layout)
             .with_element_path(tree.element_path.clone())
             .with_content_inset(content_inset);
         if let Some(element_id) = &tree.element_id {
@@ -474,9 +471,12 @@ fn render_node_with_cached_layout(
             return None;
         }
 
+        let text_layout =
+            reused_or_rebuilt_text_layout(resolved, template, content_inset, scrollbars);
         let mut node = RenderNode::text(template.layout, resolved.text.clone())
             .with_style(resolved.style.visual.clone())
             .with_transitions(resolved.style.transitions.clone())
+            .with_text_layout(text_layout)
             .with_element_path(resolved.element_path.clone())
             .with_content_inset(content_inset);
         if let Some(element_id) = &resolved.element_id {
@@ -558,30 +558,116 @@ fn apply_resolved_handlers(node: RenderNode, resolved: &ResolvedElement) -> Rend
 }
 
 fn measure_text(
-    text: &str,
-    text_style: &TextStyle,
+    context: &mut LeafMeasureContext,
     known_dimensions: TaffySize<Option<f32>>,
     available_space: TaffySize<AvailableSpace>,
 ) -> TaffySize<f32> {
-    if text.is_empty() {
+    if context.text.is_empty() {
         return TaffySize {
             width: 0.0,
             height: 0.0,
         };
     }
 
-    let wrap_width = known_dimensions
-        .width
-        .or_else(|| match available_space.width {
-            AvailableSpace::Definite(width) => Some(width.max(1.0)),
-            AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
-        });
-    let layout = layout_text_block(text, text_style, wrap_width);
+    let wrap_width = measure_wrap_width(known_dimensions, available_space);
+    let layout = cached_text_layout(context, wrap_width).layout;
 
     TaffySize {
         width: known_dimensions.width.unwrap_or(layout.width),
         height: known_dimensions.height.unwrap_or(layout.height),
     }
+}
+
+fn measure_wrap_width(
+    known_dimensions: TaffySize<Option<f32>>,
+    available_space: TaffySize<AvailableSpace>,
+) -> Option<f32> {
+    known_dimensions
+        .width
+        .or_else(|| match available_space.width {
+            AvailableSpace::Definite(width) => Some(width.max(1.0)),
+            AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
+        })
+}
+
+fn cached_text_layout(
+    context: &mut LeafMeasureContext,
+    wrap_width: Option<f32>,
+) -> PreparedTextLayout {
+    if let Some(prepared) = context.text_layout.as_ref()
+        && prepared.matches_wrap_width(wrap_width)
+    {
+        return prepared.clone();
+    }
+
+    let prepared = PreparedTextLayout::new(
+        wrap_width,
+        layout_text_block(&context.text, &context.text_style, wrap_width),
+    );
+    context.text_layout = Some(prepared.clone());
+    prepared
+}
+
+fn text_layout_from_measure_context(
+    taffy: &mut TaffyTree<LeafMeasureContext>,
+    node_id: NodeId,
+    wrap_width: Option<f32>,
+) -> Option<PreparedTextLayout> {
+    let context = taffy.get_node_context_mut(node_id)?;
+    (!context.text.is_empty()).then(|| cached_text_layout(context, wrap_width))
+}
+
+fn reused_or_rebuilt_text_layout(
+    resolved: &ResolvedElement,
+    template: &RenderNode,
+    content_inset: Insets,
+    scrollbars: Option<ScrollbarData>,
+) -> Option<PreparedTextLayout> {
+    let wrap_width = text_layout_wrap_width(template.layout, content_inset, scrollbars);
+    if let cssimpler_core::RenderKind::Text(template_text) = &template.kind
+        && template_text == &resolved.text
+        && template.style.text == resolved.style.visual.text
+        && let Some(prepared) = template.text_layout.as_ref()
+        && prepared.matches_wrap_width(wrap_width)
+    {
+        return Some(prepared.clone());
+    }
+
+    Some(PreparedTextLayout::new(
+        wrap_width,
+        layout_text_block(&resolved.text, &resolved.style.visual.text, wrap_width),
+    ))
+}
+
+fn text_layout_wrap_width(
+    layout: LayoutBox,
+    content_inset: Insets,
+    scrollbars: Option<ScrollbarData>,
+) -> Option<f32> {
+    let draw_layout = text_paint_layout(layout, content_inset, scrollbars);
+    Some(draw_layout.width.max(1.0))
+}
+
+fn text_paint_layout(
+    layout: LayoutBox,
+    content_inset: Insets,
+    scrollbars: Option<ScrollbarData>,
+) -> LayoutBox {
+    let mut layout = LayoutBox::new(
+        layout.x + content_inset.left,
+        layout.y + content_inset.top,
+        (layout.width - content_inset.left - content_inset.right).max(0.0),
+        (layout.height - content_inset.top - content_inset.bottom).max(0.0),
+    );
+
+    if let Some(scrollbars) = scrollbars {
+        layout.width = (layout.width + scrollbars.metrics.max_offset_x).max(0.0);
+        layout.height = (layout.height + scrollbars.metrics.max_offset_y).max(0.0);
+        layout.x -= scrollbars.metrics.offset_x;
+        layout.y -= scrollbars.metrics.offset_y;
+    }
+
+    layout
 }
 
 fn content_inset_from_taffy(style: &TaffyStyle) -> cssimpler_core::Insets {
