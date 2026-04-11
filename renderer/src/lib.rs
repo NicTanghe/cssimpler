@@ -1,8 +1,10 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::{Mutex, OnceLock};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,6 +56,7 @@ const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 80;
 const MAX_RENDER_WORKERS: usize = 12;
 const SCENE_TRAVERSAL_COST_PER_NODE: usize = 96;
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
+const MAX_SUBTREE_SURFACE_CACHE_ENTRIES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FramePaintMode {
@@ -111,6 +114,30 @@ struct DirtyRenderJob {
 
 static FRAME_TIMING_STATS: OnceLock<Mutex<FrameTimingStats>> = OnceLock::new();
 static WORKER_BUFFER_POOL: OnceLock<Mutex<Vec<Vec<u32>>>> = OnceLock::new();
+static SUBTREE_SURFACE_CACHE: OnceLock<Mutex<SubtreeSurfaceCache>> = OnceLock::new();
+#[cfg(test)]
+static SUBTREE_SURFACE_CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct CachedSubtreeSurface {
+    source_bounds: ClipRect,
+    width: usize,
+    height: usize,
+    pixels: Vec<LinearRgba>,
+}
+
+#[derive(Clone)]
+struct SurfaceCacheEntry {
+    surface: Arc<CachedSubtreeSurface>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct SubtreeSurfaceCache {
+    next_use: u64,
+    builds: usize,
+    surfaces: HashMap<u64, SurfaceCacheEntry>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BufferRows {
@@ -184,6 +211,306 @@ fn release_worker_buffers(buffers: Vec<Vec<u32>>) {
         .lock()
         .expect("worker buffer pool mutex should not be poisoned");
     pool.extend(buffers);
+}
+
+fn subtree_surface_cache() -> &'static Mutex<SubtreeSurfaceCache> {
+    SUBTREE_SURFACE_CACHE.get_or_init(|| Mutex::new(SubtreeSurfaceCache::default()))
+}
+
+fn next_surface_cache_use(next_use: &mut u64) -> u64 {
+    let use_index = *next_use;
+    *next_use = next_use.wrapping_add(1);
+    use_index
+}
+
+fn cached_subtree_surface_entry(cache: &mut SubtreeSurfaceCache, key: u64) -> Option<Arc<CachedSubtreeSurface>> {
+    let last_used = next_surface_cache_use(&mut cache.next_use);
+    let entry = cache.surfaces.get_mut(&key)?;
+    entry.last_used = last_used;
+    Some(entry.surface.clone())
+}
+
+fn insert_subtree_surface_entry(cache: &mut SubtreeSurfaceCache, key: u64, surface: Arc<CachedSubtreeSurface>) {
+    if cache.surfaces.len() >= MAX_SUBTREE_SURFACE_CACHE_ENTRIES {
+        evict_lru_subtree_surface_entry(&mut cache.surfaces);
+    }
+    let last_used = next_surface_cache_use(&mut cache.next_use);
+    cache.surfaces.insert(key, SurfaceCacheEntry { surface, last_used });
+}
+
+fn evict_lru_subtree_surface_entry(entries: &mut HashMap<u64, SurfaceCacheEntry>) {
+    let Some((&oldest_key, _)) = entries.iter().min_by_key(|(_, entry)| entry.last_used) else {
+        return;
+    };
+    entries.remove(&oldest_key);
+}
+
+fn neutralized_surface_root(node: &RenderNode) -> RenderNode {
+    let mut node = node.clone();
+    node.style.transform = cssimpler_core::Transform2D::default();
+    node.style.perspective = None;
+    node.style.transform_style = TransformStyleMode::Flat;
+    node
+}
+
+fn hash_surface_subtree(node: &RenderNode) -> u64 {
+    fn hash_layout(hasher: &mut DefaultHasher, layout: LayoutBox) {
+        layout.x.to_bits().hash(hasher);
+        layout.y.to_bits().hash(hasher);
+        layout.width.to_bits().hash(hasher);
+        layout.height.to_bits().hash(hasher);
+    }
+
+    fn hash_node(hasher: &mut DefaultHasher, node: &RenderNode) {
+        format!("{:?}", node.kind).hash(hasher);
+        hash_layout(hasher, node.layout);
+        format!("{:?}", node.style).hash(hasher);
+        format!("{:?}", node.content_inset).hash(hasher);
+        format!("{:?}", node.scrollbars).hash(hasher);
+        for child in &node.children {
+            hash_node(hasher, child);
+        }
+    }
+
+    let mut hasher = DefaultHasher::new();
+    hash_node(&mut hasher, node);
+    hasher.finish()
+}
+
+fn sample_cached_surface_bilinear(surface: &CachedSubtreeSurface, local_x: f32, local_y: f32) -> LinearRgba {
+    if surface.width == 0 || surface.height == 0 {
+        return LinearRgba::TRANSPARENT;
+    }
+
+    fn pixel(surface: &CachedSubtreeSurface, x: i32, y: i32) -> LinearRgba {
+        if x < 0 || y < 0 || x >= surface.width as i32 || y >= surface.height as i32 {
+            return LinearRgba::TRANSPARENT;
+        }
+        surface.pixels[y as usize * surface.width + x as usize]
+    }
+
+    let sample_x = local_x - 0.5;
+    let sample_y = local_y - 0.5;
+    let x0 = sample_x.floor() as i32;
+    let y0 = sample_y.floor() as i32;
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+    let tx = sample_x - x0 as f32;
+    let ty = sample_y - y0 as f32;
+
+    let top = pixel(surface, x0, y0).lerp(pixel(surface, x1, y0), tx);
+    let bottom = pixel(surface, x0, y1).lerp(pixel(surface, x1, y1), tx);
+    top.lerp(bottom, ty)
+}
+
+fn extract_surface_from_mattes(
+    black_buffer: &[u32],
+    white_buffer: &[u32],
+    width: usize,
+    height: usize,
+    source_bounds: ClipRect,
+) -> Option<CachedSubtreeSurface> {
+    let (x0, y0, x1, y1) = clip_pixel_bounds(source_bounds, width, height)?;
+    let surface_width = (x1 - x0).max(0) as usize;
+    let surface_height = (y1 - y0).max(0) as usize;
+    if surface_width == 0 || surface_height == 0 {
+        return None;
+    }
+
+    let mut pixels = Vec::with_capacity(surface_width.saturating_mul(surface_height));
+    for y in y0..y1 {
+        let row_start = y as usize * width;
+        for x in x0..x1 {
+            let black = unpack_rgb(black_buffer[row_start + x as usize]).to_linear_rgba();
+            let white = unpack_rgb(white_buffer[row_start + x as usize]).to_linear_rgba();
+            let alpha = (1.0
+                - ((white.r - black.r) + (white.g - black.g) + (white.b - black.b)) / 3.0)
+                .clamp(0.0, 1.0);
+            if alpha <= f32::EPSILON {
+                pixels.push(LinearRgba::TRANSPARENT);
+                continue;
+            }
+
+            let inverse_alpha = 1.0 / alpha;
+            pixels.push(LinearRgba {
+                r: (black.r * inverse_alpha).clamp(0.0, 1.0),
+                g: (black.g * inverse_alpha).clamp(0.0, 1.0),
+                b: (black.b * inverse_alpha).clamp(0.0, 1.0),
+                a: alpha,
+            });
+        }
+    }
+
+    Some(CachedSubtreeSurface {
+        source_bounds,
+        width: surface_width,
+        height: surface_height,
+        pixels,
+    })
+}
+
+fn snapped_surface_source_bounds(bounds: ClipRect, width: usize, height: usize) -> Option<ClipRect> {
+    if bounds.x0 < 0.0
+        || bounds.y0 < 0.0
+        || bounds.x1 > width as f32
+        || bounds.y1 > height as f32
+    {
+        return None;
+    }
+    snap_clip_to_pixel_grid(bounds, width, height)
+}
+
+fn cached_promoted_surface(
+    node: &RenderNode,
+    width: usize,
+    height: usize,
+) -> Option<Arc<CachedSubtreeSurface>> {
+    let surface_root = neutralized_surface_root(node);
+    let key = hash_surface_subtree(&surface_root);
+    {
+        let mut cache = subtree_surface_cache()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(surface) = cached_subtree_surface_entry(&mut cache, key) {
+            return Some(surface);
+        }
+    }
+
+    let mut node_count = 0;
+    let surface_bounds = cache_subtree_bounds(
+        &surface_root,
+        TransformMatrix3d::IDENTITY,
+        None,
+        false,
+        &mut node_count,
+    );
+    let source_bounds =
+        snapped_surface_source_bounds(surface_bounds.bounds?, width, height)?;
+    let mut buffers = acquire_worker_buffers(&[
+        width.saturating_mul(height),
+        width.saturating_mul(height),
+    ]);
+    let mut white_buffer = buffers.pop().unwrap_or_default();
+    let mut black_buffer = buffers.pop().unwrap_or_default();
+    black_buffer.fill(pack_rgb(Color::BLACK));
+    white_buffer.fill(pack_rgb(Color::WHITE));
+    with_render_buffer_rows(BufferRows::full(), || {
+        draw_node_with_cached_bounds_internal(
+            &surface_root,
+            &surface_bounds,
+            &mut black_buffer,
+            width,
+            height,
+            source_bounds,
+            false,
+        );
+        draw_node_with_cached_bounds_internal(
+            &surface_root,
+            &surface_bounds,
+            &mut white_buffer,
+            width,
+            height,
+            source_bounds,
+            false,
+        );
+    });
+    let surface = extract_surface_from_mattes(
+        &black_buffer,
+        &white_buffer,
+        width,
+        height,
+        source_bounds,
+    );
+    release_worker_buffers(vec![black_buffer, white_buffer]);
+    let surface = Arc::new(surface?);
+
+    let mut cache = subtree_surface_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(existing) = cached_subtree_surface_entry(&mut cache, key) {
+        return Some(existing);
+    }
+    cache.builds = cache.builds.saturating_add(1);
+    insert_subtree_surface_entry(&mut cache, key, surface.clone());
+    Some(surface)
+}
+
+fn draw_cached_surface_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    surface: &CachedSubtreeSurface,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+    let Some(bounds) = transform_clip_rect(surface.source_bounds, matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+    let rows = current_render_buffer_rows();
+    let row_start = rows.start.min(height) as i32;
+    let row_end = rows.end.min(height) as i32;
+    for y in y0.max(row_start)..y1.min(row_end) {
+        let local_row_start = (y as usize - rows.start) * width;
+        for x in x0..x1 {
+            let screen_x = x as f32 + 0.5;
+            let screen_y = y as f32 + 0.5;
+            if !clip_state.contains(screen_x, screen_y) {
+                continue;
+            }
+
+            let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+            let local_x = source_x - surface.source_bounds.x0;
+            let local_y = source_y - surface.source_bounds.y0;
+            let sample = sample_cached_surface_bilinear(surface, local_x, local_y);
+            if sample.a <= f32::EPSILON {
+                continue;
+            }
+            blend_linear_over(buffer, local_row_start + x as usize, sample);
+        }
+    }
+}
+
+fn node_can_use_promoted_surface(node: &RenderNode, cached_bounds: &CachedSubtreeBounds) -> bool {
+    !node.style.transform.is_identity()
+        && !node.style.transform.uses_depth()
+        && node.style.perspective.is_none()
+        && node.style.transform_style == TransformStyleMode::Flat
+        && !cached_bounds.subtree_uses_depth
+        && !node.children.is_empty()
+}
+
+#[cfg(test)]
+fn clear_subtree_surface_cache_for_tests() {
+    let mut cache = subtree_surface_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    cache.next_use = 0;
+    cache.builds = 0;
+    cache.surfaces.clear();
+}
+
+#[cfg(test)]
+fn subtree_surface_cache_builds_for_tests() -> usize {
+    subtree_surface_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .builds
+}
+
+#[cfg(test)]
+pub(crate) fn lock_subtree_surface_cache_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    SUBTREE_SURFACE_CACHE_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 fn with_render_buffer_rows<T>(rows: BufferRows, render: impl FnOnce() -> T) -> T {
@@ -1542,6 +1869,18 @@ fn draw_node_with_cached_bounds(
     height: usize,
     clip: ClipRect,
 ) {
+    draw_node_with_cached_bounds_internal(node, cached_bounds, buffer, width, height, clip, true);
+}
+
+fn draw_node_with_cached_bounds_internal(
+    node: &RenderNode,
+    cached_bounds: &CachedSubtreeBounds,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clip: ClipRect,
+    allow_surface_promotion: bool,
+) {
     if clip.is_empty()
         || cached_bounds
             .bounds
@@ -1551,7 +1890,7 @@ fn draw_node_with_cached_bounds(
         return;
     }
 
-    draw_node_contents(
+    draw_node_contents_internal(
         node,
         cached_bounds,
         buffer,
@@ -1560,9 +1899,11 @@ fn draw_node_with_cached_bounds(
         clip,
         None,
         false,
+        allow_surface_promotion,
     );
 }
 
+#[allow(dead_code)]
 fn draw_node_contents(
     node: &RenderNode,
     cached_bounds: &CachedSubtreeBounds,
@@ -1573,8 +1914,32 @@ fn draw_node_contents(
     parent_perspective: Option<PerspectiveContext>,
     in_3d_context: bool,
 ) {
+    draw_node_contents_internal(
+        node,
+        cached_bounds,
+        buffer,
+        width,
+        height,
+        clip,
+        parent_perspective,
+        in_3d_context,
+        true,
+    );
+}
+
+fn draw_node_contents_internal(
+    node: &RenderNode,
+    cached_bounds: &CachedSubtreeBounds,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clip: ClipRect,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    allow_surface_promotion: bool,
+) {
     if node_requires_projected_path(node) {
-        draw_node_transformed(
+        draw_node_transformed_internal(
             node,
             cached_bounds,
             buffer,
@@ -1584,6 +1949,7 @@ fn draw_node_contents(
             parent_perspective,
             &ClipState::new(clip),
             in_3d_context,
+            allow_surface_promotion,
         );
         return;
     }
@@ -1646,7 +2012,7 @@ fn draw_node_contents(
     let child_perspective = active_child_perspective(node, parent_perspective, child_context);
     for (child, child_bounds) in node.children.iter().zip(&cached_bounds.children) {
         if !node_requires_projected_path(child) {
-            draw_node_contents(
+            draw_node_contents_internal(
                 child,
                 child_bounds,
                 buffer,
@@ -1655,9 +2021,10 @@ fn draw_node_contents(
                 child_clip,
                 child_perspective,
                 child_context,
+                allow_surface_promotion,
             );
         } else {
-            draw_node_transformed(
+            draw_node_transformed_internal(
                 child,
                 child_bounds,
                 buffer,
@@ -1667,6 +2034,7 @@ fn draw_node_contents(
                 child_perspective,
                 &ClipState::new(child_clip),
                 child_context,
+                allow_surface_promotion,
             );
         }
     }
@@ -2148,6 +2516,7 @@ fn layout_contains(layout: LayoutBox, x: f32, y: f32) -> bool {
     x >= layout.x && y >= layout.y && x < layout.x + layout.width && y < layout.y + layout.height
 }
 
+#[allow(dead_code)]
 fn draw_node_transformed(
     node: &RenderNode,
     cached_bounds: &CachedSubtreeBounds,
@@ -2159,6 +2528,32 @@ fn draw_node_transformed(
     clip_state: &ClipState,
     in_3d_context: bool,
 ) {
+    draw_node_transformed_internal(
+        node,
+        cached_bounds,
+        buffer,
+        width,
+        height,
+        parent_world_matrix,
+        parent_perspective,
+        clip_state,
+        in_3d_context,
+        true,
+    );
+}
+
+fn draw_node_transformed_internal(
+    node: &RenderNode,
+    cached_bounds: &CachedSubtreeBounds,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
+    clip_state: &ClipState,
+    in_3d_context: bool,
+    allow_surface_promotion: bool,
+) {
     let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
         node.layout,
         &node.style.transform,
@@ -2168,6 +2563,20 @@ fn draw_node_transformed(
     else {
         return;
     };
+
+    if allow_surface_promotion && node_can_use_promoted_surface(node, cached_bounds) {
+        if let Some(surface) = cached_promoted_surface(node, width, height) {
+            draw_cached_surface_transformed(
+                buffer,
+                width,
+                height,
+                surface.as_ref(),
+                matrix,
+                clip_state,
+            );
+            return;
+        }
+    }
 
     for shadow in &node.style.shadows {
         shadow::draw_shadow_transformed(
@@ -2244,7 +2653,7 @@ fn draw_node_transformed(
     for entry in children {
         let child = &node.children[entry.index];
         let child_bounds = &cached_bounds.children[entry.index];
-        draw_node_transformed(
+        draw_node_transformed_internal(
             child,
             child_bounds,
             buffer,
@@ -2254,6 +2663,7 @@ fn draw_node_transformed(
             child_perspective,
             &child_clip_state,
             child_context,
+            allow_surface_promotion,
         );
     }
 
@@ -3436,6 +3846,34 @@ mod tests {
     const FLAG_MOUSE_UP: usize = 1 << 8;
     const FLAG_CONTEXT_MENU: usize = 1 << 9;
     const FLAG_DBLCLICK: usize = 1 << 10;
+
+    fn promoted_surface_scene(transform: Transform2D, child_color: Color) -> Vec<RenderNode> {
+        vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 120.0, 90.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(245, 247, 250)),
+                ..VisualStyle::default()
+            })
+            .with_child(
+                RenderNode::container(LayoutBox::new(24.0, 18.0, 56.0, 40.0)).with_style(
+                    VisualStyle {
+                        background: Some(Color::rgb(40, 120, 220)),
+                        corner_radius: CornerRadius::all(10.0),
+                        transform,
+                        ..VisualStyle::default()
+                    },
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(30.0, 24.0, 18.0, 12.0)).with_style(
+                        VisualStyle {
+                            background: Some(child_color),
+                            corner_radius: CornerRadius::all(4.0),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+            ),
+        ]
+    }
 
     fn increment_click_count() {
         CLICK_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -4652,6 +5090,102 @@ mod tests {
         );
         assert_eq!(buffer[12 * 48 + 12], pack_rgb(Color::WHITE));
         assert_eq!(buffer[12 * 48 + 34], accent);
+    }
+
+    #[test]
+    fn transformed_subtrees_promote_into_cached_surfaces() {
+        let _surface_cache_guard = super::lock_subtree_surface_cache_for_tests();
+        super::clear_subtree_surface_cache_for_tests();
+        let scene = promoted_surface_scene(
+            Transform2D {
+                operations: vec![TransformOperation::Translate {
+                    x: LengthPercentageValue::from_px(18.0),
+                    y: LengthPercentageValue::from_px(6.0),
+                }],
+                ..Transform2D::default()
+            },
+            Color::rgb(220, 38, 38),
+        );
+        let mut buffer = vec![0_u32; 120 * 90];
+
+        render_to_buffer(&scene, &mut buffer, 120, 90, Color::WHITE);
+
+        assert_eq!(super::subtree_surface_cache_builds_for_tests(), 1);
+        assert!(buffer.contains(&pack_rgb(Color::rgb(220, 38, 38))));
+    }
+
+    #[test]
+    fn promoted_surfaces_reuse_cached_rasters_across_transform_only_updates() {
+        let _surface_cache_guard = super::lock_subtree_surface_cache_for_tests();
+        super::clear_subtree_surface_cache_for_tests();
+        let previous = promoted_surface_scene(
+            Transform2D {
+                operations: vec![TransformOperation::Translate {
+                    x: LengthPercentageValue::from_px(8.0),
+                    y: LengthPercentageValue::from_px(4.0),
+                }],
+                ..Transform2D::default()
+            },
+            Color::rgb(22, 163, 74),
+        );
+        let next = promoted_surface_scene(
+            Transform2D {
+                operations: vec![TransformOperation::Translate {
+                    x: LengthPercentageValue::from_px(22.0),
+                    y: LengthPercentageValue::from_px(10.0),
+                }],
+                ..Transform2D::default()
+            },
+            Color::rgb(22, 163, 74),
+        );
+        let mut incremental = vec![0_u32; 120 * 90];
+        let mut full = vec![0_u32; 120 * 90];
+
+        render_to_buffer(&previous, &mut incremental, 120, 90, Color::WHITE);
+        assert_eq!(super::subtree_surface_cache_builds_for_tests(), 1);
+
+        let stats =
+            render_scene_update_internal(&previous, &next, &mut incremental, 120, 90, Color::WHITE);
+        render_to_buffer(&next, &mut full, 120, 90, Color::WHITE);
+
+        assert_eq!(super::subtree_surface_cache_builds_for_tests(), 1);
+        assert_eq!(stats.mode, FramePaintMode::Incremental);
+        assert_eq!(stats.reason, FramePaintReason::IncrementalDamage);
+        assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn promoted_surfaces_invalidate_when_subtree_content_changes() {
+        let _surface_cache_guard = super::lock_subtree_surface_cache_for_tests();
+        super::clear_subtree_surface_cache_for_tests();
+        let previous = promoted_surface_scene(
+            Transform2D {
+                operations: vec![TransformOperation::Translate {
+                    x: LengthPercentageValue::from_px(12.0),
+                    y: LengthPercentageValue::from_px(6.0),
+                }],
+                ..Transform2D::default()
+            },
+            Color::rgb(14, 165, 233),
+        );
+        let next = promoted_surface_scene(
+            Transform2D {
+                operations: vec![TransformOperation::Translate {
+                    x: LengthPercentageValue::from_px(12.0),
+                    y: LengthPercentageValue::from_px(6.0),
+                }],
+                ..Transform2D::default()
+            },
+            Color::rgb(168, 85, 247),
+        );
+        let mut previous_buffer = vec![0_u32; 120 * 90];
+        let mut next_buffer = vec![0_u32; 120 * 90];
+
+        render_to_buffer(&previous, &mut previous_buffer, 120, 90, Color::WHITE);
+        render_to_buffer(&next, &mut next_buffer, 120, 90, Color::WHITE);
+
+        assert_eq!(super::subtree_surface_cache_builds_for_tests(), 2);
+        assert_ne!(previous_buffer, next_buffer);
     }
 
     #[test]
