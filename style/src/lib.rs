@@ -4,7 +4,8 @@ use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
     Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, LayoutStyle,
-    OverflowMode, ScrollbarWidth, Style, TransformOperation, TransformOrigin, TransformStyleMode,
+    OverflowMode, ScrollbarWidth, Style, SvgPaint, TransformOperation, TransformOrigin,
+    TransformStyleMode,
     TransitionPropertyName, TransitionTimingFunction,
     fonts::{TextStyle, TextTransform},
 };
@@ -44,6 +45,7 @@ mod fonts;
 mod invalidation;
 mod render_tree;
 mod selectors;
+mod svg;
 mod transitions;
 mod variable_resolution;
 mod visual;
@@ -349,6 +351,9 @@ pub enum Declaration {
     Background(Color),
     BackgroundLayers(Vec<BackgroundLayerDeclaration>),
     Foreground(Color),
+    SvgFill(SvgPaint),
+    SvgStroke(SvgPaint),
+    SvgStrokeWidth(f32),
     FontFamilies(Vec<cssimpler_core::fonts::FontFamily>),
     FontSize(FontSizeDeclaration),
     FontWeight(FontWeightDeclaration),
@@ -490,6 +495,7 @@ pub fn resolve_style_with_interaction(
         element.style.clone(),
         None,
         None,
+        None,
         &[],
         interaction,
         element_path,
@@ -502,6 +508,7 @@ fn resolve_style_target(
     stylesheet: &Stylesheet,
     mut resolved: Style,
     inherited_text: Option<&TextStyle>,
+    inherited_foreground: Option<Color>,
     inherited_custom_properties: Option<&CustomProperties>,
     ancestors: &[ElementRef<'_>],
     interaction: &ElementInteractionState,
@@ -510,6 +517,9 @@ fn resolve_style_target(
 ) -> Style {
     if let Some(inherited_text) = inherited_text {
         resolved.visual.text = inherited_text.clone();
+    }
+    if let Some(inherited_foreground) = inherited_foreground {
+        resolved.visual.foreground = inherited_foreground;
     }
     if let Some(inherited_custom_properties) = inherited_custom_properties {
         custom_properties::inherit(&mut resolved, inherited_custom_properties);
@@ -1796,6 +1806,7 @@ mod tests {
         let resolved = resolve_element_tree(
             &root,
             &stylesheet,
+            None,
             None,
             None,
             &[],

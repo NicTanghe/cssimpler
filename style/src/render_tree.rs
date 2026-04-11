@@ -1,6 +1,6 @@
 use cssimpler_core::{
-    CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandlers, Insets,
-    LayoutBox, Node, RenderNode, ScrollbarData, Style, TransitionStyle,
+    Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandlers,
+    Insets, LayoutBox, Node, RenderNode, ScrollbarData, Style, SvgScene, TransitionStyle,
     fonts::{PreparedTextLayout, TextStyle, layout_text_block},
 };
 use taffy::geometry::Size as TaffySize;
@@ -10,12 +10,14 @@ use taffy::prelude::{
 };
 
 use crate::{ElementRef, PseudoElementKind, Stylesheet};
+use crate::svg::{is_supported_svg_tag, resolve_svg_root, seed_element_style};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedElement {
     pub(crate) element_id: Option<String>,
     pub(crate) style: Style,
     pub(crate) text: String,
+    pub(crate) svg_scene: Option<SvgScene>,
     pub(crate) element_path: ElementPath,
     pub(crate) handlers: EventHandlers,
     pub(crate) children: Vec<ResolvedElement>,
@@ -27,6 +29,7 @@ struct LayoutTree {
     element_id: Option<String>,
     style: Style,
     text: String,
+    svg_scene: Option<SvgScene>,
     element_path: ElementPath,
     handlers: EventHandlers,
     children: Vec<LayoutTree>,
@@ -73,6 +76,7 @@ pub fn rebuild_render_tree_with_cached_layout(
     let resolved = resolve_element_tree(
         root_element,
         stylesheet,
+        None,
         None,
         None,
         &[],
@@ -139,6 +143,7 @@ pub(crate) fn resolve_element_tree(
     element: &ElementNode,
     stylesheet: &Stylesheet,
     inherited_text: Option<&TextStyle>,
+    inherited_foreground: Option<Color>,
     inherited_custom_properties: Option<&CustomProperties>,
     ancestors: &[ElementRef<'_>],
     interaction: &ElementInteractionState,
@@ -147,14 +152,40 @@ pub(crate) fn resolve_element_tree(
     let style = crate::resolve_style_target(
         element,
         stylesheet,
-        element.style.clone(),
+        seed_element_style(element),
         inherited_text,
+        inherited_foreground,
         inherited_custom_properties,
         ancestors,
         interaction,
         element_path,
         None,
     );
+    if element.tag == "svg" {
+        let resolved_svg = resolve_svg_root(
+            element,
+            stylesheet,
+            style,
+            ancestors,
+            interaction,
+            element_path,
+        );
+        return ResolvedElement {
+            element_id: element.id.clone(),
+            style: resolved_svg.style,
+            text: String::new(),
+            svg_scene: Some(resolved_svg.scene),
+            element_path: element_path.clone(),
+            handlers: element.handlers,
+            children: Vec::new(),
+        };
+    }
+    if is_supported_svg_tag(&element.tag) {
+        panic!(
+            "supported SVG elements must appear inside <svg>, found <{}> at {:?}",
+            element.tag, element_path
+        );
+    }
     let mut child_ancestors = Vec::with_capacity(ancestors.len() + 1);
     child_ancestors.push(ElementRef::from(element));
     child_ancestors.extend_from_slice(ancestors);
@@ -188,6 +219,7 @@ pub(crate) fn resolve_element_tree(
             element_id: element.id.clone(),
             style,
             text: direct_text,
+            svg_scene: None,
             element_path: element_path.clone(),
             handlers: element.handlers,
             children: Vec::new(),
@@ -211,6 +243,7 @@ pub(crate) fn resolve_element_tree(
                     child,
                     stylesheet,
                     Some(&style.visual.text),
+                    Some(style.visual.foreground),
                     Some(&style.custom_properties),
                     &child_ancestors,
                     interaction,
@@ -229,6 +262,7 @@ pub(crate) fn resolve_element_tree(
         element_id: element.id.clone(),
         style,
         text: String::new(),
+        svg_scene: None,
         element_path: element_path.clone(),
         handlers: element.handlers,
         children,
@@ -249,6 +283,7 @@ fn build_render_tree_with_available_space(
     let resolved = resolve_element_tree(
         root_element,
         stylesheet,
+        None,
         None,
         None,
         &[],
@@ -306,6 +341,7 @@ fn build_layout_tree(
         element_id: resolved.element_id.clone(),
         style: resolved.style.clone(),
         text: resolved.text.clone(),
+        svg_scene: resolved.svg_scene.clone(),
         element_path: resolved.element_path.clone(),
         handlers: resolved.handlers,
         children,
@@ -345,6 +381,21 @@ fn render_node_from_layout(
         .collect();
     let content_inset = content_inset_from_taffy(&tree.style.layout.taffy);
     let scrollbars = crate::visual::scrollbars_from_layout(&tree.style, &layout);
+
+    if let Some(svg_scene) = &tree.svg_scene {
+        let mut node = RenderNode::svg(layout_box, svg_scene.clone())
+            .with_style(tree.style.visual.clone())
+            .with_transitions(tree.style.transitions.clone())
+            .with_element_path(tree.element_path.clone())
+            .with_content_inset(content_inset);
+        if let Some(element_id) = &tree.element_id {
+            node = node.with_element_id(element_id.clone());
+        }
+        if let Some(scrollbars) = scrollbars {
+            node = node.with_scrollbars(scrollbars);
+        }
+        return apply_layout_tree_handlers(node, tree);
+    }
 
     if child_nodes.is_empty() && !tree.text.is_empty() {
         let text_layout = text_layout_from_measure_context(
@@ -396,6 +447,7 @@ fn resolve_pseudo_element_tree(
         stylesheet,
         Style::default(),
         Some(&inherited_style.visual.text),
+        Some(inherited_style.visual.foreground),
         Some(&inherited_style.custom_properties),
         ancestors,
         interaction,
@@ -414,6 +466,7 @@ fn resolve_pseudo_element_tree(
         element_id: None,
         style,
         text,
+        svg_scene: None,
         element_path: element_path.clone(),
         handlers: EventHandlers::default(),
         children: Vec::new(),
@@ -444,6 +497,7 @@ fn flush_text_child(
         element_id: None,
         style: text_child_style(parent_style),
         text: std::mem::take(pending_text),
+        svg_scene: None,
         element_path: element_path.clone(),
         handlers: EventHandlers::default(),
         children: Vec::new(),
@@ -463,6 +517,28 @@ fn render_node_with_cached_layout(
 
     let content_inset = content_inset_from_taffy(&resolved.style.layout.taffy);
     let scrollbars = scrollbars_with_cached_metrics(&resolved.style, template)?;
+
+    if let Some(svg_scene) = &resolved.svg_scene {
+        let cssimpler_core::RenderKind::Svg(_) = &template.kind else {
+            return None;
+        };
+        if !template.children.is_empty() {
+            return None;
+        }
+
+        let mut node = RenderNode::svg(template.layout, svg_scene.clone())
+            .with_style(resolved.style.visual.clone())
+            .with_transitions(resolved.style.transitions.clone())
+            .with_element_path(resolved.element_path.clone())
+            .with_content_inset(content_inset);
+        if let Some(element_id) = &resolved.element_id {
+            node = node.with_element_id(element_id.clone());
+        }
+        if let Some(scrollbars) = scrollbars {
+            node = node.with_scrollbars(scrollbars);
+        }
+        return Some(apply_resolved_handlers(node, resolved));
+    }
 
     if resolved.children.is_empty() && !resolved.text.is_empty() {
         if !matches!(template.kind, cssimpler_core::RenderKind::Text(_))

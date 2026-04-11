@@ -13,6 +13,7 @@ mod gradient;
 mod scrollbar;
 mod shadow;
 mod shapes;
+mod svg;
 mod transform;
 
 use self::{
@@ -1996,6 +1997,8 @@ fn draw_node_contents_internal(
             &node.style,
             text_clip,
         );
+    } else if let RenderKind::Svg(scene) = &node.kind {
+        svg::draw_svg_scene(buffer, width, height, node.layout, scene, clip);
     }
 
     let child_clip = if node.style.overflow.clips_any_axis() {
@@ -2630,6 +2633,16 @@ fn draw_node_transformed_internal(
             &node.style,
             matrix,
             &text_clip_state,
+        );
+    } else if let RenderKind::Svg(scene) = &node.kind {
+        svg::draw_svg_scene_transformed(
+            buffer,
+            width,
+            height,
+            node.layout,
+            scene,
+            matrix,
+            clip_state,
         );
     }
 
@@ -3378,6 +3391,11 @@ fn node_own_visual_bounds_untransformed(node: &RenderNode) -> Option<ClipRect> {
             }
         }
         RenderKind::Container => {
+            for shadow in &node.style.filter_drop_shadows {
+                bounds = union_optional_bounds(bounds, shadow_effect_bounds(node.layout, *shadow));
+            }
+        }
+        RenderKind::Svg(_) => {
             for shadow in &node.style.filter_drop_shadows {
                 bounds = union_optional_bounds(bounds, shadow_effect_bounds(node.layout, *shadow));
             }

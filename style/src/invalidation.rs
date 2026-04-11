@@ -83,6 +83,9 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         Declaration::Background(_)
         | Declaration::BackgroundLayers(_)
         | Declaration::Foreground(_)
+        | Declaration::SvgFill(_)
+        | Declaration::SvgStroke(_)
+        | Declaration::SvgStrokeWidth(_)
         | Declaration::CornerTopLeft(_)
         | Declaration::CornerTopRight(_)
         | Declaration::CornerBottomRight(_)
@@ -156,6 +159,9 @@ fn variable_property_invalidation(property_name: &str) -> StyleInvalidation {
         | "background-color"
         | "background-image"
         | "color"
+        | "fill"
+        | "stroke"
+        | "stroke-width"
         | "border-color"
         | "border-top-color"
         | "border-right-color"

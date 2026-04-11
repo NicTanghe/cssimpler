@@ -5,6 +5,7 @@ pub mod fonts;
 pub mod generated_content;
 pub mod interaction;
 pub mod scrollbar;
+pub mod svg;
 pub mod transitions;
 
 use crate::fonts::{PreparedTextLayout, TextStyle};
@@ -18,6 +19,10 @@ pub use interaction::{ElementInteractionState, ElementPath};
 pub use scrollbar::{
     OverflowMode, ScrollbarAxisState, ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics,
     ScrollbarStyle, ScrollbarWidth,
+};
+pub use svg::{
+    SvgBounds, SvgContour, SvgPaint, SvgPathGeometry, SvgPathInstance, SvgPathPaint, SvgPoint,
+    SvgScene, SvgStyle, SvgViewBox,
 };
 pub use transitions::{
     TransitionEntry, TransitionPropertyName, TransitionStyle, TransitionTimingFunction,
@@ -613,6 +618,7 @@ pub struct VisualStyle {
     pub background: Option<Color>,
     pub background_layers: Vec<BackgroundLayer>,
     pub foreground: Color,
+    pub svg: SvgStyle,
     pub text: TextStyle,
     pub text_stroke: TextStrokeStyle,
     pub text_shadows: Vec<ShadowEffect>,
@@ -633,6 +639,7 @@ impl Default for VisualStyle {
             background: None,
             background_layers: Vec::new(),
             foreground: Color::BLACK,
+            svg: SvgStyle::default(),
             text: TextStyle::default(),
             text_stroke: TextStrokeStyle::default(),
             text_shadows: Vec::new(),
@@ -681,6 +688,7 @@ impl LayoutBox {
 pub enum RenderKind {
     Container,
     Text(String),
+    Svg(SvgScene),
 }
 
 #[derive(Clone, Debug)]
@@ -718,6 +726,22 @@ impl RenderNode {
     pub fn text(layout: LayoutBox, content: impl Into<String>) -> Self {
         Self {
             kind: RenderKind::Text(content.into()),
+            layout,
+            style: VisualStyle::default(),
+            transitions: TransitionStyle::default(),
+            text_layout: None,
+            element_id: None,
+            element_path: None,
+            content_inset: Insets::ZERO,
+            scrollbars: None,
+            handlers: EventHandlers::default(),
+            children: Vec::new(),
+        }
+    }
+
+    pub fn svg(layout: LayoutBox, scene: SvgScene) -> Self {
+        Self {
+            kind: RenderKind::Svg(scene),
             layout,
             style: VisualStyle::default(),
             transitions: TransitionStyle::default(),

@@ -3,6 +3,7 @@ mod color;
 mod gradient;
 mod scrollbar;
 mod shadow;
+mod svg;
 mod transform;
 
 pub use gradient::BackgroundLayerDeclaration;
@@ -43,6 +44,9 @@ pub(crate) fn extract_property(
             Some(gradient::background_image_declarations(images.as_slice()))
         }
         Property::Color(color) => Some(color::foreground_color_declaration(color)),
+        Property::Fill(paint) => Some(svg::fill_declaration(paint)),
+        Property::Stroke(paint) => Some(svg::stroke_declaration(paint)),
+        Property::StrokeWidth(value) => Some(svg::stroke_width_declaration(value)),
         Property::BorderRadius(radius, _) => Some(border::border_radius_declarations(radius)),
         Property::BorderTopLeftRadius(radius, _) => {
             Some(border::border_top_left_radius_declaration(radius))
@@ -105,6 +109,18 @@ pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) ->
         }
         Declaration::Foreground(color) => {
             color::apply_foreground(style, *color);
+            true
+        }
+        Declaration::SvgFill(paint) => {
+            svg::apply_svg_fill(style, *paint);
+            true
+        }
+        Declaration::SvgStroke(paint) => {
+            svg::apply_svg_stroke(style, *paint);
+            true
+        }
+        Declaration::SvgStrokeWidth(width) => {
+            svg::apply_svg_stroke_width(style, *width);
             true
         }
         Declaration::CornerTopLeft(value) => {

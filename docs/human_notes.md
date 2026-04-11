@@ -23,3 +23,7 @@ If we were profiling this renderer, these would be the first things I’d invest
 - Long-term: a GPU backend. The current architecture is already clean enough that RenderNode is a decent scene representation for a future GPU painter.
 
 Use Vello as renderer when transitioning to GPU also supporting lottie whould be neat.
+
+
+something is wrong with the 3d transform animations,
+THey seem unaturally slow.
