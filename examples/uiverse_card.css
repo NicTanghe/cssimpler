@@ -40,14 +40,13 @@
   border-left: 1px solid #ffffff;
   border-bottom: 1px solid #ffffff;
   background: linear-gradient(0deg, rgba(255, 255, 255, 0.35) 0%, rgba(255, 255, 255, 0.82) 100%);
-  transform: translate3d(0px, 0px, 25px);
+  transform: translate3d(0px, 0px, 12px);
   transform-style: preserve-3d;
-  transition: transform 0.5s ease-in-out, border-top-right-radius 0.5s ease-in-out;
+  transition: transform 0.5s ease-in-out;
 }
 
 .uiverse-card-demo .parent:hover .glass {
-  transform: translate3d(0px, 0px, 36px);
-  border-top-right-radius: 80%;
+  transform: translate3d(0px, 0px, 12px);
 }
 
 .uiverse-card-demo .logo {
@@ -57,7 +56,7 @@
   width: 92px;
   height: 92px;
   transform-style: preserve-3d;
-  transform: translate3d(0px, 0px, 42px);
+  transform: translate3d(0px, 0px, 56px);
 }
 
 .uiverse-card-demo .circle {
@@ -129,7 +128,8 @@
 
 .uiverse-card-demo .content {
   padding: 100px 60px 0px 30px;
-  transform: translate3d(0px, 0px, 26px);
+  transform: translate3d(0px, 0px, 44px);
+  transform-style: preserve-3d;
 }
 
 .uiverse-card-demo .content .title {
@@ -148,6 +148,14 @@
   line-height: 1.45;
 }
 
+.uiverse-card-demo .parent:hover .content .title {
+  color: #00894d;
+}
+
+.uiverse-card-demo .parent:hover .content .text {
+  color: rgba(0, 137, 78, 0.76);
+}
+
 .uiverse-card-demo .bottom {
   position: absolute;
   left: 20px;
@@ -157,7 +165,7 @@
   justify-content: space-between;
   align-items: center;
   padding: 10px 12px;
-  transform: translate3d(0px, 0px, 26px);
+  transform: translate3d(0px, 0px, 44px);
   transform-style: preserve-3d;
 }
 
@@ -223,6 +231,10 @@
   font-size: 12px;
   font-weight: 800;
   letter-spacing: 0.3px;
+}
+
+.uiverse-card-demo .parent:hover .view-more-button {
+  color: #00c37b;
 }
 
 .uiverse-card-demo .view-more .svg {

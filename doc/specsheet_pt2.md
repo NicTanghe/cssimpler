@@ -190,6 +190,77 @@ Acceptance:
 
 ---
 
+# Epic RB - Transform-aware anti-aliasing and reconstruction
+
+## RB1. Transformed text resampling
+Depends: H4, R1  
+Status: planned  
+
+Purpose:
+- Keep text readable under supported 2D and 3D transforms without requiring full-frame supersampling
+
+Should have been an extension:
+- This would ideally have extended H4 and R1 because it refines how already-supported transformed text is sampled at paint time
+
+Support:
+- Bilinear or equivalent smooth resampling for transformed text masks
+- Grayscale anti-aliasing behavior for transformed text paths
+- Deterministic handling for transformed text stroke and shadow masks
+- Explicit guidance that small body text should prefer flat presentation when visual quality would otherwise degrade
+
+Acceptance:
+- Tilted or rotated labels no longer show nearest-neighbor stair stepping at normal UI sizes
+- Transformed text remains visually stable across fractional movement and repeated frames
+- Text stroke and shadow effects continue to align with the transformed glyph body
+
+---
+
+## RB2. Coverage AA for transformed shapes
+Depends: E3, P2, R1  
+Status: planned  
+
+Purpose:
+- Replace binary inside-or-outside sampling for transformed boxes, borders, and rounded corners with cleaner edge coverage at CPU-friendly cost
+
+Should have been an extension:
+- This would ideally have extended E3, P2, and R1 because it is a paint-quality improvement over the existing transformed shape path
+
+Support:
+- Edge coverage AA for transformed filled rectangles and rounded rectangles
+- Edge coverage AA for transformed border rings and rounded border rings
+- Coverage evaluation that stays localized to edge pixels instead of turning into full-scene supersampling
+- Deterministic clipping interaction with transformed overflow and rounded corners
+
+Acceptance:
+- Projected card silhouettes no longer show hard binary stair steps along curved edges
+- Rounded borders remain visually continuous under rotateX and rotateY
+- The AA path does not require a full-frame supersampled render target
+
+---
+
+## RB3. Selective composited AA for transformed layers
+Depends: Q1, Q2, RB1, RB2  
+Status: planned  
+
+Purpose:
+- Add a higher-quality fallback for transform-heavy UI like tilted cards by flattening selected subtrees into intermediate surfaces and applying a localized cleanup pass
+
+Should have been an extension:
+- This would ideally have extended Q1 and Q2 because it builds directly on offscreen subtree surfaces and their invalidation rules
+
+Support:
+- Raster selected transform-heavy subtrees into intermediate surfaces
+- Optional higher-resolution surface rasterization for selected layers only
+- A localized CMAA-like or equivalent post-process cleanup pass on the composited surface instead of on the full frame
+- Conservative memory and invalidation budgeting so the feature stays practical on the CPU renderer
+
+Acceptance:
+- A transformed card subtree can render more cleanly without enabling full-frame post-AA
+- Small transformed text and curved card edges improve together when the subtree is promoted to a surface
+- Surface allocation, reuse, and invalidation stay deterministic under hover and motion updates
+
+---
+
 # Epic S - SVG and vector graphics subset
 
 ## S1. Vector DOM and render tree support
