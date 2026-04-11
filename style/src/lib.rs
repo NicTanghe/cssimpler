@@ -373,6 +373,7 @@ pub enum Declaration {
     BoxShadows(Vec<ShadowDeclaration>),
     TextShadows(Vec<ShadowDeclaration>),
     FilterDropShadows(Vec<ShadowDeclaration>),
+    BackdropBlur(f32),
     TextStrokeWidth(f32),
     TextStrokeColor(Option<Color>),
     TransformOperations(Vec<TransformOperation>),
@@ -1652,6 +1653,44 @@ mod tests {
                     spread: 0.0,
                 }]))
         );
+    }
+
+    #[test]
+    fn parser_supports_backdrop_blur_and_vendor_alias() {
+        let stylesheet = parse_stylesheet(
+            ".glass {
+                -webkit-backdrop-filter: blur(8px);
+                backdrop-filter: blur(8px);
+            }",
+        )
+        .expect("backdrop blur stylesheet should parse");
+        let blur_count = stylesheet.rules[0]
+            .declarations
+            .iter()
+            .filter(|declaration| match declaration {
+                Declaration::BackdropBlur(radius) => (*radius - 8.0).abs() < f32::EPSILON,
+                _ => false,
+            })
+            .count();
+
+        assert_eq!(blur_count, 2);
+
+        let tree = Node::element("div").with_class("glass").into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        assert_eq!(scene.style.backdrop_blur_radius, 8.0);
+    }
+
+    #[test]
+    fn unsupported_backdrop_filter_values_fail_clearly() {
+        let error = parse_stylesheet(".glass { backdrop-filter: saturate(1.2); }")
+            .expect_err("unsupported backdrop-filter should fail clearly");
+
+        assert!(matches!(
+            error,
+            StyleError::UnsupportedValue(message)
+                if message.contains("only blur() is supported")
+        ));
     }
 
     #[test]

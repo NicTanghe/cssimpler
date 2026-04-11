@@ -98,6 +98,7 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::BoxShadows(_)
         | Declaration::TextShadows(_)
         | Declaration::FilterDropShadows(_)
+        | Declaration::BackdropBlur(_)
         | Declaration::TextStrokeWidth(_)
         | Declaration::TextStrokeColor(_)
         | Declaration::TransformOperations(_)
@@ -170,6 +171,8 @@ fn variable_property_invalidation(property_name: &str) -> StyleInvalidation {
         | "box-shadow"
         | "text-shadow"
         | "filter"
+        | "backdrop-filter"
+        | "-webkit-backdrop-filter"
         | "-webkit-text-stroke"
         | "-webkit-text-stroke-width"
         | "-webkit-text-stroke-color"

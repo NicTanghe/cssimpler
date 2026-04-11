@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod backdrop;
 mod fonts;
 mod gradient;
 mod scrollbar;
@@ -484,6 +485,7 @@ fn node_can_use_promoted_surface(node: &RenderNode, cached_bounds: &CachedSubtre
         && !node.style.transform.uses_depth()
         && node.style.perspective.is_none()
         && node.style.transform_style == TransformStyleMode::Flat
+        && !cached_bounds.subtree_uses_backdrop_blur
         && !cached_bounds.subtree_uses_depth
         && !node.children.is_empty()
 }
@@ -1119,7 +1121,15 @@ fn render_to_buffer_internal_with_cached_bounds(
         owned_bounds = cache_scene_subtree_bounds(scene);
         &owned_bounds
     };
-    let worker_count = full_redraw_worker_count(width, height);
+    let worker_count = if cached_bounds
+        .roots
+        .iter()
+        .any(|root| root.subtree_uses_backdrop_blur)
+    {
+        1
+    } else {
+        full_redraw_worker_count(width, height)
+    };
     if worker_count <= 1 {
         render_to_buffer_serial(
             scene,
@@ -1273,6 +1283,13 @@ fn render_scene_update_internal(
     if dirty_regions.is_empty() {
         return PaintStats::default();
     }
+    let max_backdrop_blur_radius =
+        scene_max_backdrop_blur_radius(previous_scene).max(scene_max_backdrop_blur_radius(scene));
+    if max_backdrop_blur_radius > 0.0 {
+        dirty_regions.iter_mut().for_each(|region| {
+            *region = region.expand(max_backdrop_blur_radius);
+        });
+    }
 
     coalesce_dirty_regions(&mut dirty_regions);
     let full_clip = ClipRect::full(width as f32, height as f32);
@@ -1321,7 +1338,7 @@ fn render_scene_update_internal(
         return stats;
     }
 
-    if incremental_worker_count > 1 {
+    if max_backdrop_blur_radius <= 0.0 && incremental_worker_count > 1 {
         render_scene_update_parallel(
             scene,
             &scene_diff.current_bounds.roots,
@@ -1687,6 +1704,7 @@ struct CachedSubtreeBounds {
     own_bounds: Option<ClipRect>,
     bounds: Option<ClipRect>,
     subtree_uses_depth: bool,
+    subtree_uses_backdrop_blur: bool,
     children: Vec<CachedSubtreeBounds>,
 }
 
@@ -1839,6 +1857,16 @@ impl ClipRect {
         }
     }
 
+    fn expand(self, amount: f32) -> Self {
+        let amount = amount.max(0.0);
+        Self {
+            x0: self.x0 - amount,
+            y0: self.y0 - amount,
+            x1: self.x1 + amount,
+            y1: self.y1 + amount,
+        }
+    }
+
     fn overlaps_or_touches(self, other: Self) -> bool {
         self.x0 <= other.x1 && self.x1 >= other.x0 && self.y0 <= other.y1 && self.y1 >= other.y0
     }
@@ -1954,6 +1982,16 @@ fn draw_node_contents_internal(
         );
         return;
     }
+
+    backdrop::draw_backdrop_blur(
+        buffer,
+        width,
+        height,
+        node.layout,
+        node.style.corner_radius,
+        node.style.backdrop_blur_radius,
+        clip,
+    );
 
     for shadow in &node.style.shadows {
         draw_shadow(
@@ -2580,6 +2618,17 @@ fn draw_node_transformed_internal(
             return;
         }
     }
+
+    backdrop::draw_backdrop_blur_transformed(
+        buffer,
+        width,
+        height,
+        node.layout,
+        node.style.corner_radius,
+        node.style.backdrop_blur_radius,
+        matrix,
+        clip_state,
+    );
 
     for shadow in &node.style.shadows {
         shadow::draw_shadow_transformed(
@@ -3310,6 +3359,8 @@ fn cache_subtree_bounds(
             subtree_uses_depth: node.style.transform.uses_depth()
                 || node.style.perspective.is_some()
                 || children.iter().any(|child| child.subtree_uses_depth),
+            subtree_uses_backdrop_blur: node.style.backdrop_blur_radius > 0.0
+                || children.iter().any(|child| child.subtree_uses_backdrop_blur),
             children,
         };
     };
@@ -3353,8 +3404,23 @@ fn cache_subtree_bounds(
         subtree_uses_depth: node.style.transform.uses_depth()
             || node.style.perspective.is_some()
             || children.iter().any(|child| child.subtree_uses_depth),
+        subtree_uses_backdrop_blur: node.style.backdrop_blur_radius > 0.0
+            || children.iter().any(|child| child.subtree_uses_backdrop_blur),
         children,
     }
+}
+
+fn scene_max_backdrop_blur_radius(scene: &[RenderNode]) -> f32 {
+    scene.iter()
+        .map(node_max_backdrop_blur_radius)
+        .fold(0.0, f32::max)
+}
+
+fn node_max_backdrop_blur_radius(node: &RenderNode) -> f32 {
+    node.children
+        .iter()
+        .map(node_max_backdrop_blur_radius)
+        .fold(node.style.backdrop_blur_radius, f32::max)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -6716,6 +6782,106 @@ mod tests {
         let final_scene = scene(*widths.last().expect("sequence should not be empty"));
         let mut full = vec![0_u32; 200 * 96];
         render_to_buffer(&final_scene, &mut full, 200, 96, Color::WHITE);
+
+        assert_eq!(incremental, full);
+    }
+
+    fn split_backdrop_scene(panel_style: VisualStyle) -> Vec<RenderNode> {
+        let blue = Color::rgb(37, 99, 235);
+        let red = Color::rgb(239, 68, 68);
+        vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 16.0, 16.0)).with_style(VisualStyle {
+                background: Some(blue),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(16.0, 0.0, 16.0, 16.0)).with_style(
+                VisualStyle {
+                    background: Some(red),
+                    ..VisualStyle::default()
+                },
+            ),
+            RenderNode::container(LayoutBox::new(8.0, 4.0, 16.0, 8.0)).with_style(panel_style),
+        ]
+    }
+
+    fn strip_backdrop_scene(strip_color: Color) -> Vec<RenderNode> {
+        vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 32.0, 16.0)).with_style(VisualStyle {
+                background: Some(Color::WHITE),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(14.0, 0.0, 2.0, 16.0)).with_style(VisualStyle {
+                background: Some(strip_color),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(8.0, 4.0, 16.0, 8.0)).with_style(VisualStyle {
+                backdrop_blur_radius: 3.0,
+                corner_radius: CornerRadius::all(6.0),
+                ..VisualStyle::default()
+            }),
+        ]
+    }
+
+    #[test]
+    fn backdrop_blur_respects_rounded_bounds() {
+        let blue = Color::rgb(37, 99, 235);
+        let red = Color::rgb(239, 68, 68);
+        let scene = split_backdrop_scene(VisualStyle {
+            backdrop_blur_radius: 2.0,
+            corner_radius: CornerRadius::all(6.0),
+            ..VisualStyle::default()
+        });
+        let mut buffer = vec![0_u32; 32 * 16];
+
+        render_to_buffer(&scene, &mut buffer, 32, 16, Color::WHITE);
+
+        assert_eq!(buffer[4 * 32 + 8], pack_rgb(blue));
+        let center = buffer[8 * 32 + 16];
+        assert_ne!(center, pack_rgb(blue));
+        assert_ne!(center, pack_rgb(red));
+    }
+
+    #[test]
+    fn translated_backdrop_blur_uses_the_transformed_render_path() {
+        let panel_style = VisualStyle {
+            backdrop_blur_radius: 2.0,
+            corner_radius: CornerRadius::all(6.0),
+            transform: Transform2D {
+                operations: vec![TransformOperation::Translate {
+                    x: LengthPercentageValue::from_px(4.0),
+                    y: LengthPercentageValue::ZERO,
+                }],
+                ..Transform2D::default()
+            },
+            ..VisualStyle::default()
+        };
+        let transformed = split_backdrop_scene(panel_style.clone());
+        let baseline = split_backdrop_scene(VisualStyle {
+            transform: panel_style.transform.clone(),
+            ..VisualStyle::default()
+        });
+        let mut transformed_buffer = vec![0_u32; 32 * 16];
+        let mut baseline_buffer = vec![0_u32; 32 * 16];
+
+        render_to_buffer(&transformed, &mut transformed_buffer, 32, 16, Color::WHITE);
+        render_to_buffer(&baseline, &mut baseline_buffer, 32, 16, Color::WHITE);
+
+        let sample = transformed_buffer[8 * 32 + 16];
+        assert_ne!(sample, baseline_buffer[8 * 32 + 16]);
+        assert_ne!(sample, pack_rgb(Color::rgb(37, 99, 235)));
+        assert_ne!(sample, pack_rgb(Color::rgb(239, 68, 68)));
+    }
+
+    #[test]
+    fn incremental_backdrop_blur_matches_full_redraw_when_backdrop_changes() {
+        let previous = strip_backdrop_scene(Color::rgb(37, 99, 235));
+        let next = strip_backdrop_scene(Color::rgb(239, 68, 68));
+        let mut incremental = vec![0_u32; 32 * 16];
+        let mut full = vec![0_u32; 32 * 16];
+
+        render_to_buffer(&previous, &mut incremental, 32, 16, Color::WHITE);
+        render_scene_update(&previous, &next, &mut incremental, 32, 16, Color::WHITE);
+        render_to_buffer(&next, &mut full, 32, 16, Color::WHITE);
 
         assert_eq!(incremental, full);
     }
