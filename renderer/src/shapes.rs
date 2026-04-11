@@ -5,8 +5,26 @@ use super::{
     transform::{AffineTransform, ClipState},
 };
 
-const TRANSFORMED_EDGE_COVERAGE_SAMPLES: [(f32, f32); 4] =
+const TRANSFORMED_EDGE_COARSE_COVERAGE_SAMPLES: [(f32, f32); 4] =
     [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+const TRANSFORMED_EDGE_FINE_COVERAGE_SAMPLES: [(f32, f32); 16] = [
+    (0.125, 0.125),
+    (0.375, 0.125),
+    (0.625, 0.125),
+    (0.875, 0.125),
+    (0.125, 0.375),
+    (0.375, 0.375),
+    (0.625, 0.375),
+    (0.875, 0.375),
+    (0.125, 0.625),
+    (0.375, 0.625),
+    (0.625, 0.625),
+    (0.875, 0.625),
+    (0.125, 0.875),
+    (0.375, 0.875),
+    (0.625, 0.875),
+    (0.875, 0.875),
+];
 
 pub(crate) fn draw_rounded_rect(
     buffer: &mut [u32],
@@ -396,8 +414,45 @@ fn transformed_shape_coverage(
     y: i32,
     contains: impl Fn(f32, f32) -> bool,
 ) -> u8 {
+    let coarse_hits = transformed_shape_sample_hits(
+        TRANSFORMED_EDGE_COARSE_COVERAGE_SAMPLES,
+        inverse,
+        clip_state,
+        x,
+        y,
+        &contains,
+    );
+    if coarse_hits == 0 {
+        return 0;
+    }
+    if coarse_hits == TRANSFORMED_EDGE_COARSE_COVERAGE_SAMPLES.len() as u8 {
+        return u8::MAX;
+    }
+
+    let fine_hits = transformed_shape_sample_hits(
+        TRANSFORMED_EDGE_FINE_COVERAGE_SAMPLES,
+        inverse,
+        clip_state,
+        x,
+        y,
+        contains,
+    );
+    coverage_from_sample_hits(
+        fine_hits,
+        TRANSFORMED_EDGE_FINE_COVERAGE_SAMPLES.len() as u8,
+    )
+}
+
+fn transformed_shape_sample_hits<const N: usize>(
+    samples: [(f32, f32); N],
+    inverse: AffineTransform,
+    clip_state: &ClipState,
+    x: i32,
+    y: i32,
+    contains: impl Fn(f32, f32) -> bool,
+) -> u8 {
     let mut hits = 0_u8;
-    for (sample_x, sample_y) in TRANSFORMED_EDGE_COVERAGE_SAMPLES {
+    for (sample_x, sample_y) in samples {
         let screen_x = x as f32 + sample_x;
         let screen_y = y as f32 + sample_y;
         if !clip_state.contains(screen_x, screen_y) {
@@ -413,7 +468,7 @@ fn transformed_shape_coverage(
         }
     }
 
-    coverage_from_sample_hits(hits, TRANSFORMED_EDGE_COVERAGE_SAMPLES.len() as u8)
+    hits
 }
 
 fn coverage_from_sample_hits(hits: u8, total_samples: u8) -> u8 {
@@ -713,6 +768,20 @@ mod tests {
         );
 
         assert_eq!(coverage, 128);
+    }
+
+    #[test]
+    fn transformed_rounded_rect_coverage_uses_finer_edge_steps_when_needed() {
+        let coverage = transformed_rounded_rect_coverage(
+            LayoutBox::new(0.3, 0.0, 1.0, 1.0),
+            CornerRadius::default(),
+            AffineTransform::IDENTITY,
+            &ClipState::new(ClipRect::full(2.0, 2.0)),
+            0,
+            0,
+        );
+
+        assert_eq!(coverage, 191);
     }
 
     #[test]
