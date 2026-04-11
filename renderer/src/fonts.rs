@@ -1498,16 +1498,7 @@ mod tests {
         let mut direct = vec![pack_rgb(Color::WHITE); 4 * 2];
         let mut transformed = vec![pack_rgb(Color::WHITE); 4 * 2];
 
-        draw_mask(
-            &mut direct,
-            4,
-            2,
-            &mask,
-            Color::BLACK,
-            1,
-            0,
-            clip,
-        );
+        draw_mask(&mut direct, 4, 2, &mask, Color::BLACK, 1, 0, clip);
         draw_mask_transformed(
             &mut transformed,
             4,

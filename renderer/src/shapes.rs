@@ -2,7 +2,11 @@ use cssimpler_core::{Color, CornerRadius, Insets, LayoutBox};
 
 use super::{
     ClipRect, PreparedBlendColor, blend_prepared_pixel, current_render_buffer_rows, pack_rgb,
+    transform::{AffineTransform, ClipState},
 };
+
+const TRANSFORMED_EDGE_COVERAGE_SAMPLES: [(f32, f32); 4] =
+    [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
 
 pub(crate) fn draw_rounded_rect(
     buffer: &mut [u32],
@@ -309,6 +313,36 @@ pub(crate) fn union_optional_bounds(
     }
 }
 
+pub(crate) fn transformed_rounded_rect_coverage(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    inverse: AffineTransform,
+    clip_state: &ClipState,
+    x: i32,
+    y: i32,
+) -> u8 {
+    transformed_shape_coverage(inverse, clip_state, x, y, |source_x, source_y| {
+        point_in_rounded_rect(source_x, source_y, layout, radius)
+    })
+}
+
+pub(crate) fn transformed_rounded_ring_coverage(
+    outer_layout: LayoutBox,
+    outer_radius: CornerRadius,
+    inner: Option<(LayoutBox, CornerRadius)>,
+    inverse: AffineTransform,
+    clip_state: &ClipState,
+    x: i32,
+    y: i32,
+) -> u8 {
+    transformed_shape_coverage(inverse, clip_state, x, y, |source_x, source_y| {
+        point_in_rounded_rect(source_x, source_y, outer_layout, outer_radius)
+            && inner.is_none_or(|(inner_layout, inner_radius)| {
+                !point_in_rounded_rect(source_x, source_y, inner_layout, inner_radius)
+            })
+    })
+}
+
 pub(crate) fn fill_opaque_span_rows(
     buffer: &mut [u32],
     width: usize,
@@ -352,6 +386,41 @@ fn blend_prepared_span_row(
 
     for x in x0..x1 {
         blend_prepared_pixel(buffer, width, height, x, y, color);
+    }
+}
+
+fn transformed_shape_coverage(
+    inverse: AffineTransform,
+    clip_state: &ClipState,
+    x: i32,
+    y: i32,
+    contains: impl Fn(f32, f32) -> bool,
+) -> u8 {
+    let mut hits = 0_u8;
+    for (sample_x, sample_y) in TRANSFORMED_EDGE_COVERAGE_SAMPLES {
+        let screen_x = x as f32 + sample_x;
+        let screen_y = y as f32 + sample_y;
+        if !clip_state.contains(screen_x, screen_y) {
+            continue;
+        }
+
+        let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+        if !source_x.is_finite() || !source_y.is_finite() {
+            continue;
+        }
+        if contains(source_x, source_y) {
+            hits += 1;
+        }
+    }
+
+    coverage_from_sample_hits(hits, TRANSFORMED_EDGE_COVERAGE_SAMPLES.len() as u8)
+}
+
+fn coverage_from_sample_hits(hits: u8, total_samples: u8) -> u8 {
+    match hits {
+        0 => 0,
+        hits if hits >= total_samples => u8::MAX,
+        hits => ((hits as f32 / total_samples as f32) * 255.0).round() as u8,
     }
 }
 
@@ -562,7 +631,11 @@ fn point_in_corner(x: f32, y: f32, center_x: f32, center_y: f32, radius: f32) ->
 mod tests {
     use cssimpler_core::{Color, CornerRadius, LayoutBox};
 
-    use super::{draw_rounded_ring, point_in_rounded_rect, rounded_rect_row_span};
+    use super::{
+        draw_rounded_ring, point_in_rounded_rect, rounded_rect_row_span,
+        transformed_rounded_rect_coverage, transformed_rounded_ring_coverage,
+    };
+    use crate::transform::{AffineTransform, ClipState};
     use crate::{ClipRect, pack_rgb};
 
     #[test]
@@ -626,5 +699,34 @@ mod tests {
                 assert_eq!(buffer[y * 12 + x] == accent, expected);
             }
         }
+    }
+
+    #[test]
+    fn transformed_rounded_rect_coverage_reports_partial_edge_alpha() {
+        let coverage = transformed_rounded_rect_coverage(
+            LayoutBox::new(0.6, 0.0, 1.0, 1.0),
+            CornerRadius::default(),
+            AffineTransform::IDENTITY,
+            &ClipState::new(ClipRect::full(2.0, 2.0)),
+            0,
+            0,
+        );
+
+        assert_eq!(coverage, 128);
+    }
+
+    #[test]
+    fn transformed_rounded_ring_coverage_excludes_inner_samples() {
+        let coverage = transformed_rounded_ring_coverage(
+            LayoutBox::new(0.0, 0.0, 2.0, 2.0),
+            CornerRadius::default(),
+            Some((LayoutBox::new(0.5, 0.5, 1.0, 1.0), CornerRadius::default())),
+            AffineTransform::IDENTITY,
+            &ClipState::new(ClipRect::full(2.0, 2.0)),
+            0,
+            0,
+        );
+
+        assert_eq!(coverage, 191);
     }
 }

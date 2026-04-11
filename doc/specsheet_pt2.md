@@ -194,7 +194,7 @@ Acceptance:
 
 ## RB1. Transformed text resampling
 Depends: H4, R1  
-Status: planned  
+Status: implemented  
 
 Purpose:
 - Keep text readable under supported 2D and 3D transforms without requiring full-frame supersampling
@@ -240,7 +240,7 @@ Acceptance:
 
 ## RB3. Selective composited AA for transformed layers
 Depends: Q1, Q2, RB1, RB2  
-Status: planned  
+Status: probably just a waiste of memmory
 
 Purpose:
 - Add a higher-quality fallback for transform-heavy UI like tilted cards by flattening selected subtrees into intermediate surfaces and applying a localized cleanup pass

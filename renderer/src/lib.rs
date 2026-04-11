@@ -21,7 +21,8 @@ use self::{
     shapes::{
         clip_pixel_bounds, draw_axis_aligned_opaque_rect, draw_axis_aligned_opaque_ring,
         draw_rounded_rect, draw_rounded_ring, inset_corner_radius, inset_layout, layout_clip,
-        non_empty_layout_clip, offset_layout, point_in_rounded_rect, snap_clip_to_pixel_grid,
+        non_empty_layout_clip, offset_layout, snap_clip_to_pixel_grid,
+        transformed_rounded_rect_coverage, transformed_rounded_ring_coverage,
         union_optional_bounds,
     },
     transform::{
@@ -2441,17 +2442,14 @@ fn draw_transformed_rounded_rect(
     let row_end = rows.end.min(height) as i32;
     for y in y0.max(row_start)..y1.min(row_end) {
         for x in x0..x1 {
-            let screen_x = x as f32 + 0.5;
-            let screen_y = y as f32 + 0.5;
-            if !clip_state.contains(screen_x, screen_y) {
+            let coverage =
+                transformed_rounded_rect_coverage(layout, radius, inverse, clip_state, x, y);
+            if coverage == 0 {
                 continue;
             }
-
-            let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
-            if !point_in_rounded_rect(source_x, source_y, layout, radius) {
-                continue;
-            }
-            blend_prepared_pixel(buffer, width, height, x, y, prepared);
+            blend_prepared_pixel_with_coverage(
+                buffer, width, height, x, y, prepared, color.a, coverage,
+            );
         }
     }
 }
@@ -2488,22 +2486,21 @@ fn draw_transformed_rounded_ring(
     let row_end = rows.end.min(height) as i32;
     for y in y0.max(row_start)..y1.min(row_end) {
         for x in x0..x1 {
-            let screen_x = x as f32 + 0.5;
-            let screen_y = y as f32 + 0.5;
-            if !clip_state.contains(screen_x, screen_y) {
+            let coverage = transformed_rounded_ring_coverage(
+                outer_layout,
+                outer_radius,
+                inner,
+                inverse,
+                clip_state,
+                x,
+                y,
+            );
+            if coverage == 0 {
                 continue;
             }
-
-            let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
-            if !point_in_rounded_rect(source_x, source_y, outer_layout, outer_radius) {
-                continue;
-            }
-            if let Some((inner_layout, inner_radius)) = inner
-                && point_in_rounded_rect(source_x, source_y, inner_layout, inner_radius)
-            {
-                continue;
-            }
-            blend_prepared_pixel(buffer, width, height, x, y, prepared);
+            blend_prepared_pixel_with_coverage(
+                buffer, width, height, x, y, prepared, color.a, coverage,
+            );
         }
     }
 }
@@ -3107,6 +3104,31 @@ fn blend_prepared_pixel(
     }
 
     blend_linear_over(buffer, index, color.linear);
+}
+
+fn blend_prepared_pixel_with_coverage(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    color: PreparedBlendColor,
+    base_alpha: u8,
+    coverage: u8,
+) {
+    if coverage == 0 || base_alpha == 0 {
+        return;
+    }
+
+    let Some(index) = buffer_pixel_index(width, height, x, y) else {
+        return;
+    };
+    blend_mask_row(
+        &mut buffer[index..index + 1],
+        &[coverage],
+        color,
+        base_alpha,
+    );
 }
 
 fn blend_mask_row(
@@ -4687,6 +4709,46 @@ mod tests {
     }
 
     #[test]
+    fn rotate_y_face_emits_partial_edge_pixels() {
+        let accent = Color::rgb(16, 185, 129);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 400.0, 400.0))
+                .with_style(VisualStyle {
+                    perspective: Some(950.0),
+                    transform_style: TransformStyleMode::Preserve3d,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(90.0, 60.0, 220.0, 280.0)).with_style(
+                        VisualStyle {
+                            background: Some(accent),
+                            corner_radius: CornerRadius::all(28.0),
+                            transform_style: TransformStyleMode::Preserve3d,
+                            transform: Transform2D {
+                                operations: vec![TransformOperation::RotateY { degrees: 15.0 }],
+                                ..Transform2D::default()
+                            },
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 400 * 400];
+
+        render_to_buffer(&scene, &mut buffer, 400, 400, Color::WHITE);
+
+        let accent = pack_rgb(accent);
+        let white = pack_rgb(Color::WHITE);
+        assert!(
+            buffer
+                .iter()
+                .copied()
+                .any(|pixel| pixel != white && pixel != accent),
+            "transformed rounded faces should now produce partially covered edge pixels"
+        );
+    }
+
+    #[test]
     fn rotate_y_preserves_a_wide_projected_linear_gradient_face() {
         let scene = vec![
             RenderNode::container(LayoutBox::new(0.0, 0.0, 400.0, 400.0))
@@ -4757,6 +4819,49 @@ mod tests {
         assert!(
             x1 - x0 > 150,
             "rotateY(15deg) should keep a transformed gradient broad, not collapse it"
+        );
+    }
+
+    #[test]
+    fn rotate_y_border_emits_partial_edge_pixels() {
+        let border = Color::rgb(15, 23, 42);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 400.0, 400.0))
+                .with_style(VisualStyle {
+                    perspective: Some(950.0),
+                    transform_style: TransformStyleMode::Preserve3d,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(90.0, 60.0, 220.0, 280.0)).with_style(
+                        VisualStyle {
+                            border: cssimpler_core::BorderStyle {
+                                color: border,
+                                widths: Insets::all(6.0),
+                            },
+                            corner_radius: CornerRadius::all(28.0),
+                            transform_style: TransformStyleMode::Preserve3d,
+                            transform: Transform2D {
+                                operations: vec![TransformOperation::RotateY { degrees: 15.0 }],
+                                ..Transform2D::default()
+                            },
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 400 * 400];
+
+        render_to_buffer(&scene, &mut buffer, 400, 400, Color::WHITE);
+
+        let border = pack_rgb(border);
+        let white = pack_rgb(Color::WHITE);
+        assert!(
+            buffer
+                .iter()
+                .copied()
+                .any(|pixel| pixel != white && pixel != border),
+            "transformed rounded borders should now produce partially covered edge pixels"
         );
     }
 

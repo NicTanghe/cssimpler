@@ -9,7 +9,7 @@ use cssimpler_core::{
     RadialGradient, RadialShape, ShapeExtent,
 };
 
-use super::shapes::{pixel_bounds, point_in_rounded_rect, rounded_rect_row_span};
+use super::shapes::{pixel_bounds, rounded_rect_row_span, transformed_rounded_rect_coverage};
 use super::{
     ClipRect, blend_linear_over, clip_pixel_bounds, current_render_buffer_rows, pack_linear_rgb,
     transform::{AffineTransform, ClipState, transform_layout_bounds},
@@ -306,12 +306,11 @@ pub(crate) fn draw_background_layer_transformed(
                 for x in x0..x1 {
                     let screen_x = x as f32 + 0.5;
                     let screen_y = y as f32 + 0.5;
-                    if !clip_state.contains(screen_x, screen_y) {
-                        continue;
-                    }
-
                     let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
-                    if !point_in_rounded_rect(source_x, source_y, layout, radius) {
+                    let coverage = transformed_rounded_rect_coverage(
+                        layout, radius, inverse, clip_state, x, y,
+                    );
+                    if coverage == 0 {
                         continue;
                     }
 
@@ -322,7 +321,9 @@ pub(crate) fn draw_background_layer_transformed(
                     } else {
                         first_stop.color.to_linear_rgba()
                     };
-                    blend_gradient_sample(buffer, width, height, x, y, color);
+                    blend_gradient_sample_with_coverage(
+                        buffer, width, height, x, y, color, coverage,
+                    );
                 }
             }
         }
@@ -355,12 +356,11 @@ pub(crate) fn draw_background_layer_transformed(
                 for x in x0..x1 {
                     let screen_x = x as f32 + 0.5;
                     let screen_y = y as f32 + 0.5;
-                    if !clip_state.contains(screen_x, screen_y) {
-                        continue;
-                    }
-
                     let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
-                    if !point_in_rounded_rect(source_x, source_y, layout, radius) {
+                    let coverage = transformed_rounded_rect_coverage(
+                        layout, radius, inverse, clip_state, x, y,
+                    );
+                    if coverage == 0 {
                         continue;
                     }
 
@@ -392,7 +392,9 @@ pub(crate) fn draw_background_layer_transformed(
                             )
                         }
                     };
-                    blend_gradient_sample(buffer, width, height, x, y, color);
+                    blend_gradient_sample_with_coverage(
+                        buffer, width, height, x, y, color, coverage,
+                    );
                 }
             }
         }
@@ -407,12 +409,11 @@ pub(crate) fn draw_background_layer_transformed(
                 for x in x0..x1 {
                     let screen_x = x as f32 + 0.5;
                     let screen_y = y as f32 + 0.5;
-                    if !clip_state.contains(screen_x, screen_y) {
-                        continue;
-                    }
-
                     let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
-                    if !point_in_rounded_rect(source_x, source_y, layout, radius) {
+                    let coverage = transformed_rounded_rect_coverage(
+                        layout, radius, inverse, clip_state, x, y,
+                    );
+                    if coverage == 0 {
                         continue;
                     }
 
@@ -425,7 +426,9 @@ pub(crate) fn draw_background_layer_transformed(
                     };
                     let position = (angle - gradient.angle).rem_euclid(360.0);
                     let color = sample_prepared_gradient(&prepared, position, gradient.repeating);
-                    blend_gradient_sample(buffer, width, height, x, y, color);
+                    blend_gradient_sample_with_coverage(
+                        buffer, width, height, x, y, color, coverage,
+                    );
                 }
             }
         }
@@ -1350,6 +1353,33 @@ fn blend_gradient_sample(
     } else {
         blend_linear_over(buffer, index, LinearRgba { a: alpha, ..color });
     }
+}
+
+fn blend_gradient_sample_with_coverage(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    color: LinearRgba,
+    coverage: u8,
+) {
+    let coverage = coverage as f32 / 255.0;
+    if coverage <= f32::EPSILON {
+        return;
+    }
+
+    blend_gradient_sample(
+        buffer,
+        width,
+        height,
+        x,
+        y,
+        LinearRgba {
+            a: color.a * coverage,
+            ..color
+        },
+    );
 }
 
 pub(crate) fn resolve_length_stops(
