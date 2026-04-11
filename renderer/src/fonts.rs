@@ -313,17 +313,9 @@ fn draw_mask_transformed(
             }
 
             let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
-            let local_x = (source_x - (mask.origin_x + offset_x) as f32).floor() as i32;
-            let local_y = (source_y - (mask.origin_y + offset_y) as f32).floor() as i32;
-            if local_x < 0
-                || local_y < 0
-                || local_x >= mask.width as i32
-                || local_y >= mask.height as i32
-            {
-                continue;
-            }
-
-            let alpha = mask.alpha[local_x as usize + local_y as usize * mask.width];
+            let local_x = source_x - (mask.origin_x + offset_x) as f32;
+            let local_y = source_y - (mask.origin_y + offset_y) as f32;
+            let alpha = sample_mask_bilinear(mask, local_x, local_y);
             if alpha == 0 {
                 continue;
             }
@@ -337,6 +329,30 @@ fn draw_mask_transformed(
             );
         }
     }
+}
+
+fn sample_mask_bilinear(mask: &AlphaMask, local_x: f32, local_y: f32) -> u8 {
+    if mask.width == 0 || mask.height == 0 {
+        return 0;
+    }
+
+    let sample_x = local_x - 0.5;
+    let sample_y = local_y - 0.5;
+    let x0 = sample_x.floor() as i32;
+    let y0 = sample_y.floor() as i32;
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+    let tx = sample_x - x0 as f32;
+    let ty = sample_y - y0 as f32;
+
+    let top = lerp_u8(mask.get(x0, y0), mask.get(x1, y0), tx);
+    let bottom = lerp_u8(mask.get(x0, y1), mask.get(x1, y1), tx);
+    lerp_u8(top, bottom, ty)
+}
+
+fn lerp_u8(start: u8, end: u8, t: f32) -> u8 {
+    let t = t.clamp(0.0, 1.0);
+    (((start as f32) * (1.0 - t)) + ((end as f32) * t)).round() as u8
 }
 
 fn alpha_mask_with_alpha(mask: &AlphaMask, alpha: Vec<u8>) -> AlphaMask {
@@ -1255,14 +1271,16 @@ mod tests {
     use std::sync::Arc;
 
     use cssimpler_core::fonts::TextStyle;
-    use cssimpler_core::{LayoutBox, ShadowEffect};
+    use cssimpler_core::{Color, LayoutBox, ShadowEffect};
 
     use super::{
         MAX_TEXT_EFFECT_CACHE_ENTRIES, MAX_TEXT_RASTER_CACHE_ENTRIES, TextEffectCacheKind,
         blur_mask_with_workers, blur_pass_radii, cached_text_effect_mask, cached_text_mask,
-        clear_text_mask_cache_for_tests, lock_text_mask_cache_for_tests, shadow_mask_from_raster,
+        clear_text_mask_cache_for_tests, draw_mask, draw_mask_transformed,
+        lock_text_mask_cache_for_tests, sample_mask_bilinear, shadow_mask_from_raster,
         text_mask_cache,
     };
+    use crate::{ClipRect, pack_rgb, transform::AffineTransform, transform::ClipState};
 
     #[test]
     fn identical_text_masks_are_reused_across_integer_position_changes() {
@@ -1450,6 +1468,59 @@ mod tests {
         }
 
         assert!(outline.alpha.iter().any(|alpha| *alpha > 0));
+    }
+
+    #[test]
+    fn bilinear_mask_sampling_preserves_pixel_aligned_centers() {
+        let mut mask = super::AlphaMask::new(0, 0, 2, 1);
+        mask.set_max(0, 0, 64);
+        mask.set_max(1, 0, 192);
+
+        assert_eq!(sample_mask_bilinear(&mask, 0.5, 0.5), 64);
+        assert_eq!(sample_mask_bilinear(&mask, 1.5, 0.5), 192);
+    }
+
+    #[test]
+    fn bilinear_mask_sampling_interpolates_fractional_offsets() {
+        let mut mask = super::AlphaMask::new(0, 0, 1, 1);
+        mask.set_max(0, 0, 255);
+
+        assert_eq!(sample_mask_bilinear(&mask, 0.25, 0.5), 191);
+        assert_eq!(sample_mask_bilinear(&mask, 1.25, 0.5), 64);
+    }
+
+    #[test]
+    fn transformed_draw_matches_direct_draw_when_pixel_aligned() {
+        let mut mask = super::AlphaMask::new(0, 0, 2, 1);
+        mask.set_max(0, 0, 128);
+        mask.set_max(1, 0, 255);
+        let clip = ClipRect::full(4.0, 2.0);
+        let mut direct = vec![pack_rgb(Color::WHITE); 4 * 2];
+        let mut transformed = vec![pack_rgb(Color::WHITE); 4 * 2];
+
+        draw_mask(
+            &mut direct,
+            4,
+            2,
+            &mask,
+            Color::BLACK,
+            1,
+            0,
+            clip,
+        );
+        draw_mask_transformed(
+            &mut transformed,
+            4,
+            2,
+            &mask,
+            Color::BLACK,
+            1,
+            0,
+            AffineTransform::IDENTITY,
+            &ClipState::new(clip),
+        );
+
+        assert_eq!(transformed, direct);
     }
 
     #[test]
