@@ -289,6 +289,9 @@ fn length_percentage_to_px(value: &LengthPercentage) -> Result<f32, StyleError> 
             .to_px()
             .map(|value| value as f32)
             .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}"))),
+        // Encode percentages as negative fractions so the renderer can resolve
+        // them against the final layout size once width and height are known.
+        LengthPercentage::Percentage(percentage) => Ok(-percentage.0),
         _ => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
     }
 }

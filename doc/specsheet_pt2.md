@@ -164,6 +164,32 @@ Acceptance:
 
 ---
 
+## R3. Full 3D transform function coverage
+Depends: R2  
+Status: planned  
+
+Purpose:
+- Expand the initial 3D subset into a broader real-world CSS 3D transform surface so production examples do not fail on common functions like `scale3d(...)`
+
+Should have been an extension:
+- This would ideally have extended R1 as a later completeness pass over the same transform stack, but it remains separate so the minimum 3D milestone stays explicit
+
+Support:
+- `translate3d(...)` coverage is completed and documented alongside the existing depth-translation subset
+- `scaleZ(...)`
+- `scale3d(...)`
+- General `rotate3d(...)`, not just axis-aligned special cases
+- `matrix3d(...)`
+- `perspective(...)` as a transform function in addition to the standalone property
+- A documented and deterministic fallback policy for any remaining excluded 3D transform functions
+
+Acceptance:
+- The Uiverse hover card no longer fails on `scale3d(...)`
+- Supported 3D transform functions resolve into core transform data without ad hoc special-casing
+- Remaining unsupported 3D transform functions fail with specific diagnostics instead of silent misrendering
+
+---
+
 # Epic S - SVG and vector graphics subset
 
 ## S1. Vector DOM and render tree support
@@ -318,8 +344,9 @@ Acceptance:
 3. S1 + S2  
 4. R1  
 5. R2  
-6. T1 + T2  
-7. U1 + U2  
+6. R3  
+7. T1 + T2  
+8. U1 + U2  
 
 ---
 
@@ -328,7 +355,7 @@ Acceptance:
 If part 2 lands, the engine should be able to support:
 
 - 2D transform-driven UI without browser involvement
-- Controlled 3D card and layer effects
+- Controlled 3D card and layer effects with a broader CSS 3D transform surface
 - Renderer-owned inline SVG icons and logos
 - Glass-style backdrop blur in a narrow deterministic subset
 - Motion that keeps working within the explicit render loop and partial rerender model

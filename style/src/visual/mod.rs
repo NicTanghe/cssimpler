@@ -27,6 +27,15 @@ pub(crate) fn extract_property(
         return Some(declarations);
     }
 
+    if let Property::Unparsed(value) = property
+        && matches!(
+            value.property_id,
+            lightningcss::properties::PropertyId::TransformStyle(_)
+        )
+    {
+        return Some(transform::unparsed_transform_style_declarations(value));
+    }
+
     match property {
         Property::BackgroundColor(color) => Some(color::background_color_declaration(color)),
         Property::Background(backgrounds) => Some(gradient::background_declarations(backgrounds)),
@@ -75,6 +84,8 @@ pub(crate) fn extract_property(
         Property::TransformOrigin(value, _) => {
             Some(transform::transform_origin_declarations(value))
         }
+        Property::Perspective(value, _) => Some(transform::perspective_declarations(value)),
+        Property::TransformStyle(value, _) => Some(transform::transform_style_declarations(value)),
         Property::Translate(value) => Some(transform::translate_declarations(value)),
         Property::Rotate(value) => Some(transform::rotate_declarations(value)),
         Property::Scale(value) => Some(transform::scale_declarations(value)),
@@ -158,6 +169,14 @@ pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) ->
         }
         Declaration::TransformOrigin(origin) => {
             transform::apply_transform_origin(style, *origin);
+            true
+        }
+        Declaration::Perspective(perspective) => {
+            transform::apply_perspective(style, *perspective);
+            true
+        }
+        Declaration::TransformStyle(mode) => {
+            transform::apply_transform_style(style, *mode);
             true
         }
         Declaration::ScrollbarWidth(width) => {

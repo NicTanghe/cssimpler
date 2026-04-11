@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
     Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, LayoutStyle,
-    OverflowMode, ScrollbarWidth, Style, TransformOperation, TransformOrigin,
+    OverflowMode, ScrollbarWidth, Style, TransformOperation, TransformOrigin, TransformStyleMode,
     TransitionPropertyName, TransitionTimingFunction,
     fonts::{TextStyle, TextTransform},
 };
@@ -372,6 +372,8 @@ pub enum Declaration {
     TextStrokeColor(Option<Color>),
     TransformOperations(Vec<TransformOperation>),
     TransformOrigin(TransformOrigin),
+    Perspective(Option<f32>),
+    TransformStyle(TransformStyleMode),
     OverflowX(OverflowMode),
     OverflowY(OverflowMode),
     ScrollbarWidth(ScrollbarWidth),
@@ -1182,8 +1184,8 @@ mod tests {
         AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, ElementNode,
         GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
         LengthPercentageValue, LinearGradient, Node, RadialShape, ScrollbarWidth, ShapeExtent,
-        TransformOperation, TransformOrigin, TransitionPropertyName, TransitionTimingFunction,
-        fonts::TextTransform,
+        TransformMatrix3d, TransformOperation, TransformOrigin, TransformStyleMode,
+        TransitionPropertyName, TransitionTimingFunction, fonts::TextTransform,
     };
     use taffy::prelude::{
         AlignItems as TaffyAlignItems, Dimension, Display as TaffyDisplay,
@@ -1383,6 +1385,185 @@ mod tests {
             }
         );
         assert_eq!(resolved.layout.taffy.position, TaffyPosition::Relative);
+    }
+
+    #[test]
+    fn parser_supports_3d_transform_controls() {
+        let stylesheet = parse_stylesheet(
+            ".card {
+                transform: translate3d(12px, 25%, 30px) rotateX(15deg) rotateY(-20deg) rotateZ(45deg);
+                perspective: 800px;
+                transform-style: preserve-3d;
+            }",
+        )
+        .expect("3d transform stylesheet should parse");
+
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TransformOperations(vec![
+                    TransformOperation::Translate {
+                        x: LengthPercentageValue::from_px(12.0),
+                        y: LengthPercentageValue::from_fraction(0.25),
+                    },
+                    TransformOperation::TranslateZ { z: 30.0 },
+                    TransformOperation::RotateX { degrees: 15.0 },
+                    TransformOperation::RotateY { degrees: -20.0 },
+                    TransformOperation::RotateZ { degrees: 45.0 },
+                ]))
+        );
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::Perspective(Some(800.0)))
+        );
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TransformStyle(TransformStyleMode::Preserve3d))
+        );
+    }
+
+    #[test]
+    fn resolve_style_applies_perspective_and_transform_style() {
+        let stylesheet = parse_stylesheet(
+            ".card {
+                perspective: 640px;
+                transform-style: preserve-3d;
+                transform: translateZ(24px) rotateY(30deg);
+            }",
+        )
+        .expect("3d transform stylesheet should parse");
+        let element = ElementNode::new("div").with_class("card");
+
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.visual.perspective, Some(640.0));
+        assert_eq!(
+            resolved.visual.transform_style,
+            TransformStyleMode::Preserve3d
+        );
+        assert_eq!(
+            resolved.visual.transform.operations,
+            vec![
+                TransformOperation::TranslateZ { z: 24.0 },
+                TransformOperation::RotateY { degrees: 30.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_supports_extended_3d_transform_functions() {
+        let stylesheet = parse_stylesheet(
+            ".card {
+                transform:
+                    scaleZ(0.75)
+                    scale3d(1.02, 1.03, 1.04)
+                    rotate3d(1, 2, 3, 30deg)
+                    perspective(600px)
+                    matrix3d(
+                        1, 0, 0, 0,
+                        0, 1, 0, 0,
+                        0, 0, 1, 0,
+                        12, 24, 36, 1
+                    );
+            }",
+        )
+        .expect("extended 3d transform stylesheet should parse");
+
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::TransformOperations(vec![
+                    TransformOperation::Matrix3d {
+                        matrix: TransformMatrix3d::scale(1.0, 1.0, 0.75),
+                    },
+                    TransformOperation::Matrix3d {
+                        matrix: TransformMatrix3d::scale(1.02, 1.03, 1.04),
+                    },
+                    TransformOperation::Matrix3d {
+                        matrix: TransformMatrix3d::rotate(1.0, 2.0, 3.0, 30.0),
+                    },
+                    TransformOperation::Matrix3d {
+                        matrix: TransformMatrix3d::perspective(600.0)
+                            .expect("perspective matrix should build"),
+                    },
+                    TransformOperation::Matrix3d {
+                        matrix: TransformMatrix3d {
+                            m11: 1.0,
+                            m12: 0.0,
+                            m13: 0.0,
+                            m14: 12.0,
+                            m21: 0.0,
+                            m22: 1.0,
+                            m23: 0.0,
+                            m24: 24.0,
+                            m31: 0.0,
+                            m32: 0.0,
+                            m33: 1.0,
+                            m34: 36.0,
+                            m41: 0.0,
+                            m42: 0.0,
+                            m43: 0.0,
+                            m44: 1.0,
+                        },
+                    },
+                ]))
+        );
+    }
+
+    #[test]
+    fn resolve_style_applies_extended_3d_transform_functions() {
+        let stylesheet = parse_stylesheet(
+            ".card {
+                transform:
+                    scale3d(1.02, 1.03, 1.04)
+                    rotate3d(1, 2, 3, 30deg)
+                    perspective(600px);
+            }",
+        )
+        .expect("extended 3d transform stylesheet should parse");
+        let element = ElementNode::new("div").with_class("card");
+
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(
+            resolved.visual.transform.operations,
+            vec![
+                TransformOperation::Matrix3d {
+                    matrix: TransformMatrix3d::scale(1.02, 1.03, 1.04),
+                },
+                TransformOperation::Matrix3d {
+                    matrix: TransformMatrix3d::rotate(1.0, 2.0, 3.0, 30.0),
+                },
+                TransformOperation::Matrix3d {
+                    matrix: TransformMatrix3d::perspective(600.0)
+                        .expect("perspective matrix should build"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_supports_percentage_corner_radius() {
+        let stylesheet = parse_stylesheet(
+            ".card {
+                border-top-right-radius: 100%;
+                border-bottom-left-radius: 80%;
+            }",
+        )
+        .expect("percentage corner radius stylesheet should parse");
+
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::CornerTopRight(-1.0))
+        );
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::CornerBottomLeft(-0.8))
+        );
     }
 
     #[test]

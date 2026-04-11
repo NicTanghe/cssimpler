@@ -99,6 +99,8 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::TextStrokeColor(_)
         | Declaration::TransformOperations(_)
         | Declaration::TransformOrigin(_)
+        | Declaration::Perspective(_)
+        | Declaration::TransformStyle(_)
         | Declaration::ScrollbarColors(_, _) => StyleInvalidation::Paint,
         Declaration::FontFamilies(_)
         | Declaration::FontSize(_)
@@ -173,6 +175,8 @@ fn variable_property_invalidation(property_name: &str) -> StyleInvalidation {
         | "border-bottom-left-radius"
         | "transform"
         | "transform-origin"
+        | "transform-style"
+        | "perspective"
         | "translate"
         | "rotate"
         | "scale" => StyleInvalidation::Paint,

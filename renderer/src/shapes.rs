@@ -488,7 +488,12 @@ pub(crate) fn inset_layout(layout: LayoutBox, insets: Insets) -> LayoutBox {
     LayoutBox::new(layout.x + insets.left, layout.y + insets.top, width, height)
 }
 
-pub(crate) fn inset_corner_radius(radius: CornerRadius, insets: Insets) -> CornerRadius {
+pub(crate) fn inset_corner_radius(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    insets: Insets,
+) -> CornerRadius {
+    let radius = clamp_corner_radius(radius, layout.width, layout.height);
     CornerRadius {
         top_left: (radius.top_left - insets.top.max(insets.left)).max(0.0),
         top_right: (radius.top_right - insets.top.max(insets.right)).max(0.0),
@@ -507,7 +512,12 @@ pub(crate) fn offset_layout(layout: LayoutBox, x: f32, y: f32) -> LayoutBox {
     LayoutBox::new(layout.x + x, layout.y + y, layout.width, layout.height)
 }
 
-pub(crate) fn expand_corner_radius(radius: CornerRadius, amount: f32) -> CornerRadius {
+pub(crate) fn expand_corner_radius(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    amount: f32,
+) -> CornerRadius {
+    let radius = clamp_corner_radius(radius, layout.width, layout.height);
     CornerRadius {
         top_left: (radius.top_left + amount).max(0.0),
         top_right: (radius.top_right + amount).max(0.0),
@@ -523,10 +533,18 @@ fn layout_contains(layout: LayoutBox, x: f32, y: f32) -> bool {
 fn clamp_corner_radius(radius: CornerRadius, width: f32, height: f32) -> CornerRadius {
     let max_radius = 0.5 * width.min(height).max(0.0);
     CornerRadius {
-        top_left: radius.top_left.min(max_radius).max(0.0),
-        top_right: radius.top_right.min(max_radius).max(0.0),
-        bottom_right: radius.bottom_right.min(max_radius).max(0.0),
-        bottom_left: radius.bottom_left.min(max_radius).max(0.0),
+        top_left: resolve_corner_radius_value(radius.top_left, max_radius),
+        top_right: resolve_corner_radius_value(radius.top_right, max_radius),
+        bottom_right: resolve_corner_radius_value(radius.bottom_right, max_radius),
+        bottom_left: resolve_corner_radius_value(radius.bottom_left, max_radius),
+    }
+}
+
+fn resolve_corner_radius_value(value: f32, max_radius: f32) -> f32 {
+    if value < 0.0 {
+        (-value * max_radius).min(max_radius).max(0.0)
+    } else {
+        value.min(max_radius).max(0.0)
     }
 }
 

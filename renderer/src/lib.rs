@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::{Mutex, OnceLock};
@@ -24,13 +25,14 @@ use self::{
         union_optional_bounds,
     },
     transform::{
-        AffineTransform, ClipState, node_transform_matrix, transform_clip_rect,
-        transform_layout_bounds,
+        AffineTransform, ClipState, PerspectiveContext, node_local_transform_matrix,
+        perspective_context, project_world_point, project_world_transform_matrix,
+        transform_clip_rect, transform_layout_bounds,
     },
 };
 use cssimpler_core::{
     Color, ElementInteractionState, ElementPath, EventHandler, LayoutBox, LinearRgba, RenderKind,
-    RenderNode,
+    RenderNode, TransformMatrix3d, TransformStyleMode,
 };
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
@@ -781,9 +783,23 @@ fn render_to_buffer_internal_with_cached_bounds(
     height: usize,
     clear_color: Color,
 ) -> PaintStats {
+    let owned_bounds;
+    let cached_bounds = if let Some(cached_bounds) = cached_bounds {
+        cached_bounds
+    } else {
+        owned_bounds = cache_scene_subtree_bounds(scene);
+        &owned_bounds
+    };
     let worker_count = full_redraw_worker_count(width, height);
     if worker_count <= 1 {
-        render_to_buffer_serial(scene, buffer, width, height, clear_color);
+        render_to_buffer_serial(
+            scene,
+            &cached_bounds.roots,
+            buffer,
+            width,
+            height,
+            clear_color,
+        );
     } else {
         render_to_buffer_parallel(
             scene,
@@ -810,6 +826,7 @@ fn render_to_buffer_internal_with_cached_bounds(
 
 fn render_to_buffer_serial(
     scene: &[RenderNode],
+    cached_bounds: &[CachedSubtreeBounds],
     buffer: &mut [u32],
     width: usize,
     height: usize,
@@ -818,27 +835,20 @@ fn render_to_buffer_serial(
     buffer.fill(pack_rgb(clear_color));
     let clip = ClipRect::full(width as f32, height as f32);
 
-    for node in scene {
-        draw_node(node, buffer, width, height, clip, CullMode::Layout);
+    for (node, cached_bounds) in scene.iter().zip(cached_bounds) {
+        draw_node_with_cached_bounds(node, cached_bounds, buffer, width, height, clip);
     }
 }
 
 fn render_to_buffer_parallel(
     scene: &[RenderNode],
-    cached_bounds: Option<&CachedSceneBounds>,
+    cached_bounds: &CachedSceneBounds,
     buffer: &mut [u32],
     width: usize,
     height: usize,
     clear_color: Color,
     worker_count: usize,
 ) {
-    let owned_bounds;
-    let cached_bounds = if let Some(cached_bounds) = cached_bounds {
-        cached_bounds
-    } else {
-        owned_bounds = cache_scene_subtree_bounds(scene);
-        &owned_bounds
-    };
     let clear = pack_rgb(clear_color);
     let band_count = worker_count.max(1).min(height.max(1));
     let rows_per_worker = height.div_ceil(band_count);
@@ -910,7 +920,7 @@ fn render_to_buffer_parallel(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn render_scene_update(
+pub fn render_scene_update(
     previous_scene: &[RenderNode],
     scene: &[RenderNode],
     buffer: &mut [u32],
@@ -1274,6 +1284,7 @@ fn redraw_auto_scroll_indicator_regions(
     height: usize,
     clear_color: Color,
 ) {
+    let cached_bounds = cache_scene_subtree_bounds(scene);
     let mut bounds = Vec::new();
     if let Some(previous_indicator) = previous_indicator {
         bounds.push(scrollbar::auto_scroll_indicator_bounds(previous_indicator));
@@ -1294,9 +1305,16 @@ fn redraw_auto_scroll_indicator_regions(
             continue;
         };
         clear_clip(buffer, width, height, clip, clear_color);
-        for node in scene {
-            draw_node(node, buffer, width, height, clip, CullMode::Subtree);
-        }
+        let root_indices = root_indices_intersecting_clip(&cached_bounds.roots, clip);
+        draw_cached_root_indices(
+            scene,
+            &cached_bounds.roots,
+            &root_indices,
+            buffer,
+            width,
+            height,
+            clip,
+        );
     }
 
     if let Some(indicator) = indicator {
@@ -1329,12 +1347,6 @@ fn should_suspend_updates(left_down: bool, left_super_down: bool, right_super_do
     left_down && (left_super_down || right_super_down)
 }
 
-#[derive(Clone, Copy)]
-enum CullMode {
-    Layout,
-    Subtree,
-}
-
 #[derive(Clone, Debug)]
 struct CachedSceneBounds {
     roots: Vec<CachedSubtreeBounds>,
@@ -1345,6 +1357,7 @@ struct CachedSceneBounds {
 struct CachedSubtreeBounds {
     own_bounds: Option<ClipRect>,
     bounds: Option<ClipRect>,
+    subtree_uses_depth: bool,
     children: Vec<CachedSubtreeBounds>,
 }
 
@@ -1362,6 +1375,88 @@ fn root_indices_intersecting_clip(
                 .map(|_| index)
         })
         .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProjectedChildEntry {
+    index: usize,
+    depth: f32,
+}
+
+fn node_requires_projected_path(node: &RenderNode) -> bool {
+    !node.style.transform.is_identity()
+        || node.style.perspective.is_some()
+        || node.style.transform_style == TransformStyleMode::Preserve3d
+}
+
+fn node_child_perspective(node: &RenderNode) -> Option<PerspectiveContext> {
+    perspective_context(node.layout, node.style.perspective)
+}
+
+fn active_child_perspective(
+    node: &RenderNode,
+    inherited_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+) -> Option<PerspectiveContext> {
+    node_child_perspective(node).or(
+        (node.style.transform_style == TransformStyleMode::Preserve3d || in_3d_context)
+            .then_some(inherited_perspective)
+            .flatten(),
+    )
+}
+
+fn node_sorts_projected_children(node: &RenderNode, in_3d_context: bool) -> bool {
+    node.style.perspective.is_some()
+        || node.style.transform_style == TransformStyleMode::Preserve3d
+        || in_3d_context
+}
+
+fn sort_projected_children(entries: &mut [ProjectedChildEntry], sort_by_depth: bool) {
+    if !sort_by_depth {
+        return;
+    }
+
+    entries.sort_by(|left, right| {
+        left.depth
+            .partial_cmp(&right.depth)
+            .unwrap_or(Ordering::Equal)
+            .then(left.index.cmp(&right.index))
+    });
+}
+
+fn projected_children(
+    node: &RenderNode,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
+    sort_by_depth: bool,
+) -> Vec<ProjectedChildEntry> {
+    let mut entries = node
+        .children
+        .iter()
+        .enumerate()
+        .filter_map(|(index, child)| {
+            let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
+                child.layout,
+                &child.style.transform,
+            ));
+            let center_x = child.layout.x + child.layout.width * 0.5;
+            let center_y = child.layout.y + child.layout.height * 0.5;
+            Some(ProjectedChildEntry {
+                index,
+                depth: project_world_point(
+                    world_matrix,
+                    parent_perspective,
+                    center_x,
+                    center_y,
+                    0.0,
+                )
+                .map(|(_, _, z)| z)
+                .unwrap_or(f32::NEG_INFINITY),
+            })
+        })
+        .collect::<Vec<_>>();
+    sort_projected_children(&mut entries, sort_by_depth);
+    entries
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1432,19 +1527,10 @@ impl ClipRect {
     }
 }
 
-fn draw_node(
-    node: &RenderNode,
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    clip: ClipRect,
-    cull_mode: CullMode,
-) {
-    if clip.is_empty() || !node_intersects_clip(node, clip, cull_mode) {
-        return;
-    }
-
-    draw_node_contents(node, None, buffer, width, height, clip, cull_mode);
+fn child_3d_context(node: &RenderNode, in_3d_context: bool) -> bool {
+    in_3d_context
+        || node.style.perspective.is_some()
+        || node.style.transform_style == TransformStyleMode::Preserve3d
 }
 
 fn draw_node_with_cached_bounds(
@@ -1466,32 +1552,37 @@ fn draw_node_with_cached_bounds(
 
     draw_node_contents(
         node,
-        Some(cached_bounds),
+        cached_bounds,
         buffer,
         width,
         height,
         clip,
-        CullMode::Subtree,
+        None,
+        false,
     );
 }
 
 fn draw_node_contents(
     node: &RenderNode,
-    cached_bounds: Option<&CachedSubtreeBounds>,
+    cached_bounds: &CachedSubtreeBounds,
     buffer: &mut [u32],
     width: usize,
     height: usize,
     clip: ClipRect,
-    cull_mode: CullMode,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
 ) {
-    if !node.style.transform.is_identity() {
+    if node_requires_projected_path(node) {
         draw_node_transformed(
             node,
+            cached_bounds,
             buffer,
             width,
             height,
-            AffineTransform::IDENTITY,
+            TransformMatrix3d::IDENTITY,
+            parent_perspective,
             &ClipState::new(clip),
+            in_3d_context,
         );
         return;
     }
@@ -1550,55 +1641,36 @@ fn draw_node_contents(
         return;
     };
 
-    if let Some(cached_bounds) = cached_bounds {
-        for (child, child_bounds) in node.children.iter().zip(&cached_bounds.children) {
-            if child.style.transform.is_identity() {
-                draw_node_with_cached_bounds(
-                    child,
-                    child_bounds,
-                    buffer,
-                    width,
-                    height,
-                    child_clip,
-                );
-            } else {
-                draw_node_transformed(
-                    child,
-                    buffer,
-                    width,
-                    height,
-                    AffineTransform::IDENTITY,
-                    &ClipState::new(child_clip),
-                );
-            }
-        }
-    } else {
-        for child in &node.children {
-            if child.style.transform.is_identity() {
-                draw_node(child, buffer, width, height, child_clip, cull_mode);
-            } else {
-                draw_node_transformed(
-                    child,
-                    buffer,
-                    width,
-                    height,
-                    AffineTransform::IDENTITY,
-                    &ClipState::new(child_clip),
-                );
-            }
+    let child_context = child_3d_context(node, in_3d_context);
+    let child_perspective = active_child_perspective(node, parent_perspective, child_context);
+    for (child, child_bounds) in node.children.iter().zip(&cached_bounds.children) {
+        if !node_requires_projected_path(child) {
+            draw_node_contents(
+                child,
+                child_bounds,
+                buffer,
+                width,
+                height,
+                child_clip,
+                child_perspective,
+                child_context,
+            );
+        } else {
+            draw_node_transformed(
+                child,
+                child_bounds,
+                buffer,
+                width,
+                height,
+                TransformMatrix3d::IDENTITY,
+                child_perspective,
+                &ClipState::new(child_clip),
+                child_context,
+            );
         }
     }
 
     scrollbar::draw_scrollbars(node, buffer, width, height, clip);
-}
-
-fn node_intersects_clip(node: &RenderNode, clip: ClipRect, cull_mode: CullMode) -> bool {
-    match cull_mode {
-        CullMode::Layout => clip.intersect(layout_clip(node.layout)).is_some(),
-        CullMode::Subtree => subtree_visual_bounds(node)
-            .and_then(|bounds| clip.intersect(bounds))
-            .is_some(),
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1681,15 +1753,17 @@ fn hit_test_scene_for_event(
     event: MouseEventKind,
 ) -> Option<EventHandler> {
     scene.iter().rev().find_map(|node| {
-        if node.style.transform.is_identity() {
-            hit_test_node_for_event(node, x, y, ClipRect::unbounded(), event)
+        if !node_requires_projected_path(node) {
+            hit_test_node_for_event(node, x, y, ClipRect::unbounded(), None, false, event)
         } else {
             hit_test_node_for_event_transformed(
                 node,
                 x,
                 y,
                 &ClipState::new(ClipRect::unbounded()),
-                AffineTransform::IDENTITY,
+                TransformMatrix3d::IDENTITY,
+                None,
+                false,
                 event,
             )
         }
@@ -1703,15 +1777,25 @@ fn hit_test_element_path(scene: &[RenderNode], x: f32, y: f32) -> Option<Element
         .rev()
         .find_map(|(root_index, node)| {
             let root_path = ElementPath::root(root_index);
-            if node.style.transform.is_identity() {
-                hit_test_element_path_node(node, x, y, ClipRect::unbounded(), &root_path)
+            if !node_requires_projected_path(node) {
+                hit_test_element_path_node(
+                    node,
+                    x,
+                    y,
+                    ClipRect::unbounded(),
+                    None,
+                    false,
+                    &root_path,
+                )
             } else {
                 hit_test_element_path_node_transformed(
                     node,
                     x,
                     y,
                     &ClipState::new(ClipRect::unbounded()),
-                    AffineTransform::IDENTITY,
+                    TransformMatrix3d::IDENTITY,
+                    None,
+                    false,
                     &root_path,
                 )
             }
@@ -1723,6 +1807,8 @@ fn hit_test_node_for_event(
     x: f32,
     y: f32,
     clip: ClipRect,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
     event: MouseEventKind,
 ) -> Option<EventHandler> {
     if !clip.contains(x, y) || !layout_contains(node.layout, x, y) {
@@ -1735,16 +1821,28 @@ fn hit_test_node_for_event(
         clip
     };
 
+    let child_context = child_3d_context(node, in_3d_context);
+    let child_perspective = active_child_perspective(node, parent_perspective, child_context);
     for child in node.children.iter().rev() {
-        let hit = if child.style.transform.is_identity() {
-            hit_test_node_for_event(child, x, y, child_clip, event)
+        let hit = if !node_requires_projected_path(child) {
+            hit_test_node_for_event(
+                child,
+                x,
+                y,
+                child_clip,
+                child_perspective,
+                child_context,
+                event,
+            )
         } else {
             hit_test_node_for_event_transformed(
                 child,
                 x,
                 y,
                 &ClipState::new(child_clip),
-                AffineTransform::IDENTITY,
+                TransformMatrix3d::IDENTITY,
+                child_perspective,
+                child_context,
                 event,
             )
         };
@@ -1822,6 +1920,8 @@ fn hit_test_element_path_node(
     x: f32,
     y: f32,
     clip: ClipRect,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
     path: &ElementPath,
 ) -> Option<ElementPath> {
     if !clip.contains(x, y) || !layout_contains(node.layout, x, y) {
@@ -1834,17 +1934,29 @@ fn hit_test_element_path_node(
         clip
     };
 
+    let child_context = child_3d_context(node, in_3d_context);
+    let child_perspective = active_child_perspective(node, parent_perspective, child_context);
     for (index, child) in node.children.iter().enumerate().rev() {
         let child_path = path.with_child(index);
-        let hit = if child.style.transform.is_identity() {
-            hit_test_element_path_node(child, x, y, child_clip, &child_path)
+        let hit = if !node_requires_projected_path(child) {
+            hit_test_element_path_node(
+                child,
+                x,
+                y,
+                child_clip,
+                child_perspective,
+                child_context,
+                &child_path,
+            )
         } else {
             hit_test_element_path_node_transformed(
                 child,
                 x,
                 y,
                 &ClipState::new(child_clip),
-                AffineTransform::IDENTITY,
+                TransformMatrix3d::IDENTITY,
+                child_perspective,
+                child_context,
                 &child_path,
             )
         };
@@ -1861,15 +1973,20 @@ fn hit_test_node_for_event_transformed(
     x: f32,
     y: f32,
     clip_state: &ClipState,
-    parent_matrix: AffineTransform,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
     event: MouseEventKind,
 ) -> Option<EventHandler> {
     if !clip_state.contains(x, y) {
         return None;
     }
 
-    let local_matrix = node_transform_matrix(node.layout, &node.style.transform)?;
-    let matrix = parent_matrix.multiply(local_matrix);
+    let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
+        node.layout,
+        &node.style.transform,
+    ));
+    let matrix = project_world_transform_matrix(node.layout, world_matrix, parent_perspective)?;
     let inverse = matrix.invert()?;
     let (local_x, local_y) = inverse.transform_point(x, y);
     if !layout_contains(node.layout, local_x, local_y) {
@@ -1882,10 +1999,26 @@ fn hit_test_node_for_event_transformed(
         clip_state.clone()
     };
 
-    for child in node.children.iter().rev() {
-        if let Some(handler) =
-            hit_test_node_for_event_transformed(child, x, y, &child_clip_state, matrix, event)
-        {
+    let child_context = child_3d_context(node, in_3d_context);
+    let child_perspective = active_child_perspective(node, parent_perspective, child_context);
+    let children = projected_children(
+        node,
+        world_matrix,
+        child_perspective,
+        node_sorts_projected_children(node, child_context),
+    );
+    for entry in children.iter().rev() {
+        let child = &node.children[entry.index];
+        if let Some(handler) = hit_test_node_for_event_transformed(
+            child,
+            x,
+            y,
+            &child_clip_state,
+            world_matrix,
+            child_perspective,
+            child_context,
+            event,
+        ) {
             return Some(handler);
         }
     }
@@ -1898,15 +2031,20 @@ fn hit_test_element_path_node_transformed(
     x: f32,
     y: f32,
     clip_state: &ClipState,
-    parent_matrix: AffineTransform,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
     path: &ElementPath,
 ) -> Option<ElementPath> {
     if !clip_state.contains(x, y) {
         return None;
     }
 
-    let local_matrix = node_transform_matrix(node.layout, &node.style.transform)?;
-    let matrix = parent_matrix.multiply(local_matrix);
+    let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
+        node.layout,
+        &node.style.transform,
+    ));
+    let matrix = project_world_transform_matrix(node.layout, world_matrix, parent_perspective)?;
     let inverse = matrix.invert()?;
     let (local_x, local_y) = inverse.transform_point(x, y);
     if !layout_contains(node.layout, local_x, local_y) {
@@ -1919,14 +2057,25 @@ fn hit_test_element_path_node_transformed(
         clip_state.clone()
     };
 
-    for (index, child) in node.children.iter().enumerate().rev() {
-        let child_path = path.with_child(index);
+    let child_context = child_3d_context(node, in_3d_context);
+    let child_perspective = active_child_perspective(node, parent_perspective, child_context);
+    let children = projected_children(
+        node,
+        world_matrix,
+        child_perspective,
+        node_sorts_projected_children(node, child_context),
+    );
+    for entry in children.iter().rev() {
+        let child = &node.children[entry.index];
+        let child_path = path.with_child(entry.index);
         if let Some(hit) = hit_test_element_path_node_transformed(
             child,
             x,
             y,
             &child_clip_state,
-            matrix,
+            world_matrix,
+            child_perspective,
+            child_context,
             &child_path,
         ) {
             return Some(hit);
@@ -2000,16 +2149,24 @@ fn layout_contains(layout: LayoutBox, x: f32, y: f32) -> bool {
 
 fn draw_node_transformed(
     node: &RenderNode,
+    cached_bounds: &CachedSubtreeBounds,
     buffer: &mut [u32],
     width: usize,
     height: usize,
-    parent_matrix: AffineTransform,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
     clip_state: &ClipState,
+    in_3d_context: bool,
 ) {
-    let Some(local_matrix) = node_transform_matrix(node.layout, &node.style.transform) else {
+    let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
+        node.layout,
+        &node.style.transform,
+    ));
+    let Some(matrix) =
+        project_world_transform_matrix(node.layout, world_matrix, parent_perspective)
+    else {
         return;
     };
-    let matrix = parent_matrix.multiply(local_matrix);
 
     for shadow in &node.style.shadows {
         shadow::draw_shadow_transformed(
@@ -2075,8 +2232,28 @@ fn draw_node_transformed(
         clip_state.clone()
     };
 
-    for child in &node.children {
-        draw_node_transformed(child, buffer, width, height, matrix, &child_clip_state);
+    let child_context = child_3d_context(node, in_3d_context);
+    let child_perspective = active_child_perspective(node, parent_perspective, child_context);
+    let children = projected_children(
+        node,
+        world_matrix,
+        child_perspective,
+        node_sorts_projected_children(node, child_context),
+    );
+    for entry in children {
+        let child = &node.children[entry.index];
+        let child_bounds = &cached_bounds.children[entry.index];
+        draw_node_transformed(
+            child,
+            child_bounds,
+            buffer,
+            width,
+            height,
+            world_matrix,
+            child_perspective,
+            &child_clip_state,
+            child_context,
+        );
     }
 
     if matrix.is_identity() {
@@ -2093,7 +2270,11 @@ fn draw_background_and_border(
 ) {
     if !node.style.border.widths.is_zero() {
         let inner_layout = inset_layout(node.layout, node.style.border.widths);
-        let inner_radius = inset_corner_radius(node.style.corner_radius, node.style.border.widths);
+        let inner_radius = inset_corner_radius(
+            node.layout,
+            node.style.corner_radius,
+            node.style.border.widths,
+        );
         if !draw_axis_aligned_opaque_ring(
             buffer,
             width,
@@ -2125,7 +2306,11 @@ fn draw_background_and_border(
     let fill_radius = if node.style.border.widths.is_zero() {
         node.style.corner_radius
     } else {
-        inset_corner_radius(node.style.corner_radius, node.style.border.widths)
+        inset_corner_radius(
+            node.layout,
+            node.style.corner_radius,
+            node.style.border.widths,
+        )
     };
 
     if let Some(background) = node.style.background {
@@ -2165,7 +2350,11 @@ fn draw_background_and_border_transformed(
 ) {
     if !node.style.border.widths.is_zero() {
         let inner_layout = inset_layout(node.layout, node.style.border.widths);
-        let inner_radius = inset_corner_radius(node.style.corner_radius, node.style.border.widths);
+        let inner_radius = inset_corner_radius(
+            node.layout,
+            node.style.corner_radius,
+            node.style.border.widths,
+        );
         draw_transformed_rounded_ring(
             buffer,
             width,
@@ -2187,7 +2376,11 @@ fn draw_background_and_border_transformed(
     let fill_radius = if node.style.border.widths.is_zero() {
         node.style.corner_radius
     } else {
-        inset_corner_radius(node.style.corner_radius, node.style.border.widths)
+        inset_corner_radius(
+            node.layout,
+            node.style.corner_radius,
+            node.style.border.widths,
+        )
     };
 
     if let Some(background) = node.style.background {
@@ -2393,7 +2586,7 @@ fn collect_node_dirty_regions(
     current_bounds: &CachedSubtreeBounds,
     dirty_regions: &mut Vec<ClipRect>,
 ) -> bool {
-    if !previous.style.transform.is_identity() || !current.style.transform.is_identity() {
+    if node_requires_projected_path(previous) || node_requires_projected_path(current) {
         push_dirty_region(
             union_optional_bounds(previous_bounds.bounds, current_bounds.bounds),
             dirty_regions,
@@ -2588,12 +2781,44 @@ fn clip_rects_pixel_count(clips: &[ClipRect], width: usize, height: usize) -> us
         .sum()
 }
 
+#[allow(dead_code)]
 fn subtree_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
-    let mut local_bounds = node_own_visual_bounds_untransformed(node);
-    let parent_clip = non_empty_layout_clip(node.layout);
+    subtree_visual_bounds_with_context(node, TransformMatrix3d::IDENTITY, None, false)
+}
+
+#[allow(dead_code)]
+fn subtree_visual_bounds_with_context(
+    node: &RenderNode,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+) -> Option<ClipRect> {
+    let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
+        node.layout,
+        &node.style.transform,
+    ));
+    let matrix = project_world_transform_matrix(node.layout, world_matrix, parent_perspective)?;
+    let mut bounds = transform_bounds_with_context(
+        node_own_visual_bounds_untransformed(node),
+        parent_world_matrix,
+        node,
+        parent_perspective,
+    );
+    let parent_clip = if node.style.overflow.clips_any_axis() {
+        transform_layout_bounds(node.layout, matrix)
+    } else {
+        None
+    };
+    let child_context = child_3d_context(node, in_3d_context);
+    let child_perspective = active_child_perspective(node, parent_perspective, child_context);
 
     for child in &node.children {
-        let Some(mut child_bounds) = subtree_visual_bounds(child) else {
+        let Some(mut child_bounds) = subtree_visual_bounds_with_context(
+            child,
+            world_matrix,
+            child_perspective,
+            child_context,
+        ) else {
             continue;
         };
 
@@ -2607,52 +2832,119 @@ fn subtree_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
             child_bounds = clipped_bounds;
         }
 
-        local_bounds = union_optional_bounds(local_bounds, Some(child_bounds));
+        bounds = union_optional_bounds(bounds, Some(child_bounds));
     }
 
-    apply_node_transform_to_bounds(node, local_bounds)
+    bounds
 }
 
 fn cache_scene_subtree_bounds(scene: &[RenderNode]) -> CachedSceneBounds {
     let mut node_count = 0;
     let roots = scene
         .iter()
-        .map(|node| cache_subtree_bounds(node, &mut node_count))
+        .map(|node| {
+            cache_subtree_bounds(
+                node,
+                TransformMatrix3d::IDENTITY,
+                None,
+                false,
+                &mut node_count,
+            )
+        })
         .collect();
     CachedSceneBounds { roots, node_count }
 }
 
-fn cache_subtree_bounds(node: &RenderNode, node_count: &mut usize) -> CachedSubtreeBounds {
+fn cache_subtree_bounds(
+    node: &RenderNode,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    node_count: &mut usize,
+) -> CachedSubtreeBounds {
     *node_count = node_count.saturating_add(1);
+    let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
+        node.layout,
+        &node.style.transform,
+    ));
+    let Some(matrix) =
+        project_world_transform_matrix(node.layout, world_matrix, parent_perspective)
+    else {
+        let child_context = child_3d_context(node, in_3d_context);
+        let children = node
+            .children
+            .iter()
+            .map(|child| {
+                cache_subtree_bounds(
+                    child,
+                    parent_world_matrix,
+                    active_child_perspective(node, parent_perspective, child_context),
+                    child_context,
+                    node_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        return CachedSubtreeBounds {
+            own_bounds: None,
+            bounds: None,
+            subtree_uses_depth: node.style.transform.uses_depth()
+                || node.style.perspective.is_some()
+                || children.iter().any(|child| child.subtree_uses_depth),
+            children,
+        };
+    };
     let own_local_bounds = node_own_visual_bounds_untransformed(node);
-    let mut local_bounds = own_local_bounds;
-    let parent_clip = non_empty_layout_clip(node.layout);
+    let own_bounds = transform_bounds_with_context(
+        own_local_bounds,
+        parent_world_matrix,
+        node,
+        parent_perspective,
+    );
+    let mut bounds = own_bounds;
+    let parent_clip = if node.style.overflow.clips_any_axis() {
+        transform_layout_bounds(node.layout, matrix)
+    } else {
+        None
+    };
+    let child_context = child_3d_context(node, in_3d_context);
+    let child_perspective = active_child_perspective(node, parent_perspective, child_context);
     let mut children = Vec::with_capacity(node.children.len());
 
     for child in &node.children {
-        let mut cached_child = cache_subtree_bounds(child, node_count);
+        let mut cached_child = cache_subtree_bounds(
+            child,
+            world_matrix,
+            child_perspective,
+            child_context,
+            node_count,
+        );
         if node.style.overflow.clips_any_axis() {
             cached_child.bounds = cached_child
                 .bounds
                 .and_then(|child_bounds| parent_clip.and_then(|clip| child_bounds.intersect(clip)));
         }
-        local_bounds = union_optional_bounds(local_bounds, cached_child.bounds);
+        bounds = union_optional_bounds(bounds, cached_child.bounds);
         children.push(cached_child);
     }
-
-    let own_bounds = apply_node_transform_to_bounds(node, own_local_bounds);
-    let bounds = apply_node_transform_to_bounds(node, local_bounds);
 
     CachedSubtreeBounds {
         own_bounds,
         bounds,
+        subtree_uses_depth: node.style.transform.uses_depth()
+            || node.style.perspective.is_some()
+            || children.iter().any(|child| child.subtree_uses_depth),
         children,
     }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn node_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
-    apply_node_transform_to_bounds(node, node_own_visual_bounds_untransformed(node))
+    transform_bounds_with_context(
+        node_own_visual_bounds_untransformed(node),
+        TransformMatrix3d::IDENTITY,
+        node,
+        None,
+    )
 }
 
 fn node_own_visual_bounds_untransformed(node: &RenderNode) -> Option<ClipRect> {
@@ -2688,13 +2980,19 @@ fn node_own_visual_bounds_untransformed(node: &RenderNode) -> Option<ClipRect> {
     bounds
 }
 
-fn apply_node_transform_to_bounds(node: &RenderNode, bounds: Option<ClipRect>) -> Option<ClipRect> {
-    if node.style.transform.is_identity() {
-        return bounds;
-    }
-
-    let matrix = node_transform_matrix(node.layout, &node.style.transform)?;
-    bounds.and_then(|bounds| transform_clip_rect(bounds, matrix))
+fn transform_bounds_with_context(
+    bounds: Option<ClipRect>,
+    parent_world_matrix: TransformMatrix3d,
+    node: &RenderNode,
+    parent_perspective: Option<PerspectiveContext>,
+) -> Option<ClipRect> {
+    let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
+        node.layout,
+        &node.style.transform,
+    ));
+    let projected_matrix =
+        project_world_transform_matrix(node.layout, world_matrix, parent_perspective)?;
+    bounds.and_then(|bounds| transform_clip_rect(bounds, projected_matrix))
 }
 
 fn clear_clip(buffer: &mut [u32], width: usize, height: usize, clip: ClipRect, clear_color: Color) {
@@ -3086,9 +3384,10 @@ mod tests {
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, BoxShadow, CircleRadius, Color, ConicGradient,
         CornerRadius, ElementPath, GradientDirection, GradientHorizontal, GradientInterpolation,
-        GradientPoint, GradientStop, Insets, LayoutBox, LengthPercentageValue, LinearGradient,
-        Overflow, RadialGradient, RadialShape, RenderNode, ShadowEffect, TextStrokeStyle,
-        Transform2D, TransformOperation, VisualStyle,
+        GradientPoint, GradientStop, GradientVertical, Insets, LayoutBox, LengthPercentageValue,
+        LinearGradient, Overflow, RadialGradient, RadialShape, RenderNode, ShadowEffect,
+        TextStrokeStyle, Transform2D, TransformMatrix3d, TransformOperation, TransformStyleMode,
+        VisualStyle,
     };
 
     use crate::{
@@ -3275,9 +3574,25 @@ mod tests {
         ];
         let mut single = vec![0_u32; 128 * 96];
         let mut threaded = vec![0_u32; 128 * 96];
+        let cached_bounds = super::cache_scene_subtree_bounds(&scene);
 
-        super::render_to_buffer_serial(&scene, &mut single, 128, 96, Color::BLACK);
-        super::render_to_buffer_parallel(&scene, None, &mut threaded, 128, 96, Color::BLACK, 4);
+        super::render_to_buffer_serial(
+            &scene,
+            &cached_bounds.roots,
+            &mut single,
+            128,
+            96,
+            Color::BLACK,
+        );
+        super::render_to_buffer_parallel(
+            &scene,
+            &cached_bounds,
+            &mut threaded,
+            128,
+            96,
+            Color::BLACK,
+            4,
+        );
 
         assert_eq!(single, threaded);
     }
@@ -3304,7 +3619,11 @@ mod tests {
             shadow.offset_x,
             shadow.offset_y,
         );
-        let shadow_radius = super::expand_corner_radius(radius, shadow.spread);
+        let shadow_radius = super::expand_corner_radius(
+            LayoutBox::new(10.25, 20.0, 96.0, 72.0),
+            radius,
+            shadow.spread,
+        );
 
         let (first, _, _) =
             super::cached_shadow_mask(first_layout, shadow_radius, shadow.blur_radius);
@@ -4314,6 +4633,187 @@ mod tests {
     }
 
     #[test]
+    fn rotate_y_preserves_a_wide_projected_face_under_perspective() {
+        let accent = Color::rgb(16, 185, 129);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 400.0, 400.0))
+                .with_style(VisualStyle {
+                    perspective: Some(950.0),
+                    transform_style: TransformStyleMode::Preserve3d,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(90.0, 60.0, 220.0, 280.0)).with_style(
+                        VisualStyle {
+                            background: Some(accent),
+                            corner_radius: CornerRadius::all(28.0),
+                            transform_style: TransformStyleMode::Preserve3d,
+                            transform: Transform2D {
+                                operations: vec![TransformOperation::RotateY { degrees: 15.0 }],
+                                ..Transform2D::default()
+                            },
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 400 * 400];
+
+        render_to_buffer(&scene, &mut buffer, 400, 400, Color::WHITE);
+
+        let accent = pack_rgb(accent);
+        let mut x0 = usize::MAX;
+        let mut x1 = 0usize;
+        let mut hit_count = 0usize;
+        for (index, pixel) in buffer.iter().copied().enumerate() {
+            if pixel != accent {
+                continue;
+            }
+            let x = index % 400;
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            hit_count += 1;
+        }
+
+        assert!(
+            hit_count > 20_000,
+            "rotated face should still cover a large area"
+        );
+        assert!(x1 > x0, "rotated face should produce a measurable width");
+        assert!(
+            x1 - x0 > 150,
+            "rotateY(15deg) should still look like a broad face, not a thin strip"
+        );
+    }
+
+    #[test]
+    fn rotate_y_preserves_a_wide_projected_linear_gradient_face() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 400.0, 400.0))
+                .with_style(VisualStyle {
+                    perspective: Some(950.0),
+                    transform_style: TransformStyleMode::Preserve3d,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(90.0, 60.0, 220.0, 280.0)).with_style(
+                        VisualStyle {
+                            corner_radius: CornerRadius::all(28.0),
+                            background_layers: vec![BackgroundLayer::LinearGradient(
+                                LinearGradient {
+                                    direction: GradientDirection::Vertical(
+                                        GradientVertical::Bottom,
+                                    ),
+                                    interpolation: GradientInterpolation::Oklab,
+                                    repeating: false,
+                                    stops: vec![
+                                        GradientStop {
+                                            color: Color::rgba(255, 255, 255, 96),
+                                            position: LengthPercentageValue::from_fraction(0.0),
+                                        },
+                                        GradientStop {
+                                            color: Color::rgb(16, 185, 129),
+                                            position: LengthPercentageValue::from_fraction(1.0),
+                                        },
+                                    ],
+                                },
+                            )],
+                            transform_style: TransformStyleMode::Preserve3d,
+                            transform: Transform2D {
+                                operations: vec![TransformOperation::RotateY { degrees: 15.0 }],
+                                ..Transform2D::default()
+                            },
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 400 * 400];
+
+        render_to_buffer(&scene, &mut buffer, 400, 400, Color::WHITE);
+
+        let white = pack_rgb(Color::WHITE);
+        let mut x0 = usize::MAX;
+        let mut x1 = 0usize;
+        let mut hit_count = 0usize;
+        for (index, pixel) in buffer.iter().copied().enumerate() {
+            if pixel == white {
+                continue;
+            }
+            let x = index % 400;
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            hit_count += 1;
+        }
+
+        assert!(
+            hit_count > 20_000,
+            "rotated gradient face should still cover a large area"
+        );
+        assert!(
+            x1 > x0,
+            "rotated gradient face should produce a measurable width"
+        );
+        assert!(
+            x1 - x0 > 150,
+            "rotateY(15deg) should keep a transformed gradient broad, not collapse it"
+        );
+    }
+
+    #[test]
+    fn rotate_y_preserves_a_wide_projected_face_even_when_offset_far_from_origin() {
+        let accent = Color::rgb(16, 185, 129);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(450.0, 102.0, 220.0, 382.0))
+                .with_style(VisualStyle {
+                    perspective: Some(950.0),
+                    transform_style: TransformStyleMode::Preserve3d,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(450.0, 153.0, 220.0, 280.0)).with_style(
+                        VisualStyle {
+                            background: Some(accent),
+                            corner_radius: CornerRadius::all(28.0),
+                            transform_style: TransformStyleMode::Preserve3d,
+                            transform: Transform2D {
+                                operations: vec![TransformOperation::RotateY { degrees: 15.0 }],
+                                ..Transform2D::default()
+                            },
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 1440 * 980];
+
+        render_to_buffer(&scene, &mut buffer, 1440, 980, Color::WHITE);
+
+        let accent = pack_rgb(accent);
+        let mut x0 = usize::MAX;
+        let mut x1 = 0usize;
+        let mut hit_count = 0usize;
+        for (index, pixel) in buffer.iter().copied().enumerate() {
+            if pixel != accent {
+                continue;
+            }
+            let x = index % 1440;
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            hit_count += 1;
+        }
+
+        assert!(
+            hit_count > 20_000,
+            "offset rotated face should still cover a large area (hits={hit_count}, x0={x0}, x1={x1})"
+        );
+        assert!(
+            x1 - x0 > 150,
+            "offset rotateY(15deg) should still look broad (hits={hit_count}, x0={x0}, x1={x1})"
+        );
+    }
+
+    #[test]
     fn hit_testing_uses_inverse_rotation_for_transformed_nodes() {
         let scene = vec![
             RenderNode::container(LayoutBox::new(20.0, 20.0, 20.0, 20.0)).with_style(VisualStyle {
@@ -4330,6 +4830,175 @@ mod tests {
             Some(ElementPath::root(0))
         );
         assert_eq!(hit_test_element_path(&scene, 30.0, 14.0), None);
+    }
+
+    #[test]
+    fn perspective_sorts_overlapping_children_by_depth() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(10.0, 10.0, 28.0, 28.0))
+                .with_style(VisualStyle {
+                    perspective: Some(180.0),
+                    transform_style: TransformStyleMode::Preserve3d,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(16.0, 16.0, 12.0, 12.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(37, 99, 235)),
+                            transform: Transform2D {
+                                operations: vec![TransformOperation::TranslateZ { z: 36.0 }],
+                                ..Transform2D::default()
+                            },
+                            ..VisualStyle::default()
+                        },
+                    ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(16.0, 16.0, 12.0, 12.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(220, 38, 38)),
+                            transform: Transform2D {
+                                operations: vec![TransformOperation::TranslateZ { z: -36.0 }],
+                                ..Transform2D::default()
+                            },
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 48 * 48];
+
+        render_to_buffer(&scene, &mut buffer, 48, 48, Color::WHITE);
+
+        assert_eq!(buffer[22 * 48 + 22], pack_rgb(Color::rgb(37, 99, 235)));
+    }
+
+    #[test]
+    fn nested_preserve_3d_descendants_inherit_ancestor_perspective() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(8.0, 8.0, 56.0, 56.0))
+                .with_style(VisualStyle {
+                    perspective: Some(100.0),
+                    transform_style: TransformStyleMode::Preserve3d,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(16.0, 16.0, 32.0, 32.0))
+                        .with_style(VisualStyle {
+                            transform_style: TransformStyleMode::Preserve3d,
+                            ..VisualStyle::default()
+                        })
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(30.0, 30.0, 10.0, 10.0))
+                                .with_style(VisualStyle {
+                                    background: Some(Color::rgb(22, 163, 74)),
+                                    transform: Transform2D {
+                                        operations: vec![TransformOperation::TranslateZ {
+                                            z: 40.0,
+                                        }],
+                                        ..Transform2D::default()
+                                    },
+                                    ..VisualStyle::default()
+                                }),
+                        ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 80 * 80];
+
+        render_to_buffer(&scene, &mut buffer, 80, 80, Color::WHITE);
+
+        assert_eq!(buffer[35 * 80 + 28], pack_rgb(Color::rgb(22, 163, 74)));
+        assert_eq!(buffer[35 * 80 + 24], pack_rgb(Color::WHITE));
+    }
+
+    #[test]
+    fn flat_nodes_keep_local_depth_order_for_nested_3d_children() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(8.0, 8.0, 56.0, 56.0))
+                .with_style(VisualStyle {
+                    perspective: Some(180.0),
+                    transform_style: TransformStyleMode::Preserve3d,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(18.0, 18.0, 24.0, 24.0))
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(22.0, 22.0, 12.0, 12.0))
+                                .with_style(VisualStyle {
+                                    background: Some(Color::rgb(37, 99, 235)),
+                                    transform: Transform2D {
+                                        operations: vec![TransformOperation::TranslateZ {
+                                            z: 28.0,
+                                        }],
+                                        ..Transform2D::default()
+                                    },
+                                    ..VisualStyle::default()
+                                }),
+                        )
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(22.0, 22.0, 12.0, 12.0))
+                                .with_style(VisualStyle {
+                                    background: Some(Color::rgb(220, 38, 38)),
+                                    transform: Transform2D {
+                                        operations: vec![TransformOperation::TranslateZ {
+                                            z: -28.0,
+                                        }],
+                                        ..Transform2D::default()
+                                    },
+                                    ..VisualStyle::default()
+                                }),
+                        ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 80 * 80];
+
+        render_to_buffer(&scene, &mut buffer, 80, 80, Color::WHITE);
+
+        assert_eq!(buffer[28 * 80 + 28], pack_rgb(Color::rgb(37, 99, 235)));
+    }
+
+    #[test]
+    fn hit_testing_prefers_the_frontmost_3d_child() {
+        let front_path = ElementPath {
+            root: 0,
+            children: vec![0],
+        };
+        let back_path = ElementPath {
+            root: 0,
+            children: vec![1],
+        };
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(10.0, 10.0, 28.0, 28.0))
+                .with_style(VisualStyle {
+                    perspective: Some(180.0),
+                    transform_style: TransformStyleMode::Preserve3d,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(16.0, 16.0, 12.0, 12.0))
+                        .with_style(VisualStyle {
+                            transform: Transform2D {
+                                operations: vec![TransformOperation::TranslateZ { z: 36.0 }],
+                                ..Transform2D::default()
+                            },
+                            ..VisualStyle::default()
+                        })
+                        .with_element_path(front_path.clone()),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(16.0, 16.0, 12.0, 12.0))
+                        .with_style(VisualStyle {
+                            transform: Transform2D {
+                                operations: vec![TransformOperation::TranslateZ { z: -36.0 }],
+                                ..Transform2D::default()
+                            },
+                            ..VisualStyle::default()
+                        })
+                        .with_element_path(back_path.clone()),
+                ),
+        ];
+
+        assert_eq!(hit_test_element_path(&scene, 22.0, 22.0), Some(front_path));
     }
 
     #[test]
@@ -4450,6 +5119,116 @@ mod tests {
         render_to_buffer(&previous, &mut incremental, 20, 20, Color::WHITE);
         render_scene_update(&previous, &next, &mut incremental, 20, 20, Color::WHITE);
         render_to_buffer(&next, &mut full, 20, 20, Color::WHITE);
+
+        assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn incremental_render_matches_full_render_for_a_hovered_projected_card() {
+        let previous = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 420.0, 420.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(28, 28, 30)),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(60.0, 50.0, 290.0, 300.0))
+                        .with_style(VisualStyle {
+                            perspective: Some(1000.0),
+                            ..VisualStyle::default()
+                        })
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(60.0, 50.0, 290.0, 300.0))
+                                .with_style(VisualStyle {
+                                    background: Some(Color::rgb(0, 230, 150)),
+                                    corner_radius: CornerRadius::all(50.0),
+                                    overflow: Overflow::CLIP,
+                                    ..VisualStyle::default()
+                                })
+                                .with_child(
+                                    RenderNode::container(LayoutBox::new(68.0, 58.0, 274.0, 284.0))
+                                        .with_style(VisualStyle {
+                                            background: Some(Color::rgba(255, 255, 255, 210)),
+                                            corner_radius: CornerRadius {
+                                                top_left: 55.0,
+                                                top_right: -1.0,
+                                                bottom_right: 55.0,
+                                                bottom_left: 55.0,
+                                            },
+                                            transform_style: TransformStyleMode::Preserve3d,
+                                            transform: Transform2D {
+                                                operations: vec![TransformOperation::TranslateZ {
+                                                    z: 25.0,
+                                                }],
+                                                ..Transform2D::default()
+                                            },
+                                            ..VisualStyle::default()
+                                        }),
+                                ),
+                        ),
+                ),
+        ];
+
+        let next = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 420.0, 420.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(28, 28, 30)),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(60.0, 50.0, 290.0, 300.0))
+                        .with_style(VisualStyle {
+                            perspective: Some(1000.0),
+                            ..VisualStyle::default()
+                        })
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(60.0, 50.0, 290.0, 300.0))
+                                .with_style(VisualStyle {
+                                    background: Some(Color::rgb(0, 230, 150)),
+                                    corner_radius: CornerRadius::all(50.0),
+                                    overflow: Overflow::CLIP,
+                                    transform_style: TransformStyleMode::Preserve3d,
+                                    transform: Transform2D {
+                                        operations: vec![
+                                            TransformOperation::RotateX { degrees: 10.0 },
+                                            TransformOperation::RotateY { degrees: -10.0 },
+                                            TransformOperation::Matrix3d {
+                                                matrix: TransformMatrix3d::scale(1.02, 1.02, 1.02),
+                                            },
+                                        ],
+                                        ..Transform2D::default()
+                                    },
+                                    ..VisualStyle::default()
+                                })
+                                .with_child(
+                                    RenderNode::container(LayoutBox::new(68.0, 58.0, 274.0, 284.0))
+                                        .with_style(VisualStyle {
+                                            background: Some(Color::rgba(255, 255, 255, 210)),
+                                            corner_radius: CornerRadius {
+                                                top_left: 55.0,
+                                                top_right: -0.8,
+                                                bottom_right: 55.0,
+                                                bottom_left: 55.0,
+                                            },
+                                            transform_style: TransformStyleMode::Preserve3d,
+                                            transform: Transform2D {
+                                                operations: vec![TransformOperation::TranslateZ {
+                                                    z: 36.0,
+                                                }],
+                                                ..Transform2D::default()
+                                            },
+                                            ..VisualStyle::default()
+                                        }),
+                                ),
+                        ),
+                ),
+        ];
+        let mut incremental = vec![0_u32; 420 * 420];
+        let mut full = vec![0_u32; 420 * 420];
+
+        render_to_buffer(&previous, &mut incremental, 420, 420, Color::WHITE);
+        render_scene_update(&previous, &next, &mut incremental, 420, 420, Color::WHITE);
+        render_to_buffer(&next, &mut full, 420, 420, Color::WHITE);
 
         assert_eq!(incremental, full);
     }

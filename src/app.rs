@@ -1030,7 +1030,9 @@ mod tests {
     use crate::ui;
 
     use super::{App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode};
-    use crate::renderer::{FrameInfo, SceneProvider, ViewportSize};
+    use crate::renderer::{
+        FrameInfo, SceneProvider, ViewportSize, render_scene_update, render_to_buffer,
+    };
     use crate::style::{Stylesheet, parse_stylesheet};
 
     #[test]
@@ -1852,11 +1854,234 @@ mod tests {
         assert_eq!(fourth[0].layout.width, 160.0);
     }
 
+    #[test]
+    fn app_keeps_a_3d_card_near_its_center_during_transform_transitions() {
+        let stylesheet = parse_stylesheet(
+            r#"
+            #app {
+              width: 420px;
+              height: 420px;
+              padding: 60px;
+            }
+
+            .parent {
+              position: relative;
+              width: 290px;
+              height: 300px;
+              perspective: 1000px;
+            }
+
+            .card {
+              position: relative;
+              width: 100%;
+              height: 100%;
+              border-radius: 50px;
+              background: #00ffd6;
+              transform-style: preserve-3d;
+              transition: transform 500ms linear;
+            }
+
+            .parent.hot .card {
+              transform: rotateX(10deg) rotateY(-10deg) scale3d(1.02, 1.02, 1.02);
+            }
+
+            .glass {
+              position: absolute;
+              inset: 8px;
+              border-radius: 55px;
+              border-top-right-radius: 100%;
+              background: rgba(255, 255, 255, 0.7);
+              transform: translate3d(0px, 0px, 25px);
+            }
+            "#,
+        )
+        .expect("3d transition stylesheet should parse");
+        let mut app = App::new(
+            false,
+            &stylesheet,
+            |state, frame| {
+                if frame.frame_index == 1 {
+                    *state = true;
+                    Invalidation::Paint
+                } else {
+                    Invalidation::Clean
+                }
+            },
+            |state| {
+                let mut parent = Node::element("div").with_class("parent");
+                if *state {
+                    parent = parent.with_class("hot");
+                }
+                let card = Node::element("div")
+                    .with_class("card")
+                    .with_child(Node::element("div").with_class("glass").into());
+                Node::element("div")
+                    .with_id("app")
+                    .with_child(parent.with_child(card.into()).into())
+                    .into()
+            },
+        );
+
+        let idle = app.frame(frame(0));
+        let mid = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::from_millis(250),
+        });
+        let final_scene = app.frame(FrameInfo {
+            frame_index: 2,
+            delta: Duration::from_millis(250),
+        });
+
+        let clear = Color::rgb(255, 0, 255);
+        let clear_packed = ((clear.r as u32) << 16) | ((clear.g as u32) << 8) | clear.b as u32;
+        let mut idle_buffer = vec![0_u32; 420 * 420];
+        let mut mid_buffer = vec![0_u32; 420 * 420];
+        let mut final_buffer = vec![0_u32; 420 * 420];
+
+        render_to_buffer(&idle, &mut idle_buffer, 420, 420, clear);
+        render_to_buffer(&mid, &mut mid_buffer, 420, 420, clear);
+        render_to_buffer(&final_scene, &mut final_buffer, 420, 420, clear);
+
+        let idle_bounds =
+            visible_bounds(&idle_buffer, 420, 420, clear_packed).expect("idle card should render");
+        let mid_bounds = visible_bounds(&mid_buffer, 420, 420, clear_packed).unwrap_or_else(|| {
+            panic!(
+                "mid-transition card should render; midpoint transform was {:?}",
+                mid[0].children[0].children[0].style.transform.operations
+            )
+        });
+        let final_bounds = visible_bounds(&final_buffer, 420, 420, clear_packed)
+            .expect("final card should render");
+
+        let idle_center_x = (idle_bounds.0 + idle_bounds.2) as f32 * 0.5;
+        let idle_center_y = (idle_bounds.1 + idle_bounds.3) as f32 * 0.5;
+        let mid_center_x = (mid_bounds.0 + mid_bounds.2) as f32 * 0.5;
+        let mid_center_y = (mid_bounds.1 + mid_bounds.3) as f32 * 0.5;
+        let final_center_x = (final_bounds.0 + final_bounds.2) as f32 * 0.5;
+        let final_center_y = (final_bounds.1 + final_bounds.3) as f32 * 0.5;
+
+        assert!((mid_center_x - idle_center_x).abs() < 18.0);
+        assert!((mid_center_y - idle_center_y).abs() < 18.0);
+        assert!((final_center_x - idle_center_x).abs() < 24.0);
+        assert!((final_center_y - idle_center_y).abs() < 24.0);
+    }
+
+    #[test]
+    fn incremental_render_matches_full_redraw_for_a_mid_transition_3d_card() {
+        let stylesheet = parse_stylesheet(
+            r#"
+            #app {
+              width: 420px;
+              height: 420px;
+              padding: 60px;
+            }
+
+            .parent {
+              position: relative;
+              width: 290px;
+              height: 300px;
+              perspective: 1000px;
+            }
+
+            .card {
+              position: relative;
+              width: 100%;
+              height: 100%;
+              border-radius: 50px;
+              background: #00ffd6;
+              transform-style: preserve-3d;
+              transition: transform 500ms linear;
+            }
+
+            .parent.hot .card {
+              transform: rotateX(10deg) rotateY(-10deg) scale3d(1.02, 1.02, 1.02);
+            }
+
+            .glass {
+              position: absolute;
+              inset: 8px;
+              border-radius: 55px;
+              border-top-right-radius: 100%;
+              background: rgba(255, 255, 255, 0.7);
+              transform: translate3d(0px, 0px, 25px);
+            }
+            "#,
+        )
+        .expect("3d transition stylesheet should parse");
+        let mut app = App::new(
+            false,
+            &stylesheet,
+            |state, frame| {
+                if frame.frame_index == 1 {
+                    *state = true;
+                    Invalidation::Paint
+                } else {
+                    Invalidation::Clean
+                }
+            },
+            |state| {
+                let mut parent = Node::element("div").with_class("parent");
+                if *state {
+                    parent = parent.with_class("hot");
+                }
+                let card = Node::element("div")
+                    .with_class("card")
+                    .with_child(Node::element("div").with_class("glass").into());
+                Node::element("div")
+                    .with_id("app")
+                    .with_child(parent.with_child(card.into()).into())
+                    .into()
+            },
+        );
+
+        let idle = app.frame(frame(0));
+        let mid = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::from_millis(250),
+        });
+
+        let clear = Color::rgb(255, 0, 255);
+        let mut incremental = vec![0_u32; 420 * 420];
+        let mut full = vec![0_u32; 420 * 420];
+
+        render_to_buffer(&idle, &mut incremental, 420, 420, clear);
+        render_scene_update(&idle, &mid, &mut incremental, 420, 420, clear);
+        render_to_buffer(&mid, &mut full, 420, 420, clear);
+
+        assert_eq!(incremental, full);
+    }
+
     fn frame(frame_index: u64) -> FrameInfo {
         FrameInfo {
             frame_index,
             delta: Duration::from_millis(16),
         }
+    }
+
+    fn visible_bounds(
+        buffer: &[u32],
+        width: usize,
+        height: usize,
+        clear_packed: u32,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let mut x0 = width as i32;
+        let mut y0 = height as i32;
+        let mut x1 = 0_i32;
+        let mut y1 = 0_i32;
+
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                if buffer[y as usize * width + x as usize] == clear_packed {
+                    continue;
+                }
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+        }
+
+        (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
     }
 
     fn text_nodes(scene: &[RenderNode]) -> Vec<String> {

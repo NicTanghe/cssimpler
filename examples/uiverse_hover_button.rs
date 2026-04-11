@@ -132,18 +132,19 @@ fn stylesheet() -> &'static Stylesheet {
             include_str!("uiverse_hover_button.css"),
             include_str!("uiverse_card.css")
         );
-        parse_stylesheet(&source)
-            .expect("uiverse hover button stylesheet should stay valid")
+        parse_stylesheet(&source).expect("uiverse hover button stylesheet should stay valid")
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BUTTON_TEXT, build_ui, stylesheet};
+    use super::{BUTTON_TEXT, build_card, build_ui, stylesheet};
     use cssimpler::app::{App, Invalidation};
     use cssimpler::core::fonts::layout_text_block;
     use cssimpler::core::{ElementInteractionState, ElementPath, Node, RenderKind, RenderNode};
-    use cssimpler::renderer::FrameInfo;
+    use cssimpler::renderer::{
+        FrameInfo, SceneProvider, ViewportSize, render_scene_update, render_to_buffer,
+    };
     use cssimpler::style::{build_render_tree_in_viewport_with_interaction, parse_stylesheet};
     use cssimpler::ui;
     use std::time::Duration;
@@ -367,6 +368,274 @@ mod tests {
         assert_eq!(text_layout.lines.len(), 1);
     }
 
+    #[test]
+    fn hovered_card_full_render_spans_a_large_visible_area() {
+        let tree = ui! {
+            <div>
+                {build_card()}
+            </div>
+        };
+        let hovered = build_render_tree_in_viewport_with_interaction(
+            &tree,
+            stylesheet(),
+            480,
+            480,
+            &ElementInteractionState {
+                hovered: Some(ElementPath::root(0).with_child(0).with_child(0)),
+                active: None,
+            },
+        );
+        let clear = cssimpler::core::Color::rgb(255, 0, 255);
+        let clear_packed = ((clear.r as u32) << 16) | ((clear.g as u32) << 8) | clear.b as u32;
+        let mut buffer = vec![0_u32; 480 * 480];
+
+        render_to_buffer(&[hovered], &mut buffer, 480, 480, clear);
+
+        let mut x0 = 480_i32;
+        let mut y0 = 480_i32;
+        let mut x1 = 0_i32;
+        let mut y1 = 0_i32;
+        for y in 0..480_i32 {
+            for x in 0..480_i32 {
+                if buffer[y as usize * 480 + x as usize] == clear_packed {
+                    continue;
+                }
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+        }
+
+        assert!(x1 - x0 > 180, "hovered card should cover a wide area");
+        assert!(y1 - y0 > 180, "hovered card should cover a tall area");
+    }
+
+    #[test]
+    fn hovered_card_incremental_render_matches_a_full_redraw() {
+        let tree = ui! {
+            <div>
+                {build_card()}
+            </div>
+        };
+        let idle = build_render_tree_in_viewport_with_interaction(
+            &tree,
+            stylesheet(),
+            480,
+            480,
+            &ElementInteractionState::default(),
+        );
+        let hovered = build_render_tree_in_viewport_with_interaction(
+            &tree,
+            stylesheet(),
+            480,
+            480,
+            &ElementInteractionState {
+                hovered: Some(ElementPath::root(0).with_child(0).with_child(0)),
+                active: None,
+            },
+        );
+        let clear = cssimpler::core::Color::rgb(255, 0, 255);
+        let mut incremental = vec![0_u32; 480 * 480];
+        let mut full = vec![0_u32; 480 * 480];
+
+        render_to_buffer(
+            std::slice::from_ref(&idle),
+            &mut incremental,
+            480,
+            480,
+            clear,
+        );
+        render_scene_update(
+            std::slice::from_ref(&idle),
+            std::slice::from_ref(&hovered),
+            &mut incremental,
+            480,
+            480,
+            clear,
+        );
+        render_to_buffer(std::slice::from_ref(&hovered), &mut full, 480, 480, clear);
+
+        assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn hovered_card_stays_near_its_idle_center() {
+        let tree = ui! {
+            <div>
+                {build_card()}
+            </div>
+        };
+        let idle = build_render_tree_in_viewport_with_interaction(
+            &tree,
+            stylesheet(),
+            480,
+            480,
+            &ElementInteractionState::default(),
+        );
+        let hovered = build_render_tree_in_viewport_with_interaction(
+            &tree,
+            stylesheet(),
+            480,
+            480,
+            &ElementInteractionState {
+                hovered: Some(ElementPath::root(0).with_child(0).with_child(0)),
+                active: None,
+            },
+        );
+        let clear = cssimpler::core::Color::rgb(255, 0, 255);
+        let clear_packed = ((clear.r as u32) << 16) | ((clear.g as u32) << 8) | clear.b as u32;
+        let mut idle_buffer = vec![0_u32; 480 * 480];
+        let mut hovered_buffer = vec![0_u32; 480 * 480];
+
+        render_to_buffer(
+            std::slice::from_ref(&idle),
+            &mut idle_buffer,
+            480,
+            480,
+            clear,
+        );
+        render_to_buffer(
+            std::slice::from_ref(&hovered),
+            &mut hovered_buffer,
+            480,
+            480,
+            clear,
+        );
+
+        let idle_bounds = visible_bounds(&idle_buffer, 480, 480, clear_packed)
+            .expect("idle card should render visible pixels");
+        let hovered_bounds = visible_bounds(&hovered_buffer, 480, 480, clear_packed)
+            .expect("hovered card should render visible pixels");
+        let idle_center_x = (idle_bounds.0 + idle_bounds.2) as f32 * 0.5;
+        let idle_center_y = (idle_bounds.1 + idle_bounds.3) as f32 * 0.5;
+        let hovered_center_x = (hovered_bounds.0 + hovered_bounds.2) as f32 * 0.5;
+        let hovered_center_y = (hovered_bounds.1 + hovered_bounds.3) as f32 * 0.5;
+
+        assert!((hovered_center_x - idle_center_x).abs() < 40.0);
+        assert!((hovered_center_y - idle_center_y).abs() < 40.0);
+    }
+
+    #[test]
+    fn hover_transition_midpoint_keeps_the_real_card_near_its_idle_center() {
+        let mut app = App::new(
+            (),
+            stylesheet(),
+            |_state, _frame| Invalidation::Clean,
+            |_state| {
+                ui! {
+                    <div>
+                        {build_card()}
+                    </div>
+                }
+            },
+        );
+        app.set_viewport(ViewportSize {
+            width: 480,
+            height: 480,
+        });
+
+        let idle = app.frame(frame(0));
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(0).with_child(0).with_child(0)),
+                active: None,
+            },
+        ));
+        let mid = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::from_millis(250),
+        });
+        let final_scene = app.frame(FrameInfo {
+            frame_index: 2,
+            delta: Duration::from_millis(250),
+        });
+
+        let clear = cssimpler::core::Color::rgb(255, 0, 255);
+        let clear_packed = ((clear.r as u32) << 16) | ((clear.g as u32) << 8) | clear.b as u32;
+        let mut idle_buffer = vec![0_u32; 480 * 480];
+        let mut mid_buffer = vec![0_u32; 480 * 480];
+        let mut final_buffer = vec![0_u32; 480 * 480];
+
+        render_to_buffer(&idle, &mut idle_buffer, 480, 480, clear);
+        render_to_buffer(&mid, &mut mid_buffer, 480, 480, clear);
+        render_to_buffer(&final_scene, &mut final_buffer, 480, 480, clear);
+
+        let idle_bounds =
+            visible_bounds(&idle_buffer, 480, 480, clear_packed).expect("idle card should render");
+        let mid_bounds = visible_bounds(&mid_buffer, 480, 480, clear_packed)
+            .expect("mid-transition card should render");
+        let final_bounds = visible_bounds(&final_buffer, 480, 480, clear_packed)
+            .expect("final card should render");
+
+        let idle_center_x = (idle_bounds.0 + idle_bounds.2) as f32 * 0.5;
+        let idle_center_y = (idle_bounds.1 + idle_bounds.3) as f32 * 0.5;
+        let mid_center_x = (mid_bounds.0 + mid_bounds.2) as f32 * 0.5;
+        let mid_center_y = (mid_bounds.1 + mid_bounds.3) as f32 * 0.5;
+        let final_center_x = (final_bounds.0 + final_bounds.2) as f32 * 0.5;
+        let final_center_y = (final_bounds.1 + final_bounds.3) as f32 * 0.5;
+        assert!(
+            (mid_center_x - idle_center_x).abs() < 14.0,
+            "mid x drift too large: idle={idle_center_x}, mid={mid_center_x}, final={final_center_x}"
+        );
+        assert!(
+            (mid_center_y - idle_center_y).abs() < 18.0,
+            "mid y drift too large: idle={idle_center_y}, mid={mid_center_y}, final={final_center_y}"
+        );
+        assert!(
+            (final_center_x - idle_center_x).abs() < 24.0,
+            "final x drift too large: idle={idle_center_x}, mid={mid_center_x}, final={final_center_x}"
+        );
+        assert!(
+            (final_center_y - idle_center_y).abs() < 32.0,
+            "final y drift too large: idle={idle_center_y}, mid={mid_center_y}, final={final_center_y}"
+        );
+    }
+
+    #[test]
+    fn hover_transition_midpoint_incremental_render_matches_full_redraw() {
+        let mut app = App::new(
+            (),
+            stylesheet(),
+            |_state, _frame| Invalidation::Clean,
+            |_state| {
+                ui! {
+                    <div>
+                        {build_card()}
+                    </div>
+                }
+            },
+        );
+        app.set_viewport(ViewportSize {
+            width: 480,
+            height: 480,
+        });
+
+        let idle = app.frame(frame(0));
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(0).with_child(0).with_child(0)),
+                active: None,
+            },
+        ));
+        let mid = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::from_millis(250),
+        });
+
+        let clear = cssimpler::core::Color::rgb(255, 0, 255);
+        let mut incremental = vec![0_u32; 480 * 480];
+        let mut full = vec![0_u32; 480 * 480];
+
+        render_to_buffer(&idle, &mut incremental, 480, 480, clear);
+        render_scene_update(&idle, &mid, &mut incremental, 480, 480, clear);
+        render_to_buffer(&mid, &mut full, 480, 480, clear);
+
+        assert_eq!(incremental, full);
+    }
+
     fn build_test_button(is_hot: bool) -> Node {
         if is_hot {
             ui! {
@@ -418,5 +687,31 @@ mod tests {
             frame_index,
             delta: Duration::from_millis(16),
         }
+    }
+
+    fn visible_bounds(
+        buffer: &[u32],
+        width: usize,
+        height: usize,
+        clear_packed: u32,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let mut x0 = width as i32;
+        let mut y0 = height as i32;
+        let mut x1 = 0_i32;
+        let mut y1 = 0_i32;
+
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                if buffer[y as usize * width + x as usize] == clear_packed {
+                    continue;
+                }
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+        }
+
+        (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
     }
 }

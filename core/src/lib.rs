@@ -348,11 +348,216 @@ impl Default for TransformOrigin {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransformStyleMode {
+    #[default]
+    Flat,
+    Preserve3d,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformMatrix3d {
+    pub m11: f32,
+    pub m12: f32,
+    pub m13: f32,
+    pub m14: f32,
+    pub m21: f32,
+    pub m22: f32,
+    pub m23: f32,
+    pub m24: f32,
+    pub m31: f32,
+    pub m32: f32,
+    pub m33: f32,
+    pub m34: f32,
+    pub m41: f32,
+    pub m42: f32,
+    pub m43: f32,
+    pub m44: f32,
+}
+
+impl TransformMatrix3d {
+    pub const IDENTITY: Self = Self {
+        m11: 1.0,
+        m12: 0.0,
+        m13: 0.0,
+        m14: 0.0,
+        m21: 0.0,
+        m22: 1.0,
+        m23: 0.0,
+        m24: 0.0,
+        m31: 0.0,
+        m32: 0.0,
+        m33: 1.0,
+        m34: 0.0,
+        m41: 0.0,
+        m42: 0.0,
+        m43: 0.0,
+        m44: 1.0,
+    };
+
+    pub const fn translate(x: f32, y: f32, z: f32) -> Self {
+        Self {
+            m14: x,
+            m24: y,
+            m34: z,
+            ..Self::IDENTITY
+        }
+    }
+
+    pub const fn scale(x: f32, y: f32, z: f32) -> Self {
+        Self {
+            m11: x,
+            m22: y,
+            m33: z,
+            ..Self::IDENTITY
+        }
+    }
+
+    pub fn rotate(x: f32, y: f32, z: f32, degrees: f32) -> Self {
+        let length = (x * x + y * y + z * z).sqrt();
+        if length <= f32::EPSILON {
+            return Self::IDENTITY;
+        }
+
+        let x = x / length;
+        let y = y / length;
+        let z = z / length;
+        let radians = degrees.to_radians();
+        let sin = radians.sin();
+        let cos = radians.cos();
+        let t = 1.0 - cos;
+
+        Self {
+            m11: t * x * x + cos,
+            m12: t * x * y - sin * z,
+            m13: t * x * z + sin * y,
+            m14: 0.0,
+            m21: t * x * y + sin * z,
+            m22: t * y * y + cos,
+            m23: t * y * z - sin * x,
+            m24: 0.0,
+            m31: t * x * z - sin * y,
+            m32: t * y * z + sin * x,
+            m33: t * z * z + cos,
+            m34: 0.0,
+            m41: 0.0,
+            m42: 0.0,
+            m43: 0.0,
+            m44: 1.0,
+        }
+    }
+
+    pub fn perspective(depth: f32) -> Option<Self> {
+        (depth.abs() > f32::EPSILON).then_some(Self {
+            m43: -1.0 / depth,
+            ..Self::IDENTITY
+        })
+    }
+
+    pub fn is_identity(self) -> bool {
+        self == Self::IDENTITY
+    }
+
+    pub fn is_2d(self) -> bool {
+        self.m13 == 0.0
+            && self.m23 == 0.0
+            && self.m31 == 0.0
+            && self.m32 == 0.0
+            && self.m33 == 1.0
+            && self.m34 == 0.0
+            && self.m41 == 0.0
+            && self.m42 == 0.0
+            && self.m43 == 0.0
+            && self.m44 == 1.0
+    }
+
+    pub fn multiply(self, other: Self) -> Self {
+        Self {
+            m11: self.m11 * other.m11
+                + self.m12 * other.m21
+                + self.m13 * other.m31
+                + self.m14 * other.m41,
+            m12: self.m11 * other.m12
+                + self.m12 * other.m22
+                + self.m13 * other.m32
+                + self.m14 * other.m42,
+            m13: self.m11 * other.m13
+                + self.m12 * other.m23
+                + self.m13 * other.m33
+                + self.m14 * other.m43,
+            m14: self.m11 * other.m14
+                + self.m12 * other.m24
+                + self.m13 * other.m34
+                + self.m14 * other.m44,
+            m21: self.m21 * other.m11
+                + self.m22 * other.m21
+                + self.m23 * other.m31
+                + self.m24 * other.m41,
+            m22: self.m21 * other.m12
+                + self.m22 * other.m22
+                + self.m23 * other.m32
+                + self.m24 * other.m42,
+            m23: self.m21 * other.m13
+                + self.m22 * other.m23
+                + self.m23 * other.m33
+                + self.m24 * other.m43,
+            m24: self.m21 * other.m14
+                + self.m22 * other.m24
+                + self.m23 * other.m34
+                + self.m24 * other.m44,
+            m31: self.m31 * other.m11
+                + self.m32 * other.m21
+                + self.m33 * other.m31
+                + self.m34 * other.m41,
+            m32: self.m31 * other.m12
+                + self.m32 * other.m22
+                + self.m33 * other.m32
+                + self.m34 * other.m42,
+            m33: self.m31 * other.m13
+                + self.m32 * other.m23
+                + self.m33 * other.m33
+                + self.m34 * other.m43,
+            m34: self.m31 * other.m14
+                + self.m32 * other.m24
+                + self.m33 * other.m34
+                + self.m34 * other.m44,
+            m41: self.m41 * other.m11
+                + self.m42 * other.m21
+                + self.m43 * other.m31
+                + self.m44 * other.m41,
+            m42: self.m41 * other.m12
+                + self.m42 * other.m22
+                + self.m43 * other.m32
+                + self.m44 * other.m42,
+            m43: self.m41 * other.m13
+                + self.m42 * other.m23
+                + self.m43 * other.m33
+                + self.m44 * other.m43,
+            m44: self.m41 * other.m14
+                + self.m42 * other.m24
+                + self.m43 * other.m34
+                + self.m44 * other.m44,
+        }
+    }
+
+    pub fn transform_point(self, x: f32, y: f32, z: f32, w: f32) -> (f32, f32, f32, f32) {
+        (
+            self.m11 * x + self.m12 * y + self.m13 * z + self.m14 * w,
+            self.m21 * x + self.m22 * y + self.m23 * z + self.m24 * w,
+            self.m31 * x + self.m32 * y + self.m33 * z + self.m34 * w,
+            self.m41 * x + self.m42 * y + self.m43 * z + self.m44 * w,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TransformOperation {
     Translate {
         x: LengthPercentageValue,
         y: LengthPercentageValue,
+    },
+    TranslateZ {
+        z: f32,
     },
     Scale {
         x: f32,
@@ -360,6 +565,18 @@ pub enum TransformOperation {
     },
     Rotate {
         degrees: f32,
+    },
+    RotateX {
+        degrees: f32,
+    },
+    RotateY {
+        degrees: f32,
+    },
+    RotateZ {
+        degrees: f32,
+    },
+    Matrix3d {
+        matrix: TransformMatrix3d,
     },
 }
 
@@ -372,6 +589,22 @@ pub struct Transform2D {
 impl Transform2D {
     pub fn is_identity(&self) -> bool {
         self.operations.is_empty()
+    }
+
+    pub fn uses_depth(&self) -> bool {
+        self.operations
+            .iter()
+            .any(|operation| operation.uses_depth())
+    }
+}
+
+impl TransformOperation {
+    pub fn uses_depth(self) -> bool {
+        match self {
+            Self::TranslateZ { .. } | Self::RotateX { .. } | Self::RotateY { .. } => true,
+            Self::Matrix3d { matrix } => !matrix.is_2d(),
+            _ => false,
+        }
     }
 }
 
@@ -389,6 +622,8 @@ pub struct VisualStyle {
     pub shadows: Vec<BoxShadow>,
     pub overflow: Overflow,
     pub transform: Transform2D,
+    pub perspective: Option<f32>,
+    pub transform_style: TransformStyleMode,
     pub scrollbar: ScrollbarStyle,
 }
 
@@ -407,6 +642,8 @@ impl Default for VisualStyle {
             shadows: Vec::new(),
             overflow: Overflow::VISIBLE,
             transform: Transform2D::default(),
+            perspective: None,
+            transform_style: TransformStyleMode::Flat,
             scrollbar: ScrollbarStyle::default(),
         }
     }

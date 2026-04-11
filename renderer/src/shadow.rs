@@ -223,7 +223,7 @@ pub(crate) fn draw_shadow(
         shadow.offset_x,
         shadow.offset_y,
     );
-    let base_radius = expand_corner_radius(radius, shadow.spread);
+    let base_radius = expand_corner_radius(layout, radius, shadow.spread);
     let blur_radius = shadow.blur_radius.max(0.0);
 
     if blur_radius <= 0.0 {
@@ -267,7 +267,7 @@ pub(crate) fn draw_shadow_transformed(
         shadow.offset_x,
         shadow.offset_y,
     );
-    let base_radius = expand_corner_radius(radius, shadow.spread);
+    let base_radius = expand_corner_radius(layout, radius, shadow.spread);
     let blur_radius = shadow.blur_radius.max(0.0);
     let (mask, offset_x, offset_y) = cached_shadow_mask(base_layout, base_radius, blur_radius);
     draw_shadow_mask_transformed(
@@ -637,10 +637,18 @@ fn distance_to_corner(x: f32, y: f32, center_x: f32, center_y: f32, radius: f32)
 fn clamp_corner_radius(radius: CornerRadius, width: f32, height: f32) -> CornerRadius {
     let max_radius = 0.5 * width.min(height).max(0.0);
     CornerRadius {
-        top_left: radius.top_left.min(max_radius).max(0.0),
-        top_right: radius.top_right.min(max_radius).max(0.0),
-        bottom_right: radius.bottom_right.min(max_radius).max(0.0),
-        bottom_left: radius.bottom_left.min(max_radius).max(0.0),
+        top_left: resolve_corner_radius_value(radius.top_left, max_radius),
+        top_right: resolve_corner_radius_value(radius.top_right, max_radius),
+        bottom_right: resolve_corner_radius_value(radius.bottom_right, max_radius),
+        bottom_left: resolve_corner_radius_value(radius.bottom_left, max_radius),
+    }
+}
+
+fn resolve_corner_radius_value(value: f32, max_radius: f32) -> f32 {
+    if value < 0.0 {
+        (-value * max_radius).min(max_radius).max(0.0)
+    } else {
+        value.min(max_radius).max(0.0)
     }
 }
 
