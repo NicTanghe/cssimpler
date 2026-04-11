@@ -225,19 +225,28 @@ fn next_surface_cache_use(next_use: &mut u64) -> u64 {
     use_index
 }
 
-fn cached_subtree_surface_entry(cache: &mut SubtreeSurfaceCache, key: u64) -> Option<Arc<CachedSubtreeSurface>> {
+fn cached_subtree_surface_entry(
+    cache: &mut SubtreeSurfaceCache,
+    key: u64,
+) -> Option<Arc<CachedSubtreeSurface>> {
     let last_used = next_surface_cache_use(&mut cache.next_use);
     let entry = cache.surfaces.get_mut(&key)?;
     entry.last_used = last_used;
     Some(entry.surface.clone())
 }
 
-fn insert_subtree_surface_entry(cache: &mut SubtreeSurfaceCache, key: u64, surface: Arc<CachedSubtreeSurface>) {
+fn insert_subtree_surface_entry(
+    cache: &mut SubtreeSurfaceCache,
+    key: u64,
+    surface: Arc<CachedSubtreeSurface>,
+) {
     if cache.surfaces.len() >= MAX_SUBTREE_SURFACE_CACHE_ENTRIES {
         evict_lru_subtree_surface_entry(&mut cache.surfaces);
     }
     let last_used = next_surface_cache_use(&mut cache.next_use);
-    cache.surfaces.insert(key, SurfaceCacheEntry { surface, last_used });
+    cache
+        .surfaces
+        .insert(key, SurfaceCacheEntry { surface, last_used });
 }
 
 fn evict_lru_subtree_surface_entry(entries: &mut HashMap<u64, SurfaceCacheEntry>) {
@@ -279,7 +288,11 @@ fn hash_surface_subtree(node: &RenderNode) -> u64 {
     hasher.finish()
 }
 
-fn sample_cached_surface_bilinear(surface: &CachedSubtreeSurface, local_x: f32, local_y: f32) -> LinearRgba {
+fn sample_cached_surface_bilinear(
+    surface: &CachedSubtreeSurface,
+    local_x: f32,
+    local_y: f32,
+) -> LinearRgba {
     if surface.width == 0 || surface.height == 0 {
         return LinearRgba::TRANSPARENT;
     }
@@ -351,12 +364,12 @@ fn extract_surface_from_mattes(
     })
 }
 
-fn snapped_surface_source_bounds(bounds: ClipRect, width: usize, height: usize) -> Option<ClipRect> {
-    if bounds.x0 < 0.0
-        || bounds.y0 < 0.0
-        || bounds.x1 > width as f32
-        || bounds.y1 > height as f32
-    {
+fn snapped_surface_source_bounds(
+    bounds: ClipRect,
+    width: usize,
+    height: usize,
+) -> Option<ClipRect> {
+    if bounds.x0 < 0.0 || bounds.y0 < 0.0 || bounds.x1 > width as f32 || bounds.y1 > height as f32 {
         return None;
     }
     snap_clip_to_pixel_grid(bounds, width, height)
@@ -386,12 +399,9 @@ fn cached_promoted_surface(
         false,
         &mut node_count,
     );
-    let source_bounds =
-        snapped_surface_source_bounds(surface_bounds.bounds?, width, height)?;
-    let mut buffers = acquire_worker_buffers(&[
-        width.saturating_mul(height),
-        width.saturating_mul(height),
-    ]);
+    let source_bounds = snapped_surface_source_bounds(surface_bounds.bounds?, width, height)?;
+    let mut buffers =
+        acquire_worker_buffers(&[width.saturating_mul(height), width.saturating_mul(height)]);
     let mut white_buffer = buffers.pop().unwrap_or_default();
     let mut black_buffer = buffers.pop().unwrap_or_default();
     black_buffer.fill(pack_rgb(Color::BLACK));
@@ -416,13 +426,8 @@ fn cached_promoted_surface(
             false,
         );
     });
-    let surface = extract_surface_from_mattes(
-        &black_buffer,
-        &white_buffer,
-        width,
-        height,
-        source_bounds,
-    );
+    let surface =
+        extract_surface_from_mattes(&black_buffer, &white_buffer, width, height, source_bounds);
     release_worker_buffers(vec![black_buffer, white_buffer]);
     let surface = Arc::new(surface?);
 
@@ -3360,7 +3365,9 @@ fn cache_subtree_bounds(
                 || node.style.perspective.is_some()
                 || children.iter().any(|child| child.subtree_uses_depth),
             subtree_uses_backdrop_blur: node.style.backdrop_blur_radius > 0.0
-                || children.iter().any(|child| child.subtree_uses_backdrop_blur),
+                || children
+                    .iter()
+                    .any(|child| child.subtree_uses_backdrop_blur),
             children,
         };
     };
@@ -3405,13 +3412,16 @@ fn cache_subtree_bounds(
             || node.style.perspective.is_some()
             || children.iter().any(|child| child.subtree_uses_depth),
         subtree_uses_backdrop_blur: node.style.backdrop_blur_radius > 0.0
-            || children.iter().any(|child| child.subtree_uses_backdrop_blur),
+            || children
+                .iter()
+                .any(|child| child.subtree_uses_backdrop_blur),
         children,
     }
 }
 
 fn scene_max_backdrop_blur_radius(scene: &[RenderNode]) -> f32 {
-    scene.iter()
+    scene
+        .iter()
         .map(node_max_backdrop_blur_radius)
         .fold(0.0, f32::max)
 }
@@ -3933,29 +3943,28 @@ mod tests {
 
     fn promoted_surface_scene(transform: Transform2D, child_color: Color) -> Vec<RenderNode> {
         vec![
-            RenderNode::container(LayoutBox::new(0.0, 0.0, 120.0, 90.0)).with_style(VisualStyle {
-                background: Some(Color::rgb(245, 247, 250)),
-                ..VisualStyle::default()
-            })
-            .with_child(
-                RenderNode::container(LayoutBox::new(24.0, 18.0, 56.0, 40.0)).with_style(
-                    VisualStyle {
-                        background: Some(Color::rgb(40, 120, 220)),
-                        corner_radius: CornerRadius::all(10.0),
-                        transform,
-                        ..VisualStyle::default()
-                    },
-                )
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 120.0, 90.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(245, 247, 250)),
+                    ..VisualStyle::default()
+                })
                 .with_child(
-                    RenderNode::container(LayoutBox::new(30.0, 24.0, 18.0, 12.0)).with_style(
-                        VisualStyle {
-                            background: Some(child_color),
-                            corner_radius: CornerRadius::all(4.0),
+                    RenderNode::container(LayoutBox::new(24.0, 18.0, 56.0, 40.0))
+                        .with_style(VisualStyle {
+                            background: Some(Color::rgb(40, 120, 220)),
+                            corner_radius: CornerRadius::all(10.0),
+                            transform,
                             ..VisualStyle::default()
-                        },
-                    ),
+                        })
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(30.0, 24.0, 18.0, 12.0))
+                                .with_style(VisualStyle {
+                                    background: Some(child_color),
+                                    corner_radius: CornerRadius::all(4.0),
+                                    ..VisualStyle::default()
+                                }),
+                        ),
                 ),
-            ),
         ]
     }
 
@@ -6794,12 +6803,10 @@ mod tests {
                 background: Some(blue),
                 ..VisualStyle::default()
             }),
-            RenderNode::container(LayoutBox::new(16.0, 0.0, 16.0, 16.0)).with_style(
-                VisualStyle {
-                    background: Some(red),
-                    ..VisualStyle::default()
-                },
-            ),
+            RenderNode::container(LayoutBox::new(16.0, 0.0, 16.0, 16.0)).with_style(VisualStyle {
+                background: Some(red),
+                ..VisualStyle::default()
+            }),
             RenderNode::container(LayoutBox::new(8.0, 4.0, 16.0, 8.0)).with_style(panel_style),
         ]
     }

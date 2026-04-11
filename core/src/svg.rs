@@ -134,7 +134,9 @@ impl SvgPathInstance {
             } else {
                 0.0
             };
-        self.geometry.bounds.map(|bounds| bounds.expand(stroke_padding))
+        self.geometry
+            .bounds
+            .map(|bounds| bounds.expand(stroke_padding))
     }
 }
 

@@ -64,8 +64,8 @@ pub(crate) fn draw_backdrop_blur_transformed(
         return;
     }
 
-    let Some(destination_bounds) =
-        transform_layout_bounds(layout, matrix).and_then(|bounds| bounds.intersect(clip_state.coarse))
+    let Some(destination_bounds) = transform_layout_bounds(layout, matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
     else {
         return;
     };
@@ -158,12 +158,7 @@ fn blurred_snapshot(
     })
 }
 
-fn box_blur(
-    source: &[LinearRgba],
-    width: usize,
-    height: usize,
-    radius: usize,
-) -> Vec<LinearRgba> {
+fn box_blur(source: &[LinearRgba], width: usize, height: usize, radius: usize) -> Vec<LinearRgba> {
     if radius == 0 || width == 0 || height == 0 {
         return source.to_vec();
     }

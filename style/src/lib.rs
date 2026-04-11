@@ -5,8 +5,7 @@ use std::fmt::{Display, Formatter};
 use cssimpler_core::{
     Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, LayoutStyle,
     OverflowMode, ScrollbarWidth, Style, SvgPaint, TransformOperation, TransformOrigin,
-    TransformStyleMode,
-    TransitionPropertyName, TransitionTimingFunction,
+    TransformStyleMode, TransitionPropertyName, TransitionTimingFunction,
     fonts::{TextStyle, TextTransform},
 };
 use lightningcss::declaration::DeclarationBlock;

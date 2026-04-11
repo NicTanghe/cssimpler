@@ -7,7 +7,8 @@ use super::{
 
 use cssimpler_core::LayoutBox;
 
-const SVG_COVERAGE_SAMPLES: [(f32, f32); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+const SVG_COVERAGE_SAMPLES: [(f32, f32); 4] =
+    [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
 
 pub(crate) fn draw_svg_scene(
     buffer: &mut [u32],
@@ -20,14 +21,7 @@ pub(crate) fn draw_svg_scene(
     let Some(matrix) = svg_view_box_matrix(layout, scene.view_box) else {
         return;
     };
-    draw_svg_scene_with_matrix(
-        buffer,
-        width,
-        height,
-        scene,
-        matrix,
-        &ClipState::new(clip),
-    );
+    draw_svg_scene_with_matrix(buffer, width, height, scene, matrix, &ClipState::new(clip));
 }
 
 pub(crate) fn draw_svg_scene_transformed(
@@ -71,8 +65,8 @@ fn draw_svg_scene_with_matrix(
         let Some(source_bounds) = path.bounds() else {
             continue;
         };
-        let Some(bounds) =
-            transform_svg_bounds(source_bounds, matrix).and_then(|bounds| bounds.intersect(clip_state.coarse))
+        let Some(bounds) = transform_svg_bounds(source_bounds, matrix)
+            .and_then(|bounds| bounds.intersect(clip_state.coarse))
         else {
             continue;
         };
@@ -123,14 +117,18 @@ fn draw_svg_scene_with_matrix(
                 }
 
                 let index = local_row_start + x as usize;
-                if let Some(fill) = fill && fill_hits > 0 {
+                if let Some(fill) = fill
+                    && fill_hits > 0
+                {
                     blend_linear_over(
                         buffer,
                         index,
                         with_coverage(fill, fill_hits as f32 / SVG_COVERAGE_SAMPLES.len() as f32),
                     );
                 }
-                if let Some(stroke) = stroke && stroke_hits > 0 {
+                if let Some(stroke) = stroke
+                    && stroke_hits > 0
+                {
                     blend_linear_over(
                         buffer,
                         index,
@@ -234,12 +232,7 @@ fn point_in_svg_fill(geometry: &SvgPathGeometry, x: f32, y: f32) -> bool {
     winding != 0
 }
 
-fn point_in_svg_stroke(
-    geometry: &SvgPathGeometry,
-    x: f32,
-    y: f32,
-    half_width: f32,
-) -> bool {
+fn point_in_svg_stroke(geometry: &SvgPathGeometry, x: f32, y: f32, half_width: f32) -> bool {
     if half_width <= f32::EPSILON {
         return false;
     }

@@ -85,7 +85,9 @@ pub(crate) fn extract_property(
         }
         Property::TextShadow(shadows) => Some(shadow::text_shadow_declarations(shadows.as_slice())),
         Property::Filter(filters, _) => Some(shadow::filter_drop_shadow_declarations(filters)),
-        Property::BackdropFilter(filters, _) => Some(backdrop::backdrop_filter_declarations(filters)),
+        Property::BackdropFilter(filters, _) => {
+            Some(backdrop::backdrop_filter_declarations(filters))
+        }
         Property::Transform(value, _) => Some(transform::transform_declarations(value)),
         Property::TransformOrigin(value, _) => {
             Some(transform::transform_origin_declarations(value))

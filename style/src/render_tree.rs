@@ -9,8 +9,8 @@ use taffy::prelude::{
     Style as TaffyStyle, TaffyTree,
 };
 
-use crate::{ElementRef, PseudoElementKind, Stylesheet};
 use crate::svg::{is_supported_svg_tag, resolve_svg_root, seed_element_style};
+use crate::{ElementRef, PseudoElementKind, Stylesheet};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedElement {

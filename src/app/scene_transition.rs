@@ -22,6 +22,7 @@ struct TransitionPlanNode {
     foreground: Option<TransitionTimingPlan>,
     background: Option<TransitionTimingPlan>,
     border_color: Option<TransitionTimingPlan>,
+    has_sampling_work: bool,
     children: Vec<TransitionPlanNode>,
 }
 
@@ -121,6 +122,10 @@ fn sample_render_node_in_place(
     elapsed_seconds: f32,
     inherited_layout_progress: Option<f32>,
 ) {
+    if inherited_layout_progress.is_none() && !plan.has_sampling_work {
+        return;
+    }
+
     let layout_progress = plan
         .layout
         .and_then(|entry| transition_progress(entry, elapsed_seconds))
@@ -197,6 +202,10 @@ fn sample_render_node_in_place(
         .zip(&to.children)
         .zip(&plan.children)
     {
+        if layout_progress.is_none() && !child_plan.has_sampling_work {
+            continue;
+        }
+
         sample_render_node_in_place(
             sampled_child,
             from_child,
@@ -260,6 +269,13 @@ fn build_transition_plan_node(from: &RenderNode, to: &RenderNode) -> (Transition
         max_duration = max_duration.max(child_duration);
     }
 
+    let has_sampling_work = layout.is_some()
+        || transform.is_some()
+        || foreground.is_some()
+        || background.is_some()
+        || border_color.is_some()
+        || children.iter().any(|child| child.has_sampling_work);
+
     (
         TransitionPlanNode {
             layout,
@@ -267,6 +283,7 @@ fn build_transition_plan_node(from: &RenderNode, to: &RenderNode) -> (Transition
             foreground,
             background,
             border_color,
+            has_sampling_work,
             children,
         },
         max_duration,
@@ -722,12 +739,7 @@ mod tests {
 
     #[test]
     fn scene_transition_interpolates_layout_for_supported_properties() {
-        let transition = TransitionStyle {
-            properties: vec![TransitionPropertyName::Property("width".to_string())],
-            durations_seconds: vec![1.0],
-            delays_seconds: vec![0.0],
-            timing_functions: vec![TransitionTimingFunction::Linear],
-        };
+        let transition = layout_transition("width", 1.0, TransitionTimingFunction::Linear);
         let from = vec![text_node(
             LayoutBox::new(0.0, 0.0, 100.0, 20.0),
             Color::BLACK,
@@ -745,6 +757,38 @@ mod tests {
         scene_transition.advance(Duration::from_millis(500), &mut scene);
 
         assert!((scene[0].layout.width - 150.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn layout_transitions_propagate_progress_to_descendants_without_child_plans() {
+        let transition = layout_transition("width", 1.0, TransitionTimingFunction::Linear);
+        let from = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 100.0, 40.0))
+                .with_transitions(transition.clone())
+                .with_child(text_node(
+                    LayoutBox::new(10.0, 0.0, 50.0, 20.0),
+                    Color::BLACK,
+                    TransitionStyle::default(),
+                )),
+        ];
+        let to = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 200.0, 40.0))
+                .with_transitions(transition)
+                .with_child(text_node(
+                    LayoutBox::new(20.0, 0.0, 100.0, 20.0),
+                    Color::BLACK,
+                    TransitionStyle::default(),
+                )),
+        ];
+
+        let mut scene_transition =
+            SceneTransition::new(from, to).expect("layout transition should exist");
+        let mut scene = scene_transition.sample();
+        scene_transition.advance(Duration::from_millis(500), &mut scene);
+
+        assert!((scene[0].layout.width - 150.0).abs() < 0.01);
+        assert!((scene[0].children[0].layout.x - 15.0).abs() < 0.01);
+        assert!((scene[0].children[0].layout.width - 75.0).abs() < 0.01);
     }
 
     #[test]
@@ -861,8 +905,16 @@ mod tests {
         duration_seconds: f32,
         timing_function: TransitionTimingFunction,
     ) -> TransitionStyle {
+        layout_transition("transform", duration_seconds, timing_function)
+    }
+
+    fn layout_transition(
+        property_name: &str,
+        duration_seconds: f32,
+        timing_function: TransitionTimingFunction,
+    ) -> TransitionStyle {
         TransitionStyle {
-            properties: vec![TransitionPropertyName::Property("transform".to_string())],
+            properties: vec![TransitionPropertyName::Property(property_name.to_string())],
             durations_seconds: vec![duration_seconds],
             delays_seconds: vec![0.0],
             timing_functions: vec![timing_function],

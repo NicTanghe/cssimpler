@@ -18,7 +18,9 @@ pub(super) fn backdrop_filter_declarations(
             let Filter::Blur(radius) = filter else {
                 return Err(unsupported_backdrop_filter_value(filters));
             };
-            Ok(vec![Declaration::BackdropBlur(length_to_px(radius)?.max(0.0))])
+            Ok(vec![Declaration::BackdropBlur(
+                length_to_px(radius)?.max(0.0),
+            )])
         }
     }
 }

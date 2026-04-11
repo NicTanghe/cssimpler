@@ -1,8 +1,7 @@
 use cssimpler_core::{
     Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, Node, Style,
     SvgContour, SvgPaint, SvgPathGeometry, SvgPathInstance, SvgPathPaint, SvgPoint, SvgScene,
-    SvgStyle, SvgViewBox,
-    fonts::TextStyle,
+    SvgStyle, SvgViewBox, fonts::TextStyle,
 };
 use lightningcss::properties::{Property, PropertyId};
 use lightningcss::stylesheet::ParserOptions;
@@ -80,10 +79,7 @@ pub(crate) fn seed_element_style(element: &ElementNode) -> Style {
                     &normalize_svg_length_attribute(value),
                 );
             }
-            _ => panic!(
-                "unsupported SVG attribute `{}` on <{}>",
-                name, element.tag
-            ),
+            _ => panic!("unsupported SVG attribute `{}` on <{}>", name, element.tag),
         }
     }
 
@@ -189,7 +185,8 @@ fn parse_svg_root_metadata(element: &ElementNode) -> SvgRootMetadata {
         .unwrap_or(150.0);
 
     SvgRootMetadata {
-        view_box: view_box.unwrap_or_else(|| SvgViewBox::new(0.0, 0.0, fallback_width, fallback_height)),
+        view_box: view_box
+            .unwrap_or_else(|| SvgViewBox::new(0.0, 0.0, fallback_width, fallback_height)),
     }
 }
 
@@ -307,9 +304,8 @@ fn collect_svg_paths(
             let data = element
                 .attribute("d")
                 .unwrap_or_else(|| panic!("supported <path> elements require a `d` attribute"));
-            let geometry = parse_svg_path_data(data).unwrap_or_else(|error| {
-                panic!("unsupported SVG path data on <path>: {error}")
-            });
+            let geometry = parse_svg_path_data(data)
+                .unwrap_or_else(|error| panic!("unsupported SVG path data on <path>: {error}"));
             paths.push(SvgPathInstance {
                 geometry: translate_svg_geometry(
                     geometry,
@@ -333,7 +329,10 @@ fn svg_cascade_from_style(parent: SvgCascadeState, style: &SvgStyle) -> SvgCasca
     }
 }
 
-fn svg_cascade_with_transform(mut state: SvgCascadeState, element: &ElementNode) -> SvgCascadeState {
+fn svg_cascade_with_transform(
+    mut state: SvgCascadeState,
+    element: &ElementNode,
+) -> SvgCascadeState {
     let Some(transform) = element.attribute("transform") else {
         return state;
     };
@@ -389,7 +388,11 @@ fn parse_svg_translate_transform(value: &str) -> Result<(f32, f32), String> {
                     ));
                 }
             },
-            _ => return Err(format!("only translate(...) is supported, got `{function}`")),
+            _ => {
+                return Err(format!(
+                    "only translate(...) is supported, got `{function}`"
+                ));
+            }
         }
 
         rest = remaining[arguments_end + 1..].trim_start();
@@ -568,14 +571,7 @@ fn parse_svg_path_data(data: &str) -> Result<SvgPathGeometry, String> {
                 let sweep = parser.parse_arc_flag()?;
                 let current = builder.current_point()?;
                 let end = parser.parse_relative_point(current)?;
-                builder.arc_to(
-                    radius_x,
-                    radius_y,
-                    x_axis_rotation,
-                    large_arc,
-                    sweep,
-                    end,
-                )
+                builder.arc_to(radius_x, radius_y, x_axis_rotation, large_arc, sweep, end)
             })?,
             'Z' | 'z' => {
                 builder.close_path()?;
@@ -684,7 +680,14 @@ impl SvgPathBuilder {
         end: SvgPoint,
     ) -> Result<(), String> {
         let start = self.ensure_segment_start()?;
-        flatten_cubic(start, control_1, control_2, end, &mut self.current_points, 0);
+        flatten_cubic(
+            start,
+            control_1,
+            control_2,
+            end,
+            &mut self.current_points,
+            0,
+        );
         self.current_point = Some(end);
         self.last_cubic_control = Some(control_2);
         self.last_quadratic_control = None;
@@ -970,12 +973,7 @@ fn flatten_arc(
         let scale = radii_scale.sqrt();
         let radius_x = radius_x * scale;
         let radius_y = radius_y * scale;
-        (
-            radius_x,
-            radius_y,
-            radius_x * radius_x,
-            radius_y * radius_y,
-        )
+        (radius_x, radius_y, radius_x * radius_x, radius_y * radius_y)
     } else {
         (radius_x, radius_y, radius_x_sq, radius_y_sq)
     };
@@ -1013,8 +1011,8 @@ fn flatten_arc(
         delta_angle += std::f32::consts::TAU;
     }
 
-    let segment_count = ((delta_angle.abs() / (std::f32::consts::PI / 12.0)).ceil() as usize)
-        .max(1);
+    let segment_count =
+        ((delta_angle.abs() / (std::f32::consts::PI / 12.0)).ceil() as usize).max(1);
     for step in 1..=segment_count {
         let t = start_angle + delta_angle * (step as f32 / segment_count as f32);
         let cos_t = t.cos();

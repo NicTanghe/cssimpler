@@ -11,9 +11,7 @@ pub(super) fn fill_declaration(paint: &CssSvgPaint<'_>) -> Result<Vec<Declaratio
     Ok(vec![Declaration::SvgFill(svg_paint_from_css(paint)?)])
 }
 
-pub(super) fn stroke_declaration(
-    paint: &CssSvgPaint<'_>,
-) -> Result<Vec<Declaration>, StyleError> {
+pub(super) fn stroke_declaration(paint: &CssSvgPaint<'_>) -> Result<Vec<Declaration>, StyleError> {
     Ok(vec![Declaration::SvgStroke(svg_paint_from_css(paint)?)])
 }
 
