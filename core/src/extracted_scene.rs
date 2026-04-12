@@ -57,14 +57,18 @@ impl ExtractedScene {
 }
 
 fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<ExtractedPaintItem>) {
-    let clip = node
-        .style
-        .overflow
-        .clips_any_axis()
-        .then_some(node.layout);
+    let clip = node.style.overflow.clips_any_axis().then_some(node.layout);
 
     if node.style.backdrop_blur_radius > f32::EPSILON {
-        push_item(node, &path, 0, ExtractedPaintKind::BackdropBlur, clip, None, items);
+        push_item(
+            node,
+            &path,
+            0,
+            ExtractedPaintKind::BackdropBlur,
+            clip,
+            None,
+            items,
+        );
     }
 
     for (index, _) in node.style.shadows.iter().enumerate() {
@@ -217,8 +221,7 @@ mod tests {
     use crate::{
         BoxShadow, Color, CornerRadius, Insets, LayoutBox, Overflow, PreparedTextLayout,
         RenderNode, ScrollbarData, ScrollbarMetrics, ScrollbarStyle, ScrollbarWidth, TextStyle,
-        VisualStyle,
-        fonts::TextLayout,
+        VisualStyle, fonts::TextLayout,
     };
 
     use super::{ExtractedPaintKind, ExtractedScene};
@@ -226,8 +229,8 @@ mod tests {
     #[test]
     fn extracted_scene_collects_backend_facing_paint_items() {
         let scene = vec![
-            RenderNode::container(LayoutBox::new(0.0, 0.0, 160.0, 120.0)).with_style(
-                VisualStyle {
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 160.0, 120.0))
+                .with_style(VisualStyle {
                     overflow: Overflow {
                         x: crate::OverflowMode::Hidden,
                         y: crate::OverflowMode::Scroll,
@@ -246,42 +249,40 @@ mod tests {
                     }],
                     corner_radius: CornerRadius::all(12.0),
                     ..VisualStyle::default()
-                },
-            )
-            .with_scrollbars(ScrollbarData::new(
-                crate::OverflowMode::Hidden,
-                crate::OverflowMode::Scroll,
-                ScrollbarStyle {
-                    width: ScrollbarWidth::Px(12.0),
-                    ..ScrollbarStyle::default()
-                },
-                ScrollbarMetrics {
-                    max_offset_y: 240.0,
-                    reserved_width: 12.0,
-                    ..ScrollbarMetrics::default()
-                },
-            ))
-            .with_child(
-                RenderNode::text(LayoutBox::new(16.0, 20.0, 80.0, 24.0), "hello").with_style(
-                    VisualStyle {
-                        foreground: Color::WHITE,
-                        text: TextStyle {
-                            size_px: 18.0,
-                            ..TextStyle::default()
-                        },
-                        ..VisualStyle::default()
+                })
+                .with_scrollbars(ScrollbarData::new(
+                    crate::OverflowMode::Hidden,
+                    crate::OverflowMode::Scroll,
+                    ScrollbarStyle {
+                        width: ScrollbarWidth::Px(12.0),
+                        ..ScrollbarStyle::default()
                     },
-                )
-                .with_text_layout(PreparedTextLayout::new(
-                    Some(80.0),
-                    TextLayout {
-                        width: 42.0,
-                        height: 24.0,
-                        line_height: 24.0,
-                        lines: Vec::new(),
+                    ScrollbarMetrics {
+                        max_offset_y: 240.0,
+                        reserved_width: 12.0,
+                        ..ScrollbarMetrics::default()
                     },
-                )),
-            ),
+                ))
+                .with_child(
+                    RenderNode::text(LayoutBox::new(16.0, 20.0, 80.0, 24.0), "hello")
+                        .with_style(VisualStyle {
+                            foreground: Color::WHITE,
+                            text: TextStyle {
+                                size_px: 18.0,
+                                ..TextStyle::default()
+                            },
+                            ..VisualStyle::default()
+                        })
+                        .with_text_layout(PreparedTextLayout::new(
+                            Some(80.0),
+                            TextLayout {
+                                width: 42.0,
+                                height: 24.0,
+                                line_height: 24.0,
+                                lines: Vec::new(),
+                            },
+                        )),
+                ),
         ];
 
         let extracted = ExtractedScene::from_render_roots(&scene);
@@ -303,12 +304,18 @@ mod tests {
         let left = vec![
             RenderNode::container(LayoutBox::new(0.0, 0.0, 100.0, 80.0))
                 .with_child(RenderNode::container(LayoutBox::new(8.0, 8.0, 20.0, 20.0)))
-                .with_child(RenderNode::text(LayoutBox::new(16.0, 16.0, 30.0, 12.0), "stable")),
+                .with_child(RenderNode::text(
+                    LayoutBox::new(16.0, 16.0, 30.0, 12.0),
+                    "stable",
+                )),
         ];
         let right = vec![
             RenderNode::container(LayoutBox::new(0.0, 0.0, 100.0, 80.0))
                 .with_child(RenderNode::container(LayoutBox::new(8.0, 8.0, 20.0, 20.0)))
-                .with_child(RenderNode::text(LayoutBox::new(16.0, 16.0, 30.0, 12.0), "stable")),
+                .with_child(RenderNode::text(
+                    LayoutBox::new(16.0, 16.0, 30.0, 12.0),
+                    "stable",
+                )),
         ];
 
         let left_keys = ExtractedScene::from_render_roots(&left)

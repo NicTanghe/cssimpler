@@ -244,7 +244,14 @@ impl RuntimeWorld {
                 despawned_entities: 0,
             };
             let element_path = element_path_for_root_node(node, root_index);
-            self.patch_node(root, node, None, element_path.as_ref(), dirty_class, &mut result);
+            self.patch_node(
+                root,
+                node,
+                None,
+                element_path.as_ref(),
+                dirty_class,
+                &mut result,
+            );
             return result;
         }
 
@@ -257,13 +264,7 @@ impl RuntimeWorld {
             despawned_entities,
         };
         let element_path = element_path_for_root_node(node, root_index);
-        let root = self.spawn_node(
-            node,
-            None,
-            element_path.as_ref(),
-            dirty_class,
-            &mut result,
-        );
+        let root = self.spawn_node(node, None, element_path.as_ref(), dirty_class, &mut result);
         self.roots[root_index] = Some(root);
         result.root = root;
         result
@@ -296,7 +297,9 @@ impl RuntimeWorld {
                     .children
                     .iter()
                     .zip(&data.children)
-                    .all(|(child_node, child_entity)| self.node_matches_shape(child_node, *child_entity))
+                    .all(|(child_node, child_entity)| {
+                        self.node_matches_shape(child_node, *child_entity)
+                    })
             }
             (Node::Text(_), RuntimeNodeKind::Text(_)) => data.children.is_empty(),
             _ => false,
@@ -515,7 +518,10 @@ mod tests {
         assert_eq!(world.entity_count(), 3);
         let root = world.root_entity(0).expect("root entity should exist");
         let root_data = world.entity(root).expect("root data should exist");
-        assert!(matches!(root_data.authored, super::RuntimeNodeKind::Element(_)));
+        assert!(matches!(
+            root_data.authored,
+            super::RuntimeNodeKind::Element(_)
+        ));
         assert_eq!(
             root_data.computed.element_path,
             Some(crate::ElementPath::root(0))
@@ -529,7 +535,11 @@ mod tests {
             .with_child(Node::element("span").with_child(Node::text("first")).into())
             .into();
         let second = Node::element("div")
-            .with_child(Node::element("span").with_child(Node::text("second")).into())
+            .with_child(
+                Node::element("span")
+                    .with_child(Node::text("second"))
+                    .into(),
+            )
             .into();
 
         world.sync_root(
@@ -539,10 +549,7 @@ mod tests {
             RuntimeDirtyClass::Structure,
         );
         let root = world.root_entity(0).expect("first root should exist");
-        let child = world
-            .entity(root)
-            .expect("root data should exist")
-            .children[0];
+        let child = world.entity(root).expect("root data should exist").children[0];
         let text = world
             .entity(child)
             .expect("child data should exist")
@@ -558,11 +565,17 @@ mod tests {
         assert_eq!(result.action, RuntimeSyncAction::Patched);
         assert_eq!(world.root_entity(0), Some(root));
         assert_eq!(
-            world.entity(root).expect("patched root should exist").children[0],
+            world
+                .entity(root)
+                .expect("patched root should exist")
+                .children[0],
             child
         );
         assert_eq!(
-            world.entity(child).expect("patched child should exist").children[0],
+            world
+                .entity(child)
+                .expect("patched child should exist")
+                .children[0],
             text
         );
         let roundtrip = world.root_as_node(0).expect("root should roundtrip");
@@ -642,30 +655,45 @@ mod tests {
             .expect("button data should exist")
             .children[0];
 
-        assert!(world.entity(root).expect("root entity should exist").computed.interaction.hovered);
-        assert!(world
-            .entity(button)
-            .expect("button entity should exist")
-            .computed
-            .interaction
-            .hovered);
-        assert!(world
-            .entity(button)
-            .expect("button entity should exist")
-            .computed
-            .interaction
-            .active);
-        assert!(world
-            .entity(span)
-            .expect("span entity should exist")
-            .computed
-            .interaction
-            .hovered);
-        assert!(!world
-            .entity(span)
-            .expect("span entity should exist")
-            .computed
-            .interaction
-            .active);
+        assert!(
+            world
+                .entity(root)
+                .expect("root entity should exist")
+                .computed
+                .interaction
+                .hovered
+        );
+        assert!(
+            world
+                .entity(button)
+                .expect("button entity should exist")
+                .computed
+                .interaction
+                .hovered
+        );
+        assert!(
+            world
+                .entity(button)
+                .expect("button entity should exist")
+                .computed
+                .interaction
+                .active
+        );
+        assert!(
+            world
+                .entity(span)
+                .expect("span entity should exist")
+                .computed
+                .interaction
+                .hovered
+        );
+        assert!(
+            !world
+                .entity(span)
+                .expect("span entity should exist")
+                .computed
+                .interaction
+                .active
+        );
     }
 }

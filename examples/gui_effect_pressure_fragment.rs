@@ -12,13 +12,15 @@ use cssimpler::style::{Stylesheet, parse_stylesheet};
 fn main() -> Result<()> {
     let config = WindowConfig::new("cssimpler / gui effect pressure / fragments", 1440, 960);
 
-    FragmentApp::new(
-        shared::EffectStressState::default(),
-        stylesheet(),
-        update,
-        fragments(),
+    cssimpler::renderer::run_with_scene_provider(
+        config,
+        shared::PressureProvider::new(FragmentApp::new(
+            shared::EffectStressState::default(),
+            stylesheet(),
+            update,
+            fragments(),
+        )),
     )
-    .run(config)
     .map_err(Into::into)
 }
 

@@ -3,11 +3,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use cssimpler::app::{App, Invalidation, Refresh, RuntimeStats, latest_runtime_stats};
-use cssimpler::core::Node;
+use cssimpler::app::{App, FragmentApp, Invalidation, Refresh, RuntimeStats, latest_runtime_stats};
+use cssimpler::core::{ElementInteractionState, Node, RenderNode};
 use cssimpler::renderer::{
-    FrameInfo, FramePaintMode, FramePaintReason, FrameTimingStats, WindowConfig,
-    latest_frame_timing_stats,
+    EngineEvent, FrameInfo, FramePaintMode, FramePaintReason, FrameTimingStats, RedrawSchedule,
+    SceneProvider, ViewportSize, WindowConfig, latest_frame_timing_stats,
 };
 use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
@@ -251,9 +251,16 @@ fn main() -> Result<()> {
         ACTIONS.fetch_or(ACTION_TOGGLE_BASELINE, Ordering::Relaxed);
     }
 
-    App::new(EffectStressState::default(), stylesheet(), update, build_ui)
-        .run(config)
-        .map_err(Into::into)
+    cssimpler::renderer::run_with_scene_provider(
+        config,
+        PressureProvider::new(App::new(
+            EffectStressState::default(),
+            stylesheet(),
+            update,
+            build_ui,
+        )),
+    )
+    .map_err(Into::into)
 }
 
 fn update(state: &mut EffectStressState, frame: FrameInfo) -> Refresh {
@@ -552,6 +559,83 @@ pub fn maybe_log_perf(state: &mut EffectStressState, actions: u64) {
         state.renderer_stats.scene_passes,
         state.renderer_stats.render_workers,
     );
+}
+
+pub fn should_continue_redraw(state: &EffectStressState) -> bool {
+    state.baseline_harness.is_some() || (state.animate && state.tile_count > 0)
+}
+
+pub trait PressureStateSource {
+    fn pressure_state(&self) -> &EffectStressState;
+}
+
+impl<'a, Update, View, Signal> PressureStateSource
+    for App<'a, EffectStressState, Update, View, Signal>
+where
+    Update: FnMut(&mut EffectStressState, FrameInfo) -> Signal,
+    View: FnMut(&EffectStressState) -> Node,
+    Signal: Into<Refresh>,
+{
+    fn pressure_state(&self) -> &EffectStressState {
+        self.state()
+    }
+}
+
+impl<'a, Update, Signal> PressureStateSource for FragmentApp<'a, EffectStressState, Update, Signal>
+where
+    Update: FnMut(&mut EffectStressState, FrameInfo) -> Signal,
+    Signal: Into<Refresh>,
+{
+    fn pressure_state(&self) -> &EffectStressState {
+        self.state()
+    }
+}
+
+pub struct PressureProvider<P> {
+    inner: P,
+}
+
+impl<P> PressureProvider<P> {
+    pub fn new(inner: P) -> Self {
+        Self { inner }
+    }
+}
+
+impl<P> SceneProvider for PressureProvider<P>
+where
+    P: SceneProvider + PressureStateSource,
+{
+    fn update(&mut self, frame: FrameInfo) {
+        self.inner.update(frame);
+    }
+
+    fn scene(&self) -> &[RenderNode] {
+        self.inner.scene()
+    }
+
+    fn set_viewport(&mut self, viewport: ViewportSize) {
+        self.inner.set_viewport(viewport);
+    }
+
+    fn capture_scene(&mut self) -> Vec<RenderNode> {
+        self.inner.capture_scene()
+    }
+
+    fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
+        self.inner.set_element_interaction(interaction)
+    }
+
+    fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        self.inner.handle_engine_event(event)
+    }
+
+    fn redraw_schedule(&self) -> RedrawSchedule {
+        self.inner.redraw_schedule()
+    }
+
+    fn needs_redraw(&self) -> bool {
+        self.inner.needs_redraw() || should_continue_redraw(self.inner.pressure_state())
+    }
 }
 
 fn build_ui(state: &EffectStressState) -> Node {
@@ -1360,6 +1444,37 @@ mod tests {
 
         assert_eq!(refresh, Invalidation::Clean);
         assert_eq!(phase_label(state.phase), "A");
+    }
+
+    #[test]
+    fn animated_pressure_scene_keeps_requesting_redraws_between_ticks() {
+        let state = EffectStressState {
+            animate: true,
+            ..EffectStressState::default()
+        };
+
+        assert!(super::should_continue_redraw(&state));
+    }
+
+    #[test]
+    fn baseline_harness_keeps_requesting_redraws_during_idle_sampling() {
+        let state = EffectStressState {
+            animate: false,
+            baseline_harness: Some(BaselineHarness::new_with_limits(1, 1)),
+            ..EffectStressState::default()
+        };
+
+        assert!(super::should_continue_redraw(&state));
+    }
+
+    #[test]
+    fn idle_pressure_scene_does_not_force_continuous_redraws() {
+        let state = EffectStressState {
+            animate: false,
+            ..EffectStressState::default()
+        };
+
+        assert!(!super::should_continue_redraw(&state));
     }
 
     #[test]

@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use self::scene_transition::SceneTransition;
 use crate::core::{
-    ElementInteractionState, ElementPath, Node, RenderNode, RuntimeDirtyClass,
-    RuntimeDirtyFlags, RuntimeSyncAction, RuntimeSyncPolicy, RuntimeViewport, RuntimeWorld,
+    ElementInteractionState, ElementPath, Node, RenderNode, RuntimeDirtyClass, RuntimeDirtyFlags,
+    RuntimeSyncAction, RuntimeSyncPolicy, RuntimeViewport, RuntimeWorld,
 };
 use crate::renderer::{self, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
 use crate::style::{
@@ -528,7 +528,10 @@ where
             &mut self.runtime_world,
             0,
             &tree,
-            runtime_sync_policy(self.cached_scene.is_none(), self.pending_refresh.invalidation),
+            runtime_sync_policy(
+                self.cached_scene.is_none(),
+                self.pending_refresh.invalidation,
+            ),
             dirty_class,
             stats,
         );
@@ -540,7 +543,10 @@ where
                 0,
                 self.stylesheet,
                 self.viewport(),
-                root_render_mode(dirty_flags, self.cached_scene.as_ref().and_then(|scene| scene.first())),
+                root_render_mode(
+                    dirty_flags,
+                    self.cached_scene.as_ref().and_then(|scene| scene.first()),
+                ),
                 stats,
             )
             .expect("runtime world should contain the app root before rendering"),
@@ -921,7 +927,10 @@ where
     }
 
     fn rebuild_all_fragments(&mut self, stats: &mut RuntimeStats) {
-        let policy = runtime_sync_policy(self.cached_scene.is_none(), self.pending_refresh.invalidation);
+        let policy = runtime_sync_policy(
+            self.cached_scene.is_none(),
+            self.pending_refresh.invalidation,
+        );
         let dirty_class = runtime_dirty_class(
             self.pending_refresh.invalidation,
             self.cached_scene.is_none(),
@@ -948,7 +957,9 @@ where
                     self.viewport(),
                     root_render_mode(
                         dirty_flags,
-                        self.cached_scene.as_ref().and_then(|scene| scene.get(index)),
+                        self.cached_scene
+                            .as_ref()
+                            .and_then(|scene| scene.get(index)),
                     ),
                     stats,
                 )
@@ -1300,10 +1311,7 @@ fn find_render_node_mut<'a>(
     None
 }
 
-fn runtime_sync_policy(
-    initial_build: bool,
-    invalidation: Invalidation,
-) -> RuntimeSyncPolicy {
+fn runtime_sync_policy(initial_build: bool, invalidation: Invalidation) -> RuntimeSyncPolicy {
     if initial_build || matches!(invalidation, Invalidation::Structure) {
         RuntimeSyncPolicy::ForceRebuild
     } else {
@@ -1339,8 +1347,8 @@ mod tests {
     use crate::ui;
 
     use super::{
-        App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode,
-        RuntimePhase, latest_runtime_stats,
+        App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode, RuntimePhase,
+        latest_runtime_stats,
     };
     use crate::renderer::{
         FrameInfo, SceneProvider, ViewportSize, render_scene_update, render_to_buffer,
