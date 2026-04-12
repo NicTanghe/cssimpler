@@ -9,7 +9,7 @@ use std::time::Instant;
 use self::scene_transition::SceneTransition;
 use crate::core::{
     ElementInteractionState, ElementPath, Node, RenderNode, RuntimeDirtyClass, RuntimeDirtyFlags,
-    RuntimeSyncAction, RuntimeSyncPolicy, RuntimeViewport, RuntimeWorld,
+    RuntimeSyncAction, RuntimeSyncPolicy, RuntimeViewport, RuntimeWorld, StaticNodeDesc,
 };
 use crate::renderer::{self, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
 use crate::style::{
@@ -239,16 +239,36 @@ enum RootRenderMode<'a> {
     CachedLayout(&'a RenderNode),
 }
 
+pub enum ViewTree {
+    Dynamic(Node),
+    Static(&'static StaticNodeDesc),
+}
+
+impl From<Node> for ViewTree {
+    fn from(value: Node) -> Self {
+        Self::Dynamic(value)
+    }
+}
+
+impl From<&'static StaticNodeDesc> for ViewTree {
+    fn from(value: &'static StaticNodeDesc) -> Self {
+        Self::Static(value)
+    }
+}
+
 pub struct Fragment<'a, State> {
     id: String,
-    view: Box<dyn Fn(&State) -> Node + 'a>,
+    view: Box<dyn Fn(&State) -> ViewTree + 'a>,
 }
 
 impl<'a, State> Fragment<'a, State> {
-    pub fn new(id: impl Into<String>, view: impl Fn(&State) -> Node + 'a) -> Self {
+    pub fn new<Tree>(id: impl Into<String>, view: impl Fn(&State) -> Tree + 'a) -> Self
+    where
+        Tree: Into<ViewTree> + 'a,
+    {
         Self {
             id: id.into(),
-            view: Box::new(view),
+            view: Box::new(move |state| view(state).into()),
         }
     }
 
@@ -256,7 +276,7 @@ impl<'a, State> Fragment<'a, State> {
         &self.id
     }
 
-    fn render(&self, state: &State) -> Node {
+    fn render(&self, state: &State) -> ViewTree {
         (self.view)(state)
     }
 }
@@ -280,15 +300,32 @@ struct RenderBoundaryMatch<'a> {
 fn sync_runtime_world(
     runtime_world: &mut RuntimeWorld,
     root_index: usize,
-    tree: &Node,
+    tree: &ViewTree,
     policy: RuntimeSyncPolicy,
     dirty_class: RuntimeDirtyClass,
     stats: &mut RuntimeStats,
 ) -> RuntimeSyncAction {
     let structural_start = Instant::now();
-    let sync = runtime_world.sync_root(root_index, tree, policy, dirty_class);
+    let sync = match tree {
+        ViewTree::Dynamic(node) => runtime_world.sync_root(root_index, node, policy, dirty_class),
+        ViewTree::Static(node) => {
+            runtime_world.sync_static_root(root_index, node, policy, dirty_class)
+        }
+    };
     stats.record_phase(RuntimePhase::StructuralUpdate, structural_start.elapsed());
     sync.action
+}
+
+fn view_tree_node<'a>(tree: &'a ViewTree, materialized: &'a mut Option<Node>) -> &'a Node {
+    match tree {
+        ViewTree::Dynamic(node) => node,
+        ViewTree::Static(node) => {
+            *materialized = Some(node.to_node());
+            materialized
+                .as_ref()
+                .expect("materialized static prefab should exist")
+        }
+    }
 }
 
 fn sync_runtime_interaction(runtime_world: &mut RuntimeWorld, stats: &mut RuntimeStats) {
@@ -516,7 +553,7 @@ where
     fn rebuild_scene(&mut self, stats: &mut RuntimeStats) {
         let view = &mut self.view;
         let view_start = Instant::now();
-        let tree = view(&self.state);
+        let tree = ViewTree::Dynamic(view(&self.state));
         stats.view_us = duration_to_us(view_start.elapsed());
 
         let dirty_class = runtime_dirty_class(
@@ -571,13 +608,15 @@ where
 
         let view = &mut self.view;
         let view_start = Instant::now();
-        let tree = view(&self.state);
+        let tree_source = ViewTree::Dynamic(view(&self.state));
         stats.view_us = duration_to_us(view_start.elapsed());
+        let mut materialized_tree = None;
+        let tree = view_tree_node(&tree_source, &mut materialized_tree);
 
         let sync = sync_runtime_world(
             &mut self.runtime_world,
             0,
-            &tree,
+            &tree_source,
             RuntimeSyncPolicy::PreferPatch,
             runtime_dirty_class(self.pending_refresh.invalidation, false, false),
             stats,
@@ -592,7 +631,7 @@ where
         let mut replacements = Vec::with_capacity(ids.len());
         for id in ids {
             let UniqueMatch::Single(node_match) =
-                find_unique_node_boundary(&tree, id, &ElementPath::root(0))
+                find_unique_node_boundary(tree, id, &ElementPath::root(0))
             else {
                 return false;
             };
@@ -643,10 +682,11 @@ where
             filtered.push((path, node));
         }
 
-        let mut scene = self
+        let previous = self
             .cached_scene
             .take()
             .expect("app scene should be cached while refreshing fragments");
+        let mut scene = previous.clone();
         for (path, node) in filtered {
             let Some(target) = find_render_node_mut(&mut scene[0], &path) else {
                 return false;
@@ -655,7 +695,7 @@ where
         }
 
         let scene_swap_start = Instant::now();
-        self.replace_scene(scene);
+        self.replace_scene_from_previous(Some(previous), scene);
         stats.scene_swap_us = duration_to_us(scene_swap_start.elapsed());
         stats.rerendered = true;
         self.runtime_world.clear_dirty_flags();
@@ -676,7 +716,14 @@ where
 
     fn replace_scene(&mut self, scene: Vec<RenderNode>) {
         let previous = self.cached_scene.take();
+        self.replace_scene_from_previous(previous, scene);
+    }
 
+    fn replace_scene_from_previous(
+        &mut self,
+        previous: Option<Vec<RenderNode>>,
+        scene: Vec<RenderNode>,
+    ) {
         match previous {
             Some(p) if SceneTransition::should_create(&p, &scene) => {
                 let transition = SceneTransition::new(p, scene)
@@ -1011,15 +1058,16 @@ where
             ));
         }
 
-        let mut scene = self
+        let previous = self
             .cached_scene
             .take()
             .expect("fragment app scene should be cached while refreshing fragments");
+        let mut scene = previous.clone();
         for (index, node) in replacements {
             scene[index] = node;
         }
 
-        self.replace_scene(scene);
+        self.replace_scene_from_previous(Some(previous), scene);
         self.runtime_world.clear_dirty_flags();
 
         true
@@ -1038,7 +1086,16 @@ where
     }
 
     fn replace_scene(&mut self, scene: Vec<RenderNode>) {
-        if let Some(previous) = self.cached_scene.take() {
+        let previous = self.cached_scene.take();
+        self.replace_scene_from_previous(previous, scene);
+    }
+
+    fn replace_scene_from_previous(
+        &mut self,
+        previous: Option<Vec<RenderNode>>,
+        scene: Vec<RenderNode>,
+    ) {
+        if let Some(previous) = previous {
             if SceneTransition::should_create(&previous, &scene) {
                 let transition = SceneTransition::new(previous, scene)
                     .expect("scene transition should exist after precheck");
@@ -1344,7 +1401,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::core::{Color, ElementInteractionState, ElementPath, Node, RenderKind, RenderNode};
-    use crate::ui;
+    use crate::{ui, ui_prefab};
 
     use super::{
         App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode, RuntimePhase,
@@ -2352,6 +2409,139 @@ mod tests {
         assert!((second[0].layout.width - 120.0).abs() < 0.01);
         assert_eq!(third[0].layout.width, 160.0);
         assert_eq!(fourth[0].layout.width, 160.0);
+    }
+
+    #[test]
+    fn app_advances_color_transitions_during_fragment_refresh() {
+        let stylesheet = parse_stylesheet(
+            ".button { color: #111111; transition: color 32ms linear; }
+             .button.hot { color: #2563eb; }",
+        )
+        .expect("transition stylesheet should parse");
+        let mut app = App::new(
+            false,
+            &stylesheet,
+            |state, frame| {
+                if frame.frame_index == 1 {
+                    *state = true;
+                    Refresh::fragment("button", Invalidation::Paint)
+                } else {
+                    Refresh::clean()
+                }
+            },
+            |state| {
+                let mut button = Node::element("button")
+                    .with_id("button")
+                    .with_class("button");
+                if *state {
+                    button = button.with_class("hot");
+                }
+                Node::element("div")
+                    .with_id("app")
+                    .with_child(button.with_child(Node::text("hover me")).into())
+                    .into()
+            },
+        );
+
+        let first = app.frame(frame(0));
+        let second = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::from_millis(16),
+        });
+        let third = app.frame(FrameInfo {
+            frame_index: 2,
+            delta: Duration::from_millis(16),
+        });
+
+        let first_button = &first[0].children[0];
+        let second_button = &second[0].children[0];
+        let third_button = &third[0].children[0];
+
+        assert_eq!(first_button.style.foreground, Color::rgb(17, 17, 17));
+        assert_ne!(second_button.style.foreground, Color::rgb(17, 17, 17));
+        assert_ne!(second_button.style.foreground, Color::rgb(37, 99, 235));
+        assert_eq!(third_button.style.foreground, Color::rgb(37, 99, 235));
+    }
+
+    #[test]
+    fn fragment_app_advances_color_transitions_for_static_prefab_fragments() {
+        let stylesheet = parse_stylesheet(
+            ".button { color: #111111; transition: color 32ms linear; }
+             .button:hover { color: #2563eb; }",
+        )
+        .expect("transition stylesheet should parse");
+        let mut app = FragmentApp::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Refresh::clean(),
+            [Fragment::new("button", |_state: &()| {
+                ui_prefab! {
+                    <button class="button">{"hover me"}</button>
+                }
+            })],
+        );
+
+        let first = app.frame(frame(0));
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(0)),
+                active: None,
+            },
+        ));
+        let second = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::from_millis(16),
+        });
+        let third = app.frame(FrameInfo {
+            frame_index: 2,
+            delta: Duration::from_millis(16),
+        });
+
+        assert_eq!(first[0].style.foreground, Color::rgb(17, 17, 17));
+        assert_ne!(second[0].style.foreground, Color::rgb(17, 17, 17));
+        assert_ne!(second[0].style.foreground, Color::rgb(37, 99, 235));
+        assert_eq!(third[0].style.foreground, Color::rgb(37, 99, 235));
+    }
+
+    #[test]
+    fn fragment_app_advances_layout_transitions_for_static_prefab_fragments() {
+        let stylesheet = parse_stylesheet(
+            ".button { width: 80px; transition: width 32ms linear; }
+             .button:hover { width: 160px; }",
+        )
+        .expect("transition stylesheet should parse");
+        let mut app = FragmentApp::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Refresh::clean(),
+            [Fragment::new("button", |_state: &()| {
+                ui_prefab! {
+                    <button class="button">{"hover me"}</button>
+                }
+            })],
+        );
+
+        let first = app.frame(frame(0));
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(0)),
+                active: None,
+            },
+        ));
+        let second = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::from_millis(16),
+        });
+        let third = app.frame(FrameInfo {
+            frame_index: 2,
+            delta: Duration::from_millis(16),
+        });
+
+        assert_eq!(first[0].layout.width, 80.0);
+        assert!((second[0].layout.width - 120.0).abs() < 0.01);
+        assert_eq!(third[0].layout.width, 160.0);
     }
 
     #[test]

@@ -164,7 +164,7 @@ Acceptance:
 ---
 
 ## Y4. Render extraction world and backend-facing scene data
-Depends: Y3, E1, Z1  
+Depends: Y3, E1  
 Status: planned
 
 Purpose:
@@ -378,6 +378,75 @@ Acceptance:
 
 ---
 
+## AA5. Direct static style resolution and selector matching
+Depends: AA3, Y3  
+Status: planned
+
+Purpose:
+- Preserve baked prefab data through the style phase so static subtrees do not need to round-trip back into owned `Node` trees before selector matching
+
+Should have been an extension:
+- This would ideally have extended Y3 because it teaches the explicit style schedule how to consume the static authored form directly
+
+Support:
+- Selector matching against ECS-authored static elements and text without `root_as_node()` reconstruction
+- Prefab-aware rule prefiltering keyed by baked tags, ids, classes, attributes, and other selector-relevant facts
+- Correct handling of interaction-driven selectors such as `:hover` and `:active` on baked subtrees
+- Coexistence of static and dynamic authored forms inside the same runtime world and same selector walk
+
+Acceptance:
+- A baked subtree can resolve style without first rebuilding an owned `Node` tree
+- Interaction selectors and descendant selectors behave the same on baked and dynamic trees
+- Runtime stats can isolate a measurable reduction in structural or style-prep cost for stable baked subtrees
+
+---
+
+## AA6. Direct static layout and transition reuse
+Depends: AA4, AA5, Y3  
+Status: planned
+
+Purpose:
+- Carry prefab identity and compile-time layout hints deeper into layout and transition scheduling so static subtrees can reuse more work than the dynamic path
+
+Should have been an extension:
+- This would ideally have extended Y3 because it is the layout and transition analogue of AA5's direct style path
+
+Support:
+- Prefab-aware layout caches keyed by stable prefab identity, viewport bucket, and relevant style inputs
+- Eligibility checks that use AA4-computed metrics and flags to decide when a static subtree can safely reuse geometry
+- Transition bookkeeping that survives partial refresh and patch paths for static subtrees
+- Partial re-layout boundaries around dynamic leaves inside otherwise static prefab shells
+
+Acceptance:
+- Paint-only changes on a baked subtree do not force full layout reconstruction for static-only descendants
+- Layout and transition behavior remains equivalent between baked and dynamic authored forms
+- Stable baked demos show reduced layout or transition stage time even when total frame time is dominated elsewhere
+
+---
+
+## AA7. Direct static extraction and backend-neutral scene templates
+Depends: AA5, AA6, Y3  
+Status: planned
+
+Purpose:
+- Push the static path through render extraction so CPU and future GPU backends can consume prefab-aware scene data instead of repeatedly rebuilding equivalent extracted structures
+
+Should have been an extension:
+- This would ideally have extended Y4 because it turns extracted scene data into something that can also be templated and patched from static prefabs
+
+Support:
+- Prefab-aware extracted scene templates or draw-list skeletons for fully static branches
+- Patch paths that update only dynamic fields such as text payloads, transforms, colors, or effect parameters on top of a static template
+- Stable backend resource keys for text, SVG, clip, and effect inputs derived from prefab identity
+- A backend-neutral extraction contract so the CPU renderer benefits immediately and the GPU backend starts from the same optimized scene format later
+
+Acceptance:
+- A fully static baked screen can reach backend-facing scene data without owned `Node` reconstruction
+- Mixed static and dynamic screens can patch extracted scene data without rebuilding unaffected static branches
+- The GPU roadmap can start from shared prefab-aware extracted scene templates instead of rediscovering the same optimization later
+
+---
+
 # Suggested implementation order (part 3)
 
 1. X1 + X2 + X3  
@@ -386,8 +455,11 @@ Acceptance:
 4. AA1 + AA2  
 5. AA3  
 6. AA4  
-7. Z1 + Z2  
-8. Z3 + Z4  
+7. AA5  
+8. AA6  
+9. AA7  
+10. Z1 + Z2  
+11. Z3 + Z4  
 
 ---
 
@@ -400,6 +472,7 @@ If part 3 lands, the engine should gain:
 - An optional GPU backend without abandoning the current deterministic CPU path
 - A realistic compile-time asset pipeline for selected static UI
 - Lower startup work and lower runtime allocation pressure for baked screens
+- A path for baked screens to eventually reduce style, layout, and extraction cost instead of only parse and sync cost
 
 Important caveat:
 
@@ -407,6 +480,8 @@ Important caveat:
 - Binary size may go down if raw CSS, parsing code, and dynamic runtime machinery can be feature-gated out
 - Binary size may also go up if generated descriptors duplicate data or force too much monomorphized code
 - Size and memory wins should be measured, not assumed
+- AA1 through AA4 mostly establish parsing, descriptor, prefab, and const-finalization infrastructure
+- AA5 through AA7 are where the direct static path is expected to start paying down style, layout, extraction, and backend-facing frame cost
 
 ---
 

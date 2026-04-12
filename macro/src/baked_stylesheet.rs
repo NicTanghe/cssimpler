@@ -1,8 +1,13 @@
 use proc_macro::TokenStream;
+use std::fs;
+use std::path::PathBuf;
 
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
-use syn::{Error, LitStr, parse_macro_input};
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
+use syn::{Error, Expr, ExprLit, ExprMacro, Lit, LitStr, Token, parse_macro_input};
 use taffy::prelude::{
     AlignContent as TaffyAlignContent, AlignItems as TaffyAlignItems, AlignSelf as TaffyAlignSelf,
     Dimension, Display as TaffyDisplay, FlexDirection, FlexWrap,
@@ -11,15 +16,16 @@ use taffy::prelude::{
 };
 
 pub fn expand_baked_stylesheet(input: TokenStream) -> TokenStream {
-    let source = parse_macro_input!(input as LitStr);
-    match expand_stylesheet_literal(&source) {
+    let source = parse_macro_input!(input as Expr);
+    match expand_stylesheet_expr(&source) {
         Ok(expanded) => expanded.into(),
         Err(error) => error.to_compile_error().into(),
     }
 }
 
-fn expand_stylesheet_literal(source: &LitStr) -> syn::Result<TokenStream2> {
-    let parsed = cssimpler_style::parse_stylesheet(&source.value()).map_err(|error| {
+fn expand_stylesheet_expr(source: &Expr) -> syn::Result<TokenStream2> {
+    let source_text = evaluate_stylesheet_expr(source)?;
+    let parsed = cssimpler_style::parse_stylesheet(&source_text).map_err(|error| {
         Error::new(
             source.span(),
             format!("baked_stylesheet! failed to parse stylesheet: {error}"),
@@ -36,6 +42,65 @@ fn expand_stylesheet_literal(source: &LitStr) -> syn::Result<TokenStream2> {
             ::cssimpler_style::StaticStylesheetDesc::new(&[#(#rules),*]);
         __CSSIMPLER_BAKED_STYLESHEET.to_stylesheet()
     }))
+}
+
+fn evaluate_stylesheet_expr(expr: &Expr) -> syn::Result<String> {
+    match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(source),
+            ..
+        }) => Ok(source.value()),
+        Expr::Macro(expr_macro) if expr_macro.mac.path.is_ident("include_str") => {
+            evaluate_include_str(expr_macro)
+        }
+        Expr::Macro(expr_macro) if expr_macro.mac.path.is_ident("concat") => {
+            evaluate_concat(expr_macro)
+        }
+        _ => Err(Error::new(
+            expr.span(),
+            "baked_stylesheet! expects a string literal, include_str!(...), or concat!(...) of those",
+        )),
+    }
+}
+
+fn evaluate_include_str(expr_macro: &ExprMacro) -> syn::Result<String> {
+    let path = syn::parse2::<LitStr>(expr_macro.mac.tokens.clone()).map_err(|_| {
+        Error::new(
+            expr_macro.mac.span(),
+            "include_str! inside baked_stylesheet! expects a string literal path",
+        )
+    })?;
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
+        Error::new(
+            expr_macro.mac.span(),
+            "CARGO_MANIFEST_DIR is unavailable while expanding baked_stylesheet!",
+        )
+    })?;
+    let full_path = PathBuf::from(manifest_dir).join(path.value());
+    fs::read_to_string(&full_path).map_err(|error| {
+        Error::new(
+            path.span(),
+            format!(
+                "failed to read stylesheet source from {}: {error}",
+                full_path.display()
+            ),
+        )
+    })
+}
+
+fn evaluate_concat(expr_macro: &ExprMacro) -> syn::Result<String> {
+    let parser = Punctuated::<Expr, Token![,]>::parse_terminated;
+    let parts = parser.parse2(expr_macro.mac.tokens.clone()).map_err(|_| {
+        Error::new(
+            expr_macro.mac.span(),
+            "concat! inside baked_stylesheet! expects comma-separated string expressions",
+        )
+    })?;
+    let mut source = String::new();
+    for part in parts {
+        source.push_str(&evaluate_stylesheet_expr(&part)?);
+    }
+    Ok(source)
 }
 
 fn quote_rule(rule: &cssimpler_style::StyleRule, span: Span) -> syn::Result<TokenStream2> {
