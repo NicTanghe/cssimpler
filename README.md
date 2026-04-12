@@ -156,7 +156,6 @@ Use cssimpler if you want:
 Avoid it if you want:
 
 - SPA frameworks  
-- heavy interactivity  
 - JS ecosystem tooling  
 
 ---
@@ -181,7 +180,9 @@ Early stage — APIs may change.
 
 Keep it simple.
 
-If it adds complexity without clear value, it doesn’t belong.
+If you want to add something it probably has value so 
+don`t be afraid to put in a request.
+
 
 ---
 
