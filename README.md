@@ -82,6 +82,86 @@ Dynamic theming = changing variables. Nothing more.
 
 ---
 
+## Counter Button Example
+
+If you do want a button, it can stay simple too:
+
+~~~rust
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use anyhow::Result;
+use cssimpler::app::{App, Invalidation};
+use cssimpler::core::Node;
+use cssimpler::renderer::{FrameInfo, WindowConfig};
+use cssimpler::style::{Stylesheet, parse_stylesheet};
+use cssimpler::ui;
+
+static CLICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn main() -> Result<()> {
+    let config = WindowConfig::new("cssimpler / counter", 480, 220);
+
+    App::new((), stylesheet(), update, build_ui)
+        .run(config)
+        .map_err(Into::into)
+}
+
+fn update(_state: &mut (), _frame: FrameInfo) -> Invalidation {
+    Invalidation::Clean
+}
+
+fn build_ui(_state: &()) -> Node {
+    let count = CLICK_COUNT.load(Ordering::Relaxed);
+
+    ui! {
+        <div class="card">
+            <p>{format!("count: {count}")}</p>
+            <button class="button" type="button" onclick={increment}>
+                {"Increment"}
+            </button>
+        </div>
+    }
+}
+
+fn increment() {
+    CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+fn stylesheet() -> &'static Stylesheet {
+    static STYLESHEET: OnceLock<Stylesheet> = OnceLock::new();
+
+    STYLESHEET.get_or_init(|| {
+        parse_stylesheet(
+            r#"
+            .card {
+                min-height: 100vh;
+                display: flex;
+                gap: 12px;
+                justify-content: center;
+                align-items: center;
+                background: #101218;
+                color: #f5f7ff;
+            }
+
+            .button {
+                padding: 10px 14px;
+            }
+            "#,
+        )
+        .expect("counter stylesheet should stay valid")
+    })
+}
+~~~
+
+No state struct.  
+No signals.  
+Just a counter and a button.
+
+---
+
+
+
 ## What This Is Not
 
 - ❌ No JavaScript execution  
