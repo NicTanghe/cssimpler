@@ -9,7 +9,7 @@ use crate::{
 };
 
 const MIN_THUMB_LENGTH: f32 = 18.0;
-const WHEEL_SCROLL_STEP: f32 = 40.0;
+pub(crate) const WHEEL_SCROLL_STEP: f32 = 40.0;
 const AUTO_SCROLL_DEADZONE: f32 = 8.0;
 const AUTO_SCROLL_SPEED_PER_PIXEL: f32 = 10.0;
 const AUTO_SCROLL_MAX_FRAME_SECONDS: f32 = 0.05;

@@ -7,7 +7,8 @@ edition.workspace = true
 ab_glyph.workspace = true
 cssimpler-core.workspace = true
 font8x8.workspace = true
-minifb.workspace = true
+softbuffer.workspace = true
+winit.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["winuser"] }

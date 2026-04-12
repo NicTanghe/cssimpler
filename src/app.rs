@@ -263,6 +263,12 @@ where
         self.render_mode
     }
 
+    pub fn needs_redraw(&self) -> bool {
+        self.cached_scene.is_none()
+            || self.pending_refresh.needs_rerender()
+            || self.scene_transition.is_some()
+    }
+
     pub fn state(&self) -> &State {
         &self.state
     }
@@ -553,6 +559,17 @@ where
     fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
         App::set_interaction_state(self, interaction)
     }
+
+    fn redraw_schedule(&self) -> renderer::RedrawSchedule {
+        match self.render_mode {
+            RenderMode::EveryFrame => renderer::RedrawSchedule::EveryFrame,
+            RenderMode::OnInvalidation => renderer::RedrawSchedule::OnInvalidation,
+        }
+    }
+
+    fn needs_redraw(&self) -> bool {
+        App::needs_redraw(self)
+    }
 }
 
 pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
@@ -603,6 +620,12 @@ where
 
     pub fn render_mode(&self) -> RenderMode {
         self.render_mode
+    }
+
+    pub fn needs_redraw(&self) -> bool {
+        self.cached_scene.is_none()
+            || self.pending_refresh.needs_rerender()
+            || self.scene_transition.is_some()
     }
 
     pub fn state(&self) -> &State {
@@ -847,6 +870,17 @@ where
 
     fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
         FragmentApp::set_interaction_state(self, interaction)
+    }
+
+    fn redraw_schedule(&self) -> renderer::RedrawSchedule {
+        match self.render_mode {
+            RenderMode::EveryFrame => renderer::RedrawSchedule::EveryFrame,
+            RenderMode::OnInvalidation => renderer::RedrawSchedule::OnInvalidation,
+        }
+    }
+
+    fn needs_redraw(&self) -> bool {
+        FragmentApp::needs_redraw(self)
     }
 }
 

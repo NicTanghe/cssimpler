@@ -68,6 +68,18 @@ impl SceneProvider for GradientGalleryProvider {
     fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
         <GalleryApp as SceneProvider>::set_element_interaction(&mut self.app, interaction)
     }
+
+    fn handle_engine_event(&mut self, event: &cssimpler::renderer::EngineEvent) -> bool {
+        <GalleryApp as SceneProvider>::handle_engine_event(&mut self.app, event)
+    }
+
+    fn redraw_schedule(&self) -> cssimpler::renderer::RedrawSchedule {
+        <GalleryApp as SceneProvider>::redraw_schedule(&self.app)
+    }
+
+    fn needs_redraw(&self) -> bool {
+        <GalleryApp as SceneProvider>::needs_redraw(&self.app)
+    }
 }
 
 fn main() -> Result<()> {

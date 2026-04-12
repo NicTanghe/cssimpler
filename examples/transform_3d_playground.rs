@@ -228,6 +228,18 @@ impl SceneProvider for PlaygroundProvider {
         set_active_path(interaction.active.clone());
         <PlaygroundApp as SceneProvider>::set_element_interaction(&mut self.app, interaction)
     }
+
+    fn handle_engine_event(&mut self, event: &cssimpler::renderer::EngineEvent) -> bool {
+        <PlaygroundApp as SceneProvider>::handle_engine_event(&mut self.app, event)
+    }
+
+    fn redraw_schedule(&self) -> cssimpler::renderer::RedrawSchedule {
+        <PlaygroundApp as SceneProvider>::redraw_schedule(&self.app)
+    }
+
+    fn needs_redraw(&self) -> bool {
+        <PlaygroundApp as SceneProvider>::needs_redraw(&self.app)
+    }
 }
 
 fn main() -> Result<()> {

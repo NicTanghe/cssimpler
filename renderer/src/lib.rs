@@ -7,11 +7,13 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem::size_of;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod backdrop;
 mod fonts;
 mod gradient;
+mod input;
+mod runtime;
 mod scrollbar;
 mod shadow;
 mod shapes;
@@ -40,8 +42,13 @@ use cssimpler_core::{
     Color, ElementInteractionState, ElementPath, EventHandler, LayoutBox, LinearRgba, RenderKind,
     RenderNode, Transform2D, TransformMatrix3d, TransformStyleMode, VisualStyle,
 };
-use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
+use softbuffer::SoftBufferError;
+use winit::error::{EventLoopError, OsError};
 
+pub use self::input::{
+    ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
+    PointerButton, PointerPosition, ScrollDelta, TextInputEvent, ViewportEvent,
+};
 #[cfg(test)]
 use self::{
     shadow::cached_shadow_mask,
@@ -525,8 +532,13 @@ fn cached_promoted_surface(
             false,
         );
     });
-    let surface =
-        extract_surface_from_mattes(&black_buffer, &white_buffer, source_bounds, surface_width, surface_height);
+    let surface = extract_surface_from_mattes(
+        &black_buffer,
+        &white_buffer,
+        source_bounds,
+        surface_width,
+        surface_height,
+    );
     release_worker_buffers(vec![black_buffer, white_buffer]);
     let surface = Arc::new(surface?);
 
@@ -760,26 +772,49 @@ impl WindowConfig {
 
 #[derive(Debug)]
 pub enum RendererError {
-    Window(minifb::Error),
+    EventLoop(String),
+    Window(String),
+    Surface(String),
 }
 
 impl Display for RendererError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Window(source) => write!(f, "renderer backend error: {source}"),
+            Self::EventLoop(source) => write!(f, "renderer event loop error: {source}"),
+            Self::Window(source) => write!(f, "renderer window error: {source}"),
+            Self::Surface(source) => write!(f, "renderer surface error: {source}"),
         }
     }
 }
 
 impl Error for RendererError {}
 
-impl From<minifb::Error> for RendererError {
-    fn from(value: minifb::Error) -> Self {
-        Self::Window(value)
+impl From<EventLoopError> for RendererError {
+    fn from(value: EventLoopError) -> Self {
+        Self::EventLoop(value.to_string())
+    }
+}
+
+impl From<OsError> for RendererError {
+    fn from(value: OsError) -> Self {
+        Self::Window(value.to_string())
+    }
+}
+
+impl From<SoftBufferError> for RendererError {
+    fn from(value: SoftBufferError) -> Self {
+        Self::Surface(value.to_string())
     }
 }
 
 pub type Result<T> = std::result::Result<T, RendererError>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RedrawSchedule {
+    EveryFrame,
+    #[default]
+    OnInvalidation,
+}
 
 pub trait SceneProvider {
     fn update(&mut self, frame: FrameInfo);
@@ -796,6 +831,19 @@ pub trait SceneProvider {
 
     fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
         let _ = interaction;
+        false
+    }
+
+    fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        let _ = event;
+        false
+    }
+
+    fn redraw_schedule(&self) -> RedrawSchedule {
+        RedrawSchedule::OnInvalidation
+    }
+
+    fn needs_redraw(&self) -> bool {
         false
     }
 }
@@ -845,6 +893,14 @@ where
     fn capture_scene(&mut self) -> Vec<RenderNode> {
         std::mem::take(&mut self.scene)
     }
+
+    fn redraw_schedule(&self) -> RedrawSchedule {
+        RedrawSchedule::EveryFrame
+    }
+
+    fn needs_redraw(&self) -> bool {
+        true
+    }
 }
 
 impl<F> SceneProvider for ViewportClosureSceneProvider<F>
@@ -866,6 +922,14 @@ where
     fn capture_scene(&mut self) -> Vec<RenderNode> {
         std::mem::take(&mut self.scene)
     }
+
+    fn redraw_schedule(&self) -> RedrawSchedule {
+        RedrawSchedule::EveryFrame
+    }
+
+    fn needs_redraw(&self) -> bool {
+        true
+    }
 }
 
 pub fn run<F>(config: WindowConfig, render_scene: F) -> Result<()>
@@ -882,10 +946,12 @@ where
     run_with_scene_provider(config, ViewportClosureSceneProvider::new(render_scene))
 }
 
-pub fn run_with_scene_provider<P>(config: WindowConfig, mut scene_provider: P) -> Result<()>
+pub fn run_with_scene_provider<P>(config: WindowConfig, scene_provider: P) -> Result<()>
 where
     P: SceneProvider,
 {
+    runtime::run_with_scene_provider(config, scene_provider)
+    /*
     let startup_begin = Instant::now();
     let initial_viewport = ViewportSize::new(config.width, config.height);
     scene_provider.set_viewport(initial_viewport);
@@ -1213,14 +1279,7 @@ where
         frame_index += 1;
     }
 
-    Ok(())
-}
-
-fn window_options() -> WindowOptions {
-    WindowOptions {
-        resize: true,
-        ..WindowOptions::default()
-    }
+    */
 }
 
 pub fn render_to_buffer(
@@ -1826,7 +1885,10 @@ fn render_nodes_match_own_visuals(left: &RenderNode, right: &RenderNode) -> bool
         && left.scrollbars == right.scrollbars
 }
 
-fn render_nodes_match_own_visuals_ignoring_projection(left: &RenderNode, right: &RenderNode) -> bool {
+fn render_nodes_match_own_visuals_ignoring_projection(
+    left: &RenderNode,
+    right: &RenderNode,
+) -> bool {
     left.kind == right.kind
         && left.layout == right.layout
         && left.content_inset == right.content_inset
@@ -4163,14 +4225,6 @@ fn unpack_rgb(pixel: u32) -> Color {
     )
 }
 
-fn frame_time_to_fps(frame_time: Duration) -> usize {
-    if frame_time.is_zero() {
-        return 0;
-    }
-
-    (1.0 / frame_time.as_secs_f64()).round().max(1.0) as usize
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -4194,7 +4248,7 @@ mod tests {
         dispatch_mouse_event, distribute_dirty_render_jobs, drawable_viewport_size,
         hit_test_element_path, pack_rgb, render_scene_update, render_scene_update_internal,
         render_to_buffer, resize_buffer, scenes_match_visuals, should_present_frame,
-        should_present_scene, should_suspend_updates, window_options,
+        should_present_scene, should_suspend_updates,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -5503,7 +5557,9 @@ mod tests {
             &mut node_count,
         );
         let source_bounds = super::snapped_surface_source_bounds(
-            surface_bounds.bounds.expect("promoted subtree should have bounds"),
+            surface_bounds
+                .bounds
+                .expect("promoted subtree should have bounds"),
             800,
             600,
         )
@@ -5532,7 +5588,10 @@ mod tests {
             super::subtree_surface_last_build_surface_bytes_for_tests(),
             expected_surface_bytes
         );
-        assert_eq!(super::subtree_surface_cache_bytes_for_tests(), expected_surface_bytes);
+        assert_eq!(
+            super::subtree_surface_cache_bytes_for_tests(),
+            expected_surface_bytes
+        );
         assert!(
             expected_temp_bytes
                 < 800_usize
@@ -5656,7 +5715,10 @@ mod tests {
 
         assert_eq!(super::subtree_surface_cache_builds_for_tests(), 0);
         assert_eq!(super::subtree_surface_cache_bytes_for_tests(), 0);
-        assert_eq!(super::subtree_surface_last_build_surface_bytes_for_tests(), 0);
+        assert_eq!(
+            super::subtree_surface_last_build_surface_bytes_for_tests(),
+            0
+        );
         assert_eq!(super::subtree_surface_last_build_temp_bytes_for_tests(), 0);
         assert!(buffer.contains(&pack_rgb(Color::rgb(220, 38, 38))));
     }
@@ -6161,11 +6223,6 @@ mod tests {
     }
 
     #[test]
-    fn window_options_enable_native_resizing() {
-        assert!(window_options().resize);
-    }
-
-    #[test]
     fn visual_scene_comparison_ignores_click_handlers() {
         let left = vec![
             RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0))
@@ -6488,7 +6545,9 @@ mod tests {
                                     corner_radius: CornerRadius::all(20.0),
                                     transform_style: TransformStyleMode::Preserve3d,
                                     transform: Transform2D {
-                                        operations: vec![TransformOperation::TranslateZ { z: 10.0 }],
+                                        operations: vec![TransformOperation::TranslateZ {
+                                            z: 10.0,
+                                        }],
                                         ..Transform2D::default()
                                     },
                                     ..VisualStyle::default()
@@ -6501,7 +6560,9 @@ mod tests {
                                     corner_radius: CornerRadius::all(20.0),
                                     transform_style: TransformStyleMode::Preserve3d,
                                     transform: Transform2D {
-                                        operations: vec![TransformOperation::TranslateZ { z: 26.0 }],
+                                        operations: vec![TransformOperation::TranslateZ {
+                                            z: 26.0,
+                                        }],
                                         ..Transform2D::default()
                                     },
                                     ..VisualStyle::default()
@@ -6530,7 +6591,9 @@ mod tests {
                                     corner_radius: CornerRadius::all(20.0),
                                     transform_style: TransformStyleMode::Preserve3d,
                                     transform: Transform2D {
-                                        operations: vec![TransformOperation::TranslateZ { z: 42.0 }],
+                                        operations: vec![TransformOperation::TranslateZ {
+                                            z: 42.0,
+                                        }],
                                         ..Transform2D::default()
                                     },
                                     ..VisualStyle::default()
