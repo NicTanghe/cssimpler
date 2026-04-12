@@ -7,6 +7,7 @@ pub mod generated_content;
 pub mod interaction;
 pub mod runtime_ecs;
 pub mod scrollbar;
+pub mod static_desc;
 pub mod svg;
 pub mod transitions;
 
@@ -21,12 +22,17 @@ pub use generated_content::GeneratedTextSource;
 pub use interaction::{ElementInteractionState, ElementPath};
 pub use runtime_ecs::{
     Entity, RuntimeComputedNode, RuntimeDirtyClass, RuntimeDirtyFlags, RuntimeElementInteraction,
-    RuntimeEntityData, RuntimeNodeKind, RuntimeScrollState, RuntimeSyncAction, RuntimeSyncPolicy,
-    RuntimeSyncResult, RuntimeViewport, RuntimeWorld,
+    RuntimeEntityData, RuntimeNodeKind, RuntimePrefabId, RuntimeScrollState,
+    RuntimeStaticElementData, RuntimeSyncAction, RuntimeSyncPolicy, RuntimeSyncResult,
+    RuntimeViewport, RuntimeWorld,
 };
 pub use scrollbar::{
     OverflowMode, ScrollbarAxisState, ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics,
     ScrollbarStyle, ScrollbarWidth,
+};
+pub use static_desc::{
+    StaticAttribute, StaticElementNodeDesc, StaticNodeDesc, StaticPrefabFlags, StaticPrefabMetrics,
+    StaticTextRun, analyze_prefab,
 };
 pub use svg::{
     SvgBounds, SvgContour, SvgPaint, SvgPathGeometry, SvgPathInstance, SvgPathPaint, SvgPoint,

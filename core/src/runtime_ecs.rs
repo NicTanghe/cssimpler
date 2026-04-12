@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     ElementInteractionState, ElementNode, ElementPath, EventHandlers, LayoutBox, Node,
-    ScrollbarData, Style,
+    ScrollbarData, StaticAttribute, StaticNodeDesc, Style,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -91,9 +91,29 @@ pub struct RuntimeElementData {
 }
 
 #[derive(Clone, Debug)]
+pub struct RuntimeStaticElementData {
+    pub tag: &'static str,
+    pub id: Option<&'static str>,
+    pub classes: &'static [&'static str],
+    pub attributes: &'static [StaticAttribute],
+    pub handlers: EventHandlers,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RuntimePrefabId(usize);
+
+impl RuntimePrefabId {
+    pub const fn value(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum RuntimeNodeKind {
     Element(RuntimeElementData),
+    StaticElement(RuntimeStaticElementData),
     Text(String),
+    StaticText(&'static str),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -111,6 +131,7 @@ pub struct RuntimeEntityData {
     pub parent: Option<Entity>,
     pub children: Vec<Entity>,
     pub authored: RuntimeNodeKind,
+    pub prefab_identity: Option<RuntimePrefabId>,
     pub computed: RuntimeComputedNode,
 }
 
@@ -218,7 +239,28 @@ impl RuntimeWorld {
                     handlers: element.handlers,
                 }))
             }
+            RuntimeNodeKind::StaticElement(element) => {
+                let mut children = Vec::with_capacity(data.children.len());
+                for child in &data.children {
+                    children.push(self.entity_as_node(*child)?);
+                }
+
+                let mut node = ElementNode::new(element.tag);
+                if let Some(id) = element.id {
+                    node = node.with_id(id);
+                }
+                for class_name in element.classes {
+                    node = node.with_class(*class_name);
+                }
+                for attribute in element.attributes {
+                    node = node.with_attribute(attribute.name, attribute.value);
+                }
+                node.handlers = element.handlers;
+                node.children = children;
+                Some(Node::Element(node))
+            }
             RuntimeNodeKind::Text(text) => Some(Node::Text(text.clone())),
+            RuntimeNodeKind::StaticText(text) => Some(Node::Text((*text).to_string())),
         }
     }
 
@@ -270,6 +312,55 @@ impl RuntimeWorld {
         result
     }
 
+    pub fn sync_static_root(
+        &mut self,
+        root_index: usize,
+        node: &'static StaticNodeDesc,
+        policy: RuntimeSyncPolicy,
+        dirty_class: RuntimeDirtyClass,
+    ) -> RuntimeSyncResult {
+        self.ensure_root_slot(root_index);
+
+        let existing_root = self.roots[root_index];
+        if matches!(policy, RuntimeSyncPolicy::PreferPatch)
+            && let Some(root) = existing_root
+            && self.static_node_matches_shape(node, root)
+        {
+            let mut result = RuntimeSyncResult {
+                root,
+                action: RuntimeSyncAction::Patched,
+                reused_entities: 0,
+                spawned_entities: 0,
+                despawned_entities: 0,
+            };
+            let element_path = element_path_for_static_root_node(node, root_index);
+            self.patch_static_node(
+                root,
+                node,
+                None,
+                element_path.as_ref(),
+                dirty_class,
+                &mut result,
+            );
+            return result;
+        }
+
+        let despawned_entities = existing_root.map_or(0, |root| self.despawn_subtree(root));
+        let mut result = RuntimeSyncResult {
+            root: Entity(0),
+            action: RuntimeSyncAction::Rebuilt,
+            reused_entities: 0,
+            spawned_entities: 0,
+            despawned_entities,
+        };
+        let element_path = element_path_for_static_root_node(node, root_index);
+        let root =
+            self.spawn_static_node(node, None, element_path.as_ref(), dirty_class, &mut result);
+        self.roots[root_index] = Some(root);
+        result.root = root;
+        result
+    }
+
     fn ensure_root_slot(&mut self, root_index: usize) {
         if self.roots.len() <= root_index {
             self.roots.resize(root_index + 1, None);
@@ -289,7 +380,10 @@ impl RuntimeWorld {
             return false;
         };
         match (node, &data.authored) {
-            (Node::Element(element), RuntimeNodeKind::Element(_)) => {
+            (
+                Node::Element(element),
+                RuntimeNodeKind::Element(_) | RuntimeNodeKind::StaticElement(_),
+            ) => {
                 if element.children.len() != data.children.len() {
                     return false;
                 }
@@ -301,7 +395,37 @@ impl RuntimeWorld {
                         self.node_matches_shape(child_node, *child_entity)
                     })
             }
-            (Node::Text(_), RuntimeNodeKind::Text(_)) => data.children.is_empty(),
+            (Node::Text(_), RuntimeNodeKind::Text(_) | RuntimeNodeKind::StaticText(_)) => {
+                data.children.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    fn static_node_matches_shape(&self, node: &'static StaticNodeDesc, entity: Entity) -> bool {
+        let Some(data) = self.entity(entity) else {
+            return false;
+        };
+        match (node, &data.authored) {
+            (
+                StaticNodeDesc::Element(element),
+                RuntimeNodeKind::Element(_) | RuntimeNodeKind::StaticElement(_),
+            ) => {
+                if element.children.len() != data.children.len() {
+                    return false;
+                }
+                element
+                    .children
+                    .iter()
+                    .zip(&data.children)
+                    .all(|(child_node, child_entity)| {
+                        self.static_node_matches_shape(child_node, *child_entity)
+                    })
+            }
+            (
+                StaticNodeDesc::Text(_),
+                RuntimeNodeKind::Text(_) | RuntimeNodeKind::StaticText(_),
+            ) => data.children.is_empty(),
             _ => false,
         }
     }
@@ -322,6 +446,7 @@ impl RuntimeWorld {
                 .expect("patched runtime entities should exist");
             data.parent = parent;
             data.authored = authored_from_node(node);
+            data.prefab_identity = None;
             data.computed.resolved_style = None;
             data.computed.layout = None;
             data.computed.scroll = RuntimeScrollState::default();
@@ -364,6 +489,65 @@ impl RuntimeWorld {
         }
     }
 
+    fn patch_static_node(
+        &mut self,
+        entity: Entity,
+        node: &'static StaticNodeDesc,
+        parent: Option<Entity>,
+        element_path: Option<&ElementPath>,
+        dirty_class: RuntimeDirtyClass,
+        result: &mut RuntimeSyncResult,
+    ) {
+        let interaction = self.interaction.clone();
+        let (children, authored_children) = {
+            let data = self
+                .entity_mut(entity)
+                .expect("patched runtime entities should exist");
+            data.parent = parent;
+            data.authored = authored_from_static_node(node);
+            data.prefab_identity = Some(prefab_identity_for_static_node(node));
+            data.computed.resolved_style = None;
+            data.computed.layout = None;
+            data.computed.scroll = RuntimeScrollState::default();
+            data.computed.dirty.clear();
+            data.computed.dirty.mark(dirty_class);
+            data.computed.element_path = element_path.cloned();
+            data.computed.interaction =
+                interaction_component(&interaction, data.computed.element_path.as_ref());
+            result.reused_entities += 1;
+
+            let authored_children = match node {
+                StaticNodeDesc::Element(element) => Some(element.children),
+                StaticNodeDesc::Text(_) => None,
+            };
+            (data.children.clone(), authored_children)
+        };
+
+        let Some(authored_children) = authored_children else {
+            return;
+        };
+
+        let mut element_child_index = 0;
+        for (child_entity, child_node) in children.into_iter().zip(authored_children.iter()) {
+            let child_element_path = match child_node {
+                StaticNodeDesc::Element(_) => {
+                    let path = element_path.map(|path| path.with_child(element_child_index));
+                    element_child_index += 1;
+                    path
+                }
+                StaticNodeDesc::Text(_) => None,
+            };
+            self.patch_static_node(
+                child_entity,
+                child_node,
+                Some(entity),
+                child_element_path.as_ref(),
+                dirty_class,
+                result,
+            );
+        }
+    }
+
     fn spawn_node(
         &mut self,
         node: &Node,
@@ -390,6 +574,7 @@ impl RuntimeWorld {
             parent,
             children: Vec::new(),
             authored: authored_from_node(node),
+            prefab_identity: None,
             computed,
         });
         result.spawned_entities += 1;
@@ -407,6 +592,66 @@ impl RuntimeWorld {
                     Node::Text(_) => None,
                 };
                 let child_entity = self.spawn_node(
+                    child,
+                    Some(entity),
+                    child_element_path.as_ref(),
+                    dirty_class,
+                    result,
+                );
+                child_entities.push(child_entity);
+            }
+            self.entity_mut(entity)
+                .expect("spawned entity should still exist")
+                .children = child_entities;
+        }
+
+        entity
+    }
+
+    fn spawn_static_node(
+        &mut self,
+        node: &'static StaticNodeDesc,
+        parent: Option<Entity>,
+        element_path: Option<&ElementPath>,
+        dirty_class: RuntimeDirtyClass,
+        result: &mut RuntimeSyncResult,
+    ) -> Entity {
+        let entity = self.allocate_entity();
+        let interaction = interaction_component(&self.interaction, element_path);
+        let computed = RuntimeComputedNode {
+            resolved_style: None,
+            layout: None,
+            interaction,
+            scroll: RuntimeScrollState::default(),
+            dirty: {
+                let mut dirty = RuntimeDirtyFlags::default();
+                dirty.mark(dirty_class);
+                dirty
+            },
+            element_path: element_path.cloned(),
+        };
+        self.entities[entity.index()] = Some(RuntimeEntityData {
+            parent,
+            children: Vec::new(),
+            authored: authored_from_static_node(node),
+            prefab_identity: Some(prefab_identity_for_static_node(node)),
+            computed,
+        });
+        result.spawned_entities += 1;
+
+        if let StaticNodeDesc::Element(element) = node {
+            let mut child_entities = Vec::with_capacity(element.children.len());
+            let mut element_child_index = 0;
+            for child in element.children {
+                let child_element_path = match child {
+                    StaticNodeDesc::Element(_) => {
+                        let path = element_path.map(|path| path.with_child(element_child_index));
+                        element_child_index += 1;
+                        path
+                    }
+                    StaticNodeDesc::Text(_) => None,
+                };
+                let child_entity = self.spawn_static_node(
                     child,
                     Some(entity),
                     child_element_path.as_ref(),
@@ -461,8 +706,34 @@ fn authored_from_node(node: &Node) -> RuntimeNodeKind {
     }
 }
 
+fn authored_from_static_node(node: &'static StaticNodeDesc) -> RuntimeNodeKind {
+    match node {
+        StaticNodeDesc::Element(element) => {
+            RuntimeNodeKind::StaticElement(RuntimeStaticElementData {
+                tag: element.tag,
+                id: element.id,
+                classes: element.classes,
+                attributes: element.attributes,
+                handlers: element.handlers,
+            })
+        }
+        StaticNodeDesc::Text(text) => RuntimeNodeKind::StaticText(text.text),
+    }
+}
+
 fn element_path_for_root_node(node: &Node, root_index: usize) -> Option<ElementPath> {
     matches!(node, Node::Element(_)).then(|| ElementPath::root(root_index))
+}
+
+fn element_path_for_static_root_node(
+    node: &'static StaticNodeDesc,
+    root_index: usize,
+) -> Option<ElementPath> {
+    matches!(node, StaticNodeDesc::Element(_)).then(|| ElementPath::root(root_index))
+}
+
+fn prefab_identity_for_static_node(node: &'static StaticNodeDesc) -> RuntimePrefabId {
+    RuntimePrefabId(node as *const StaticNodeDesc as usize)
 }
 
 fn interaction_component(
@@ -481,11 +752,59 @@ fn interaction_component(
 
 #[cfg(test)]
 mod tests {
-    use crate::{Node, Style};
+    use crate::{Node, StaticAttribute, StaticElementNodeDesc, StaticNodeDesc, Style};
 
     use super::{
-        RuntimeDirtyClass, RuntimeSyncAction, RuntimeSyncPolicy, RuntimeViewport, RuntimeWorld,
+        RuntimeDirtyClass, RuntimeNodeKind, RuntimeSyncAction, RuntimeSyncPolicy, RuntimeViewport,
+        RuntimeWorld,
     };
+
+    static STATIC_LABEL_CHILDREN: [StaticNodeDesc; 1] = [StaticNodeDesc::text("hello")];
+    static STATIC_ROOT_ATTRIBUTES: [StaticAttribute; 1] =
+        [StaticAttribute::new("data-kind", "card")];
+    static STATIC_ROOT: StaticNodeDesc = StaticNodeDesc::element(StaticElementNodeDesc::new(
+        "section",
+        Some("card"),
+        &["panel"],
+        &STATIC_ROOT_ATTRIBUTES,
+        &[StaticNodeDesc::element(StaticElementNodeDesc::new(
+            "p",
+            None,
+            &[],
+            &[],
+            &STATIC_LABEL_CHILDREN,
+        ))],
+    ));
+    static STATIC_PATCH_FIRST_CHILDREN: [StaticNodeDesc; 1] = [StaticNodeDesc::text("first")];
+    static STATIC_PATCH_SECOND_CHILDREN: [StaticNodeDesc; 1] = [StaticNodeDesc::text("second")];
+    static STATIC_PATCH_FIRST: StaticNodeDesc =
+        StaticNodeDesc::element(StaticElementNodeDesc::new(
+            "div",
+            None,
+            &[],
+            &[],
+            &[StaticNodeDesc::element(StaticElementNodeDesc::new(
+                "span",
+                None,
+                &[],
+                &[],
+                &STATIC_PATCH_FIRST_CHILDREN,
+            ))],
+        ));
+    static STATIC_PATCH_SECOND: StaticNodeDesc =
+        StaticNodeDesc::element(StaticElementNodeDesc::new(
+            "div",
+            None,
+            &[],
+            &[],
+            &[StaticNodeDesc::element(StaticElementNodeDesc::new(
+                "span",
+                None,
+                &[],
+                &[],
+                &STATIC_PATCH_SECOND_CHILDREN,
+            ))],
+        ));
 
     #[test]
     fn viewport_is_engine_owned_and_clamped() {
@@ -526,6 +845,53 @@ mod tests {
             root_data.computed.element_path,
             Some(crate::ElementPath::root(0))
         );
+        assert_eq!(root_data.prefab_identity, None);
+    }
+
+    #[test]
+    fn sync_static_root_builds_runtime_entities_from_prefabs_without_owned_nodes() {
+        let mut world = RuntimeWorld::default();
+
+        let result = world.sync_static_root(
+            0,
+            &STATIC_ROOT,
+            RuntimeSyncPolicy::ForceRebuild,
+            RuntimeDirtyClass::Structure,
+        );
+
+        assert_eq!(result.action, RuntimeSyncAction::Rebuilt);
+        assert_eq!(world.entity_count(), 3);
+        let root = world.root_entity(0).expect("root entity should exist");
+        let root_data = world.entity(root).expect("root data should exist");
+        assert!(matches!(
+            root_data.authored,
+            RuntimeNodeKind::StaticElement(_)
+        ));
+        assert!(root_data.prefab_identity.is_some());
+        assert_eq!(
+            root_data.computed.element_path,
+            Some(crate::ElementPath::root(0))
+        );
+
+        let child = root_data.children[0];
+        let text = world
+            .entity(child)
+            .expect("child entity should exist")
+            .children[0];
+        assert!(matches!(
+            world
+                .entity(text)
+                .expect("text entity should exist")
+                .authored,
+            RuntimeNodeKind::StaticText("hello")
+        ));
+
+        let roundtrip = world.root_as_node(0).expect("root should roundtrip");
+        let Node::Element(root_element) = roundtrip else {
+            panic!("roundtripped root should stay an element");
+        };
+        assert_eq!(root_element.attribute("data-kind"), Some("card"));
+        assert_eq!(root_element.id.as_deref(), Some("card"));
     }
 
     #[test]
@@ -578,6 +944,71 @@ mod tests {
                 .children[0],
             text
         );
+        let roundtrip = world.root_as_node(0).expect("root should roundtrip");
+        let Node::Element(root_element) = roundtrip else {
+            panic!("roundtripped root should stay an element");
+        };
+        let Node::Element(span) = &root_element.children[0] else {
+            panic!("roundtripped child should stay an element");
+        };
+        let Node::Text(text) = &span.children[0] else {
+            panic!("roundtripped grandchild should stay text");
+        };
+        assert_eq!(text, "second");
+    }
+
+    #[test]
+    fn prefer_patch_reuses_entities_when_static_prefab_shape_stays_stable() {
+        let mut world = RuntimeWorld::default();
+
+        world.sync_static_root(
+            0,
+            &STATIC_PATCH_FIRST,
+            RuntimeSyncPolicy::ForceRebuild,
+            RuntimeDirtyClass::Structure,
+        );
+        let root = world.root_entity(0).expect("first root should exist");
+        let first_prefab_identity = world
+            .entity(root)
+            .expect("root data should exist")
+            .prefab_identity;
+        let child = world.entity(root).expect("root data should exist").children[0];
+        let text = world
+            .entity(child)
+            .expect("child data should exist")
+            .children[0];
+
+        let result = world.sync_static_root(
+            0,
+            &STATIC_PATCH_SECOND,
+            RuntimeSyncPolicy::PreferPatch,
+            RuntimeDirtyClass::Paint,
+        );
+
+        assert_eq!(result.action, RuntimeSyncAction::Patched);
+        assert_eq!(world.root_entity(0), Some(root));
+        assert_eq!(
+            world
+                .entity(root)
+                .expect("patched root should exist")
+                .children[0],
+            child
+        );
+        assert_eq!(
+            world
+                .entity(child)
+                .expect("patched child should exist")
+                .children[0],
+            text
+        );
+        assert_ne!(
+            world
+                .entity(root)
+                .expect("patched root should exist")
+                .prefab_identity,
+            first_prefab_identity
+        );
+
         let roundtrip = world.root_as_node(0).expect("root should roundtrip");
         let Node::Element(root_element) = roundtrip else {
             panic!("roundtripped root should stay an element");
@@ -695,5 +1126,41 @@ mod tests {
                 .interaction
                 .active
         );
+    }
+
+    #[test]
+    fn baked_and_dynamic_roots_can_coexist_in_one_runtime_world() {
+        let mut world = RuntimeWorld::default();
+        let dynamic = Node::element("article")
+            .with_id("dynamic")
+            .with_child(Node::text("runtime"))
+            .into();
+
+        world.sync_static_root(
+            0,
+            &STATIC_ROOT,
+            RuntimeSyncPolicy::ForceRebuild,
+            RuntimeDirtyClass::Structure,
+        );
+        world.sync_root(
+            1,
+            &dynamic,
+            RuntimeSyncPolicy::ForceRebuild,
+            RuntimeDirtyClass::Structure,
+        );
+
+        assert_eq!(world.entity_count(), 5);
+        let static_root = world.root_as_node(0).expect("static root should exist");
+        let dynamic_root = world.root_as_node(1).expect("dynamic root should exist");
+
+        let Node::Element(static_root) = static_root else {
+            panic!("static root should roundtrip as element");
+        };
+        let Node::Element(dynamic_root) = dynamic_root else {
+            panic!("dynamic root should roundtrip as element");
+        };
+
+        assert_eq!(static_root.tag, "section");
+        assert_eq!(dynamic_root.id.as_deref(), Some("dynamic"));
     }
 }

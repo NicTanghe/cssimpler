@@ -82,6 +82,17 @@ Dynamic theming = changing variables. Nothing more.
 
 ---
 
+## Compile-Time Baking
+
+For static screens, you can bake UI and CSS ahead of time with `ui_prefab!`,
+`baked_ui!`, and `baked_stylesheet!`.
+
+`const fn finalize_box_style::<Theme>()` is the next optimization layer over those
+baked descriptors: it specializes already-structured data from trait-provided
+constants at compile time. It does not parse raw CSS.
+
+---
+
 ## Counter Button Example
 
 If you do want a button, it can stay simple too:

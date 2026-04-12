@@ -39,11 +39,13 @@ use taffy::prelude::{
 };
 
 mod attributes;
+mod const_finalize;
 mod custom_properties;
 mod fonts;
 mod invalidation;
 mod render_tree;
 mod selectors;
+mod static_desc;
 mod svg;
 mod transitions;
 mod variable_resolution;
@@ -68,12 +70,22 @@ pub use render_tree::{
 };
 
 pub use attributes::{AttributeTextSource, parse_attribute_text_source};
+pub use const_finalize::{
+    FinalizedStaticBoxStyle, FinalizedStaticStyle, StaticLayoutHint, StaticStyleFlags,
+    StaticThemeSpec, finalize_box_style, summarize_static_declarations,
+};
 pub use invalidation::StyleInvalidation;
 pub use selectors::{
     AncestorSelector, CompoundSelector, ElementRef, PseudoElementKind, Selector,
     SelectorCombinator, SimpleSelector,
 };
 use selectors::{InteractionDependencies, SelectorAnchor};
+pub use static_desc::{
+    StaticAlignContent, StaticAlignItems, StaticAlignSelf, StaticAncestorSelectorDesc,
+    StaticDeclarationDesc, StaticDimension, StaticDisplay, StaticFlexDirection, StaticFlexWrap,
+    StaticJustifyContent, StaticLengthPercentage, StaticLengthPercentageAuto, StaticPosition,
+    StaticSelectorDesc, StaticSimpleSelectorDesc, StaticStyleRuleDesc, StaticStylesheetDesc,
+};
 pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 
 #[derive(Clone, Debug, Default)]

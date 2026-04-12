@@ -19,6 +19,21 @@ pub struct EventHandlers {
     pub mouseup: Option<EventHandler>,
 }
 
+impl EventHandlers {
+    pub const NONE: Self = Self {
+        click: None,
+        contextmenu: None,
+        dblclick: None,
+        mousedown: None,
+        mouseenter: None,
+        mouseleave: None,
+        mousemove: None,
+        mouseout: None,
+        mouseover: None,
+        mouseup: None,
+    };
+}
+
 pub trait IntoNode {
     fn into_node(self) -> Node;
 }

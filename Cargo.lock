@@ -390,9 +390,11 @@ name = "cssimpler-macro"
 version = "0.1.0"
 dependencies = [
  "cssimpler-core",
+ "cssimpler-style",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+ "taffy",
 ]
 
 [[package]]
