@@ -408,6 +408,57 @@ Acceptance:
 
 ---
 
+# Epic V - Projected-scene invalidation and repaint tightening
+
+## V1. Projected dirty-region descent
+Depends: R2, U2, G3  
+Status: planned  
+
+Purpose:
+- Reduce CPU cost for 3D and perspective motion by repainting less of a projected scene while keeping the current analytic raster path
+
+Should have been an extension:
+- This would ideally have extended G3, R2, and U2 because it is mostly a smarter invalidation policy for already-supported projected rendering
+
+Support:
+- Descend into projected containers when their own visual style is unchanged instead of always invalidating the whole projected branch
+- Dirty only the conservative union of previous and current projected bounds for safe transform-only leaf updates
+- Conservative fallback to whole-branch invalidation when depth ordering, clipping, perspective inheritance, flattening boundaries, or subtree structure could change the result
+- Preserve existing full-redraw parity checks so partial rerender remains deterministic
+
+Acceptance:
+- Animating a single tilted child under a perspective parent no longer forces the whole projected ancestor subtree to repaint in common safe cases
+- Incremental render remains visually identical to a full redraw for the supported projected cases
+- CPU-side 3D motion improves without introducing blur, AA, or text-quality regressions
+
+---
+
+# Epic W - Budgeted subtree surfaces and reconstruction policy
+
+## W1. Subtree-sized offscreen surfaces
+Depends: Q2, RB3, V1  
+Status: planned  
+
+Purpose:
+- Redesign subtree compositing as an explicitly budgeted renderer feature for carefully selected flat subtrees after projected invalidation has already been tightened
+
+Should have been an extension:
+- This would ideally have extended Q1, Q2, and RB3 because it is a safer second pass over compositing infrastructure rather than a new rendering model
+
+Support:
+- Subtree-sized temporary buffers instead of full-window matte allocation
+- Premultiplied-alpha surface storage and reconstruction rules
+- A documented edge-sampling policy for promoted surfaces so transparent borders do not darken or otherwise distort nearby blur and AA
+- Strict byte-budgeting, eviction, and promotion heuristics that prefer skipping promotion over memory spikes
+- Promotion limited to explicitly safe subtree classes until parity and memory behavior are proven
+
+Acceptance:
+- Promoting a safe flat subtree no longer scales memory cost with the full window size
+- Promoted subtrees match the non-promoted analytic path closely enough that no obvious blur fringe or AA halo is introduced
+- Surface promotion remains optional and deterministic under memory pressure
+
+---
+
 # Suggested implementation order (part 2)
 
 1. P1 + P2  
@@ -418,6 +469,8 @@ Acceptance:
 6. R3  
 7. T1 + T2  
 8. U1 + U2  
+9. V1  
+10. W1  
 
 ---
 
@@ -427,6 +480,8 @@ If part 2 lands, the engine should be able to support:
 
 - 2D transform-driven UI without browser involvement
 - Controlled 3D card and layer effects with a broader CSS 3D transform surface
+- Smoother CPU-side projected 3D motion through tighter invalidation before any compositor-heavy fallback is used
 - Renderer-owned inline SVG icons and logos
 - Glass-style backdrop blur in a narrow deterministic subset
+- Budgeted subtree compositing only where it materially helps and stays visually stable
 - Motion that keeps working within the explicit render loop and partial rerender model

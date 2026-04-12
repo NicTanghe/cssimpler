@@ -271,6 +271,43 @@
   transform: translate3d(0px, 0px, 48px) scale(0.6);
 }
 
+.depth-svg-frame {
+  position: absolute;
+  left: 56px;
+  top: 108px;
+  width: 108px;
+  height: 108px;
+  transform: translate3d(0px, 0px, 76px);
+}
+
+.depth-svg {
+  width: 100%;
+  height: 100%;
+}
+
+.depth-svg-face {
+  stroke: rgba(236, 254, 255, 0.46);
+  stroke-width: 1.5px;
+}
+
+.depth-svg-face-back {
+  fill: rgba(236, 254, 255, 0.14);
+}
+
+.depth-svg-face-left {
+  fill: rgba(15, 118, 110, 0.34);
+}
+
+.depth-svg-face-right {
+  fill: rgba(20, 184, 166, 0.58);
+}
+
+.depth-svg-line {
+  fill: none;
+  stroke: rgba(248, 250, 252, 0.92);
+  stroke-width: 2.5px;
+}
+
 .controls-panel {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

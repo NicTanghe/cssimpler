@@ -277,7 +277,7 @@ fn build_stage_copy(state: &PlaygroundState) -> Node {
             text_node(
                 "p",
                 "stage-note",
-                "The transformed card now sits on top of a static ghost outline, and the only depth cues are centered layers, so rotateX and rotateY are easier to judge without off-center parallax noise.",
+                "The transformed card now sits on top of a static ghost outline, and the centered depth stack includes an inline SVG layer so we can check 3D transforms on vector content too.",
             ),
             text_node("p", "transform-order", "Order: translate -> rotate -> scale"),
             text_node("p", "transform-readout", transform_readout(state)),
@@ -330,7 +330,7 @@ fn build_card(state: &PlaygroundState) -> Node {
                     text_node(
                         "p",
                         "card-text",
-                        "A static ghost outline behind this card makes drift and pivot issues easier to see.",
+                        "A static ghost outline and a lifted SVG badge make it easier to spot pivot, clipping, and vector transform issues.",
                     ),
                 ])
                 .into(),
@@ -361,9 +361,52 @@ fn build_card(state: &PlaygroundState) -> Node {
                         .with_class("depth-chip")
                         .with_class("depth-chip-three")
                         .into(),
+                    build_depth_svg(),
                 ])
                 .into(),
         ])
+        .into()
+}
+
+fn build_depth_svg() -> Node {
+    Node::element("div")
+        .with_class("depth-svg-frame")
+        .with_child(
+            Node::element("svg")
+                .with_class("depth-svg")
+                .with_attribute("xmlns", "http://www.w3.org/2000/svg")
+                .with_attribute("viewBox", "0 0 100 100")
+                .with_children([
+                    Node::element("path")
+                        .with_class("depth-svg-face")
+                        .with_class("depth-svg-face-back")
+                        .with_attribute("d", "M50 12 L82 30 L50 48 L18 30 Z")
+                        .into(),
+                    Node::element("path")
+                        .with_class("depth-svg-face")
+                        .with_class("depth-svg-face-left")
+                        .with_attribute("d", "M18 30 L50 48 L50 86 L18 68 Z")
+                        .into(),
+                    Node::element("path")
+                        .with_class("depth-svg-face")
+                        .with_class("depth-svg-face-right")
+                        .with_attribute("d", "M82 30 L50 48 L50 86 L82 68 Z")
+                        .into(),
+                    Node::element("path")
+                        .with_class("depth-svg-line")
+                        .with_attribute("d", "M50 12 L82 30 L82 68 L50 86 L18 68 L18 30 Z")
+                        .into(),
+                    Node::element("path")
+                        .with_class("depth-svg-line")
+                        .with_attribute("d", "M18 30 L50 48 L82 30")
+                        .into(),
+                    Node::element("path")
+                        .with_class("depth-svg-line")
+                        .with_attribute("d", "M50 48 L50 86")
+                        .into(),
+                ])
+                .into(),
+        )
         .into()
 }
 
