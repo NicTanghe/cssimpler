@@ -7,29 +7,83 @@ use std::time::Duration;
 use std::time::Instant;
 
 use self::scene_transition::SceneTransition;
-use crate::core::{ElementInteractionState, ElementPath, Node, RenderNode};
+use crate::core::{
+    ElementInteractionState, ElementPath, Node, RenderNode, RuntimeDirtyClass,
+    RuntimeDirtyFlags, RuntimeSyncAction, RuntimeSyncPolicy, RuntimeViewport, RuntimeWorld,
+};
 use crate::renderer::{self, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
 use crate::style::{
-    Stylesheet, build_render_tree_in_viewport_with_interaction_at_root,
-    build_render_tree_with_interaction_at_root, rebuild_render_tree_with_cached_layout,
+    Stylesheet, extract_render_tree, layout_resolved_render_tree_in_viewport,
+    rebuild_resolved_render_tree_with_cached_layout, resolve_render_tree_with_interaction_at_path,
+    resolve_render_tree_with_interaction_at_root,
 };
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimePhase {
+    StructuralUpdate,
+    InteractionSync,
+    StyleResolution,
+    LayoutSync,
+    RenderExtraction,
+    TransitionAdvance,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeStats {
     pub view_us: u64,
     pub render_tree_us: u64,
     pub scene_swap_us: u64,
     pub transition_us: u64,
+    pub structural_update_us: u64,
+    pub interaction_us: u64,
+    pub style_resolution_us: u64,
+    pub layout_sync_us: u64,
+    pub render_extraction_us: u64,
+    pub phase_order: Vec<RuntimePhase>,
     pub rerendered: bool,
     pub transition_active: bool,
+}
+
+impl RuntimeStats {
+    fn record_phase(&mut self, phase: RuntimePhase, elapsed: Duration) {
+        let micros = duration_to_us(elapsed);
+        self.phase_order.push(phase);
+        match phase {
+            RuntimePhase::StructuralUpdate => {
+                self.structural_update_us = self.structural_update_us.saturating_add(micros);
+            }
+            RuntimePhase::InteractionSync => {
+                self.interaction_us = self.interaction_us.saturating_add(micros);
+            }
+            RuntimePhase::StyleResolution => {
+                self.style_resolution_us = self.style_resolution_us.saturating_add(micros);
+            }
+            RuntimePhase::LayoutSync => {
+                self.layout_sync_us = self.layout_sync_us.saturating_add(micros);
+            }
+            RuntimePhase::RenderExtraction => {
+                self.render_extraction_us = self.render_extraction_us.saturating_add(micros);
+            }
+            RuntimePhase::TransitionAdvance => {
+                self.transition_us = self.transition_us.saturating_add(micros);
+            }
+        }
+        self.render_tree_us = self
+            .structural_update_us
+            .saturating_add(self.interaction_us)
+            .saturating_add(self.style_resolution_us)
+            .saturating_add(self.layout_sync_us)
+            .saturating_add(self.render_extraction_us);
+    }
 }
 
 static RUNTIME_STATS: OnceLock<Mutex<RuntimeStats>> = OnceLock::new();
 
 pub fn latest_runtime_stats() -> RuntimeStats {
-    *runtime_stats_store()
+    runtime_stats_store()
         .lock()
         .expect("runtime stats mutex should not be poisoned")
+        .clone()
 }
 
 fn record_runtime_stats(stats: RuntimeStats) {
@@ -180,6 +234,11 @@ pub enum RenderMode {
     OnInvalidation,
 }
 
+enum RootRenderMode<'a> {
+    FullLayout,
+    CachedLayout(&'a RenderNode),
+}
+
 pub struct Fragment<'a, State> {
     id: String,
     view: Box<dyn Fn(&State) -> Node + 'a>,
@@ -218,13 +277,120 @@ struct RenderBoundaryMatch<'a> {
     path: ElementPath,
 }
 
+fn sync_runtime_world(
+    runtime_world: &mut RuntimeWorld,
+    root_index: usize,
+    tree: &Node,
+    policy: RuntimeSyncPolicy,
+    dirty_class: RuntimeDirtyClass,
+    stats: &mut RuntimeStats,
+) -> RuntimeSyncAction {
+    let structural_start = Instant::now();
+    let sync = runtime_world.sync_root(root_index, tree, policy, dirty_class);
+    stats.record_phase(RuntimePhase::StructuralUpdate, structural_start.elapsed());
+    sync.action
+}
+
+fn sync_runtime_interaction(runtime_world: &mut RuntimeWorld, stats: &mut RuntimeStats) {
+    let interaction_start = Instant::now();
+    runtime_world.sync_interaction_components();
+    stats.record_phase(RuntimePhase::InteractionSync, interaction_start.elapsed());
+}
+
+fn render_root_with_schedule(
+    runtime_world: &RuntimeWorld,
+    root_index: usize,
+    stylesheet: &Stylesheet,
+    viewport: Option<ViewportSize>,
+    mode: RootRenderMode<'_>,
+    stats: &mut RuntimeStats,
+) -> Option<RenderNode> {
+    let root = runtime_world.root_as_node(root_index)?;
+
+    let style_start = Instant::now();
+    let resolved = resolve_render_tree_with_interaction_at_root(
+        &root,
+        stylesheet,
+        runtime_world.interaction(),
+        root_index,
+    );
+    stats.record_phase(RuntimePhase::StyleResolution, style_start.elapsed());
+
+    match mode {
+        RootRenderMode::FullLayout => {
+            let layout_start = Instant::now();
+            let mut layout = layout_resolved_render_tree_in_viewport(
+                &resolved,
+                viewport.map(|viewport| (viewport.width, viewport.height)),
+            );
+            stats.record_phase(RuntimePhase::LayoutSync, layout_start.elapsed());
+
+            let extract_start = Instant::now();
+            let node = extract_render_tree(&mut layout);
+            stats.record_phase(RuntimePhase::RenderExtraction, extract_start.elapsed());
+            Some(node)
+        }
+        RootRenderMode::CachedLayout(template) => {
+            let extract_start = Instant::now();
+            let node = rebuild_resolved_render_tree_with_cached_layout(&resolved, template)?;
+            stats.record_phase(RuntimePhase::RenderExtraction, extract_start.elapsed());
+            Some(node)
+        }
+    }
+}
+
+fn render_boundary_with_schedule(
+    resolved: &crate::style::ResolvedRenderTree,
+    element_path: ElementPath,
+    viewport: Option<ViewportSize>,
+    mode: RootRenderMode<'_>,
+    stats: &mut RuntimeStats,
+) -> Option<RenderNode> {
+    match mode {
+        RootRenderMode::FullLayout => {
+            let layout_start = Instant::now();
+            let mut layout = layout_resolved_render_tree_in_viewport(
+                resolved,
+                viewport.map(|viewport| (viewport.width, viewport.height)),
+            );
+            stats.record_phase(RuntimePhase::LayoutSync, layout_start.elapsed());
+
+            let extract_start = Instant::now();
+            let node = extract_render_tree(&mut layout);
+            stats.record_phase(RuntimePhase::RenderExtraction, extract_start.elapsed());
+            Some(node)
+        }
+        RootRenderMode::CachedLayout(template) => {
+            if template.element_path.as_ref() != Some(&element_path) {
+                return None;
+            }
+            let extract_start = Instant::now();
+            let node = rebuild_resolved_render_tree_with_cached_layout(resolved, template)?;
+            stats.record_phase(RuntimePhase::RenderExtraction, extract_start.elapsed());
+            Some(node)
+        }
+    }
+}
+
+fn root_render_mode<'a>(
+    dirty_flags: RuntimeDirtyFlags,
+    template: Option<&'a RenderNode>,
+) -> RootRenderMode<'a> {
+    if dirty_flags.layout || dirty_flags.structure {
+        RootRenderMode::FullLayout
+    } else if let Some(template) = template {
+        RootRenderMode::CachedLayout(template)
+    } else {
+        RootRenderMode::FullLayout
+    }
+}
+
 pub struct App<'a, State, Update, View, Signal = Invalidation> {
     state: State,
     stylesheet: &'a Stylesheet,
     update: Update,
     view: View,
-    viewport: Option<ViewportSize>,
-    interaction: ElementInteractionState,
+    runtime_world: RuntimeWorld,
     render_mode: RenderMode,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
@@ -244,8 +410,7 @@ where
             stylesheet,
             update,
             view,
-            viewport: None,
-            interaction: ElementInteractionState::default(),
+            runtime_world: RuntimeWorld::default(),
             render_mode: RenderMode::OnInvalidation,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
@@ -273,9 +438,14 @@ where
         &self.state
     }
 
+    pub fn runtime_world(&self) -> &RuntimeWorld {
+        &self.runtime_world
+    }
+
     pub fn set_viewport(&mut self, viewport: ViewportSize) {
-        if self.viewport != Some(viewport) {
-            self.viewport = Some(viewport);
+        let viewport = RuntimeViewport::new(viewport.width, viewport.height);
+        if self.runtime_world.viewport() != Some(viewport) {
+            self.runtime_world.set_viewport(Some(viewport));
             self.invalidate(Invalidation::Layout);
         }
     }
@@ -349,14 +519,38 @@ where
         let tree = view(&self.state);
         stats.view_us = duration_to_us(view_start.elapsed());
 
-        let render_tree_start = Instant::now();
-        let scene = vec![self.render_root(&tree)];
-        stats.render_tree_us = duration_to_us(render_tree_start.elapsed());
+        let dirty_class = runtime_dirty_class(
+            self.pending_refresh.invalidation,
+            self.cached_scene.is_none(),
+            matches!(self.render_mode, RenderMode::EveryFrame),
+        );
+        sync_runtime_world(
+            &mut self.runtime_world,
+            0,
+            &tree,
+            runtime_sync_policy(self.cached_scene.is_none(), self.pending_refresh.invalidation),
+            dirty_class,
+            stats,
+        );
+        sync_runtime_interaction(&mut self.runtime_world, stats);
+        let dirty_flags = self.runtime_world.root_dirty_flags(0);
+        let scene = vec![
+            render_root_with_schedule(
+                &self.runtime_world,
+                0,
+                self.stylesheet,
+                self.viewport(),
+                root_render_mode(dirty_flags, self.cached_scene.as_ref().and_then(|scene| scene.first())),
+                stats,
+            )
+            .expect("runtime world should contain the app root before rendering"),
+        ];
 
         let scene_swap_start = Instant::now();
         self.replace_scene(scene);
         stats.scene_swap_us = duration_to_us(scene_swap_start.elapsed());
         stats.rerendered = true;
+        self.runtime_world.clear_dirty_flags();
         self.pending_refresh = Refresh::clean();
     }
 
@@ -374,7 +568,21 @@ where
         let tree = view(&self.state);
         stats.view_us = duration_to_us(view_start.elapsed());
 
-        let render_tree_start = Instant::now();
+        let sync = sync_runtime_world(
+            &mut self.runtime_world,
+            0,
+            &tree,
+            RuntimeSyncPolicy::PreferPatch,
+            runtime_dirty_class(self.pending_refresh.invalidation, false, false),
+            stats,
+        );
+        if matches!(sync, RuntimeSyncAction::Rebuilt) {
+            return false;
+        }
+        sync_runtime_interaction(&mut self.runtime_world, stats);
+        let dirty_flags = self.runtime_world.root_dirty_flags(0);
+        let needs_layout = dirty_flags.layout || dirty_flags.structure;
+
         let mut replacements = Vec::with_capacity(ids.len());
         for id in ids {
             let UniqueMatch::Single(node_match) =
@@ -389,18 +597,31 @@ where
             if node_match.path != render_match.path {
                 return false;
             }
-            let Some(node) = rebuild_render_tree_with_cached_layout(
+            let style_start = Instant::now();
+            let resolved = resolve_render_tree_with_interaction_at_path(
                 node_match.node,
                 self.stylesheet,
-                &self.interaction,
+                self.runtime_world.interaction(),
                 &node_match.path,
-                render_match.node,
+            );
+            stats.record_phase(RuntimePhase::StyleResolution, style_start.elapsed());
+
+            let mode = if needs_layout {
+                RootRenderMode::FullLayout
+            } else {
+                RootRenderMode::CachedLayout(render_match.node)
+            };
+            let Some(node) = render_boundary_with_schedule(
+                &resolved,
+                node_match.path.clone(),
+                self.viewport(),
+                mode,
+                stats,
             ) else {
                 return false;
             };
             replacements.push((render_match.path, node));
         }
-        stats.render_tree_us = duration_to_us(render_tree_start.elapsed());
 
         replacements.sort_by_key(|(path, _)| path.children.len());
         let mut filtered = Vec::with_capacity(replacements.len());
@@ -431,22 +652,14 @@ where
         self.replace_scene(scene);
         stats.scene_swap_us = duration_to_us(scene_swap_start.elapsed());
         stats.rerendered = true;
+        self.runtime_world.clear_dirty_flags();
         true
     }
 
-    fn render_root(&self, tree: &Node) -> RenderNode {
-        if let Some(viewport) = self.viewport {
-            build_render_tree_in_viewport_with_interaction_at_root(
-                tree,
-                self.stylesheet,
-                viewport.width,
-                viewport.height,
-                &self.interaction,
-                0,
-            )
-        } else {
-            build_render_tree_with_interaction_at_root(tree, self.stylesheet, &self.interaction, 0)
-        }
+    fn viewport(&self) -> Option<ViewportSize> {
+        self.runtime_world
+            .viewport()
+            .map(|viewport| ViewportSize::new(viewport.width, viewport.height))
     }
 
     fn scene(&self) -> &[RenderNode] {
@@ -481,19 +694,20 @@ where
         if let Some(scene) = self.cached_scene.as_mut() {
             transition.advance(delta, scene);
         }
-        stats.transition_us = duration_to_us(sample_start.elapsed());
+        stats.record_phase(RuntimePhase::TransitionAdvance, sample_start.elapsed());
         if !transition.is_active() {
             self.scene_transition = None;
         }
     }
 
     fn set_interaction_state(&mut self, interaction: ElementInteractionState) -> bool {
-        if self.interaction == interaction {
+        if self.runtime_world.interaction() == &interaction {
             return false;
         }
 
-        let refresh = self.interaction_refresh(&self.interaction, &interaction);
-        self.interaction = interaction;
+        let previous = self.runtime_world.interaction().clone();
+        let refresh = self.interaction_refresh(&previous, &interaction);
+        self.runtime_world.set_interaction(interaction);
         let needs_rerender = refresh.needs_rerender();
         self.invalidate(refresh);
         needs_rerender
@@ -578,8 +792,7 @@ pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     update: Update,
     fragments: Vec<Fragment<'a, State>>,
     fragment_indices: HashMap<String, usize>,
-    viewport: Option<ViewportSize>,
-    interaction: ElementInteractionState,
+    runtime_world: RuntimeWorld,
     render_mode: RenderMode,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
@@ -603,8 +816,7 @@ where
             update,
             fragment_indices: build_fragment_indices(&fragments),
             fragments,
-            viewport: None,
-            interaction: ElementInteractionState::default(),
+            runtime_world: RuntimeWorld::default(),
             render_mode: RenderMode::OnInvalidation,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
@@ -632,9 +844,14 @@ where
         &self.state
     }
 
+    pub fn runtime_world(&self) -> &RuntimeWorld {
+        &self.runtime_world
+    }
+
     pub fn set_viewport(&mut self, viewport: ViewportSize) {
-        if self.viewport != Some(viewport) {
-            self.viewport = Some(viewport);
+        let viewport = RuntimeViewport::new(viewport.width, viewport.height);
+        if self.runtime_world.viewport() != Some(viewport) {
+            self.runtime_world.set_viewport(Some(viewport));
             self.invalidate(Invalidation::Layout);
         }
     }
@@ -675,14 +892,12 @@ where
     }
 
     fn refresh_scene(&mut self, stats: &mut RuntimeStats) {
-        let refresh_start = Instant::now();
         let must_full_refresh = self.cached_scene.is_none()
             || matches!(self.render_mode, RenderMode::EveryFrame)
             || matches!(self.pending_refresh.target, RefreshTarget::Full);
 
         if must_full_refresh {
-            self.rebuild_all_fragments();
-            stats.render_tree_us = duration_to_us(refresh_start.elapsed());
+            self.rebuild_all_fragments(stats);
             stats.rerendered = true;
             self.pending_refresh = Refresh::clean();
             return;
@@ -690,7 +905,6 @@ where
 
         let fragment_ids = match &self.pending_refresh.target {
             RefreshTarget::None => {
-                stats.render_tree_us = duration_to_us(refresh_start.elapsed());
                 self.pending_refresh = Refresh::clean();
                 return;
             }
@@ -698,26 +912,54 @@ where
             RefreshTarget::Fragments(ids) => ids.clone(),
         };
 
-        if !self.refresh_fragments(&fragment_ids) {
-            self.rebuild_all_fragments();
+        if !self.refresh_fragments(&fragment_ids, stats) {
+            self.rebuild_all_fragments(stats);
         }
 
-        stats.render_tree_us = duration_to_us(refresh_start.elapsed());
         stats.rerendered = true;
         self.pending_refresh = Refresh::clean();
     }
 
-    fn rebuild_all_fragments(&mut self) {
-        let scene = self
-            .fragments
-            .iter()
-            .enumerate()
-            .map(|(index, fragment)| self.render_fragment(index, fragment))
-            .collect();
+    fn rebuild_all_fragments(&mut self, stats: &mut RuntimeStats) {
+        let policy = runtime_sync_policy(self.cached_scene.is_none(), self.pending_refresh.invalidation);
+        let dirty_class = runtime_dirty_class(
+            self.pending_refresh.invalidation,
+            self.cached_scene.is_none(),
+            matches!(self.render_mode, RenderMode::EveryFrame),
+        );
+        let mut scene = Vec::with_capacity(self.fragments.len());
+        for index in 0..self.fragments.len() {
+            let node = self.fragments[index].render(&self.state);
+            sync_runtime_world(
+                &mut self.runtime_world,
+                index,
+                &node,
+                policy,
+                dirty_class,
+                stats,
+            );
+            sync_runtime_interaction(&mut self.runtime_world, stats);
+            let dirty_flags = self.runtime_world.root_dirty_flags(index);
+            scene.push(
+                render_root_with_schedule(
+                    &self.runtime_world,
+                    index,
+                    self.stylesheet,
+                    self.viewport(),
+                    root_render_mode(
+                        dirty_flags,
+                        self.cached_scene.as_ref().and_then(|scene| scene.get(index)),
+                    ),
+                    stats,
+                )
+                .expect("runtime world should contain the fragment root before rendering"),
+            );
+        }
         self.replace_scene(scene);
+        self.runtime_world.clear_dirty_flags();
     }
 
-    fn refresh_fragments(&mut self, ids: &[String]) -> bool {
+    fn refresh_fragments(&mut self, ids: &[String], stats: &mut RuntimeStats) -> bool {
         let Some(existing_scene) = self.cached_scene.as_ref() else {
             return false;
         };
@@ -731,7 +973,31 @@ where
                 return false;
             };
             let node = self.fragments[index].render(&self.state);
-            replacements.push((index, self.render_node(&node, index)));
+            let sync = sync_runtime_world(
+                &mut self.runtime_world,
+                index,
+                &node,
+                RuntimeSyncPolicy::PreferPatch,
+                runtime_dirty_class(self.pending_refresh.invalidation, false, false),
+                stats,
+            );
+            if matches!(sync, RuntimeSyncAction::Rebuilt) {
+                return false;
+            }
+            sync_runtime_interaction(&mut self.runtime_world, stats);
+            let dirty_flags = self.runtime_world.root_dirty_flags(index);
+            replacements.push((
+                index,
+                render_root_with_schedule(
+                    &self.runtime_world,
+                    index,
+                    self.stylesheet,
+                    self.viewport(),
+                    root_render_mode(dirty_flags, existing_scene.get(index)),
+                    stats,
+                )
+                .expect("runtime world should contain the fragment root before rendering"),
+            ));
         }
 
         let mut scene = self
@@ -743,33 +1009,15 @@ where
         }
 
         self.replace_scene(scene);
+        self.runtime_world.clear_dirty_flags();
 
         true
     }
 
-    fn render_fragment(&self, index: usize, fragment: &Fragment<'a, State>) -> RenderNode {
-        let node = fragment.render(&self.state);
-        self.render_node(&node, index)
-    }
-
-    fn render_node(&self, node: &Node, root_index: usize) -> RenderNode {
-        if let Some(viewport) = self.viewport {
-            build_render_tree_in_viewport_with_interaction_at_root(
-                node,
-                self.stylesheet,
-                viewport.width,
-                viewport.height,
-                &self.interaction,
-                root_index,
-            )
-        } else {
-            build_render_tree_with_interaction_at_root(
-                node,
-                self.stylesheet,
-                &self.interaction,
-                root_index,
-            )
-        }
+    fn viewport(&self) -> Option<ViewportSize> {
+        self.runtime_world
+            .viewport()
+            .map(|viewport| ViewportSize::new(viewport.width, viewport.height))
     }
 
     fn scene(&self) -> &[RenderNode] {
@@ -801,19 +1049,20 @@ where
         if let Some(scene) = self.cached_scene.as_mut() {
             transition.advance(delta, scene);
         }
-        stats.transition_us = duration_to_us(sample_start.elapsed());
+        stats.record_phase(RuntimePhase::TransitionAdvance, sample_start.elapsed());
         if !transition.is_active() {
             self.scene_transition = None;
         }
     }
 
     fn set_interaction_state(&mut self, interaction: ElementInteractionState) -> bool {
-        if self.interaction == interaction {
+        if self.runtime_world.interaction() == &interaction {
             return false;
         }
 
-        let refresh = self.interaction_refresh(&self.interaction, &interaction);
-        self.interaction = interaction;
+        let previous = self.runtime_world.interaction().clone();
+        let refresh = self.interaction_refresh(&previous, &interaction);
+        self.runtime_world.set_interaction(interaction);
         let needs_rerender = refresh.needs_rerender();
         self.invalidate(refresh);
         needs_rerender
@@ -1051,6 +1300,32 @@ fn find_render_node_mut<'a>(
     None
 }
 
+fn runtime_sync_policy(
+    initial_build: bool,
+    invalidation: Invalidation,
+) -> RuntimeSyncPolicy {
+    if initial_build || matches!(invalidation, Invalidation::Structure) {
+        RuntimeSyncPolicy::ForceRebuild
+    } else {
+        RuntimeSyncPolicy::PreferPatch
+    }
+}
+
+fn runtime_dirty_class(
+    invalidation: Invalidation,
+    initial_build: bool,
+    every_frame_refresh: bool,
+) -> RuntimeDirtyClass {
+    match invalidation {
+        Invalidation::Clean if initial_build => RuntimeDirtyClass::Structure,
+        Invalidation::Clean if every_frame_refresh => RuntimeDirtyClass::Paint,
+        Invalidation::Clean => RuntimeDirtyClass::Clean,
+        Invalidation::Paint => RuntimeDirtyClass::Paint,
+        Invalidation::Layout => RuntimeDirtyClass::Layout,
+        Invalidation::Structure => RuntimeDirtyClass::Structure,
+    }
+}
+
 fn duration_to_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
@@ -1063,7 +1338,10 @@ mod tests {
     use crate::core::{Color, ElementInteractionState, ElementPath, Node, RenderKind, RenderNode};
     use crate::ui;
 
-    use super::{App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode};
+    use super::{
+        App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode,
+        RuntimePhase, latest_runtime_stats,
+    };
     use crate::renderer::{
         FrameInfo, SceneProvider, ViewportSize, render_scene_update, render_to_buffer,
     };
@@ -1093,6 +1371,186 @@ mod tests {
 
         assert_eq!(render_calls.get(), 1);
         assert_eq!(text_nodes(&scene), vec!["count 3".to_string()]);
+    }
+
+    #[test]
+    fn app_runtime_stats_record_explicit_phase_order() {
+        let stylesheet = Stylesheet::default();
+        let mut app = App::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Invalidation::Clean,
+            |_state| {
+                ui! {
+                    <div id="app">
+                        <p>{"hello"}</p>
+                    </div>
+                }
+            },
+        );
+
+        app.frame(frame(0));
+        let stats = latest_runtime_stats();
+
+        assert_eq!(
+            stats.phase_order,
+            vec![
+                RuntimePhase::StructuralUpdate,
+                RuntimePhase::InteractionSync,
+                RuntimePhase::StyleResolution,
+                RuntimePhase::LayoutSync,
+                RuntimePhase::RenderExtraction,
+            ]
+        );
+    }
+
+    #[test]
+    fn paint_only_refresh_skips_the_layout_phase() {
+        let stylesheet = parse_stylesheet(
+            ".button { color: #111111; }
+             .button.hot { color: #2563eb; }",
+        )
+        .expect("paint-only stylesheet should parse");
+        let mut app = App::new(
+            false,
+            &stylesheet,
+            |state, frame| {
+                if frame.frame_index == 1 {
+                    *state = true;
+                    Invalidation::Paint
+                } else {
+                    Invalidation::Clean
+                }
+            },
+            |state| {
+                let mut button = Node::element("button").with_class("button");
+                if *state {
+                    button = button.with_class("hot");
+                }
+                button.with_child(Node::text("hover me")).into()
+            },
+        );
+
+        app.frame(frame(0));
+        app.frame(frame(1));
+        let stats = latest_runtime_stats();
+
+        assert!(!stats.phase_order.contains(&RuntimePhase::LayoutSync));
+        assert!(stats.phase_order.contains(&RuntimePhase::RenderExtraction));
+    }
+
+    #[test]
+    fn app_populates_the_runtime_world_from_view_output() {
+        let stylesheet = Stylesheet::default();
+        let mut app = App::new(
+            3_u32,
+            &stylesheet,
+            |_state, _frame| Invalidation::Clean,
+            |state| {
+                ui! {
+                    <div id="app">
+                        <p class="label">
+                            {format!("count {}", state)}
+                        </p>
+                    </div>
+                }
+            },
+        );
+
+        app.frame(frame(0));
+
+        assert_eq!(app.runtime_world().entity_count(), 3);
+        let root = app
+            .runtime_world()
+            .root_entity(0)
+            .expect("runtime world should contain the app root");
+        let label = app
+            .runtime_world()
+            .entity(root)
+            .expect("root entity should exist")
+            .children[0];
+        let text = app
+            .runtime_world()
+            .entity(label)
+            .expect("label entity should exist")
+            .children[0];
+        assert_eq!(
+            app.runtime_world()
+                .entity(root)
+                .expect("root entity should exist")
+                .computed
+                .element_path,
+            Some(ElementPath::root(0))
+        );
+
+        let roundtrip = app
+            .runtime_world()
+            .root_as_node(0)
+            .expect("app root should roundtrip through the runtime world");
+        let Node::Element(root_element) = roundtrip else {
+            panic!("runtime world root should stay an element");
+        };
+        let Node::Element(label_element) = &root_element.children[0] else {
+            panic!("runtime world child should stay an element");
+        };
+        let Node::Text(text_content) = &label_element.children[0] else {
+            panic!("runtime world grandchild should stay text");
+        };
+
+        assert_eq!(text_content, "count 3");
+        assert!(app.runtime_world().entity(text).is_some());
+    }
+
+    #[test]
+    fn app_reuses_runtime_entities_for_paint_only_refreshes() {
+        let stylesheet = parse_stylesheet(
+            ".button { color: #111111; }
+             .button.hot { color: #2563eb; }",
+        )
+        .expect("stylesheet should parse");
+        let mut app = App::new(
+            false,
+            &stylesheet,
+            |state, frame| {
+                if frame.frame_index == 1 {
+                    *state = true;
+                    Invalidation::Paint
+                } else {
+                    Invalidation::Clean
+                }
+            },
+            |state| {
+                let mut button = Node::element("button").with_class("button");
+                if *state {
+                    button = button.with_class("hot");
+                }
+                button.with_child(Node::text("hover me")).into()
+            },
+        );
+
+        let first = app.frame(frame(0));
+        let root = app
+            .runtime_world()
+            .root_entity(0)
+            .expect("runtime world should contain the app root");
+        let text = app
+            .runtime_world()
+            .entity(root)
+            .expect("root entity should exist")
+            .children[0];
+
+        let second = app.frame(frame(1));
+
+        assert_eq!(app.runtime_world().root_entity(0), Some(root));
+        assert_eq!(
+            app.runtime_world()
+                .entity(root)
+                .expect("root entity should exist")
+                .children[0],
+            text
+        );
+        assert_eq!(first[0].style.foreground, Color::rgb(17, 17, 17));
+        assert_eq!(second[0].style.foreground, Color::rgb(37, 99, 235));
     }
 
     #[test]

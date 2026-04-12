@@ -61,7 +61,10 @@ pub use render_tree::{
     build_render_tree, build_render_tree_in_viewport,
     build_render_tree_in_viewport_with_interaction,
     build_render_tree_in_viewport_with_interaction_at_root, build_render_tree_with_interaction,
-    build_render_tree_with_interaction_at_root, rebuild_render_tree_with_cached_layout,
+    build_render_tree_with_interaction_at_root, extract_render_tree, layout_resolved_render_tree,
+    layout_resolved_render_tree_in_viewport, rebuild_render_tree_with_cached_layout,
+    rebuild_resolved_render_tree_with_cached_layout, resolve_render_tree_with_interaction_at_path,
+    resolve_render_tree_with_interaction_at_root, LaidOutRenderTree, ResolvedRenderTree,
 };
 
 pub use attributes::{AttributeTextSource, parse_attribute_text_source};

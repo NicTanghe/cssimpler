@@ -42,6 +42,105 @@ struct LeafMeasureContext {
     text_layout: Option<PreparedTextLayout>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ResolvedRenderTree {
+    root: ResolvedElement,
+}
+
+pub struct LaidOutRenderTree {
+    root: LayoutTree,
+    taffy: TaffyTree<LeafMeasureContext>,
+}
+
+impl ResolvedRenderTree {
+    pub(crate) fn root(&self) -> &ResolvedElement {
+        &self.root
+    }
+}
+
+pub fn resolve_render_tree_with_interaction_at_root(
+    root: &Node,
+    stylesheet: &Stylesheet,
+    interaction: &ElementInteractionState,
+    root_index: usize,
+) -> ResolvedRenderTree {
+    resolve_render_tree_with_interaction_at_path(
+        root,
+        stylesheet,
+        interaction,
+        &ElementPath::root(root_index),
+    )
+}
+
+pub fn resolve_render_tree_with_interaction_at_path(
+    root: &Node,
+    stylesheet: &Stylesheet,
+    interaction: &ElementInteractionState,
+    element_path: &ElementPath,
+) -> ResolvedRenderTree {
+    let Node::Element(root_element) = root else {
+        panic!("render tree roots must be elements");
+    };
+
+    ResolvedRenderTree {
+        root: resolve_element_tree(
+            root_element,
+            stylesheet,
+            None,
+            None,
+            None,
+            &[],
+            interaction,
+            element_path,
+        ),
+    }
+}
+
+pub fn layout_resolved_render_tree(
+    resolved: &ResolvedRenderTree,
+    available_space_override: Option<TaffySize<AvailableSpace>>,
+) -> LaidOutRenderTree {
+    let mut taffy = TaffyTree::<LeafMeasureContext>::new();
+    let root = build_layout_tree(resolved.root(), &mut taffy);
+    let available_space = available_space_override
+        .unwrap_or_else(|| available_space_from_root(&root.style.layout.taffy));
+    taffy
+        .compute_layout_with_measure(
+            root.node_id,
+            available_space,
+            |known_dimensions, available_space, _, context, _| {
+                context.map_or(TaffySize::ZERO, |context| {
+                    measure_text(context, known_dimensions, available_space)
+                })
+            },
+        )
+        .expect("resolved layout should be valid for taffy");
+
+    LaidOutRenderTree { root, taffy }
+}
+
+pub fn layout_resolved_render_tree_in_viewport(
+    resolved: &ResolvedRenderTree,
+    viewport: Option<(usize, usize)>,
+) -> LaidOutRenderTree {
+    let available_space = viewport.map(|(width, height)| TaffySize {
+        width: AvailableSpace::Definite(width.max(1) as f32),
+        height: AvailableSpace::Definite(height.max(1) as f32),
+    });
+    layout_resolved_render_tree(resolved, available_space)
+}
+
+pub fn extract_render_tree(layout: &mut LaidOutRenderTree) -> RenderNode {
+    render_node_from_layout(&layout.root, &mut layout.taffy, 0.0, 0.0)
+}
+
+pub fn rebuild_resolved_render_tree_with_cached_layout(
+    resolved: &ResolvedRenderTree,
+    template: &RenderNode,
+) -> Option<RenderNode> {
+    render_node_with_cached_layout(resolved.root(), template)
+}
+
 pub fn build_render_tree(root: &Node, stylesheet: &Stylesheet) -> RenderNode {
     build_render_tree_with_interaction(root, stylesheet, &ElementInteractionState::default())
 }
@@ -83,7 +182,10 @@ pub fn rebuild_render_tree_with_cached_layout(
         interaction,
         element_path,
     );
-    render_node_with_cached_layout(&resolved, template)
+    rebuild_resolved_render_tree_with_cached_layout(
+        &ResolvedRenderTree { root: resolved },
+        template,
+    )
 }
 
 pub fn build_render_tree_in_viewport(
@@ -276,37 +378,10 @@ fn build_render_tree_with_available_space(
     interaction: &ElementInteractionState,
     root_index: usize,
 ) -> RenderNode {
-    let Node::Element(root_element) = root else {
-        panic!("render tree roots must be elements");
-    };
-
-    let resolved = resolve_element_tree(
-        root_element,
-        stylesheet,
-        None,
-        None,
-        None,
-        &[],
-        interaction,
-        &ElementPath::root(root_index),
-    );
-    let mut taffy = TaffyTree::<LeafMeasureContext>::new();
-    let layout_tree = build_layout_tree(&resolved, &mut taffy);
-    let available_space = available_space_override
-        .unwrap_or_else(|| available_space_from_root(&layout_tree.style.layout.taffy));
-    taffy
-        .compute_layout_with_measure(
-            layout_tree.node_id,
-            available_space,
-            |known_dimensions, available_space, _, context, _| {
-                context.map_or(TaffySize::ZERO, |context| {
-                    measure_text(context, known_dimensions, available_space)
-                })
-            },
-        )
-        .expect("resolved layout should be valid for taffy");
-
-    render_node_from_layout(&layout_tree, &mut taffy, 0.0, 0.0)
+    let resolved =
+        resolve_render_tree_with_interaction_at_root(root, stylesheet, interaction, root_index);
+    let mut layout = layout_resolved_render_tree(&resolved, available_space_override);
+    extract_render_tree(&mut layout)
 }
 
 fn build_layout_tree(

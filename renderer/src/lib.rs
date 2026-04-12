@@ -39,8 +39,9 @@ use self::{
     },
 };
 use cssimpler_core::{
-    Color, ElementInteractionState, ElementPath, EventHandler, LayoutBox, LinearRgba, RenderKind,
-    RenderNode, Transform2D, TransformMatrix3d, TransformStyleMode, VisualStyle,
+    Color, ElementInteractionState, ElementPath, EventHandler, ExtractedScene, LayoutBox,
+    LinearRgba, RenderKind, RenderNode, Transform2D, TransformMatrix3d, TransformStyleMode,
+    VisualStyle,
 };
 use softbuffer::SoftBufferError;
 use winit::error::{EventLoopError, OsError};
@@ -1289,11 +1290,12 @@ pub fn render_to_buffer(
     height: usize,
     clear_color: Color,
 ) {
-    let _ = render_to_buffer_internal(scene, buffer, width, height, clear_color);
+    let extracted = ExtractedScene::from_render_roots(scene);
+    let _ = render_to_buffer_internal(&extracted, buffer, width, height, clear_color);
 }
 
 fn render_to_buffer_internal(
-    scene: &[RenderNode],
+    scene: &ExtractedScene,
     buffer: &mut [u32],
     width: usize,
     height: usize,
@@ -1303,7 +1305,7 @@ fn render_to_buffer_internal(
 }
 
 fn render_to_buffer_internal_with_cached_bounds(
-    scene: &[RenderNode],
+    scene: &ExtractedScene,
     cached_bounds: Option<&CachedSceneBounds>,
     buffer: &mut [u32],
     width: usize,
@@ -1314,7 +1316,7 @@ fn render_to_buffer_internal_with_cached_bounds(
     let cached_bounds = if let Some(cached_bounds) = cached_bounds {
         cached_bounds
     } else {
-        owned_bounds = cache_scene_subtree_bounds(scene);
+        owned_bounds = cache_scene_subtree_bounds(&scene.roots);
         &owned_bounds
     };
     let worker_count = if cached_bounds
@@ -1328,7 +1330,7 @@ fn render_to_buffer_internal_with_cached_bounds(
     };
     if worker_count <= 1 {
         render_to_buffer_serial(
-            scene,
+            &scene.roots,
             &cached_bounds.roots,
             buffer,
             width,
@@ -1337,7 +1339,7 @@ fn render_to_buffer_internal_with_cached_bounds(
         );
     } else {
         render_to_buffer_parallel(
-            scene,
+            &scene.roots,
             cached_bounds,
             buffer,
             width,
@@ -1463,10 +1465,20 @@ pub fn render_scene_update(
     height: usize,
     clear_color: Color,
 ) {
-    let _ = render_scene_update_internal(previous_scene, scene, buffer, width, height, clear_color);
+    let previous_extracted = ExtractedScene::from_render_roots(previous_scene);
+    let extracted = ExtractedScene::from_render_roots(scene);
+    let _ = render_scene_update_internal(
+        &previous_extracted,
+        &extracted,
+        buffer,
+        width,
+        height,
+        clear_color,
+    );
 }
 
-fn render_scene_update_internal(
+#[cfg_attr(not(test), allow(dead_code))]
+fn render_scene_update_internal_from_roots(
     previous_scene: &[RenderNode],
     scene: &[RenderNode],
     buffer: &mut [u32],
@@ -1474,13 +1486,33 @@ fn render_scene_update_internal(
     height: usize,
     clear_color: Color,
 ) -> PaintStats {
-    let scene_diff = prepare_scene_diff(previous_scene, scene);
+    let previous_extracted = ExtractedScene::from_render_roots(previous_scene);
+    let extracted = ExtractedScene::from_render_roots(scene);
+    render_scene_update_internal(
+        &previous_extracted,
+        &extracted,
+        buffer,
+        width,
+        height,
+        clear_color,
+    )
+}
+
+fn render_scene_update_internal(
+    previous_scene: &ExtractedScene,
+    scene: &ExtractedScene,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+) -> PaintStats {
+    let scene_diff = prepare_scene_diff(&previous_scene.roots, &scene.roots);
     let mut dirty_regions = scene_diff.dirty_regions;
     if dirty_regions.is_empty() {
         return PaintStats::default();
     }
-    let max_backdrop_blur_radius =
-        scene_max_backdrop_blur_radius(previous_scene).max(scene_max_backdrop_blur_radius(scene));
+    let max_backdrop_blur_radius = scene_max_backdrop_blur_radius(&previous_scene.roots)
+        .max(scene_max_backdrop_blur_radius(&scene.roots));
     if max_backdrop_blur_radius > 0.0 {
         dirty_regions.iter_mut().for_each(|region| {
             *region = region.expand(max_backdrop_blur_radius);
@@ -1536,7 +1568,7 @@ fn render_scene_update_internal(
 
     if max_backdrop_blur_radius <= 0.0 && incremental_worker_count > 1 {
         render_scene_update_parallel(
-            scene,
+            &scene.roots,
             &scene_diff.current_bounds.roots,
             buffer,
             width,
@@ -1562,7 +1594,7 @@ fn render_scene_update_internal(
         let root_indices =
             root_indices_intersecting_clip(&scene_diff.current_bounds.roots, dirty_region);
         draw_cached_root_indices(
-            scene,
+            &scene.roots,
             &scene_diff.current_bounds.roots,
             &root_indices,
             buffer,
@@ -1792,8 +1824,8 @@ fn incremental_scene_pass_count(
 }
 
 fn should_present_scene(
-    previous_scene: Option<&[RenderNode]>,
-    scene: &[RenderNode],
+    previous_scene: Option<&ExtractedScene>,
+    scene: &ExtractedScene,
     resized: bool,
 ) -> bool {
     if resized {
@@ -1804,12 +1836,12 @@ fn should_present_scene(
         return true;
     };
 
-    !scenes_match_visuals(previous_scene, scene)
+    !scenes_match_visuals(&previous_scene.roots, &scene.roots)
 }
 
 fn should_present_frame(
-    previous_scene: Option<&[RenderNode]>,
-    scene: &[RenderNode],
+    previous_scene: Option<&ExtractedScene>,
+    scene: &ExtractedScene,
     previous_indicator: Option<scrollbar::AutoScrollIndicator>,
     indicator: Option<scrollbar::AutoScrollIndicator>,
     resized: bool,
@@ -4234,11 +4266,11 @@ mod tests {
     use cssimpler_core::fonts::{FontFamily, TextStyle, TextTransform, register_font_file};
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, BoxShadow, CircleRadius, Color, ConicGradient,
-        CornerRadius, ElementPath, GradientDirection, GradientHorizontal, GradientInterpolation,
-        GradientPoint, GradientStop, GradientVertical, Insets, LayoutBox, LengthPercentageValue,
-        LinearGradient, Overflow, RadialGradient, RadialShape, RenderNode, ShadowEffect,
-        TextStrokeStyle, Transform2D, TransformMatrix3d, TransformOperation, TransformStyleMode,
-        VisualStyle,
+        CornerRadius, ElementPath, ExtractedScene, GradientDirection, GradientHorizontal,
+        GradientInterpolation, GradientPoint, GradientStop, GradientVertical, Insets, LayoutBox,
+        LengthPercentageValue, LinearGradient, Overflow, RadialGradient, RadialShape, RenderNode,
+        ShadowEffect, TextStrokeStyle, Transform2D, TransformMatrix3d, TransformOperation,
+        TransformStyleMode, VisualStyle,
     };
 
     use crate::{
@@ -4246,9 +4278,9 @@ mod tests {
         WindowConfig, blend_pixel, build_incremental_render_jobs, coalesce_dirty_regions,
         dirty_regions_between_scenes, dispatch_click, dispatch_hover_transition_events,
         dispatch_mouse_event, distribute_dirty_render_jobs, drawable_viewport_size,
-        hit_test_element_path, pack_rgb, render_scene_update, render_scene_update_internal,
-        render_to_buffer, resize_buffer, scenes_match_visuals, should_present_frame,
-        should_present_scene, should_suspend_updates,
+        hit_test_element_path, pack_rgb, render_scene_update,
+        render_scene_update_internal_from_roots, render_to_buffer, resize_buffer,
+        scenes_match_visuals, should_present_frame, should_present_scene, should_suspend_updates,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -5631,8 +5663,14 @@ mod tests {
         render_to_buffer(&previous, &mut incremental, 120, 90, Color::WHITE);
         assert_eq!(super::subtree_surface_cache_builds_for_tests(), 1);
 
-        let stats =
-            render_scene_update_internal(&previous, &next, &mut incremental, 120, 90, Color::WHITE);
+        let stats = render_scene_update_internal_from_roots(
+            &previous,
+            &next,
+            &mut incremental,
+            120,
+            90,
+            Color::WHITE,
+        );
         render_to_buffer(&next, &mut full, 120, 90, Color::WHITE);
 
         assert_eq!(super::subtree_surface_cache_builds_for_tests(), 1);
@@ -6250,16 +6288,27 @@ mod tests {
                 ..VisualStyle::default()
             }),
         ];
+        let previous_extracted = ExtractedScene::from_render_roots(&previous);
+        let next_extracted = ExtractedScene::from_render_roots(&next);
 
-        assert!(should_present_scene(Some(&previous), &next, false));
-        assert!(!should_present_scene(Some(&previous), &previous, false));
+        assert!(should_present_scene(
+            Some(&previous_extracted),
+            &next_extracted,
+            false
+        ));
+        assert!(!should_present_scene(
+            Some(&previous_extracted),
+            &previous_extracted,
+            false
+        ));
     }
 
     #[test]
     fn should_present_scene_when_buffer_is_resized() {
         let scene = vec![RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0))];
+        let extracted = ExtractedScene::from_render_roots(&scene);
 
-        assert!(should_present_scene(Some(&scene), &scene, true));
+        assert!(should_present_scene(Some(&extracted), &extracted, true));
     }
 
     #[test]
@@ -6292,10 +6341,11 @@ mod tests {
     #[test]
     fn auto_scroll_indicator_changes_force_a_present() {
         let scene = vec![RenderNode::container(LayoutBox::new(4.0, 6.0, 40.0, 24.0))];
+        let extracted = ExtractedScene::from_render_roots(&scene);
 
         assert!(should_present_frame(
-            Some(&scene),
-            &scene,
+            Some(&extracted),
+            &extracted,
             None,
             Some(crate::scrollbar::AutoScrollIndicator { x: 24.0, y: 18.0 }),
             false,
@@ -7064,7 +7114,7 @@ mod tests {
         let mut full = vec![0_u32; 400 * 400];
 
         render_to_buffer(&previous, &mut incremental, 400, 400, Color::WHITE);
-        let stats = render_scene_update_internal(
+        let stats = render_scene_update_internal_from_roots(
             &previous,
             &next,
             &mut incremental,
@@ -7133,7 +7183,7 @@ mod tests {
         let mut full = vec![0_u32; 480 * 640];
 
         render_to_buffer(&previous, &mut incremental, 480, 640, Color::WHITE);
-        let stats = render_scene_update_internal(
+        let stats = render_scene_update_internal_from_roots(
             &previous,
             &next,
             &mut incremental,

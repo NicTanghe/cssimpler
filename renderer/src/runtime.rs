@@ -2,6 +2,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cssimpler_core::ExtractedScene;
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -72,7 +73,7 @@ struct RuntimeApp<P> {
     left_press_target: Option<ElementPath>,
     last_click: Option<(Instant, ElementPath)>,
     element_interaction: ElementInteractionState,
-    previous_presented_scene: Option<Vec<super::RenderNode>>,
+    previous_presented_scene: Option<ExtractedScene>,
     previous_presented_indicator: Option<scrollbar::AutoScrollIndicator>,
     scrollbar_controller: scrollbar::ScrollbarController,
 }
@@ -527,9 +528,11 @@ where
             self.config.clear_color,
         );
 
+        let extracted_scene = ExtractedScene::from_render_roots(&scene);
+
         if should_present_frame(
-            self.previous_presented_scene.as_deref(),
-            &scene,
+            self.previous_presented_scene.as_ref(),
+            &extracted_scene,
             self.previous_presented_indicator,
             auto_scroll_indicator,
             resized,
@@ -537,16 +540,16 @@ where
             let paint_start = Instant::now();
             let paint_stats = if resized {
                 render_to_buffer_internal(
-                    &scene,
+                    &extracted_scene,
                     &mut self.buffer,
                     self.buffer_width,
                     self.buffer_height,
                     self.config.clear_color,
                 )
-            } else if let Some(previous_scene) = self.previous_presented_scene.as_deref() {
+            } else if let Some(previous_scene) = self.previous_presented_scene.as_ref() {
                 render_scene_update_internal(
                     previous_scene,
-                    &scene,
+                    &extracted_scene,
                     &mut self.buffer,
                     self.buffer_width,
                     self.buffer_height,
@@ -554,7 +557,7 @@ where
                 )
             } else {
                 render_to_buffer_internal(
-                    &scene,
+                    &extracted_scene,
                     &mut self.buffer,
                     self.buffer_width,
                     self.buffer_height,
@@ -597,7 +600,7 @@ where
                 }
             }
             frame_stats.present_us = duration_to_us(present_start.elapsed());
-            self.previous_presented_scene = Some(scene);
+            self.previous_presented_scene = Some(extracted_scene);
             self.previous_presented_indicator = auto_scroll_indicator;
         }
 

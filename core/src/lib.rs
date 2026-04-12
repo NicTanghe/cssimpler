@@ -1,9 +1,11 @@
 pub mod color;
 pub mod custom_properties;
 pub mod dom;
+pub mod extracted_scene;
 pub mod fonts;
 pub mod generated_content;
 pub mod interaction;
+pub mod runtime_ecs;
 pub mod scrollbar;
 pub mod svg;
 pub mod transitions;
@@ -14,8 +16,14 @@ use taffy::Style as TaffyStyle;
 pub use color::{Color, GradientInterpolation, LinearRgba};
 pub use custom_properties::CustomProperties;
 pub use dom::{ElementNode, EventHandler, EventHandlers, IntoNode, Node, into_node};
+pub use extracted_scene::{ExtractedPaintItem, ExtractedPaintKind, ExtractedScene};
 pub use generated_content::GeneratedTextSource;
 pub use interaction::{ElementInteractionState, ElementPath};
+pub use runtime_ecs::{
+    Entity, RuntimeComputedNode, RuntimeDirtyClass, RuntimeDirtyFlags,
+    RuntimeElementInteraction, RuntimeEntityData, RuntimeNodeKind, RuntimeScrollState,
+    RuntimeSyncAction, RuntimeSyncPolicy, RuntimeSyncResult, RuntimeViewport, RuntimeWorld,
+};
 pub use scrollbar::{
     OverflowMode, ScrollbarAxisState, ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics,
     ScrollbarStyle, ScrollbarWidth,
