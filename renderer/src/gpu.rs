@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,7 +18,7 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::fonts::{RasterizedTextMask, rasterize_text_color_texture, rasterize_text_mask};
-use crate::shadow::{rasterize_shadow_texture, shadow_bounds};
+use crate::shadow::{rasterize_shadow_texture_uncached, shadow_bounds};
 use crate::shapes::{inset_corner_radius, inset_layout, offset_layout};
 use crate::svg::rasterize_svg_scene_texture;
 use crate::transform::{
@@ -26,7 +26,7 @@ use crate::transform::{
     project_world_transform_matrix,
 };
 use crate::{RasterizedColorTexture, RendererError, Result};
-use crate::{gradient::rasterize_background_layer_texture, shadow::shadow_effect_bounds};
+use crate::{gradient::rasterize_background_layer_texture_uncached, shadow::shadow_effect_bounds};
 
 const MAX_TEXT_TEXTURE_CACHE_ENTRIES: usize = 256;
 const MAX_COLOR_TEXTURE_CACHE_ENTRIES: usize = 512;
@@ -887,6 +887,15 @@ impl GpuRuntimeBackend {
             evict_lru_color_texture(&mut self.color_textures);
         }
 
+        let texture = self.create_color_texture(raster, last_used);
+        self.color_textures.insert(*key, texture);
+    }
+
+    fn create_color_texture(
+        &self,
+        raster: &RasterizedColorTexture,
+        last_used: u64,
+    ) -> CachedColorTexture {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("cssimpler gpu color texture"),
             size: wgpu::Extent3d {
@@ -936,13 +945,10 @@ impl GpuRuntimeBackend {
                 },
             ],
         });
-        self.color_textures.insert(
-            *key,
-            CachedColorTexture {
-                bind_group,
-                last_used,
-            },
-        );
+        CachedColorTexture {
+            bind_group,
+            last_used,
+        }
     }
 }
 
@@ -975,6 +981,7 @@ fn prepare_gpu_scene(
         .map(|command| command.path.clone())
         .collect::<Vec<_>>();
     let mut pending_projected_index = 0_usize;
+    let mut prepared_color_texture_keys = HashSet::new();
 
     for item in &scene.items {
         while let Some(projected) = pending_projected.get(pending_projected_index) {
@@ -1038,10 +1045,12 @@ fn prepare_gpu_scene(
                 }
                 for layer in item.style.background_layers.iter().rev() {
                     let key = background_layer_texture_key(fill_layout, fill_radius, layer);
-                    let raster = if cached_color_textures.contains_key(&key) {
+                    let raster = if cached_color_textures.contains_key(&key)
+                        || !prepared_color_texture_keys.insert(key)
+                    {
                         None
                     } else {
-                        rasterize_background_layer_texture(fill_layout, fill_radius, layer)
+                        rasterize_background_layer_texture_uncached(fill_layout, fill_radius, layer)
                     };
                     let instance_index = color_textures.len() as u32;
                     let instance = raster
@@ -1171,10 +1180,12 @@ fn prepare_gpu_scene(
                     continue;
                 };
                 let key = shadow_texture_key(item.layout, item.style.corner_radius, shadow);
-                let raster = if cached_color_textures.contains_key(&key) {
+                let raster = if cached_color_textures.contains_key(&key)
+                    || !prepared_color_texture_keys.insert(key)
+                {
                     None
                 } else {
-                    rasterize_shadow_texture(item.layout, item.style.corner_radius, shadow)
+                    rasterize_shadow_texture_uncached(item.layout, item.style.corner_radius, shadow)
                 };
                 let instance_index = color_textures.len() as u32;
                 color_textures.push(PreparedColorTextureCommand {
@@ -1204,10 +1215,16 @@ fn prepare_gpu_scene(
                     spread: shadow.spread,
                 };
                 let key = shadow_texture_key(item.layout, item.style.corner_radius, box_shadow);
-                let raster = if cached_color_textures.contains_key(&key) {
+                let raster = if cached_color_textures.contains_key(&key)
+                    || !prepared_color_texture_keys.insert(key)
+                {
                     None
                 } else {
-                    rasterize_shadow_texture(item.layout, item.style.corner_radius, box_shadow)
+                    rasterize_shadow_texture_uncached(
+                        item.layout,
+                        item.style.corner_radius,
+                        box_shadow,
+                    )
                 };
                 let instance_index = color_textures.len() as u32;
                 color_textures.push(PreparedColorTextureCommand {
@@ -1222,7 +1239,9 @@ fn prepare_gpu_scene(
                     continue;
                 };
                 let key = svg_texture_key(item.layout, svg_scene);
-                let raster = if cached_color_textures.contains_key(&key) {
+                let raster = if cached_color_textures.contains_key(&key)
+                    || !prepared_color_texture_keys.insert(key)
+                {
                     None
                 } else {
                     rasterize_svg_scene_texture(item.layout, svg_scene)
@@ -2630,6 +2649,50 @@ mod tests {
                 .commands
                 .iter()
                 .any(|command| matches!(command, super::GpuPaintCommand::ColorTexture { .. }))
+        );
+    }
+
+    #[test]
+    fn gpu_scene_rasterizes_a_shared_gradient_texture_only_once_per_frame() {
+        let gradient =
+            cssimpler_core::BackgroundLayer::LinearGradient(cssimpler_core::LinearGradient {
+                direction: cssimpler_core::GradientDirection::Angle(90.0),
+                interpolation: cssimpler_core::GradientInterpolation::Oklab,
+                repeating: false,
+                stops: vec![
+                    cssimpler_core::GradientStop {
+                        color: Color::rgb(59, 130, 246),
+                        position: cssimpler_core::LengthPercentageValue::from_fraction(0.0),
+                    },
+                    cssimpler_core::GradientStop {
+                        color: Color::rgb(16, 185, 129),
+                        position: cssimpler_core::LengthPercentageValue::from_fraction(1.0),
+                    },
+                ],
+            });
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 32.0, 20.0)).with_style(VisualStyle {
+                background_layers: vec![gradient.clone()],
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(64.0, 0.0, 32.0, 20.0)).with_style(VisualStyle {
+                background_layers: vec![gradient],
+                ..VisualStyle::default()
+            }),
+        ];
+
+        let extracted = ExtractedScene::from_render_roots(&scene);
+        let prepared = prepare_gpu_scene(&extracted, 128, 32, true, &HashMap::new())
+            .expect("shared gradient textures should stay supported");
+
+        assert_eq!(prepared.color_textures.len(), 2);
+        assert_eq!(
+            prepared
+                .color_textures
+                .iter()
+                .filter(|command| command.raster.is_some())
+                .count(),
+            1
         );
     }
 

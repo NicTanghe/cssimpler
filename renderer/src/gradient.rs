@@ -437,6 +437,7 @@ pub(crate) fn draw_background_layer_transformed(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn rasterize_background_layer_texture(
     layout: LayoutBox,
     radius: CornerRadius,
@@ -460,6 +461,16 @@ pub(crate) fn rasterize_background_layer_texture(
         ));
     }
 
+    let (relative_layout, offset_x, offset_y) = split_layout_for_gradient_cache(layout);
+    let raster = rasterize_gradient_layer(relative_layout, radius, layer)?;
+    Some(cached_gradient_layer_texture(&raster, offset_x, offset_y))
+}
+
+pub(crate) fn rasterize_background_layer_texture_uncached(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    layer: &BackgroundLayer,
+) -> Option<RasterizedColorTexture> {
     let (relative_layout, offset_x, offset_y) = split_layout_for_gradient_cache(layout);
     let raster = rasterize_gradient_layer(relative_layout, radius, layer)?;
     Some(cached_gradient_layer_texture(&raster, offset_x, offset_y))

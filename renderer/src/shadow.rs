@@ -340,6 +340,7 @@ pub(crate) fn draw_shadow_effect_transformed(
     );
 }
 
+#[allow(dead_code)]
 pub(crate) fn rasterize_shadow_texture(
     layout: LayoutBox,
     radius: CornerRadius,
@@ -353,6 +354,40 @@ pub(crate) fn rasterize_shadow_texture(
     let base_radius = expand_corner_radius(layout, radius, shadow.spread);
     let blur_radius = shadow.blur_radius.max(0.0);
     let (mask, offset_x, offset_y) = cached_shadow_mask(base_layout, base_radius, blur_radius);
+    if mask.width == 0 || mask.height == 0 || shadow.color.a == 0 {
+        return None;
+    }
+
+    let color = shadow.color.to_linear_rgba();
+    let pixels = mask
+        .alpha
+        .iter()
+        .map(|alpha| alpha_mask_color(color, *alpha))
+        .collect();
+
+    Some(RasterizedColorTexture {
+        origin_x: mask.origin_x + offset_x,
+        origin_y: mask.origin_y + offset_y,
+        width: mask.width,
+        height: mask.height,
+        pixels,
+    })
+}
+
+pub(crate) fn rasterize_shadow_texture_uncached(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    shadow: cssimpler_core::BoxShadow,
+) -> Option<RasterizedColorTexture> {
+    let base_layout = offset_layout(
+        expand_layout(layout, shadow.spread),
+        shadow.offset_x,
+        shadow.offset_y,
+    );
+    let base_radius = expand_corner_radius(layout, radius, shadow.spread);
+    let blur_radius = shadow.blur_radius.max(0.0);
+    let (relative_layout, offset_x, offset_y) = split_layout_for_shadow_cache(base_layout);
+    let mask = rasterize_shadow_mask(relative_layout, base_radius, blur_radius);
     if mask.width == 0 || mask.height == 0 || shadow.color.a == 0 {
         return None;
     }
