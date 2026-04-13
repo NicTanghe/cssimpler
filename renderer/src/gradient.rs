@@ -11,8 +11,10 @@ use cssimpler_core::{
 
 use super::shapes::{pixel_bounds, rounded_rect_row_span, transformed_rounded_rect_coverage};
 use super::{
-    ClipRect, blend_linear_over, clip_pixel_bounds, current_render_buffer_rows, pack_linear_rgb,
+    ClipRect, RasterizedColorTexture, blend_linear_over, clip_pixel_bounds,
+    current_render_buffer_rows, pack_linear_rgb,
     transform::{AffineTransform, ClipState, transform_layout_bounds},
+    unpack_rgb,
 };
 
 const MAX_GRADIENT_LAYER_CACHE_ENTRIES: usize = 16;
@@ -433,6 +435,34 @@ pub(crate) fn draw_background_layer_transformed(
             }
         }
     }
+}
+
+pub(crate) fn rasterize_background_layer_texture(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    layer: &BackgroundLayer,
+) -> Option<RasterizedColorTexture> {
+    if let Some((cached_layer, offset_x, offset_y)) =
+        cached_static_gradient_layer(layout, radius, layer)
+    {
+        return Some(cached_gradient_layer_texture(
+            cached_layer.as_ref(),
+            offset_x,
+            offset_y,
+        ));
+    }
+
+    if let Some((cached_layer, offset_x, offset_y)) = cached_gradient_layer(layout, radius, layer) {
+        return Some(cached_gradient_layer_texture(
+            cached_layer.as_ref(),
+            offset_x,
+            offset_y,
+        ));
+    }
+
+    let (relative_layout, offset_x, offset_y) = split_layout_for_gradient_cache(layout);
+    let raster = rasterize_gradient_layer(relative_layout, radius, layer)?;
+    Some(cached_gradient_layer_texture(&raster, offset_x, offset_y))
 }
 
 fn gradient_layer_cache() -> &'static Mutex<GradientLayerCache> {
@@ -920,6 +950,36 @@ fn draw_cached_gradient_layer(
                 }
             }
         }
+    }
+}
+
+fn cached_gradient_layer_texture(
+    cached: &CachedGradientLayer,
+    offset_x: i32,
+    offset_y: i32,
+) -> RasterizedColorTexture {
+    RasterizedColorTexture {
+        origin_x: offset_x,
+        origin_y: offset_y,
+        width: cached.width,
+        height: cached.height,
+        pixels: cached_gradient_pixels(cached),
+    }
+}
+
+fn cached_gradient_pixels(cached: &CachedGradientLayer) -> Vec<LinearRgba> {
+    match &cached.pixels {
+        CachedGradientPixels::BinaryAlpha(pixels) => pixels
+            .iter()
+            .map(|pixel| {
+                if *pixel == 0 {
+                    LinearRgba::TRANSPARENT
+                } else {
+                    unpack_rgb(*pixel & 0x00FF_FFFF).to_linear_rgba()
+                }
+            })
+            .collect(),
+        CachedGradientPixels::Linear(pixels) => pixels.clone(),
     }
 }
 

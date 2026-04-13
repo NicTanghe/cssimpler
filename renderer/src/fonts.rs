@@ -8,11 +8,12 @@ use cssimpler_core::fonts::{
     FontFamily, FontStyle, GenericFontFamily, LineHeight, PreparedTextLayout, ResolvedFont,
     TextLayout, TextStyle, TextTransform, layout_text_block, resolve_font,
 };
-use cssimpler_core::{Color, LayoutBox, ShadowEffect, TextStrokeStyle, VisualStyle};
+use cssimpler_core::{Color, LayoutBox, LinearRgba, ShadowEffect, TextStrokeStyle, VisualStyle};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 
 use crate::{
-    ClipRect, PreparedBlendColor, blend_mask_row, clip_pixel_bounds, current_render_buffer_rows,
+    ClipRect, PreparedBlendColor, RasterizedColorTexture, blend_mask_row, clip_pixel_bounds,
+    current_render_buffer_rows,
     transform::{AffineTransform, ClipState, transform_clip_rect},
 };
 
@@ -22,6 +23,49 @@ const MAX_TEXT_EFFECT_CACHE_ENTRIES: usize = 512;
 const MAX_TEXT_EFFECT_WORKERS: usize = 8;
 const MIN_PARALLEL_BLUR_PIXELS: usize = 24_576;
 const TEXT_BLUR_PASS_COUNT: usize = 3;
+
+#[derive(Clone)]
+pub(crate) struct RasterizedTextMask {
+    mask: Arc<AlphaMask>,
+    offset_x: i32,
+    offset_y: i32,
+}
+
+impl RasterizedTextMask {
+    pub(crate) fn origin_x(&self) -> i32 {
+        self.mask.origin_x + self.offset_x
+    }
+
+    pub(crate) fn origin_y(&self) -> i32 {
+        self.mask.origin_y + self.offset_y
+    }
+
+    pub(crate) fn width(&self) -> usize {
+        self.mask.width
+    }
+
+    pub(crate) fn height(&self) -> usize {
+        self.mask.height
+    }
+
+    pub(crate) fn alpha(&self) -> &[u8] {
+        &self.mask.alpha
+    }
+}
+
+pub(crate) fn rasterize_text_mask(
+    layout: LayoutBox,
+    text: &str,
+    prepared_text_layout: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+) -> Option<RasterizedTextMask> {
+    let raster = cached_text_mask(layout, text, &style.text, prepared_text_layout)?;
+    Some(RasterizedTextMask {
+        mask: raster.mask,
+        offset_x: raster.offset_x,
+        offset_y: raster.offset_y,
+    })
+}
 
 pub(crate) fn draw_text(
     buffer: &mut [u32],
@@ -154,6 +198,111 @@ pub(crate) fn draw_text_transformed(
         matrix,
         clip_state,
     );
+}
+
+pub(crate) fn rasterize_text_color_texture(
+    layout: LayoutBox,
+    text: &str,
+    prepared_text_layout: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+) -> Option<RasterizedColorTexture> {
+    let raster = cached_text_mask(layout, text, &style.text, prepared_text_layout)?;
+    let mut bounds = mask_bounds(raster.mask.as_ref(), raster.offset_x, raster.offset_y);
+    let mut shadow_layers = Vec::new();
+
+    for shadow in style
+        .filter_drop_shadows
+        .iter()
+        .chain(style.text_shadows.iter())
+    {
+        let mask = if shadow.spread > 0.0 || shadow.blur_radius > 0.0 {
+            cached_text_effect_mask(
+                &raster,
+                TextEffectCacheKind::Shadow {
+                    spread_bits: shadow.spread.to_bits(),
+                    blur_bits: shadow.blur_radius.to_bits(),
+                },
+                |base| shadow_mask_from_raster(base, *shadow),
+            )
+        } else {
+            raster.mask.clone()
+        };
+        let origin_x = mask.origin_x + raster.offset_x + shadow.offset_x.round() as i32;
+        let origin_y = mask.origin_y + raster.offset_y + shadow.offset_y.round() as i32;
+        bounds = union_bounds(bounds, mask_bounds(mask.as_ref(), origin_x, origin_y));
+        shadow_layers.push((
+            mask,
+            shadow.color.unwrap_or(style.foreground),
+            origin_x,
+            origin_y,
+        ));
+    }
+
+    let stroke_layer = if style.text_stroke.width > 0.0 {
+        let mask = cached_text_effect_mask(
+            &raster,
+            TextEffectCacheKind::Stroke {
+                width_bits: style.text_stroke.width.to_bits(),
+            },
+            |base| stroke_mask_from_raster(base, style.text_stroke.width),
+        );
+        let origin_x = mask.origin_x + raster.offset_x;
+        let origin_y = mask.origin_y + raster.offset_y;
+        bounds = union_bounds(bounds, mask_bounds(mask.as_ref(), origin_x, origin_y));
+        Some((
+            mask,
+            style.text_stroke.color.unwrap_or(style.foreground),
+            origin_x,
+            origin_y,
+        ))
+    } else {
+        None
+    };
+
+    let (origin_x, origin_y, width, height) = bounds?;
+    let mut pixels = vec![LinearRgba::TRANSPARENT; width.saturating_mul(height)];
+    for (mask, color, mask_origin_x, mask_origin_y) in shadow_layers {
+        blend_mask_into_texture(
+            &mut pixels,
+            width,
+            origin_x,
+            origin_y,
+            mask.as_ref(),
+            mask_origin_x,
+            mask_origin_y,
+            color,
+        );
+    }
+    if let Some((mask, color, mask_origin_x, mask_origin_y)) = stroke_layer {
+        blend_mask_into_texture(
+            &mut pixels,
+            width,
+            origin_x,
+            origin_y,
+            mask.as_ref(),
+            mask_origin_x,
+            mask_origin_y,
+            color,
+        );
+    }
+    blend_mask_into_texture(
+        &mut pixels,
+        width,
+        origin_x,
+        origin_y,
+        raster.mask.as_ref(),
+        raster.mask.origin_x + raster.offset_x,
+        raster.mask.origin_y + raster.offset_y,
+        style.foreground,
+    );
+
+    Some(RasterizedColorTexture {
+        origin_x,
+        origin_y,
+        width,
+        height,
+        pixels,
+    })
 }
 
 fn draw_shadow_mask(
@@ -329,6 +478,106 @@ fn draw_mask_transformed(
             );
         }
     }
+}
+
+fn mask_bounds(mask: &AlphaMask, origin_x: i32, origin_y: i32) -> Option<(i32, i32, usize, usize)> {
+    if mask.width == 0 || mask.height == 0 {
+        return None;
+    }
+    Some((origin_x, origin_y, mask.width, mask.height))
+}
+
+fn union_bounds(
+    bounds: Option<(i32, i32, usize, usize)>,
+    next: Option<(i32, i32, usize, usize)>,
+) -> Option<(i32, i32, usize, usize)> {
+    match (bounds, next) {
+        (Some((x0, y0, width, height)), Some((next_x0, next_y0, next_width, next_height))) => {
+            let x1 = x0 + width as i32;
+            let y1 = y0 + height as i32;
+            let next_x1 = next_x0 + next_width as i32;
+            let next_y1 = next_y0 + next_height as i32;
+            Some((
+                x0.min(next_x0),
+                y0.min(next_y0),
+                x1.max(next_x1).saturating_sub(x0.min(next_x0)) as usize,
+                y1.max(next_y1).saturating_sub(y0.min(next_y0)) as usize,
+            ))
+        }
+        (Some(bounds), None) => Some(bounds),
+        (None, Some(bounds)) => Some(bounds),
+        (None, None) => None,
+    }
+}
+
+fn blend_mask_into_texture(
+    pixels: &mut [LinearRgba],
+    texture_width: usize,
+    texture_origin_x: i32,
+    texture_origin_y: i32,
+    mask: &AlphaMask,
+    mask_origin_x: i32,
+    mask_origin_y: i32,
+    color: Color,
+) {
+    if color.a == 0 || mask.width == 0 || mask.height == 0 {
+        return;
+    }
+
+    let color = color.to_linear_rgba();
+    for y in 0..mask.height {
+        for x in 0..mask.width {
+            let alpha = mask.alpha[x + y * mask.width];
+            if alpha == 0 {
+                continue;
+            }
+            let dst_x = mask_origin_x - texture_origin_x + x as i32;
+            let dst_y = mask_origin_y - texture_origin_y + y as i32;
+            if dst_x < 0 || dst_y < 0 {
+                continue;
+            }
+            let index = dst_x as usize + dst_y as usize * texture_width;
+            blend_linear_pixel(
+                &mut pixels[index],
+                LinearRgba {
+                    r: color.r,
+                    g: color.g,
+                    b: color.b,
+                    a: (color.a * alpha as f32 / 255.0).clamp(0.0, 1.0),
+                },
+            );
+        }
+    }
+}
+
+fn blend_linear_pixel(destination: &mut LinearRgba, source: LinearRgba) {
+    let source_alpha = source.a.clamp(0.0, 1.0);
+    if source_alpha <= f32::EPSILON {
+        return;
+    }
+    let destination_alpha = destination.a.clamp(0.0, 1.0);
+    let out_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
+    if out_alpha <= f32::EPSILON {
+        *destination = LinearRgba::TRANSPARENT;
+        return;
+    }
+
+    let source_r = source.r * source_alpha;
+    let source_g = source.g * source_alpha;
+    let source_b = source.b * source_alpha;
+    let destination_r = destination.r * destination_alpha;
+    let destination_g = destination.g * destination_alpha;
+    let destination_b = destination.b * destination_alpha;
+    let out_r = source_r + destination_r * (1.0 - source_alpha);
+    let out_g = source_g + destination_g * (1.0 - source_alpha);
+    let out_b = source_b + destination_b * (1.0 - source_alpha);
+
+    *destination = LinearRgba {
+        r: (out_r / out_alpha).clamp(0.0, 1.0),
+        g: (out_g / out_alpha).clamp(0.0, 1.0),
+        b: (out_b / out_alpha).clamp(0.0, 1.0),
+        a: out_alpha,
+    };
 }
 
 fn sample_mask_bilinear(mask: &AlphaMask, local_x: f32, local_y: f32) -> u8 {

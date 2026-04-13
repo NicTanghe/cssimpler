@@ -3,7 +3,7 @@ use crate::{
     ScrollbarData, SvgScene, Transform2D, TransitionStyle, VisualStyle,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExtractedPaintKind {
     BackdropBlur,
     BoxShadow,
@@ -44,10 +44,10 @@ pub struct ExtractedScene {
 impl ExtractedScene {
     pub fn from_render_roots(roots: &[RenderNode]) -> Self {
         let mut items = Vec::new();
+        let mut next_sort_key = 0_u64;
         for (root_index, root) in roots.iter().enumerate() {
-            collect_paint_items(root, vec![root_index], &mut items);
+            collect_paint_items(root, vec![root_index], None, &mut next_sort_key, &mut items);
         }
-        items.sort_by_key(|item| item.stable_sort_key);
 
         Self {
             roots: roots.to_vec(),
@@ -56,42 +56,51 @@ impl ExtractedScene {
     }
 }
 
-fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<ExtractedPaintItem>) {
-    let clip = node.style.overflow.clips_any_axis().then_some(node.layout);
+fn collect_paint_items(
+    node: &RenderNode,
+    path: Vec<usize>,
+    inherited_clip: Option<LayoutBox>,
+    next_sort_key: &mut u64,
+    items: &mut Vec<ExtractedPaintItem>,
+) {
+    let clip = combine_clips(
+        inherited_clip,
+        node.style.overflow.clips_any_axis().then_some(node.layout),
+    );
 
     if node.style.backdrop_blur_radius > f32::EPSILON {
         push_item(
             node,
             &path,
-            0,
             ExtractedPaintKind::BackdropBlur,
             clip,
             None,
+            next_sort_key,
             items,
         );
     }
 
-    for (index, _) in node.style.shadows.iter().enumerate() {
+    for _ in &node.style.shadows {
         push_item(
             node,
             &path,
-            16 + index as u8,
             ExtractedPaintKind::BoxShadow,
             clip,
             None,
+            next_sort_key,
             items,
         );
     }
 
     if !matches!(node.kind, RenderKind::Text(_)) {
-        for (index, _) in node.style.filter_drop_shadows.iter().enumerate() {
+        for _ in &node.style.filter_drop_shadows {
             push_item(
                 node,
                 &path,
-                32 + index as u8,
                 ExtractedPaintKind::FilterDropShadow,
                 clip,
                 None,
+                next_sort_key,
                 items,
             );
         }
@@ -101,10 +110,10 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
         push_item(
             node,
             &path,
-            64,
             ExtractedPaintKind::Background,
             clip,
             None,
+            next_sort_key,
             items,
         );
     }
@@ -113,10 +122,10 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
         push_item(
             node,
             &path,
-            80,
             ExtractedPaintKind::Border,
             clip,
             None,
+            next_sort_key,
             items,
         );
     }
@@ -127,10 +136,10 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
             push_item(
                 node,
                 &path,
-                96,
                 ExtractedPaintKind::TextRun,
                 clip,
                 Some(ExtractedPayload::Text(text.clone())),
+                next_sort_key,
                 items,
             );
         }
@@ -138,10 +147,10 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
             push_item(
                 node,
                 &path,
-                112,
                 ExtractedPaintKind::Svg,
                 clip,
                 Some(ExtractedPayload::Svg(scene.clone())),
+                next_sort_key,
                 items,
             );
         }
@@ -150,20 +159,37 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
     for (child_index, child) in node.children.iter().enumerate() {
         let mut child_path = path.clone();
         child_path.push(child_index);
-        collect_paint_items(child, child_path, items);
+        collect_paint_items(child, child_path, clip, next_sort_key, items);
     }
 
     if node.scrollbars.is_some() {
         push_item(
             node,
             &path,
-            240,
             ExtractedPaintKind::Scrollbar,
             clip,
             None,
+            next_sort_key,
             items,
         );
     }
+}
+
+fn combine_clips(left: Option<LayoutBox>, right: Option<LayoutBox>) -> Option<LayoutBox> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(intersect_layout_boxes(left, right)),
+        (Some(clip), None) | (None, Some(clip)) => Some(clip),
+        (None, None) => None,
+    }
+}
+
+fn intersect_layout_boxes(left: LayoutBox, right: LayoutBox) -> LayoutBox {
+    let x0 = left.x.max(right.x);
+    let y0 = left.y.max(right.y);
+    let x1 = (left.x + left.width).min(right.x + right.width);
+    let y1 = (left.y + left.height).min(right.y + right.height);
+
+    LayoutBox::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
 }
 
 enum ExtractedPayload {
@@ -174,10 +200,10 @@ enum ExtractedPayload {
 fn push_item(
     node: &RenderNode,
     path: &[usize],
-    phase: u8,
     kind: ExtractedPaintKind,
     clip: Option<LayoutBox>,
     payload: Option<ExtractedPayload>,
+    next_sort_key: &mut u64,
     items: &mut Vec<ExtractedPaintItem>,
 ) {
     let (text, svg_scene) = match payload {
@@ -187,7 +213,7 @@ fn push_item(
     };
 
     items.push(ExtractedPaintItem {
-        stable_sort_key: stable_sort_key(path, phase),
+        stable_sort_key: *next_sort_key,
         path: path.to_vec(),
         kind,
         layout: node.layout,
@@ -204,16 +230,7 @@ fn push_item(
         scrollbars: node.scrollbars,
         handlers: node.handlers,
     });
-}
-
-fn stable_sort_key(path: &[usize], phase: u8) -> u64 {
-    let mut key = phase as u64;
-    for &segment in path {
-        key = key
-            .wrapping_mul(1_099_511_628_211)
-            .wrapping_add(segment as u64 + 1);
-    }
-    key
+    *next_sort_key = next_sort_key.saturating_add(1);
 }
 
 #[cfg(test)]
@@ -330,5 +347,91 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(left_keys, right_keys);
+    }
+
+    #[test]
+    fn extracted_scene_preserves_tree_paint_order_across_descendants_and_siblings() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 160.0, 120.0))
+                .with_child(
+                    RenderNode::container(LayoutBox::new(8.0, 8.0, 48.0, 48.0))
+                        .with_style(VisualStyle {
+                            background: Some(Color::rgb(15, 23, 42)),
+                            ..VisualStyle::default()
+                        })
+                        .with_child(
+                            RenderNode::text(LayoutBox::new(12.0, 12.0, 24.0, 16.0), "first")
+                                .with_style(VisualStyle {
+                                    foreground: Color::WHITE,
+                                    ..VisualStyle::default()
+                                }),
+                        ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(72.0, 8.0, 48.0, 48.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(30, 41, 59)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+
+        let extracted = ExtractedScene::from_render_roots(&scene);
+        let order = extracted
+            .items
+            .iter()
+            .map(|item| (item.path.clone(), item.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            order,
+            vec![
+                (vec![0, 0], ExtractedPaintKind::Background),
+                (vec![0, 0, 0], ExtractedPaintKind::TextRun),
+                (vec![0, 1], ExtractedPaintKind::Background),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracted_scene_accumulates_ancestor_clips_for_backend_consumers() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 120.0, 120.0))
+                .with_style(VisualStyle {
+                    overflow: Overflow {
+                        x: crate::OverflowMode::Hidden,
+                        y: crate::OverflowMode::Hidden,
+                    },
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(16.0, 12.0, 72.0, 48.0))
+                        .with_style(VisualStyle {
+                            overflow: Overflow {
+                                x: crate::OverflowMode::Clip,
+                                y: crate::OverflowMode::Clip,
+                            },
+                            background: Some(Color::rgb(15, 23, 42)),
+                            ..VisualStyle::default()
+                        })
+                        .with_child(
+                            RenderNode::text(LayoutBox::new(40.0, 30.0, 120.0, 24.0), "clipped")
+                                .with_style(VisualStyle {
+                                    foreground: Color::WHITE,
+                                    ..VisualStyle::default()
+                                }),
+                        ),
+                ),
+        ];
+
+        let extracted = ExtractedScene::from_render_roots(&scene);
+        let text_item = extracted
+            .items
+            .iter()
+            .find(|item| matches!(item.kind, ExtractedPaintKind::TextRun))
+            .expect("text item should be extracted");
+
+        assert_eq!(text_item.clip, Some(LayoutBox::new(16.0, 12.0, 72.0, 48.0)));
     }
 }

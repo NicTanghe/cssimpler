@@ -16,7 +16,7 @@ Planning note:
 
 ## X1. Window/event loop migration to `winit`
 Depends: A2, E2, F2, G1  
-Status: planned
+Status: implemented
 
 Purpose:
 - Replace `minifb` windowing with `winit` so the engine has a modern event loop, better platform coverage, and window handles suitable for GPU surfaces
@@ -39,7 +39,7 @@ Acceptance:
 
 ## X2. Engine-owned input and text event model
 Depends: X1, F2, H4  
-Status: planned
+Status: implemented
 
 Purpose:
 - Normalize `winit` input into engine-owned events so interaction, text editing, and future widgets are not backend-specific
@@ -63,7 +63,7 @@ Acceptance:
 
 ## X3. Redraw scheduling and surface lifecycle
 Depends: X1, G1, G3, Z1  
-Status: planned
+Status: implemented
 
 Purpose:
 - Keep the current explicit invalidation model while making the frame lifecycle safe for swapchain or surface-backed renderers
@@ -89,7 +89,7 @@ Acceptance:
 
 ## Y1. ECS world for runtime UI state
 Depends: A3, B1, G3  
-Status: planned
+Status: implemented
 
 Purpose:
 - Move runtime UI state into an ECS world so style, layout, interaction, transitions, and rendering can operate over explicit component data instead of one monolithic recursive structure
@@ -116,7 +116,7 @@ Acceptance:
 
 ## Y2. DOM-to-ECS lowering and migration path
 Depends: Y1, B2, J1  
-Status: planned
+Status: implemented
 
 Purpose:
 - Keep `ui!` and `Node` as the authoring model at first, while lowering them into ECS so the architecture can evolve without a full public API reset
@@ -140,6 +140,7 @@ Acceptance:
 ## Y3. ECS schedules for style, layout, interaction, and transitions
 Depends: Y1, Y2, C4, D2, G3  
 Status: planned
+Status: implemented
 
 Purpose:
 - Replace ad hoc cross-crate runtime passes with explicit ECS schedules so the work graph becomes measurable, reorderable, and backend-independent
@@ -166,6 +167,7 @@ Acceptance:
 ## Y4. Render extraction world and backend-facing scene data
 Depends: Y3, E1, Z1  
 Status: planned
+Status: implemented
 
 Purpose:
 - Extract renderer-facing data from ECS into a backend-neutral scene or draw list so CPU and GPU backends can share the same upstream runtime model
@@ -189,7 +191,7 @@ Acceptance:
 
 ## Z1. Backend abstraction above extracted scene data
 Depends: X3, Y4, E2  
-Status: planned
+Status: implemente
 
 Purpose:
 - Define a shared renderer contract so the software renderer and GPU renderer can coexist without duplicating app/runtime logic
@@ -212,8 +214,7 @@ Acceptance:
 
 ## Z2. Baseline GPU backend
 Depends: Z1, X3  
-Status: planned
-
+Status: implemented
 Purpose:
 - Add a practical first GPU renderer for rectangles, borders, rounded corners, text, and clipping so the engine is no longer locked to CPU raster
 
@@ -235,7 +236,7 @@ Acceptance:
 
 ## Z3. GPU scene batching, atlasing, and effect pipeline
 Depends: Z2, H4, E3, S2, T2  
-Status: planned
+Status: yimplemented
 
 Purpose:
 - Move beyond a naive GPU port and actually exploit the extracted scene model for batching and resource reuse
@@ -249,6 +250,9 @@ Support:
 - Clip stack or clip-mask strategy
 - GPU-friendly transforms
 - Controlled support for gradients, shadows, SVG paint, and backdrop-style effects
+
+Human note:
+-dual-kawase is a good GPU blur 
 
 Acceptance:
 - Common UI scenes do not degrade into one expensive draw call per node
@@ -283,7 +287,7 @@ Acceptance:
 
 ## AA1. Optional build-time CSS and UI compilation
 Depends: B2, C1, C4, Y2  
-Status: planned
+Status: abandonned branch left alive
 
 Purpose:
 - Allow selected UI and stylesheet inputs to be compiled ahead of time so startup does not have to parse them at runtime
@@ -311,7 +315,7 @@ I beleave this whould be the correct way to do this so it also keeps variables i
 
 ## AA2. Const-friendly static node and style descriptors
 Depends: AA1, Y1  
-Status: planned
+Status: abandonned branch left alive
 
 Purpose:
 - Define a baked data format that can live in `.rodata` and be consumed without heap-driven parsing or runtime normalization
@@ -334,7 +338,7 @@ Acceptance:
 
 ## AA3. Baked prefab spawning into ECS
 Depends: AA2, Y2, Y3  
-Status: planned
+Status: abandonned branch left alive
 
 Purpose:
 - Let precompiled UI instantiate directly into runtime ECS storage so startup and hot paths do not need a temporary DOM or stylesheet representation

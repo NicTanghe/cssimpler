@@ -1,7 +1,8 @@
 use cssimpler_core::{LinearRgba, SvgBounds, SvgPathGeometry, SvgPoint, SvgScene, SvgViewBox};
 
 use super::{
-    ClipRect, blend_linear_over, clip_pixel_bounds, current_render_buffer_rows,
+    ClipRect, RasterizedColorTexture, blend_linear_over, clip_pixel_bounds,
+    current_render_buffer_rows,
     transform::{AffineTransform, ClipState, transform_clip_rect},
 };
 
@@ -44,6 +45,47 @@ pub(crate) fn draw_svg_scene_transformed(
         matrix.multiply(view_matrix),
         clip_state,
     );
+}
+
+pub(crate) fn rasterize_svg_scene_texture(
+    layout: LayoutBox,
+    scene: &SvgScene,
+) -> Option<RasterizedColorTexture> {
+    let Some(matrix) = svg_view_box_matrix(layout, scene.view_box) else {
+        return None;
+    };
+    let origin_x = layout.x.floor() as i32;
+    let origin_y = layout.y.floor() as i32;
+    let width = ((layout.x + layout.width).ceil() - layout.x.floor()).max(0.0) as usize;
+    let height = ((layout.y + layout.height).ceil() - layout.y.floor()).max(0.0) as usize;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let clip = ClipRect {
+        x0: origin_x as f32,
+        y0: origin_y as f32,
+        x1: origin_x as f32 + width as f32,
+        y1: origin_y as f32 + height as f32,
+    };
+    let mut pixels = vec![LinearRgba::TRANSPARENT; width.saturating_mul(height)];
+    rasterize_svg_scene_with_matrix(
+        &mut pixels,
+        width,
+        height,
+        origin_x,
+        origin_y,
+        scene,
+        matrix,
+        &ClipState::new(clip),
+    );
+    Some(RasterizedColorTexture {
+        origin_x,
+        origin_y,
+        width,
+        height,
+        pixels,
+    })
 }
 
 fn draw_svg_scene_with_matrix(
@@ -143,6 +185,103 @@ fn draw_svg_scene_with_matrix(
     }
 }
 
+fn rasterize_svg_scene_with_matrix(
+    pixels: &mut [LinearRgba],
+    width: usize,
+    height: usize,
+    origin_x: i32,
+    origin_y: i32,
+    scene: &SvgScene,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+
+    for path in &scene.paths {
+        let Some(source_bounds) = path.bounds() else {
+            continue;
+        };
+        let Some(bounds) = transform_svg_bounds(source_bounds, matrix)
+            .and_then(|bounds| bounds.intersect(clip_state.coarse))
+        else {
+            continue;
+        };
+        let x0 = bounds.x0.floor().max(origin_x as f32) as i32;
+        let y0 = bounds.y0.floor().max(origin_y as f32) as i32;
+        let x1 = bounds.x1.ceil().min(origin_x as f32 + width as f32) as i32;
+        let y1 = bounds.y1.ceil().min(origin_y as f32 + height as f32) as i32;
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+
+        let fill = path.paint.fill.map(|color| color.to_linear_rgba());
+        let stroke = if path.paint.stroke_width > f32::EPSILON {
+            path.paint.stroke.map(|color| color.to_linear_rgba())
+        } else {
+            None
+        };
+        if fill.is_none() && stroke.is_none() {
+            continue;
+        }
+
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let mut fill_hits = 0_u8;
+                let mut stroke_hits = 0_u8;
+                for (sample_x, sample_y) in SVG_COVERAGE_SAMPLES {
+                    let screen_x = x as f32 + sample_x;
+                    let screen_y = y as f32 + sample_y;
+                    if !clip_state.contains(screen_x, screen_y) {
+                        continue;
+                    }
+
+                    let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+                    if !source_x.is_finite() || !source_y.is_finite() {
+                        continue;
+                    }
+
+                    if fill.is_some() && point_in_svg_fill(&path.geometry, source_x, source_y) {
+                        fill_hits = fill_hits.saturating_add(1);
+                    }
+                    if stroke.is_some()
+                        && point_in_svg_stroke(
+                            &path.geometry,
+                            source_x,
+                            source_y,
+                            path.paint.stroke_width * 0.5,
+                        )
+                    {
+                        stroke_hits = stroke_hits.saturating_add(1);
+                    }
+                }
+
+                let index = (x - origin_x) as usize + (y - origin_y) as usize * width;
+                if let Some(fill) = fill
+                    && fill_hits > 0
+                {
+                    blend_linear_pixel(
+                        &mut pixels[index],
+                        with_coverage(fill, fill_hits as f32 / SVG_COVERAGE_SAMPLES.len() as f32),
+                    );
+                }
+                if let Some(stroke) = stroke
+                    && stroke_hits > 0
+                {
+                    blend_linear_pixel(
+                        &mut pixels[index],
+                        with_coverage(
+                            stroke,
+                            stroke_hits as f32 / SVG_COVERAGE_SAMPLES.len() as f32,
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn svg_view_box_matrix(layout: LayoutBox, view_box: SvgViewBox) -> Option<AffineTransform> {
     if layout.width <= f32::EPSILON
         || layout.height <= f32::EPSILON
@@ -192,6 +331,36 @@ fn with_coverage(color: LinearRgba, coverage: f32) -> LinearRgba {
         a: (color.a * coverage).clamp(0.0, 1.0),
         ..color
     }
+}
+
+fn blend_linear_pixel(destination: &mut LinearRgba, source: LinearRgba) {
+    let source_alpha = source.a.clamp(0.0, 1.0);
+    if source_alpha <= f32::EPSILON {
+        return;
+    }
+    let destination_alpha = destination.a.clamp(0.0, 1.0);
+    let out_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
+    if out_alpha <= f32::EPSILON {
+        *destination = LinearRgba::TRANSPARENT;
+        return;
+    }
+
+    let source_r = source.r * source_alpha;
+    let source_g = source.g * source_alpha;
+    let source_b = source.b * source_alpha;
+    let destination_r = destination.r * destination_alpha;
+    let destination_g = destination.g * destination_alpha;
+    let destination_b = destination.b * destination_alpha;
+    let out_r = source_r + destination_r * (1.0 - source_alpha);
+    let out_g = source_g + destination_g * (1.0 - source_alpha);
+    let out_b = source_b + destination_b * (1.0 - source_alpha);
+
+    *destination = LinearRgba {
+        r: (out_r / out_alpha).clamp(0.0, 1.0),
+        g: (out_g / out_alpha).clamp(0.0, 1.0),
+        b: (out_b / out_alpha).clamp(0.0, 1.0),
+        a: out_alpha,
+    };
 }
 
 fn point_in_svg_fill(geometry: &SvgPathGeometry, x: f32, y: f32) -> bool {

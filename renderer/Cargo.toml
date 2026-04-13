@@ -5,9 +5,12 @@ edition.workspace = true
 
 [dependencies]
 ab_glyph.workspace = true
+bytemuck.workspace = true
 cssimpler-core.workspace = true
 font8x8.workspace = true
+pollster.workspace = true
 softbuffer.workspace = true
+wgpu.workspace = true
 winit.workspace = true
 
 [target.'cfg(windows)'.dependencies]

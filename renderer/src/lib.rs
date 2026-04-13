@@ -11,6 +11,7 @@ use std::time::Duration;
 
 mod backdrop;
 mod fonts;
+mod gpu;
 mod gradient;
 mod input;
 mod runtime;
@@ -163,6 +164,15 @@ struct SubtreeSurfaceCache {
 struct BufferRows {
     start: usize,
     end: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RasterizedColorTexture {
+    pub(crate) origin_x: i32,
+    pub(crate) origin_y: i32,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) pixels: Vec<LinearRgba>,
 }
 
 impl BufferRows {
@@ -748,6 +758,13 @@ fn drawable_viewport_size(width: usize, height: usize) -> Option<ViewportSize> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RendererBackendKind {
+    #[default]
+    Cpu,
+    Gpu,
+}
+
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
     pub title: String,
@@ -756,6 +773,7 @@ pub struct WindowConfig {
     pub clear_color: Color,
     pub frame_time: Duration,
     pub middle_button_auto_scroll: bool,
+    pub backend: RendererBackendKind,
 }
 
 impl WindowConfig {
@@ -767,7 +785,13 @@ impl WindowConfig {
             clear_color: Color::rgb(248, 250, 252),
             frame_time: Duration::from_millis(16),
             middle_button_auto_scroll: true,
+            backend: RendererBackendKind::Cpu,
         }
+    }
+
+    pub fn with_backend(mut self, backend: RendererBackendKind) -> Self {
+        self.backend = backend;
+        self
     }
 }
 
@@ -776,6 +800,7 @@ pub enum RendererError {
     EventLoop(String),
     Window(String),
     Surface(String),
+    Backend(String),
 }
 
 impl Display for RendererError {
@@ -784,6 +809,7 @@ impl Display for RendererError {
             Self::EventLoop(source) => write!(f, "renderer event loop error: {source}"),
             Self::Window(source) => write!(f, "renderer window error: {source}"),
             Self::Surface(source) => write!(f, "renderer surface error: {source}"),
+            Self::Backend(source) => write!(f, "renderer backend error: {source}"),
         }
     }
 }

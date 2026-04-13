@@ -21,9 +21,11 @@ use crate::input::{
 };
 
 use super::{
-    ElementInteractionState, ElementPath, FrameInfo, FrameTimingStats, MouseEventKind,
-    RedrawSchedule, RendererError, Result, SceneProvider, WindowConfig,
-    dispatch_hover_transition_events, dispatch_mouse_event, drawable_viewport_size, duration_to_us,
+    ElementInteractionState, ElementPath, FrameInfo, FramePaintMode, FramePaintReason,
+    FrameTimingStats, MouseEventKind, PaintStats, RedrawSchedule, RendererBackendKind,
+    RendererError, Result, SceneProvider, WindowConfig, dispatch_hover_transition_events,
+    dispatch_mouse_event, drawable_viewport_size, duration_to_us,
+    gpu::{GpuPresentOutcome, GpuRuntimeBackend},
     record_frame_timing_stats, redraw_auto_scroll_indicator_regions, render_scene_update_internal,
     render_to_buffer_internal, resize_buffer, scrollbar, settle_element_interaction,
     should_present_frame, should_suspend_updates,
@@ -40,17 +42,411 @@ where
     app.finish()
 }
 
+struct CpuRuntimeBackend {
+    surface: Option<Surface<OwnedDisplayHandle, Arc<Window>>>,
+    buffer: Vec<u32>,
+    buffer_width: usize,
+    buffer_height: usize,
+}
+
+impl CpuRuntimeBackend {
+    fn new(context: &Context<OwnedDisplayHandle>, window: &Arc<Window>) -> Result<Self> {
+        let mut backend = Self {
+            surface: None,
+            buffer: Vec::new(),
+            buffer_width: 0,
+            buffer_height: 0,
+        };
+        backend.recreate_surface(context, window)?;
+        Ok(backend)
+    }
+
+    fn recreate_surface(
+        &mut self,
+        context: &Context<OwnedDisplayHandle>,
+        window: &Arc<Window>,
+    ) -> Result<()> {
+        self.surface =
+            Some(Surface::new(context, Arc::clone(window)).map_err(RendererError::from)?);
+        Ok(())
+    }
+
+    fn resize_surface(
+        &mut self,
+        width: usize,
+        height: usize,
+        clear_color: cssimpler_core::Color,
+    ) -> Result<bool> {
+        let resized = self.buffer_width != width || self.buffer_height != height;
+        resize_buffer(
+            &mut self.buffer,
+            &mut self.buffer_width,
+            &mut self.buffer_height,
+            width,
+            height,
+            clear_color,
+        );
+
+        let Some(surface) = self.surface.as_mut() else {
+            return Ok(resized);
+        };
+        let (Some(width), Some(height)) = (
+            NonZeroU32::new(self.buffer_width as u32),
+            NonZeroU32::new(self.buffer_height as u32),
+        ) else {
+            return Ok(resized);
+        };
+        surface.resize(width, height).map_err(RendererError::from)?;
+        Ok(resized)
+    }
+
+    fn has_surface(&self) -> bool {
+        self.surface.is_some()
+    }
+
+    fn suspend(&mut self) {
+        self.surface = None;
+    }
+
+    fn present(
+        &mut self,
+        scene: &[cssimpler_core::RenderNode],
+        extracted_scene: &ExtractedScene,
+        previous_scene: Option<&ExtractedScene>,
+        previous_indicator: Option<scrollbar::AutoScrollIndicator>,
+        indicator: Option<scrollbar::AutoScrollIndicator>,
+        clear_color: cssimpler_core::Color,
+        resized: bool,
+    ) -> Result<Option<PresentedFrame>> {
+        let paint_start = Instant::now();
+        let paint_stats = if resized {
+            render_to_buffer_internal(
+                extracted_scene,
+                &mut self.buffer,
+                self.buffer_width,
+                self.buffer_height,
+                clear_color,
+            )
+        } else if let Some(previous_scene) = previous_scene {
+            render_scene_update_internal(
+                previous_scene,
+                extracted_scene,
+                &mut self.buffer,
+                self.buffer_width,
+                self.buffer_height,
+                clear_color,
+            )
+        } else {
+            render_to_buffer_internal(
+                extracted_scene,
+                &mut self.buffer,
+                self.buffer_width,
+                self.buffer_height,
+                clear_color,
+            )
+        };
+        let paint_us = duration_to_us(paint_start.elapsed());
+
+        redraw_auto_scroll_indicator_regions(
+            previous_indicator,
+            indicator,
+            scene,
+            &mut self.buffer,
+            self.buffer_width,
+            self.buffer_height,
+            clear_color,
+        );
+
+        let Some(surface) = self.surface.as_mut() else {
+            return Ok(Some(PresentedFrame {
+                paint_stats,
+                paint_us,
+                present_us: 0,
+            }));
+        };
+        let present_start = Instant::now();
+        let mut target = surface.buffer_mut().map_err(RendererError::from)?;
+        target.copy_from_slice(&self.buffer);
+        target.present().map_err(RendererError::from)?;
+        Ok(Some(PresentedFrame {
+            paint_stats,
+            paint_us,
+            present_us: duration_to_us(present_start.elapsed()),
+        }))
+    }
+}
+
+struct RuntimeBackendState {
+    preferred: RendererBackendKind,
+    cpu: Option<CpuRuntimeBackend>,
+    gpu: Option<GpuRuntimeBackend>,
+    last_fallback_reason: Option<String>,
+}
+
+struct PresentedFrame {
+    paint_stats: PaintStats,
+    paint_us: u64,
+    present_us: u64,
+}
+
+impl RuntimeBackendState {
+    fn new(preferred: RendererBackendKind) -> Self {
+        Self {
+            preferred,
+            cpu: None,
+            gpu: None,
+            last_fallback_reason: None,
+        }
+    }
+
+    fn attach_window(
+        &mut self,
+        context: &Context<OwnedDisplayHandle>,
+        window: &Arc<Window>,
+    ) -> Result<()> {
+        match self.preferred {
+            RendererBackendKind::Cpu => {
+                let _ = self.ensure_cpu(context, window)?;
+            }
+            RendererBackendKind::Gpu => {
+                if self.ensure_gpu(window).is_err() {
+                    self.report_fallback("GPU backend initialization failed; using CPU fallback");
+                    let _ = self.ensure_cpu(context, window)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_viewport(
+        &mut self,
+        context: &Context<OwnedDisplayHandle>,
+        window: &Arc<Window>,
+        viewport: super::ViewportSize,
+        clear_color: cssimpler_core::Color,
+    ) -> Result<bool> {
+        match self.preferred {
+            RendererBackendKind::Cpu => self.ensure_cpu(context, window)?.resize_surface(
+                viewport.width,
+                viewport.height,
+                clear_color,
+            ),
+            RendererBackendKind::Gpu => {
+                if let Ok(gpu) = self.ensure_gpu(window) {
+                    gpu.resize_surface(viewport.width as u32, viewport.height as u32)
+                } else {
+                    self.report_fallback("GPU backend is unavailable; using CPU fallback");
+                    self.ensure_cpu(context, window)?.resize_surface(
+                        viewport.width,
+                        viewport.height,
+                        clear_color,
+                    )
+                }
+            }
+        }
+    }
+
+    fn has_surface(&self) -> bool {
+        self.gpu
+            .as_ref()
+            .is_some_and(GpuRuntimeBackend::has_surface)
+            || self
+                .cpu
+                .as_ref()
+                .is_some_and(CpuRuntimeBackend::has_surface)
+    }
+
+    fn suspend(&mut self) {
+        if let Some(cpu) = self.cpu.as_mut() {
+            cpu.suspend();
+        }
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.suspend();
+        }
+    }
+
+    fn present(
+        &mut self,
+        context: &Context<OwnedDisplayHandle>,
+        window: &Arc<Window>,
+        scene: &[cssimpler_core::RenderNode],
+        extracted_scene: &ExtractedScene,
+        previous_scene: Option<&ExtractedScene>,
+        previous_indicator: Option<scrollbar::AutoScrollIndicator>,
+        indicator: Option<scrollbar::AutoScrollIndicator>,
+        clear_color: cssimpler_core::Color,
+        resized: bool,
+    ) -> Result<Option<PresentedFrame>> {
+        match self.preferred {
+            RendererBackendKind::Cpu => self.present_cpu(
+                context,
+                window,
+                scene,
+                extracted_scene,
+                previous_scene,
+                previous_indicator,
+                indicator,
+                clear_color,
+                resized,
+            ),
+            RendererBackendKind::Gpu => {
+                if let Ok(gpu) = self.ensure_gpu(window) {
+                    match gpu.present(extracted_scene, clear_color, indicator.is_some())? {
+                        GpuPresentOutcome::Presented {
+                            paint_us,
+                            present_us,
+                        } => {
+                            self.clear_fallback();
+                            Ok(Some(PresentedFrame {
+                                paint_stats: gpu_paint_stats(extracted_scene),
+                                paint_us,
+                                present_us,
+                            }))
+                        }
+                        GpuPresentOutcome::Skipped => Ok(None),
+                        GpuPresentOutcome::Fallback(reason) => {
+                            self.report_fallback(&reason);
+                            self.present_cpu(
+                                context,
+                                window,
+                                scene,
+                                extracted_scene,
+                                previous_scene,
+                                previous_indicator,
+                                indicator,
+                                clear_color,
+                                resized,
+                            )
+                        }
+                    }
+                } else {
+                    self.report_fallback("GPU backend is unavailable; using CPU fallback");
+                    self.present_cpu(
+                        context,
+                        window,
+                        scene,
+                        extracted_scene,
+                        previous_scene,
+                        previous_indicator,
+                        indicator,
+                        clear_color,
+                        resized,
+                    )
+                }
+            }
+        }
+    }
+
+    fn ensure_cpu(
+        &mut self,
+        context: &Context<OwnedDisplayHandle>,
+        window: &Arc<Window>,
+    ) -> Result<&mut CpuRuntimeBackend> {
+        if self.cpu.is_none() {
+            self.cpu = Some(CpuRuntimeBackend::new(context, window)?);
+        } else if !self
+            .cpu
+            .as_ref()
+            .is_some_and(CpuRuntimeBackend::has_surface)
+        {
+            self.cpu
+                .as_mut()
+                .expect("cpu backend should exist")
+                .recreate_surface(context, window)?;
+        }
+        Ok(self.cpu.as_mut().expect("cpu backend should exist"))
+    }
+
+    fn ensure_gpu(&mut self, window: &Arc<Window>) -> Result<&mut GpuRuntimeBackend> {
+        if self.gpu.is_none() {
+            self.gpu = Some(GpuRuntimeBackend::new(window)?);
+        } else if !self
+            .gpu
+            .as_ref()
+            .is_some_and(GpuRuntimeBackend::has_surface)
+        {
+            self.gpu
+                .as_mut()
+                .expect("gpu backend should exist")
+                .recreate_surface(window)?;
+        }
+        Ok(self.gpu.as_mut().expect("gpu backend should exist"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn present_cpu(
+        &mut self,
+        context: &Context<OwnedDisplayHandle>,
+        window: &Arc<Window>,
+        scene: &[cssimpler_core::RenderNode],
+        extracted_scene: &ExtractedScene,
+        previous_scene: Option<&ExtractedScene>,
+        previous_indicator: Option<scrollbar::AutoScrollIndicator>,
+        indicator: Option<scrollbar::AutoScrollIndicator>,
+        clear_color: cssimpler_core::Color,
+        resized: bool,
+    ) -> Result<Option<PresentedFrame>> {
+        let size = window.inner_size();
+        let Some(viewport) = drawable_viewport_size(size.width as usize, size.height as usize)
+        else {
+            return Ok(None);
+        };
+        let cpu = self.ensure_cpu(context, window)?;
+        let _ = cpu.resize_surface(viewport.width, viewport.height, clear_color)?;
+        cpu.present(
+            scene,
+            extracted_scene,
+            previous_scene,
+            previous_indicator,
+            indicator,
+            clear_color,
+            resized,
+        )
+    }
+
+    fn report_fallback(&mut self, reason: &str) {
+        if self.last_fallback_reason.as_deref() == Some(reason) {
+            return;
+        }
+        eprintln!("cssimpler renderer: {reason}");
+        self.last_fallback_reason = Some(reason.to_string());
+    }
+
+    fn clear_fallback(&mut self) {
+        self.last_fallback_reason = None;
+    }
+}
+
+fn gpu_paint_stats(scene: &ExtractedScene) -> PaintStats {
+    let painted_pixels = scene
+        .items
+        .iter()
+        .map(|item| {
+            (item.layout.width.max(0.0).ceil() as usize)
+                .saturating_mul(item.layout.height.max(0.0).ceil() as usize)
+        })
+        .sum::<usize>();
+
+    PaintStats {
+        workers: 1,
+        dirty_regions: 0,
+        dirty_jobs: 0,
+        damage_pixels: painted_pixels,
+        painted_pixels,
+        scene_passes: 1,
+        mode: FramePaintMode::Full,
+        reason: FramePaintReason::FullRedraw,
+    }
+}
+
 struct RuntimeApp<P> {
     config: WindowConfig,
     scene_provider: P,
     context: Context<OwnedDisplayHandle>,
-    surface: Option<Surface<OwnedDisplayHandle, Arc<Window>>>,
+    backend: RuntimeBackendState,
     window: Option<Arc<Window>>,
     window_id: Option<WindowId>,
     fatal_error: Option<RendererError>,
-    buffer: Vec<u32>,
-    buffer_width: usize,
-    buffer_height: usize,
     frame_index: u64,
     last_frame_at: Option<Instant>,
     next_redraw_at: Option<Instant>,
@@ -83,17 +479,15 @@ where
     P: SceneProvider,
 {
     fn new(config: WindowConfig, scene_provider: P, context: Context<OwnedDisplayHandle>) -> Self {
+        let backend_kind = config.backend;
         Self {
             config,
             scene_provider,
             context,
-            surface: None,
+            backend: RuntimeBackendState::new(backend_kind),
             window: None,
             window_id: None,
             fatal_error: None,
-            buffer: Vec::new(),
-            buffer_width: 0,
-            buffer_height: 0,
             frame_index: 0,
             last_frame_at: None,
             next_redraw_at: None,
@@ -123,7 +517,7 @@ where
     }
 
     fn finish(mut self) -> Result<()> {
-        self.surface = None;
+        self.backend.suspend();
         self.window = None;
         self.fatal_error.map_or(Ok(()), Err)
     }
@@ -143,7 +537,7 @@ where
             return false;
         };
         let size = window.inner_size();
-        size.width > 0 && size.height > 0 && self.surface.is_some()
+        size.width > 0 && size.height > 0 && self.backend.has_surface()
     }
 
     fn wants_continuous_redraw(&self) -> bool {
@@ -172,29 +566,26 @@ where
         let Some(window) = self.window.as_ref() else {
             return;
         };
-        match Surface::new(&self.context, Arc::clone(window)) {
-            Ok(surface) => {
-                self.surface = Some(surface);
-                self.resize_surface(event_loop);
-            }
-            Err(error) => self.fail(event_loop, error),
+        if let Err(error) = self.backend.attach_window(&self.context, window) {
+            self.fail(event_loop, error);
+            return;
         }
+        self.resize_surface(event_loop);
     }
 
     fn resize_surface(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(surface) = self.surface.as_mut() else {
-            return;
-        };
         let Some(window) = self.window.as_ref() else {
             return;
         };
         let size = window.inner_size();
-        let (Some(width), Some(height)) =
-            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        let Some(viewport) = drawable_viewport_size(size.width as usize, size.height as usize)
         else {
             return;
         };
-        if let Err(error) = surface.resize(width, height) {
+        if let Err(error) =
+            self.backend
+                .prepare_viewport(&self.context, window, viewport, self.config.clear_color)
+        {
             self.fail(event_loop, error);
         }
     }
@@ -276,7 +667,7 @@ where
     fn prepare_suspend(&mut self, event_loop: &ActiveEventLoop) {
         self.suspended = true;
         let _ = self.scrollbar_controller.cancel_middle_button_auto_scroll();
-        self.surface = None;
+        self.backend.suspend();
         self.clear_pointer_state();
         self.handle_engine_event(event_loop, EngineEvent::Suspended);
     }
@@ -335,6 +726,18 @@ where
         let Some(viewport) = drawable_viewport_size(size.width as usize, size.height as usize)
         else {
             return;
+        };
+        let resized = match self.backend.prepare_viewport(
+            &self.context,
+            window,
+            viewport,
+            self.config.clear_color,
+        ) {
+            Ok(resized) => resized,
+            Err(error) => {
+                self.fail(event_loop, error);
+                return;
+            }
         };
 
         let frame_begin = Instant::now();
@@ -518,16 +921,6 @@ where
 
         frame_stats.scene_prep_us = duration_to_us(scene_prep_start.elapsed());
         let auto_scroll_indicator = self.scrollbar_controller.auto_scroll_indicator();
-        let resized = self.buffer_width != viewport.width || self.buffer_height != viewport.height;
-        resize_buffer(
-            &mut self.buffer,
-            &mut self.buffer_width,
-            &mut self.buffer_height,
-            viewport.width,
-            viewport.height,
-            self.config.clear_color,
-        );
-
         let extracted_scene = ExtractedScene::from_render_roots(&scene);
 
         if should_present_frame(
@@ -537,71 +930,37 @@ where
             auto_scroll_indicator,
             resized,
         ) {
-            let paint_start = Instant::now();
-            let paint_stats = if resized {
-                render_to_buffer_internal(
-                    &extracted_scene,
-                    &mut self.buffer,
-                    self.buffer_width,
-                    self.buffer_height,
-                    self.config.clear_color,
-                )
-            } else if let Some(previous_scene) = self.previous_presented_scene.as_ref() {
-                render_scene_update_internal(
-                    previous_scene,
-                    &extracted_scene,
-                    &mut self.buffer,
-                    self.buffer_width,
-                    self.buffer_height,
-                    self.config.clear_color,
-                )
-            } else {
-                render_to_buffer_internal(
-                    &extracted_scene,
-                    &mut self.buffer,
-                    self.buffer_width,
-                    self.buffer_height,
-                    self.config.clear_color,
-                )
-            };
-            frame_stats.paint_us = duration_to_us(paint_start.elapsed());
-            frame_stats.render_workers = paint_stats.workers;
-            frame_stats.dirty_regions = paint_stats.dirty_regions;
-            frame_stats.dirty_jobs = paint_stats.dirty_jobs;
-            frame_stats.damage_pixels = paint_stats.damage_pixels;
-            frame_stats.painted_pixels = paint_stats.painted_pixels;
-            frame_stats.scene_passes = paint_stats.scene_passes;
-            frame_stats.paint_mode = paint_stats.mode;
-            frame_stats.paint_reason = paint_stats.reason;
-
-            let present_start = Instant::now();
-            redraw_auto_scroll_indicator_regions(
+            let presented_frame = match self.backend.present(
+                &self.context,
+                window,
+                &scene,
+                &extracted_scene,
+                self.previous_presented_scene.as_ref(),
                 self.previous_presented_indicator,
                 auto_scroll_indicator,
-                &scene,
-                &mut self.buffer,
-                self.buffer_width,
-                self.buffer_height,
                 self.config.clear_color,
-            );
-            if let Some(surface) = self.surface.as_mut() {
-                match surface.buffer_mut() {
-                    Ok(mut target) => {
-                        target.copy_from_slice(&self.buffer);
-                        if let Err(error) = target.present() {
-                            self.fail(event_loop, error);
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        self.fail(event_loop, error);
-                        return;
-                    }
+                resized,
+            ) {
+                Ok(paint_stats) => paint_stats,
+                Err(error) => {
+                    self.fail(event_loop, error);
+                    return;
                 }
+            };
+            if let Some(presented_frame) = presented_frame {
+                frame_stats.paint_us = presented_frame.paint_us;
+                frame_stats.render_workers = presented_frame.paint_stats.workers;
+                frame_stats.dirty_regions = presented_frame.paint_stats.dirty_regions;
+                frame_stats.dirty_jobs = presented_frame.paint_stats.dirty_jobs;
+                frame_stats.damage_pixels = presented_frame.paint_stats.damage_pixels;
+                frame_stats.painted_pixels = presented_frame.paint_stats.painted_pixels;
+                frame_stats.scene_passes = presented_frame.paint_stats.scene_passes;
+                frame_stats.paint_mode = presented_frame.paint_stats.mode;
+                frame_stats.paint_reason = presented_frame.paint_stats.reason;
+                frame_stats.present_us = presented_frame.present_us;
+                self.previous_presented_scene = Some(extracted_scene);
+                self.previous_presented_indicator = auto_scroll_indicator;
             }
-            frame_stats.present_us = duration_to_us(present_start.elapsed());
-            self.previous_presented_scene = Some(extracted_scene);
-            self.previous_presented_indicator = auto_scroll_indicator;
         }
 
         self.previous_left_down = interactive_left_down;
@@ -661,7 +1020,7 @@ where
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.surface = None;
+        self.backend.suspend();
         self.window = None;
     }
 

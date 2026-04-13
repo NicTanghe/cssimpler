@@ -246,7 +246,14 @@ struct BaselineSummary {
 }
 
 fn main() -> Result<()> {
-    let config = WindowConfig::new("cssimpler / gui effect pressure", 1440, 960);
+    run(WindowConfig::new(
+        "cssimpler / gui effect pressure",
+        1440,
+        960,
+    ))
+}
+
+pub fn run(config: WindowConfig) -> Result<()> {
     if baseline_autostart_requested() {
         ACTIONS.fetch_or(ACTION_TOGGLE_BASELINE, Ordering::Relaxed);
     }
@@ -855,7 +862,9 @@ fn stat_chip(label: impl Into<String>, value: impl Into<String>) -> Node {
 fn control_button(label: &'static str, handler: fn(), active: bool) -> Node {
     let button = ui! {
         <button class="control-button" type="button" onclick={handler}>
-            {label}
+            <span class="control-button-label">
+                {label}
+            </span>
         </button>
     };
 
@@ -1342,7 +1351,9 @@ mod tests {
         normal_app_refresh, phase_label,
     };
     use cssimpler::app::{Invalidation, Refresh, RuntimeStats};
+    use cssimpler::core::{Color, RenderKind, RenderNode};
     use cssimpler::renderer::{FrameInfo, FramePaintMode, FrameTimingStats};
+    use cssimpler::style::build_render_tree_in_viewport;
 
     #[test]
     fn actions_expand_the_effect_wall() {
@@ -1641,6 +1652,24 @@ mod tests {
         assert_eq!(summary.scenarios[2].full_frames, 2);
     }
 
+    #[test]
+    fn control_buttons_keep_visible_text_nodes() {
+        let scene = build_render_tree_in_viewport(
+            &super::build_ui(&EffectStressState::default()),
+            super::stylesheet(),
+            1440,
+            960,
+        );
+        let button =
+            find_text_node(&scene, "-8 tiles").expect("control button text node should exist");
+
+        assert!(matches!(button.kind, RenderKind::Text(ref text) if text == "-8 tiles"));
+        assert_eq!(button.style.foreground, Color::rgb(226, 232, 240));
+        assert!(button.layout.width > 0.0);
+        assert!(button.layout.height > 0.0);
+        assert!(button.text_layout.is_some());
+    }
+
     fn frame(frame_index: u64) -> FrameInfo {
         frame_with_delta(frame_index, 16)
     }
@@ -1693,5 +1722,15 @@ mod tests {
                 ..FrameTimingStats::default()
             },
         };
+    }
+
+    fn find_text_node<'a>(node: &'a RenderNode, text: &str) -> Option<&'a RenderNode> {
+        if matches!(&node.kind, RenderKind::Text(content) if content == text) {
+            return Some(node);
+        }
+
+        node.children
+            .iter()
+            .find_map(|child| find_text_node(child, text))
     }
 }

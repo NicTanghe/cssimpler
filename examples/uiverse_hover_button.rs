@@ -10,8 +10,14 @@ use cssimpler::ui;
 const BUTTON_TEXT: &str = "uiverse";
 
 fn main() -> Result<()> {
-    let config = WindowConfig::new("cssimpler / uiverse hover button", 1280, 720);
+    run(WindowConfig::new(
+        "cssimpler / uiverse hover button",
+        1280,
+        720,
+    ))
+}
 
+pub fn run(config: WindowConfig) -> Result<()> {
     App::new((), stylesheet(), update, build_ui)
         .run(config)
         .map_err(Into::into)

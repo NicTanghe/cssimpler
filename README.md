@@ -39,7 +39,7 @@ If you know HTML and CSS, you already know this library.
 - Real CSS (no custom styling DSL)  
 - Taffy layout engine  
 - CPU renderer (current)  
-- Optional GPU renderer (planned)  
+- Optional GPU renderer with CPU fallback for unsupported features  
 - Minimal runtime overhead  
 
 ---
@@ -93,14 +93,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation};
 use cssimpler::core::Node;
-use cssimpler::renderer::{FrameInfo, WindowConfig};
+use cssimpler::renderer::{FrameInfo, RendererBackendKind, WindowConfig};
 use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
 
 static CLICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> Result<()> {
-    let config = WindowConfig::new("cssimpler / counter", 480, 220);
+    let config = WindowConfig::new("cssimpler / counter", 480, 220)
+        .with_backend(RendererBackendKind::Gpu);
 
     App::new((), stylesheet(), update, build_ui)
         .run(config)
@@ -178,7 +179,7 @@ If you want a reactive framework — this is not it.
 ~~~text
 core/      - DOM, layout bridge, style resolution  
 style/     - CSS parsing (lightningcss), selectors  
-renderer/  - CPU renderer (current), GPU (planned)  
+renderer/  - CPU renderer + baseline GPU backend  
 macro/     - ui! macro (HTML-like → AST)  
 app/       - entrypoint + render loop  
 ~~~
@@ -189,11 +190,9 @@ app/       - entrypoint + render loop
 
 **Current**
 - CPU renderer  
+- Optional GPU backend for fills, borders, rounded corners, text, and clipping  
 - Partial redraws  
 - Deterministic output  
-
-**Planned**
-- Optional GPU backend  
 - Same API  
 
 ---
@@ -249,7 +248,7 @@ Early stage — APIs may change.
 ## Roadmap
 
 - [ ] Expand CSS coverage  
-- [ ] GPU renderer  
+- [ ] Expand GPU feature parity beyond the baseline backend  
 - [ ] Text layout improvements  
 - [ ] Full HTML5 support  
 - [ ] Profiling tools  

@@ -21,9 +21,12 @@ anyhow = "1"
 font8x8 = "0.3"
 fontdb = "0.23.0"
 lightningcss = "1.0.0-alpha.70"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
 softbuffer = "0.4.8"
 taffy = "0.7"
 cssparser = "0.33.0"
+wgpu = "25"
 winit = "0.30.13"
 
 [dependencies]

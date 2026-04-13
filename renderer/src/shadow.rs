@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use cssimpler_core::{Color, CornerRadius, LayoutBox, TextStrokeStyle};
+use cssimpler_core::{Color, CornerRadius, LayoutBox, LinearRgba, TextStrokeStyle};
 
 use super::shapes::{
     clip_pixel_bounds, draw_rounded_rect, expand_corner_radius, expand_layout,
     non_empty_layout_clip, offset_layout, point_in_rounded_rect,
 };
 use super::{
-    ClipRect, PreparedBlendColor, blend_mask_row, current_render_buffer_rows,
+    ClipRect, PreparedBlendColor, RasterizedColorTexture, blend_mask_row,
+    current_render_buffer_rows,
     transform::{AffineTransform, ClipState, transform_clip_rect},
 };
 
@@ -339,6 +340,39 @@ pub(crate) fn draw_shadow_effect_transformed(
     );
 }
 
+pub(crate) fn rasterize_shadow_texture(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    shadow: cssimpler_core::BoxShadow,
+) -> Option<RasterizedColorTexture> {
+    let base_layout = offset_layout(
+        expand_layout(layout, shadow.spread),
+        shadow.offset_x,
+        shadow.offset_y,
+    );
+    let base_radius = expand_corner_radius(layout, radius, shadow.spread);
+    let blur_radius = shadow.blur_radius.max(0.0);
+    let (mask, offset_x, offset_y) = cached_shadow_mask(base_layout, base_radius, blur_radius);
+    if mask.width == 0 || mask.height == 0 || shadow.color.a == 0 {
+        return None;
+    }
+
+    let color = shadow.color.to_linear_rgba();
+    let pixels = mask
+        .alpha
+        .iter()
+        .map(|alpha| alpha_mask_color(color, *alpha))
+        .collect();
+
+    Some(RasterizedColorTexture {
+        origin_x: mask.origin_x + offset_x,
+        origin_y: mask.origin_y + offset_y,
+        width: mask.width,
+        height: mask.height,
+        pixels,
+    })
+}
+
 pub(crate) fn shadow_bounds(
     layout: LayoutBox,
     shadow: cssimpler_core::BoxShadow,
@@ -529,6 +563,19 @@ fn draw_shadow_mask_transformed(
                 color.a,
             );
         }
+    }
+}
+
+fn alpha_mask_color(color: LinearRgba, alpha: u8) -> LinearRgba {
+    let alpha = color.a * (alpha as f32 / 255.0);
+    if alpha <= f32::EPSILON {
+        return LinearRgba::TRANSPARENT;
+    }
+    LinearRgba {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+        a: alpha.clamp(0.0, 1.0),
     }
 }
 
