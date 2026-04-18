@@ -150,50 +150,53 @@ fn update(state: &mut SidebarState, _frame: FrameInfo) -> Invalidation {
 }
 
 fn build_ui(state: &SidebarState) -> Node {
-    Node::element("div")
-        .with_id("app")
-        .with_child(build_workspace(state))
-        .into()
+    ui! {
+        <div id="app">
+            {build_workspace(state)}
+        </div>
+    }
 }
 
 fn build_workspace(state: &SidebarState) -> Node {
-    Node::element("section")
-        .with_class("workspace")
-        .with_child(build_sidebar(state))
-        .with_child(build_content(state))
-        .into()
+    ui! {
+        <section class="workspace">
+            {build_sidebar(state)}
+            {build_content(state)}
+        </section>
+    }
 }
 
 fn build_sidebar(state: &SidebarState) -> Node {
-    let mut sidebar = Node::element("aside").with_class("sidebar");
     if state.collapsed {
-        sidebar = sidebar.with_class("sidebar-collapsed");
+        ui! {
+            <aside class="sidebar sidebar-collapsed">
+                {build_sidebar_header(state)}
+                {build_menu(state)}
+            </aside>
+        }
+    } else {
+        ui! {
+            <aside class="sidebar">
+                {build_sidebar_header(state)}
+                {build_menu(state)}
+                {build_queue_panel(state)}
+            </aside>
+        }
     }
-
-    sidebar = sidebar
-        .with_child(build_sidebar_header(state))
-        .with_child(build_menu(state));
-
-    if !state.collapsed {
-        sidebar = sidebar.with_child(build_queue_panel(state));
-    }
-
-    sidebar.into()
 }
 
 fn build_sidebar_header(state: &SidebarState) -> Node {
     if state.collapsed {
-        return Node::element("div")
-            .with_class("sidebar-header-compact")
-            .with_child(text_element("p", "rail-badge", "UI"))
-            .with_child(
-                Node::element("button")
-                    .with_class("rail-toggle")
-                    .on_click(toggle_sidebar)
-                    .with_child(Node::text(">"))
-                    .into(),
-            )
-            .into();
+        return ui! {
+            <div class="sidebar-header-compact">
+                <p class="rail-badge">
+                    UI
+                </p>
+                <button class="rail-toggle" onclick={toggle_sidebar}>
+                    {">"}
+                </button>
+            </div>
+        };
     }
 
     ui! {
@@ -214,38 +217,42 @@ fn build_sidebar_header(state: &SidebarState) -> Node {
 }
 
 fn build_menu(state: &SidebarState) -> Node {
-    let items = [
-        ("Browse", "BR", "menu-item-active"),
-        ("Pinned", "PI", "menu-item-soft"),
-        ("Activity", "AC", "menu-item-soft"),
-        ("Archive", "AR", "menu-item-soft"),
-    ];
-
-    let mut menu = Node::element("nav").with_class("menu-stack");
-    for (label, glyph, accent_class) in items {
-        menu = menu.with_child(build_menu_item(label, glyph, accent_class, state.collapsed));
+    ui! {
+        <nav class="menu-stack">
+            {build_menu_item("Browse", "BR", "menu-item-active", state.collapsed)}
+            {build_menu_item("Pinned", "PI", "menu-item-soft", state.collapsed)}
+            {build_menu_item("Activity", "AC", "menu-item-soft", state.collapsed)}
+            {build_menu_item("Archive", "AR", "menu-item-soft", state.collapsed)}
+        </nav>
     }
-
-    menu.into()
 }
 
 fn build_menu_item(label: &str, glyph: &str, accent_class: &'static str, collapsed: bool) -> Node {
-    let mut item = Node::element("div")
-        .with_class("menu-item")
-        .with_class(accent_class)
-        .with_child(text_element("p", "menu-glyph", glyph));
-
-    if !collapsed {
-        item = item.with_child(text_element("p", "menu-label", label));
+    if collapsed {
+        return ui! {
+            <div class="menu-item" class={accent_class}>
+                <p class="menu-glyph">
+                    {glyph}
+                </p>
+            </div>
+        };
     }
 
-    item.into()
+    ui! {
+        <div class="menu-item" class={accent_class}>
+            <p class="menu-glyph">
+                {glyph}
+            </p>
+            <p class="menu-label">
+                {label}
+            </p>
+        </div>
+    }
 }
 
 fn build_queue_panel(state: &SidebarState) -> Node {
-    Node::element("section")
-        .with_class("queue-panel")
-        .with_child(ui! {
+    ui! {
+        <section class="queue-panel">
             <div class="queue-header">
                 <p class="queue-kicker">
                     Left panel queue
@@ -254,35 +261,46 @@ fn build_queue_panel(state: &SidebarState) -> Node {
                     {state.queue_count_label()}
                 </p>
             </div>
-        })
-        .with_child(build_queue_shell(state))
-        .into()
+            {build_queue_shell(state)}
+        </section>
+    }
 }
 
 fn build_queue_shell(state: &SidebarState) -> Node {
-    Node::element("div")
-        .with_class("queue-shell")
-        .with_child(build_queue_viewport(state))
-        .into()
+    ui! {
+        <div class="queue-shell">
+            {build_queue_viewport(state)}
+        </div>
+    }
 }
 
 fn build_queue_viewport(state: &SidebarState) -> Node {
-    let mut viewport = Node::element("div").with_class("queue-viewport");
+    let mut viewport = ui! {
+        <div class="queue-viewport"></div>
+    };
 
-    for card in &state.cards {
-        viewport = viewport.with_child(build_queue_card(card));
-    }
+    let Node::Element(viewport_element) = &mut viewport else {
+        unreachable!("queue viewport root should stay an element");
+    };
 
-    viewport.into()
+    viewport_element
+        .children
+        .extend(state.cards.iter().map(build_queue_card));
+
+    viewport
 }
 
 fn build_queue_card(card: &QueueCard) -> Node {
-    Node::element("article")
-        .with_class("queue-card")
-        .with_class(card.accent_class)
-        .with_child(text_element("p", "queue-card-title", &card.title))
-        .with_child(text_element("p", "queue-card-note", &card.note))
-        .into()
+    ui! {
+        <article class="queue-card" class={card.accent_class}>
+            <p class="queue-card-title">
+                {&card.title}
+            </p>
+            <p class="queue-card-note">
+                {&card.note}
+            </p>
+        </article>
+    }
 }
 
 fn build_content(state: &SidebarState) -> Node {
@@ -331,13 +349,6 @@ fn build_content(state: &SidebarState) -> Node {
             </div>
         </section>
     }
-}
-
-fn text_element(tag: &str, class_name: &str, text: impl Into<String>) -> Node {
-    Node::element(tag)
-        .with_class(class_name)
-        .with_child(Node::text(text.into()))
-        .into()
 }
 
 fn generate_card(seed: u64) -> QueueCard {

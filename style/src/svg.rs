@@ -157,8 +157,9 @@ fn apply_svg_attribute_property(
         )
     });
     let mut position_explicit = style.layout.taffy.position != taffy::prelude::Position::Relative;
+    let mut font_state = crate::fonts::FontDeclarationState::default();
     for declaration in declarations {
-        crate::apply_declaration(style, &mut position_explicit, &declaration);
+        crate::apply_declaration(style, &mut position_explicit, &mut font_state, &declaration);
     }
 }
 

@@ -387,6 +387,28 @@ Acceptance
 
 ---
 
+## H6. Real-world stylesheet compatibility hardening (`../simpla`)
+Depends: C1, C2, H1, H3  
+Status: planned  
+
+Purpose:
+- Prevent startup panics when downstream projects use valid CSS values that currently fail conversion
+
+Context:
+- Reported from `../simpla`: `thread 'main' panicked at ui/src/main.rs:41:52` with `UnsupportedValue("Value(Em(0.05))")` while loading `main.css`
+
+Support:
+- Add explicit conversion support for `em` length values in typography-related declarations that currently reject `Em(...)`
+- Route unsupported-but-parseable values through structured diagnostics instead of panic-only startup paths
+- Add regression coverage from the Simpla stylesheet cases that triggered this crash class
+
+Acceptance
+- Loading `../simpla` `main.css` no longer panics with `UnsupportedValue("Value(Em(...))")`
+- Unsupported declarations include property/value diagnostics that are actionable during debugging
+- A regression test fails if this panic class returns
+
+---
+
 # Epic F - Event system & interaction
 
 ## F1. Hit testing
@@ -1018,7 +1040,7 @@ Acceptance
 4. C2 + C4 (apply styles)  
 5. D1 + D2 (layout working)  
 6. E2 (basic rendering)  
-7. H1 + H2 + H3 + H4 + H5 (real typography, system fonts, arbitrary fonts, demo validation)  
+7. H1 + H2 + H3 + H4 + H5 + H6 (real typography plus real-world stylesheet compatibility hardening)  
 8. F1 + F2 (click handling)  
 9. E3 (shadows, visuals)  
 10. I1 + I2 + I3 + I4 (engine-owned CSS scrollbars)  

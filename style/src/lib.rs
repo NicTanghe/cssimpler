@@ -4,11 +4,12 @@ use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
     BorderLineStyle, Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath,
-    LayoutStyle, OverflowMode, ScrollbarWidth, Style, SvgPaint, TransformOperation, TransformOrigin,
-    TransformStyleMode, TransitionPropertyName, TransitionTimingFunction,
+    LayoutStyle, OverflowMode, ScrollbarWidth, Style, SvgPaint, TransformOperation,
+    TransformOrigin, TransformStyleMode, TransitionPropertyName, TransitionTimingFunction,
     fonts::{TextStyle, TextTransform},
 };
 use lightningcss::declaration::DeclarationBlock;
+use lightningcss::printer::PrinterOptions;
 use lightningcss::properties::Property;
 use lightningcss::properties::align::{
     AlignContent as CssAlignContent, AlignItems as CssAlignItems, AlignSelf as CssAlignSelf,
@@ -53,20 +54,20 @@ mod visual;
 
 use self::attributes::{parse_content_text_source, reject_unsupported_attr_usage};
 use self::fonts::{
-    FontSizeDeclaration, FontWeightDeclaration, LineHeightDeclaration, apply_font_declaration,
-    extract_property as extract_font_property,
+    FontDeclarationState, FontSizeDeclaration, FontWeightDeclaration, LetterSpacingDeclaration,
+    LineHeightDeclaration, apply_font_declaration, extract_property as extract_font_property,
 };
 use self::selectors::extract_selector;
 #[cfg(test)]
 pub(crate) use render_tree::resolve_element_tree;
 pub use render_tree::{
-    build_render_tree, build_render_tree_in_viewport,
+    LaidOutRenderTree, ResolvedRenderTree, build_render_tree, build_render_tree_in_viewport,
     build_render_tree_in_viewport_with_interaction,
     build_render_tree_in_viewport_with_interaction_at_root, build_render_tree_with_interaction,
     build_render_tree_with_interaction_at_root, extract_render_tree, layout_resolved_render_tree,
     layout_resolved_render_tree_in_viewport, rebuild_render_tree_with_cached_layout,
     rebuild_resolved_render_tree_with_cached_layout, resolve_render_tree_with_interaction_at_path,
-    resolve_render_tree_with_interaction_at_root, LaidOutRenderTree, ResolvedRenderTree,
+    resolve_render_tree_with_interaction_at_root,
 };
 
 pub use attributes::{AttributeTextSource, parse_attribute_text_source};
@@ -324,15 +325,35 @@ impl StyleRule {
             && (!self.interaction_dependencies.active || interaction.active.is_some())
     }
 
-    fn apply_custom_declarations(&self, style: &mut Style, position_explicit: &mut bool) {
+    fn apply_custom_declarations(
+        &self,
+        style: &mut Style,
+        position_explicit: &mut bool,
+        font_state: &mut FontDeclarationState,
+    ) {
         for &index in &self.custom_declaration_indices {
-            apply_declaration(style, position_explicit, &self.declarations[index]);
+            apply_declaration(
+                style,
+                position_explicit,
+                font_state,
+                &self.declarations[index],
+            );
         }
     }
 
-    fn apply_other_declarations(&self, style: &mut Style, position_explicit: &mut bool) {
+    fn apply_other_declarations(
+        &self,
+        style: &mut Style,
+        position_explicit: &mut bool,
+        font_state: &mut FontDeclarationState,
+    ) {
         for &index in &self.other_declaration_indices {
-            apply_declaration(style, position_explicit, &self.declarations[index]);
+            apply_declaration(
+                style,
+                position_explicit,
+                font_state,
+                &self.declarations[index],
+            );
         }
     }
 }
@@ -363,7 +384,7 @@ pub enum Declaration {
     FontWeight(FontWeightDeclaration),
     FontStyle(cssimpler_core::fonts::FontStyle),
     LineHeight(LineHeightDeclaration),
-    LetterSpacing(f32),
+    LetterSpacing(LetterSpacingDeclaration),
     TextTransform(TextTransform),
     CornerTopLeft(f32),
     CornerTopRight(f32),
@@ -535,6 +556,7 @@ fn resolve_style_target(
         custom_properties::inherit(&mut resolved, inherited_custom_properties);
     }
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
+    let mut font_state = FontDeclarationState::default();
     let element_ref = ElementRef::from(element);
     let matching_rule_indices = stylesheet.matching_rule_indices_with_context_and_pseudo(
         element_ref,
@@ -546,13 +568,13 @@ fn resolve_style_target(
 
     for &rule_index in &matching_rule_indices {
         if let Some(rule) = stylesheet.rules.get(rule_index) {
-            rule.apply_custom_declarations(&mut resolved, &mut position_explicit);
+            rule.apply_custom_declarations(&mut resolved, &mut position_explicit, &mut font_state);
         }
     }
 
     for &rule_index in &matching_rule_indices {
         if let Some(rule) = stylesheet.rules.get(rule_index) {
-            rule.apply_other_declarations(&mut resolved, &mut position_explicit);
+            rule.apply_other_declarations(&mut resolved, &mut position_explicit, &mut font_state);
         }
     }
 
@@ -567,10 +589,26 @@ fn extract_declarations(block: &DeclarationBlock<'_>) -> Result<Vec<Declaration>
     let mut declarations = Vec::new();
 
     for (property, _important) in block.iter() {
-        declarations.extend(extract_property(property)?);
+        declarations.extend(
+            extract_property(property)
+                .map_err(|error| contextualize_property_error(property, error))?,
+        );
     }
 
     Ok(declarations)
+}
+
+fn contextualize_property_error(property: &Property<'_>, error: StyleError) -> StyleError {
+    match error {
+        StyleError::UnsupportedValue(message) => {
+            let property_name = property.property_id().name().to_string();
+            let property_value = property
+                .value_to_css_string(PrinterOptions::default())
+                .unwrap_or_else(|_| format!("{property:?}"));
+            StyleError::UnsupportedValue(format!("{property_name}: {property_value} ({message})"))
+        }
+        other => other,
+    }
 }
 
 fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleError> {
@@ -636,12 +674,12 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
         Property::MinHeight(size) => {
             Ok(vec![Declaration::MinHeight(dimension_from_css_size(size)?)])
         }
-        Property::MaxWidth(size) => {
-            Ok(vec![Declaration::MaxWidth(dimension_from_css_max_size(size)?)])
-        }
-        Property::MaxHeight(size) => {
-            Ok(vec![Declaration::MaxHeight(dimension_from_css_max_size(size)?)])
-        }
+        Property::MaxWidth(size) => Ok(vec![Declaration::MaxWidth(dimension_from_css_max_size(
+            size,
+        )?)]),
+        Property::MaxHeight(size) => Ok(vec![Declaration::MaxHeight(dimension_from_css_max_size(
+            size,
+        )?)]),
         Property::Margin(margin) => Ok(vec![
             Declaration::MarginTop(length_percentage_auto_to_taffy(&margin.top)?),
             Declaration::MarginRight(length_percentage_auto_to_taffy(&margin.right)?),
@@ -1151,7 +1189,12 @@ fn grid_placement_from_css(line: &CssGridLine<'_>) -> Result<GridPlacement, Styl
     }
 }
 
-fn apply_declaration(style: &mut Style, position_explicit: &mut bool, declaration: &Declaration) {
+fn apply_declaration(
+    style: &mut Style,
+    position_explicit: &mut bool,
+    font_state: &mut FontDeclarationState,
+    declaration: &Declaration,
+) {
     if custom_properties::apply_declaration(style, declaration) {
         return;
     }
@@ -1161,12 +1204,12 @@ fn apply_declaration(style: &mut Style, position_explicit: &mut bool, declaratio
     {
         let declarations = declarations.unwrap_or_else(|error| panic!("{error}"));
         for declaration in declarations {
-            apply_declaration(style, position_explicit, &declaration);
+            apply_declaration(style, position_explicit, font_state, &declaration);
         }
         return;
     }
 
-    if apply_font_declaration(style, declaration) {
+    if apply_font_declaration(style, declaration, font_state) {
         return;
     }
 
@@ -1282,9 +1325,9 @@ mod tests {
     };
 
     use super::{
-        Declaration, ElementRef, Selector, ShadowDeclaration, StyleError, StyleRule, Stylesheet,
-        build_render_tree, build_render_tree_in_viewport, extract_render_tree,
-        layout_resolved_render_tree_in_viewport, parse_stylesheet,
+        Declaration, ElementRef, LetterSpacingDeclaration, Selector, ShadowDeclaration, StyleError,
+        StyleRule, Stylesheet, build_render_tree, build_render_tree_in_viewport,
+        extract_render_tree, layout_resolved_render_tree_in_viewport, parse_stylesheet,
         rebuild_render_tree_with_cached_layout, resolve_element_tree,
         resolve_render_tree_with_interaction_at_root, resolve_style, to_taffy,
     };
@@ -1391,20 +1434,25 @@ mod tests {
     fn flex_shorthand_matches_existing_longhand_pipeline_for_flex_one() {
         let shorthand_stylesheet =
             parse_stylesheet(".workspace { flex: 1; }").expect("flex shorthand should parse");
-        let longhand_stylesheet = parse_stylesheet(
-            ".workspace { flex-grow: 1; flex-shrink: 1; flex-basis: 0%; }",
-        )
-        .expect("flex longhand should parse");
+        let longhand_stylesheet =
+            parse_stylesheet(".workspace { flex-grow: 1; flex-shrink: 1; flex-basis: 0%; }")
+                .expect("flex longhand should parse");
         let element = Node::element("main").with_class("workspace");
         let shorthand = resolve_style(&element, &shorthand_stylesheet);
         let longhand = resolve_style(&element, &longhand_stylesheet);
 
-        assert_eq!(shorthand.layout.taffy.flex_grow, longhand.layout.taffy.flex_grow);
+        assert_eq!(
+            shorthand.layout.taffy.flex_grow,
+            longhand.layout.taffy.flex_grow
+        );
         assert_eq!(
             shorthand.layout.taffy.flex_shrink,
             longhand.layout.taffy.flex_shrink
         );
-        assert_eq!(shorthand.layout.taffy.flex_basis, longhand.layout.taffy.flex_basis);
+        assert_eq!(
+            shorthand.layout.taffy.flex_basis,
+            longhand.layout.taffy.flex_basis
+        );
     }
 
     #[test]
@@ -1490,10 +1538,22 @@ mod tests {
 
         assert_eq!(resolved.layout.taffy.size.width, Dimension::Percent(1.0));
         assert_eq!(resolved.layout.taffy.size.height, Dimension::Percent(1.0));
-        assert_eq!(resolved.layout.taffy.min_size.width, Dimension::Percent(0.5));
-        assert_eq!(resolved.layout.taffy.min_size.height, Dimension::Percent(0.5));
-        assert_eq!(resolved.layout.taffy.max_size.width, Dimension::Percent(1.0));
-        assert_eq!(resolved.layout.taffy.max_size.height, Dimension::Percent(1.0));
+        assert_eq!(
+            resolved.layout.taffy.min_size.width,
+            Dimension::Percent(0.5)
+        );
+        assert_eq!(
+            resolved.layout.taffy.min_size.height,
+            Dimension::Percent(0.5)
+        );
+        assert_eq!(
+            resolved.layout.taffy.max_size.width,
+            Dimension::Percent(1.0)
+        );
+        assert_eq!(
+            resolved.layout.taffy.max_size.height,
+            Dimension::Percent(1.0)
+        );
     }
 
     #[test]
@@ -1505,12 +1565,28 @@ mod tests {
         assert!(
             stylesheet.rules[0]
                 .declarations
-                .contains(&Declaration::LetterSpacing(2.0))
+                .contains(&Declaration::LetterSpacing(LetterSpacingDeclaration::Px(
+                    2.0
+                )))
         );
         assert!(
             stylesheet.rules[0]
                 .declarations
                 .contains(&Declaration::TextTransform(TextTransform::Uppercase))
+        );
+    }
+
+    #[test]
+    fn parser_supports_em_letter_spacing_values() {
+        let stylesheet = parse_stylesheet(".label { letter-spacing: 0.05em; }")
+            .expect("em letter-spacing stylesheet should parse");
+
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::LetterSpacing(LetterSpacingDeclaration::Em(
+                    0.05
+                )))
         );
     }
 
@@ -1798,6 +1874,25 @@ mod tests {
     }
 
     #[test]
+    fn em_letter_spacing_tracks_font_size_from_later_rules() {
+        let spaced_stylesheet = parse_stylesheet(
+            ".label { letter-spacing: 0.05em; } .label.large { font-size: 20px; }",
+        )
+        .expect("stylesheet with em letter-spacing should parse");
+        let baseline_stylesheet = parse_stylesheet(".label.large { font-size: 20px; }")
+            .expect("baseline stylesheet should parse");
+        let tree = Node::element("span")
+            .with_class("label")
+            .with_class("large")
+            .with_child(Node::text("ABCD"))
+            .into();
+        let baseline_scene = build_render_tree(&tree, &baseline_stylesheet);
+        let spaced_scene = build_render_tree(&tree, &spaced_stylesheet);
+
+        assert!((spaced_scene.layout.width - (baseline_scene.layout.width + 3.0)).abs() < 0.01);
+    }
+
+    #[test]
     fn parser_supports_text_effect_controls() {
         let stylesheet = parse_stylesheet(
             ".label {
@@ -1876,7 +1971,9 @@ mod tests {
         assert!(matches!(
             error,
             StyleError::UnsupportedValue(message)
-                if message.contains("only blur() is supported")
+                if message.contains("backdrop-filter")
+                    && message.contains("saturate(1.2)")
+                    && message.contains("only blur() is supported")
         ));
     }
 
@@ -1916,7 +2013,9 @@ mod tests {
         assert!(matches!(
             error,
             StyleError::UnsupportedValue(message)
-                if message.contains("only drop-shadow() is supported")
+                if message.contains("filter")
+                    && message.contains("blur(2px)")
+                    && message.contains("only drop-shadow() is supported")
         ));
     }
 

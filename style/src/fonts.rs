@@ -15,7 +15,7 @@ use lightningcss::properties::text::{
     Spacing, TextTransform as CssTextTransform, TextTransformCase as CssTextTransformCase,
 };
 use lightningcss::traits::ToCss;
-use lightningcss::values::length::{Length, LengthPercentage};
+use lightningcss::values::length::{Length, LengthPercentage, LengthValue};
 
 use crate::{Declaration, StyleError};
 
@@ -64,6 +64,33 @@ impl FontWeightDeclaration {
 
 pub type LineHeightDeclaration = CoreLineHeight;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LetterSpacingDeclaration {
+    Px(f32),
+    Em(f32),
+}
+
+impl LetterSpacingDeclaration {
+    fn resolve_px(self, font_size_px: f32) -> f32 {
+        match self {
+            Self::Px(px) => px,
+            Self::Em(scale) => font_size_px * scale,
+        }
+    }
+
+    fn em_scale(self) -> Option<f32> {
+        match self {
+            Self::Em(scale) => Some(scale),
+            Self::Px(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct FontDeclarationState {
+    letter_spacing_em: Option<f32>,
+}
+
 pub(crate) fn extract_property(
     property: &Property<'_>,
 ) -> Option<Result<Vec<Declaration>, StyleError>> {
@@ -94,7 +121,11 @@ pub(crate) fn extract_property(
     }
 }
 
-pub(crate) fn apply_font_declaration(style: &mut Style, declaration: &Declaration) -> bool {
+pub(crate) fn apply_font_declaration(
+    style: &mut Style,
+    declaration: &Declaration,
+    state: &mut FontDeclarationState,
+) -> bool {
     match declaration {
         Declaration::FontFamilies(value) => {
             style.visual.text.families = value.clone();
@@ -102,6 +133,9 @@ pub(crate) fn apply_font_declaration(style: &mut Style, declaration: &Declaratio
         }
         Declaration::FontSize(value) => {
             style.visual.text.size_px = value.resolve(style.visual.text.size_px);
+            if let Some(scale) = state.letter_spacing_em {
+                style.visual.text.letter_spacing_px = style.visual.text.size_px * scale;
+            }
             true
         }
         Declaration::FontWeight(value) => {
@@ -117,7 +151,8 @@ pub(crate) fn apply_font_declaration(style: &mut Style, declaration: &Declaratio
             true
         }
         Declaration::LetterSpacing(value) => {
-            style.visual.text.letter_spacing_px = *value;
+            state.letter_spacing_em = value.em_scale();
+            style.visual.text.letter_spacing_px = value.resolve_px(style.visual.text.size_px);
             true
         }
         Declaration::TextTransform(value) => {
@@ -205,12 +240,10 @@ fn font_size_from_css(value: &CssFontSize) -> Result<FontSizeDeclaration, StyleE
 
 fn font_size_from_length(value: &LengthPercentage) -> Result<FontSizeDeclaration, StyleError> {
     match value {
-        LengthPercentage::Dimension(length) => Ok(FontSizeDeclaration::Px(
-            length
-                .to_px()
-                .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}")))?
-                as f32,
-        )),
+        LengthPercentage::Dimension(length) => match length_value_to_typography_measure(length)? {
+            TypographyLengthMeasure::Px(px) => Ok(FontSizeDeclaration::Px(px)),
+            TypographyLengthMeasure::Em(scale) => Ok(FontSizeDeclaration::Scale(scale)),
+        },
         LengthPercentage::Percentage(percentage) => Ok(FontSizeDeclaration::Scale(percentage.0)),
         _ => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
     }
@@ -241,22 +274,25 @@ fn line_height_from_css(value: &CssLineHeight) -> Result<LineHeightDeclaration, 
         CssLineHeight::Normal => Ok(CoreLineHeight::Normal),
         CssLineHeight::Number(value) => Ok(CoreLineHeight::Scale(*value)),
         CssLineHeight::Length(length) => match length {
-            LengthPercentage::Dimension(length) => Ok(CoreLineHeight::Px(
-                length
-                    .to_px()
-                    .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}")))?
-                    as f32,
-            )),
+            LengthPercentage::Dimension(length) => {
+                match length_value_to_typography_measure(length)? {
+                    TypographyLengthMeasure::Px(px) => Ok(CoreLineHeight::Px(px)),
+                    TypographyLengthMeasure::Em(scale) => Ok(CoreLineHeight::Scale(scale)),
+                }
+            }
             LengthPercentage::Percentage(percentage) => Ok(CoreLineHeight::Scale(percentage.0)),
             _ => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
         },
     }
 }
 
-fn letter_spacing_from_css(value: &Spacing) -> Result<f32, StyleError> {
+fn letter_spacing_from_css(value: &Spacing) -> Result<LetterSpacingDeclaration, StyleError> {
     match value {
-        Spacing::Normal => Ok(0.0),
-        Spacing::Length(length) => length_to_px(length),
+        Spacing::Normal => Ok(LetterSpacingDeclaration::Px(0.0)),
+        Spacing::Length(length) => match length_to_typography_measure(length)? {
+            TypographyLengthMeasure::Px(px) => Ok(LetterSpacingDeclaration::Px(px)),
+            TypographyLengthMeasure::Em(scale) => Ok(LetterSpacingDeclaration::Em(scale)),
+        },
     }
 }
 
@@ -277,11 +313,30 @@ fn text_transform_from_css(value: &CssTextTransform) -> Result<CoreTextTransform
     })
 }
 
-fn length_to_px(value: &Length) -> Result<f32, StyleError> {
-    value
-        .to_px()
-        .map(|value| value as f32)
-        .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}")))
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TypographyLengthMeasure {
+    Px(f32),
+    Em(f32),
+}
+
+fn length_to_typography_measure(value: &Length) -> Result<TypographyLengthMeasure, StyleError> {
+    match value {
+        Length::Value(length) => length_value_to_typography_measure(length),
+        _ => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
+    }
+}
+
+fn length_value_to_typography_measure(
+    value: &LengthValue,
+) -> Result<TypographyLengthMeasure, StyleError> {
+    if let Some(px) = value.to_px() {
+        return Ok(TypographyLengthMeasure::Px(px as f32));
+    }
+
+    match value {
+        LengthValue::Em(scale) => Ok(TypographyLengthMeasure::Em(*scale)),
+        _ => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
+    }
 }
 
 #[cfg(test)]
@@ -290,17 +345,22 @@ mod tests {
         FontFamily, GenericFontFamily, LineHeight, TextStyle, TextTransform,
     };
 
-    use super::{FontSizeDeclaration, FontWeightDeclaration, apply_font_declaration};
+    use super::{
+        FontDeclarationState, FontSizeDeclaration, FontWeightDeclaration, LetterSpacingDeclaration,
+        apply_font_declaration,
+    };
     use crate::Declaration;
 
     #[test]
     fn relative_font_size_scales_from_current_value() {
         let mut style = cssimpler_core::Style::default();
         style.visual.text.size_px = 20.0;
+        let mut declaration_state = FontDeclarationState::default();
 
         assert!(apply_font_declaration(
             &mut style,
             &Declaration::FontSize(FontSizeDeclaration::Scale(1.5)),
+            &mut declaration_state,
         ));
 
         assert_eq!(style.visual.text.size_px, 30.0);
@@ -310,10 +370,12 @@ mod tests {
     fn relative_font_weight_steps_up_from_regular_weight() {
         let mut style = cssimpler_core::Style::default();
         style.visual.text.weight = 400;
+        let mut declaration_state = FontDeclarationState::default();
 
         assert!(apply_font_declaration(
             &mut style,
             &Declaration::FontWeight(FontWeightDeclaration::Bolder),
+            &mut declaration_state,
         ));
 
         assert_eq!(style.visual.text.weight, 700);
@@ -322,10 +384,12 @@ mod tests {
     #[test]
     fn line_height_assignment_replaces_the_current_value() {
         let mut style = cssimpler_core::Style::default();
+        let mut declaration_state = FontDeclarationState::default();
 
         assert!(apply_font_declaration(
             &mut style,
             &Declaration::LineHeight(LineHeight::Scale(1.4)),
+            &mut declaration_state,
         ));
 
         assert_eq!(style.visual.text.line_height, LineHeight::Scale(1.4));
@@ -335,10 +399,12 @@ mod tests {
     fn explicit_font_family_replaces_the_family_stack() {
         let mut style = cssimpler_core::Style::default();
         let family = FontFamily::Generic(GenericFontFamily::Monospace);
+        let mut declaration_state = FontDeclarationState::default();
 
         assert!(apply_font_declaration(
             &mut style,
             &Declaration::FontFamilies(vec![family.clone()]),
+            &mut declaration_state,
         ));
 
         assert_eq!(style.visual.text, TextStyle::default().with_family(family));
@@ -347,10 +413,12 @@ mod tests {
     #[test]
     fn letter_spacing_assignment_updates_the_text_style() {
         let mut style = cssimpler_core::Style::default();
+        let mut declaration_state = FontDeclarationState::default();
 
         assert!(apply_font_declaration(
             &mut style,
-            &Declaration::LetterSpacing(2.5),
+            &Declaration::LetterSpacing(LetterSpacingDeclaration::Px(2.5)),
+            &mut declaration_state,
         ));
 
         assert_eq!(style.visual.text.letter_spacing_px, 2.5);
@@ -359,12 +427,34 @@ mod tests {
     #[test]
     fn text_transform_assignment_updates_the_text_style() {
         let mut style = cssimpler_core::Style::default();
+        let mut declaration_state = FontDeclarationState::default();
 
         assert!(apply_font_declaration(
             &mut style,
             &Declaration::TextTransform(TextTransform::Uppercase),
+            &mut declaration_state,
         ));
 
         assert_eq!(style.visual.text.text_transform, TextTransform::Uppercase);
+    }
+
+    #[test]
+    fn em_letter_spacing_recomputes_when_font_size_changes() {
+        let mut style = cssimpler_core::Style::default();
+        let mut declaration_state = FontDeclarationState::default();
+
+        assert!(apply_font_declaration(
+            &mut style,
+            &Declaration::LetterSpacing(LetterSpacingDeclaration::Em(0.05)),
+            &mut declaration_state,
+        ));
+        assert!((style.visual.text.letter_spacing_px - 0.8).abs() < 0.001);
+
+        assert!(apply_font_declaration(
+            &mut style,
+            &Declaration::FontSize(FontSizeDeclaration::Px(20.0)),
+            &mut declaration_state,
+        ));
+        assert!((style.visual.text.letter_spacing_px - 1.0).abs() < 0.001);
     }
 }
