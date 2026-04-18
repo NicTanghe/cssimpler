@@ -20,9 +20,9 @@ pub use extracted_scene::{ExtractedPaintItem, ExtractedPaintKind, ExtractedScene
 pub use generated_content::GeneratedTextSource;
 pub use interaction::{ElementInteractionState, ElementPath};
 pub use runtime_ecs::{
-    Entity, RuntimeComputedNode, RuntimeDirtyClass, RuntimeDirtyFlags,
-    RuntimeElementInteraction, RuntimeEntityData, RuntimeNodeKind, RuntimeScrollState,
-    RuntimeSyncAction, RuntimeSyncPolicy, RuntimeSyncResult, RuntimeViewport, RuntimeWorld,
+    Entity, RuntimeComputedNode, RuntimeDirtyClass, RuntimeDirtyFlags, RuntimeElementInteraction,
+    RuntimeEntityData, RuntimeNodeKind, RuntimeScrollState, RuntimeSyncAction, RuntimeSyncPolicy,
+    RuntimeSyncResult, RuntimeViewport, RuntimeWorld,
 };
 pub use scrollbar::{
     OverflowMode, ScrollbarAxisState, ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics,
@@ -243,16 +243,60 @@ impl Insets {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LengthPercentageCalc {
+    pub percent: f32,
+    pub px: f32,
+}
+
+impl LengthPercentageCalc {
+    pub const fn new(percent: f32, px: f32) -> Self {
+        Self { percent, px }
+    }
+
+    pub fn resolve(self, basis: f32) -> f32 {
+        basis * self.percent + self.px
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LayoutCalcStyle {
+    pub width: Option<LengthPercentageCalc>,
+    pub height: Option<LengthPercentageCalc>,
+    pub min_width: Option<LengthPercentageCalc>,
+    pub min_height: Option<LengthPercentageCalc>,
+    pub max_width: Option<LengthPercentageCalc>,
+    pub max_height: Option<LengthPercentageCalc>,
+    pub inset_top: Option<LengthPercentageCalc>,
+    pub inset_right: Option<LengthPercentageCalc>,
+    pub inset_bottom: Option<LengthPercentageCalc>,
+    pub inset_left: Option<LengthPercentageCalc>,
+    pub margin_top: Option<LengthPercentageCalc>,
+    pub margin_right: Option<LengthPercentageCalc>,
+    pub margin_bottom: Option<LengthPercentageCalc>,
+    pub margin_left: Option<LengthPercentageCalc>,
+    pub padding_top: Option<LengthPercentageCalc>,
+    pub padding_right: Option<LengthPercentageCalc>,
+    pub padding_bottom: Option<LengthPercentageCalc>,
+    pub padding_left: Option<LengthPercentageCalc>,
+    pub gap_row: Option<LengthPercentageCalc>,
+    pub gap_column: Option<LengthPercentageCalc>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LayoutStyle {
     pub taffy: TaffyStyle,
+    pub calc: LayoutCalcStyle,
 }
 
 impl Default for LayoutStyle {
     fn default() -> Self {
         let mut taffy = TaffyStyle::default();
         taffy.display = taffy::Display::Block;
-        Self { taffy }
+        Self {
+            taffy,
+            calc: LayoutCalcStyle::default(),
+        }
     }
 }
 

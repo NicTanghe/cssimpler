@@ -1,12 +1,13 @@
 use cssimpler_core::{
     Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, EventHandlers,
-    Insets, LayoutBox, Node, RenderNode, ScrollbarData, Style, SvgScene, TransitionStyle,
+    Insets, LayoutBox, LengthPercentageCalc, Node, RenderNode, ScrollbarData, Style, SvgScene,
+    TransitionStyle,
     fonts::{PreparedTextLayout, TextStyle, layout_text_block},
 };
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::{
-    AvailableSpace, Dimension, LengthPercentage as TaffyLengthPercentage, NodeId,
-    Style as TaffyStyle, TaffyTree,
+    AvailableSpace, Dimension, LengthPercentage as TaffyLengthPercentage,
+    LengthPercentageAuto as TaffyLengthPercentageAuto, NodeId, Style as TaffyStyle, TaffyTree,
 };
 
 use crate::svg::{is_supported_svg_tag, resolve_svg_root, seed_element_style};
@@ -104,17 +105,15 @@ pub fn layout_resolved_render_tree(
     let root = build_layout_tree(resolved.root(), &mut taffy);
     let available_space = available_space_override
         .unwrap_or_else(|| available_space_from_root(&root.style.layout.taffy));
-    taffy
-        .compute_layout_with_measure(
-            root.node_id,
-            available_space,
-            |known_dimensions, available_space, _, context, _| {
-                context.map_or(TaffySize::ZERO, |context| {
-                    measure_text(context, known_dimensions, available_space)
-                })
-            },
-        )
-        .expect("resolved layout should be valid for taffy");
+    compute_taffy_layout(&mut taffy, root.node_id, available_space);
+    let root_basis = available_space_basis(available_space);
+
+    for _ in 0..4 {
+        if !apply_layout_calc_overrides(&root, &mut taffy, root_basis) {
+            break;
+        }
+        compute_taffy_layout(&mut taffy, root.node_id, available_space);
+    }
 
     LaidOutRenderTree { root, taffy }
 }
@@ -455,6 +454,224 @@ fn available_space_from_dimension(dimension: Dimension) -> AvailableSpace {
     match dimension {
         Dimension::Length(value) => AvailableSpace::Definite(value),
         _ => AvailableSpace::MaxContent,
+    }
+}
+
+fn compute_taffy_layout(
+    taffy: &mut TaffyTree<LeafMeasureContext>,
+    root_id: NodeId,
+    available_space: TaffySize<AvailableSpace>,
+) {
+    taffy
+        .compute_layout_with_measure(
+            root_id,
+            available_space,
+            |known_dimensions, available_space, _, context, _| {
+                context.map_or(TaffySize::ZERO, |context| {
+                    measure_text(context, known_dimensions, available_space)
+                })
+            },
+        )
+        .expect("resolved layout should be valid for taffy");
+}
+
+fn available_space_basis(available_space: TaffySize<AvailableSpace>) -> TaffySize<Option<f32>> {
+    TaffySize {
+        width: match available_space.width {
+            AvailableSpace::Definite(value) => Some(value),
+            _ => None,
+        },
+        height: match available_space.height {
+            AvailableSpace::Definite(value) => Some(value),
+            _ => None,
+        },
+    }
+}
+
+fn apply_layout_calc_overrides(
+    root: &LayoutTree,
+    taffy: &mut TaffyTree<LeafMeasureContext>,
+    root_basis: TaffySize<Option<f32>>,
+) -> bool {
+    apply_layout_calc_overrides_recursive(root, taffy, root_basis)
+}
+
+fn apply_layout_calc_overrides_recursive(
+    node: &LayoutTree,
+    taffy: &mut TaffyTree<LeafMeasureContext>,
+    basis: TaffySize<Option<f32>>,
+) -> bool {
+    let mut changed = false;
+    let mut style = taffy
+        .style(node.node_id)
+        .expect("computed layout nodes should expose styles")
+        .clone();
+    changed |= apply_dimension_calc_override(
+        &mut style.size.width,
+        node.style.layout.calc.width,
+        basis.width,
+    );
+    changed |= apply_dimension_calc_override(
+        &mut style.size.height,
+        node.style.layout.calc.height,
+        basis.height,
+    );
+    changed |= apply_dimension_calc_override(
+        &mut style.min_size.width,
+        node.style.layout.calc.min_width,
+        basis.width,
+    );
+    changed |= apply_dimension_calc_override(
+        &mut style.min_size.height,
+        node.style.layout.calc.min_height,
+        basis.height,
+    );
+    changed |= apply_dimension_calc_override(
+        &mut style.max_size.width,
+        node.style.layout.calc.max_width,
+        basis.width,
+    );
+    changed |= apply_dimension_calc_override(
+        &mut style.max_size.height,
+        node.style.layout.calc.max_height,
+        basis.height,
+    );
+    changed |= apply_length_percentage_auto_calc_override(
+        &mut style.inset.top,
+        node.style.layout.calc.inset_top,
+        basis.height,
+    );
+    changed |= apply_length_percentage_auto_calc_override(
+        &mut style.inset.right,
+        node.style.layout.calc.inset_right,
+        basis.width,
+    );
+    changed |= apply_length_percentage_auto_calc_override(
+        &mut style.inset.bottom,
+        node.style.layout.calc.inset_bottom,
+        basis.height,
+    );
+    changed |= apply_length_percentage_auto_calc_override(
+        &mut style.inset.left,
+        node.style.layout.calc.inset_left,
+        basis.width,
+    );
+    changed |= apply_length_percentage_auto_calc_override(
+        &mut style.margin.top,
+        node.style.layout.calc.margin_top,
+        basis.height,
+    );
+    changed |= apply_length_percentage_auto_calc_override(
+        &mut style.margin.right,
+        node.style.layout.calc.margin_right,
+        basis.width,
+    );
+    changed |= apply_length_percentage_auto_calc_override(
+        &mut style.margin.bottom,
+        node.style.layout.calc.margin_bottom,
+        basis.height,
+    );
+    changed |= apply_length_percentage_auto_calc_override(
+        &mut style.margin.left,
+        node.style.layout.calc.margin_left,
+        basis.width,
+    );
+    changed |= apply_length_percentage_calc_override(
+        &mut style.padding.top,
+        node.style.layout.calc.padding_top,
+        basis.height,
+    );
+    changed |= apply_length_percentage_calc_override(
+        &mut style.padding.right,
+        node.style.layout.calc.padding_right,
+        basis.width,
+    );
+    changed |= apply_length_percentage_calc_override(
+        &mut style.padding.bottom,
+        node.style.layout.calc.padding_bottom,
+        basis.height,
+    );
+    changed |= apply_length_percentage_calc_override(
+        &mut style.padding.left,
+        node.style.layout.calc.padding_left,
+        basis.width,
+    );
+    changed |= apply_length_percentage_calc_override(
+        &mut style.gap.height,
+        node.style.layout.calc.gap_row,
+        basis.height,
+    );
+    changed |= apply_length_percentage_calc_override(
+        &mut style.gap.width,
+        node.style.layout.calc.gap_column,
+        basis.width,
+    );
+    if changed {
+        taffy
+            .set_style(node.node_id, style)
+            .expect("computed layout nodes should accept style updates");
+    }
+
+    let layout = *taffy
+        .layout(node.node_id)
+        .expect("computed layout nodes should expose layout metrics");
+    let child_basis = TaffySize {
+        width: Some(layout.content_box_width()),
+        height: Some(layout.content_box_height()),
+    };
+    node.children.iter().fold(changed, |changed, child| {
+        changed | apply_layout_calc_overrides_recursive(child, taffy, child_basis)
+    })
+}
+
+fn apply_dimension_calc_override(
+    target: &mut Dimension,
+    calc: Option<LengthPercentageCalc>,
+    basis: Option<f32>,
+) -> bool {
+    let (Some(calc), Some(basis)) = (calc, basis) else {
+        return false;
+    };
+    let resolved = Dimension::Length(calc.resolve(basis));
+    if *target == resolved {
+        false
+    } else {
+        *target = resolved;
+        true
+    }
+}
+
+fn apply_length_percentage_calc_override(
+    target: &mut TaffyLengthPercentage,
+    calc: Option<LengthPercentageCalc>,
+    basis: Option<f32>,
+) -> bool {
+    let (Some(calc), Some(basis)) = (calc, basis) else {
+        return false;
+    };
+    let resolved = TaffyLengthPercentage::Length(calc.resolve(basis));
+    if *target == resolved {
+        false
+    } else {
+        *target = resolved;
+        true
+    }
+}
+
+fn apply_length_percentage_auto_calc_override(
+    target: &mut TaffyLengthPercentageAuto,
+    calc: Option<LengthPercentageCalc>,
+    basis: Option<f32>,
+) -> bool {
+    let (Some(calc), Some(basis)) = (calc, basis) else {
+        return false;
+    };
+    let resolved = TaffyLengthPercentageAuto::Length(calc.resolve(basis));
+    if *target == resolved {
+        false
+    } else {
+        *target = resolved;
+        true
     }
 }
 

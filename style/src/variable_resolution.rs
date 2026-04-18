@@ -90,7 +90,8 @@ fn resolve_variable_dependent_property(
         ));
     }
 
-    let declarations = super::extract_property(&resolved_property)?;
+    let declarations = super::extract_property(&resolved_property)
+        .map_err(|error| super::contextualize_property_error(&resolved_property, error))?;
 
     if declarations.is_empty() {
         return Err(unresolved_property_error(
@@ -330,12 +331,15 @@ fn unresolved_property_error(property_name: &str, value_css: &str, reason: &str)
 
 #[cfg(test)]
 mod tests {
-    use cssimpler_core::{BorderLineStyle, Color, Node};
+    use cssimpler_core::{BackgroundLayer, BorderLineStyle, Color, LengthPercentageValue, Node};
     use taffy::prelude::{
         LengthPercentageAuto as TaffyLengthPercentageAuto, Position as TaffyPosition,
     };
 
-    use crate::{Declaration, build_render_tree, parse_stylesheet, resolve_style};
+    use crate::{
+        Declaration, build_render_tree, build_render_tree_in_viewport, parse_stylesheet,
+        resolve_style,
+    };
 
     #[test]
     fn parser_tracks_variable_dependent_properties_for_runtime_resolution() {
@@ -484,5 +488,71 @@ mod tests {
         let element = Node::element("div").with_class("badge");
 
         let _ = resolve_style(&element, &stylesheet);
+    }
+
+    #[test]
+    fn variable_backed_calc_values_resolve_during_layout() {
+        let stylesheet = parse_stylesheet(
+            ".panel {
+                --panel-width: calc(100% - 56px);
+                width: var(--panel-width);
+                height: 40px;
+            }",
+        )
+        .expect("variable-backed calc stylesheet should parse");
+        let tree = Node::element("div").with_class("panel").into();
+        let scene = build_render_tree_in_viewport(&tree, &stylesheet, 640, 360);
+
+        assert!((scene.layout.width - 584.0).abs() < 0.01);
+        assert!((scene.layout.height - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn variable_backed_inset_calc_values_resolve_during_layout() {
+        let stylesheet = parse_stylesheet(
+            ".panel {
+                --offset: calc(100% - 56px);
+                top: var(--offset);
+                left: 0;
+                width: 24px;
+                height: 24px;
+            }",
+        )
+        .expect("variable-backed inset calc stylesheet should parse");
+        let tree = Node::element("div")
+            .with_child(Node::element("div").with_class("panel").into())
+            .into();
+        let scene = build_render_tree_in_viewport(&tree, &stylesheet, 640, 360);
+
+        assert!((scene.children[0].layout.y - 304.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn variable_backed_background_gradient_calc_values_resolve() {
+        let stylesheet = parse_stylesheet(
+            ".panel {
+                --stop: calc(100% - 56px);
+                background: linear-gradient(
+                    to right,
+                    #111111 0%,
+                    #222222 var(--stop),
+                    #333333 100%
+                );
+            }",
+        )
+        .expect("variable-backed gradient calc stylesheet should parse");
+        let tree = Node::element("div").with_class("panel").into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        let BackgroundLayer::LinearGradient(gradient) = &scene.style.background_layers[0] else {
+            panic!("expected a linear gradient background layer");
+        };
+        assert_eq!(
+            gradient.stops[1].position,
+            LengthPercentageValue {
+                px: -56.0,
+                fraction: 1.0,
+            }
+        );
     }
 }

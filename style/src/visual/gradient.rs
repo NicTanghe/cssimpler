@@ -9,6 +9,7 @@ use cssimpler_core::{
 };
 use lightningcss::properties::background::Background;
 use lightningcss::values::angle::{Angle, AnglePercentage};
+use lightningcss::values::calc::{Calc as CssCalc, MathFunction as CssMathFunction};
 use lightningcss::values::gradient::{
     Circle as CssCircle, ConicGradient as CssConicGradient, Ellipse as CssEllipse,
     EndingShape as CssEndingShape, Gradient as CssGradient, GradientItem,
@@ -393,26 +394,104 @@ fn normalize_stops<P: StopPosition>(
 fn length_percentage_from_css(
     value: &LengthPercentage,
 ) -> Result<LengthPercentageValue, StyleError> {
-    match value {
-        LengthPercentage::Dimension(length) => {
-            Ok(LengthPercentageValue::from_px(length_value_to_px(length)?))
-        }
-        LengthPercentage::Percentage(percentage) => {
-            Ok(LengthPercentageValue::from_fraction(percentage.0))
-        }
-        _ => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
-    }
+    length_percentage_value_from_css(value)
+        .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}")))
 }
 
 fn angle_percentage_from_css(value: &AnglePercentage) -> Result<AnglePercentageValue, StyleError> {
+    angle_percentage_value_from_css(value)
+        .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}")))
+}
+
+fn length_percentage_value_from_css(value: &LengthPercentage) -> Option<LengthPercentageValue> {
+    match value {
+        LengthPercentage::Dimension(length) => length_value_to_px(length)
+            .ok()
+            .map(LengthPercentageValue::from_px),
+        LengthPercentage::Percentage(percentage) => {
+            Some(LengthPercentageValue::from_fraction(percentage.0))
+        }
+        LengthPercentage::Calc(calc) => length_percentage_value_from_calc(calc),
+    }
+}
+
+fn length_percentage_value_from_calc(
+    value: &CssCalc<LengthPercentage>,
+) -> Option<LengthPercentageValue> {
+    match value {
+        CssCalc::Value(value) => length_percentage_value_from_css(value),
+        CssCalc::Sum(left, right) => {
+            let left = length_percentage_value_from_calc(left)?;
+            let right = length_percentage_value_from_calc(right)?;
+            Some(LengthPercentageValue {
+                px: left.px + right.px,
+                fraction: left.fraction + right.fraction,
+            })
+        }
+        CssCalc::Product(factor, value) => {
+            let value = length_percentage_value_from_calc(value)?;
+            Some(LengthPercentageValue {
+                px: value.px * *factor,
+                fraction: value.fraction * *factor,
+            })
+        }
+        CssCalc::Function(function) => length_percentage_value_from_math_function(function),
+        CssCalc::Number(_) => None,
+    }
+}
+
+fn length_percentage_value_from_math_function(
+    value: &CssMathFunction<LengthPercentage>,
+) -> Option<LengthPercentageValue> {
+    match value {
+        CssMathFunction::Calc(value) => length_percentage_value_from_calc(value),
+        _ => None,
+    }
+}
+
+fn angle_percentage_value_from_css(value: &AnglePercentage) -> Option<AnglePercentageValue> {
     match value {
         AnglePercentage::Dimension(angle) => {
-            Ok(AnglePercentageValue::from_degrees(angle_to_degrees(angle)))
+            Some(AnglePercentageValue::from_degrees(angle_to_degrees(angle)))
         }
         AnglePercentage::Percentage(percentage) => {
-            Ok(AnglePercentageValue::from_turns(percentage.0))
+            Some(AnglePercentageValue::from_turns(percentage.0))
         }
-        _ => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
+        AnglePercentage::Calc(calc) => angle_percentage_value_from_calc(calc),
+    }
+}
+
+fn angle_percentage_value_from_calc(
+    value: &CssCalc<AnglePercentage>,
+) -> Option<AnglePercentageValue> {
+    match value {
+        CssCalc::Value(value) => angle_percentage_value_from_css(value),
+        CssCalc::Sum(left, right) => {
+            let left = angle_percentage_value_from_calc(left)?;
+            let right = angle_percentage_value_from_calc(right)?;
+            Some(AnglePercentageValue {
+                degrees: left.degrees + right.degrees,
+                turns: left.turns + right.turns,
+            })
+        }
+        CssCalc::Product(factor, value) => {
+            let value = angle_percentage_value_from_calc(value)?;
+            Some(AnglePercentageValue {
+                degrees: value.degrees * *factor,
+                turns: value.turns * *factor,
+            })
+        }
+        CssCalc::Function(function) => angle_percentage_value_from_math_function(function),
+        CssCalc::Number(_) => None,
+    }
+}
+
+fn angle_percentage_value_from_math_function(
+    value: &CssMathFunction<AnglePercentage>,
+) -> Option<AnglePercentageValue> {
+    match value {
+        CssMathFunction::Calc(value) => angle_percentage_value_from_calc(value),
+        _ => None,
     }
 }
 

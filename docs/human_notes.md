@@ -27,3 +27,6 @@ Use Vello as renderer when transitioning to GPU also supporting lottie whould be
 
 something is wrong with the 3d transform animations,
 THey seem unaturally slow.
+
+
+ad support for @font-face

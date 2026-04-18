@@ -4,8 +4,9 @@ use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
     BorderLineStyle, Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath,
-    LayoutStyle, OverflowMode, ScrollbarWidth, Style, SvgPaint, TransformOperation,
-    TransformOrigin, TransformStyleMode, TransitionPropertyName, TransitionTimingFunction,
+    LayoutStyle, LengthPercentageCalc, OverflowMode, ScrollbarWidth, Style, SvgPaint,
+    TransformOperation, TransformOrigin, TransformStyleMode, TransitionPropertyName,
+    TransitionTimingFunction,
     fonts::{TextStyle, TextTransform},
 };
 use lightningcss::declaration::DeclarationBlock;
@@ -27,8 +28,11 @@ use lightningcss::properties::grid::{
 use lightningcss::properties::overflow::OverflowKeyword as CssOverflowKeyword;
 use lightningcss::properties::position::Position as CssPosition;
 use lightningcss::properties::size::{MaxSize as CssMaxSize, Size as CssSize};
-use lightningcss::rules::CssRule;
+use lightningcss::rules::style::StyleRule as LightningStyleRule;
+use lightningcss::rules::{CssRule, CssRuleList};
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
+use lightningcss::targets::{Features as CssFeatures, Targets as CssTargets};
+use lightningcss::values::calc::{Calc as CssCalc, MathFunction as CssMathFunction};
 use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto, LengthValue};
 use taffy::geometry::Line;
 use taffy::prelude::{
@@ -413,23 +417,41 @@ pub enum Declaration {
     Display(TaffyDisplay),
     Position(TaffyPosition),
     InsetTop(TaffyLengthPercentageAuto),
+    InsetTopCalc(LengthPercentageCalc),
     InsetRight(TaffyLengthPercentageAuto),
+    InsetRightCalc(LengthPercentageCalc),
     InsetBottom(TaffyLengthPercentageAuto),
+    InsetBottomCalc(LengthPercentageCalc),
     InsetLeft(TaffyLengthPercentageAuto),
+    InsetLeftCalc(LengthPercentageCalc),
     Width(Dimension),
+    WidthCalc(LengthPercentageCalc),
     Height(Dimension),
+    HeightCalc(LengthPercentageCalc),
     MinWidth(Dimension),
+    MinWidthCalc(LengthPercentageCalc),
     MinHeight(Dimension),
+    MinHeightCalc(LengthPercentageCalc),
     MaxWidth(Dimension),
+    MaxWidthCalc(LengthPercentageCalc),
     MaxHeight(Dimension),
+    MaxHeightCalc(LengthPercentageCalc),
     MarginTop(TaffyLengthPercentageAuto),
+    MarginTopCalc(LengthPercentageCalc),
     MarginRight(TaffyLengthPercentageAuto),
+    MarginRightCalc(LengthPercentageCalc),
     MarginBottom(TaffyLengthPercentageAuto),
+    MarginBottomCalc(LengthPercentageCalc),
     MarginLeft(TaffyLengthPercentageAuto),
+    MarginLeftCalc(LengthPercentageCalc),
     PaddingTop(TaffyLengthPercentage),
+    PaddingTopCalc(LengthPercentageCalc),
     PaddingRight(TaffyLengthPercentage),
+    PaddingRightCalc(LengthPercentageCalc),
     PaddingBottom(TaffyLengthPercentage),
+    PaddingBottomCalc(LengthPercentageCalc),
     PaddingLeft(TaffyLengthPercentage),
+    PaddingLeftCalc(LengthPercentageCalc),
     FlexDirection(FlexDirection),
     FlexWrap(FlexWrap),
     JustifyContent(Option<TaffyJustifyContent>),
@@ -437,7 +459,9 @@ pub enum Declaration {
     AlignSelf(Option<TaffyAlignSelf>),
     AlignContent(Option<TaffyAlignContent>),
     GapRow(TaffyLengthPercentage),
+    GapRowCalc(LengthPercentageCalc),
     GapColumn(TaffyLengthPercentage),
+    GapColumnCalc(LengthPercentageCalc),
     FlexGrow(f32),
     FlexShrink(f32),
     FlexBasis(Dimension),
@@ -475,34 +499,98 @@ impl Error for StyleError {}
 pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
     let parsed = StyleSheet::parse(source, ParserOptions::default())
         .map_err(|error| StyleError::Parse(error.to_string()))?;
+    let normalized = parsed
+        .to_css(PrinterOptions {
+            // Force LightningCSS to flatten nested selectors so the internal parser
+            // can consume them as regular top-level style rules.
+            targets: CssTargets {
+                include: CssFeatures::Nesting,
+                ..CssTargets::default()
+            },
+            ..PrinterOptions::default()
+        })
+        .map_err(|error| StyleError::Parse(error.to_string()))?;
+    let parsed = StyleSheet::parse(&normalized.code, ParserOptions::default())
+        .map_err(|error| StyleError::Parse(error.to_string()))?;
     let mut stylesheet = Stylesheet::default();
+    collect_style_rules(&parsed.rules, &mut stylesheet)?;
 
-    for rule in &parsed.rules.0 {
-        let CssRule::Style(style_rule) = rule else {
-            return Err(StyleError::UnsupportedRule(
-                "only top-level style rules are supported".to_string(),
-            ));
-        };
+    Ok(stylesheet)
+}
 
-        if !style_rule.rules.0.is_empty() {
-            return Err(StyleError::UnsupportedRule(
-                "nested style rules are not supported".to_string(),
-            ));
-        }
-
-        let declarations = extract_declarations(&style_rule.declarations)?;
-        for selector in style_rule
-            .selectors
-            .0
-            .iter()
-            .map(extract_selector)
-            .collect::<Result<Vec<_>, _>>()?
-        {
-            stylesheet.push(StyleRule::new(selector, declarations.clone()));
+fn collect_style_rules(
+    rule_list: &CssRuleList<'_, impl Clone>,
+    stylesheet: &mut Stylesheet,
+) -> Result<(), StyleError> {
+    for rule in &rule_list.0 {
+        match rule {
+            CssRule::Style(style_rule) => {
+                collect_style_rule(style_rule, stylesheet)?;
+                collect_style_rules(&style_rule.rules, stylesheet)?;
+            }
+            CssRule::Nesting(nesting_rule) => {
+                collect_style_rule(&nesting_rule.style, stylesheet)?;
+                collect_style_rules(&nesting_rule.style.rules, stylesheet)?;
+            }
+            CssRule::Media(media_rule) => {
+                collect_style_rules(&media_rule.rules, stylesheet)?;
+            }
+            CssRule::Supports(supports_rule) => {
+                collect_style_rules(&supports_rule.rules, stylesheet)?;
+            }
+            CssRule::LayerBlock(layer_rule) => {
+                collect_style_rules(&layer_rule.rules, stylesheet)?;
+            }
+            CssRule::Container(container_rule) => {
+                collect_style_rules(&container_rule.rules, stylesheet)?;
+            }
+            CssRule::Scope(scope_rule) => {
+                collect_style_rules(&scope_rule.rules, stylesheet)?;
+            }
+            CssRule::StartingStyle(starting_style_rule) => {
+                collect_style_rules(&starting_style_rule.rules, stylesheet)?;
+            }
+            CssRule::MozDocument(document_rule) => {
+                collect_style_rules(&document_rule.rules, stylesheet)?;
+            }
+            CssRule::NestedDeclarations(_)
+            | CssRule::Import(_)
+            | CssRule::Keyframes(_)
+            | CssRule::FontFace(_)
+            | CssRule::FontPaletteValues(_)
+            | CssRule::FontFeatureValues(_)
+            | CssRule::Page(_)
+            | CssRule::CounterStyle(_)
+            | CssRule::Namespace(_)
+            | CssRule::Viewport(_)
+            | CssRule::CustomMedia(_)
+            | CssRule::LayerStatement(_)
+            | CssRule::Property(_)
+            | CssRule::ViewTransition(_)
+            | CssRule::Unknown(_)
+            | CssRule::Custom(_)
+            | CssRule::Ignored => {}
         }
     }
 
-    Ok(stylesheet)
+    Ok(())
+}
+
+fn collect_style_rule(
+    style_rule: &LightningStyleRule<'_, impl Clone>,
+    stylesheet: &mut Stylesheet,
+) -> Result<(), StyleError> {
+    let declarations = extract_declarations(&style_rule.declarations)?;
+    for selector in style_rule
+        .selectors
+        .0
+        .iter()
+        .map(extract_selector)
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        stylesheet.push(StyleRule::new(selector, declarations.clone()));
+    }
+    Ok(())
 }
 
 pub fn resolve_style(element: &ElementNode, stylesheet: &Stylesheet) -> Style {
@@ -650,72 +738,60 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
         Property::Position(position) => {
             Ok(vec![Declaration::Position(position_from_css(position))])
         }
-        Property::Top(value) => Ok(vec![Declaration::InsetTop(
-            length_percentage_auto_to_taffy(value)?,
-        )]),
-        Property::Right(value) => Ok(vec![Declaration::InsetRight(
-            length_percentage_auto_to_taffy(value)?,
-        )]),
-        Property::Bottom(value) => Ok(vec![Declaration::InsetBottom(
-            length_percentage_auto_to_taffy(value)?,
-        )]),
-        Property::Left(value) => Ok(vec![Declaration::InsetLeft(
-            length_percentage_auto_to_taffy(value)?,
-        )]),
+        Property::Top(value) => Ok(vec![inset_top_declaration(value)?]),
+        Property::Right(value) => Ok(vec![inset_right_declaration(value)?]),
+        Property::Bottom(value) => Ok(vec![inset_bottom_declaration(value)?]),
+        Property::Left(value) => Ok(vec![inset_left_declaration(value)?]),
         Property::Inset(inset) => Ok(vec![
-            Declaration::InsetTop(length_percentage_auto_to_taffy(&inset.top)?),
-            Declaration::InsetRight(length_percentage_auto_to_taffy(&inset.right)?),
-            Declaration::InsetBottom(length_percentage_auto_to_taffy(&inset.bottom)?),
-            Declaration::InsetLeft(length_percentage_auto_to_taffy(&inset.left)?),
+            inset_top_declaration(&inset.top)?,
+            inset_right_declaration(&inset.right)?,
+            inset_bottom_declaration(&inset.bottom)?,
+            inset_left_declaration(&inset.left)?,
         ]),
-        Property::Width(size) => Ok(vec![Declaration::Width(dimension_from_css_size(size)?)]),
-        Property::Height(size) => Ok(vec![Declaration::Height(dimension_from_css_size(size)?)]),
-        Property::MinWidth(size) => Ok(vec![Declaration::MinWidth(dimension_from_css_size(size)?)]),
-        Property::MinHeight(size) => {
-            Ok(vec![Declaration::MinHeight(dimension_from_css_size(size)?)])
-        }
-        Property::MaxWidth(size) => Ok(vec![Declaration::MaxWidth(dimension_from_css_max_size(
-            size,
-        )?)]),
-        Property::MaxHeight(size) => Ok(vec![Declaration::MaxHeight(dimension_from_css_max_size(
-            size,
-        )?)]),
+        Property::Width(size) => Ok(vec![match dimension_from_css_size(size)? {
+            DimensionValue::Dimension(value) => Declaration::Width(value),
+            DimensionValue::Calc(value) => Declaration::WidthCalc(value),
+        }]),
+        Property::Height(size) => Ok(vec![match dimension_from_css_size(size)? {
+            DimensionValue::Dimension(value) => Declaration::Height(value),
+            DimensionValue::Calc(value) => Declaration::HeightCalc(value),
+        }]),
+        Property::MinWidth(size) => Ok(vec![match dimension_from_css_size(size)? {
+            DimensionValue::Dimension(value) => Declaration::MinWidth(value),
+            DimensionValue::Calc(value) => Declaration::MinWidthCalc(value),
+        }]),
+        Property::MinHeight(size) => Ok(vec![match dimension_from_css_size(size)? {
+            DimensionValue::Dimension(value) => Declaration::MinHeight(value),
+            DimensionValue::Calc(value) => Declaration::MinHeightCalc(value),
+        }]),
+        Property::MaxWidth(size) => Ok(vec![match dimension_from_css_max_size(size)? {
+            DimensionValue::Dimension(value) => Declaration::MaxWidth(value),
+            DimensionValue::Calc(value) => Declaration::MaxWidthCalc(value),
+        }]),
+        Property::MaxHeight(size) => Ok(vec![match dimension_from_css_max_size(size)? {
+            DimensionValue::Dimension(value) => Declaration::MaxHeight(value),
+            DimensionValue::Calc(value) => Declaration::MaxHeightCalc(value),
+        }]),
         Property::Margin(margin) => Ok(vec![
-            Declaration::MarginTop(length_percentage_auto_to_taffy(&margin.top)?),
-            Declaration::MarginRight(length_percentage_auto_to_taffy(&margin.right)?),
-            Declaration::MarginBottom(length_percentage_auto_to_taffy(&margin.bottom)?),
-            Declaration::MarginLeft(length_percentage_auto_to_taffy(&margin.left)?),
+            margin_top_declaration(&margin.top)?,
+            margin_right_declaration(&margin.right)?,
+            margin_bottom_declaration(&margin.bottom)?,
+            margin_left_declaration(&margin.left)?,
         ]),
-        Property::MarginTop(value) => Ok(vec![Declaration::MarginTop(
-            length_percentage_auto_to_taffy(value)?,
-        )]),
-        Property::MarginRight(value) => Ok(vec![Declaration::MarginRight(
-            length_percentage_auto_to_taffy(value)?,
-        )]),
-        Property::MarginBottom(value) => Ok(vec![Declaration::MarginBottom(
-            length_percentage_auto_to_taffy(value)?,
-        )]),
-        Property::MarginLeft(value) => Ok(vec![Declaration::MarginLeft(
-            length_percentage_auto_to_taffy(value)?,
-        )]),
+        Property::MarginTop(value) => Ok(vec![margin_top_declaration(value)?]),
+        Property::MarginRight(value) => Ok(vec![margin_right_declaration(value)?]),
+        Property::MarginBottom(value) => Ok(vec![margin_bottom_declaration(value)?]),
+        Property::MarginLeft(value) => Ok(vec![margin_left_declaration(value)?]),
         Property::Padding(padding) => Ok(vec![
-            Declaration::PaddingTop(length_percentage_auto_to_taffy_padding(&padding.top)?),
-            Declaration::PaddingRight(length_percentage_auto_to_taffy_padding(&padding.right)?),
-            Declaration::PaddingBottom(length_percentage_auto_to_taffy_padding(&padding.bottom)?),
-            Declaration::PaddingLeft(length_percentage_auto_to_taffy_padding(&padding.left)?),
+            padding_top_declaration(&padding.top)?,
+            padding_right_declaration(&padding.right)?,
+            padding_bottom_declaration(&padding.bottom)?,
+            padding_left_declaration(&padding.left)?,
         ]),
-        Property::PaddingTop(value) => Ok(vec![Declaration::PaddingTop(
-            length_percentage_auto_to_taffy_padding(value)?,
-        )]),
-        Property::PaddingRight(value) => Ok(vec![Declaration::PaddingRight(
-            length_percentage_auto_to_taffy_padding(value)?,
-        )]),
-        Property::PaddingBottom(value) => Ok(vec![Declaration::PaddingBottom(
-            length_percentage_auto_to_taffy_padding(value)?,
-        )]),
-        Property::PaddingLeft(value) => Ok(vec![Declaration::PaddingLeft(
-            length_percentage_auto_to_taffy_padding(value)?,
-        )]),
+        Property::PaddingTop(value) => Ok(vec![padding_top_declaration(value)?]),
+        Property::PaddingRight(value) => Ok(vec![padding_right_declaration(value)?]),
+        Property::PaddingBottom(value) => Ok(vec![padding_bottom_declaration(value)?]),
+        Property::PaddingLeft(value) => Ok(vec![padding_left_declaration(value)?]),
         Property::FlexDirection(direction, _) => Ok(vec![Declaration::FlexDirection(
             flex_direction_from_css(direction),
         )]),
@@ -732,16 +808,16 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
         Property::AlignContent(content, _) => Ok(vec![Declaration::AlignContent(
             align_content_from_css(content)?,
         )]),
-        Property::RowGap(value) => Ok(vec![Declaration::GapRow(gap_value_to_taffy(value)?)]),
-        Property::ColumnGap(value) => Ok(vec![Declaration::GapColumn(gap_value_to_taffy(value)?)]),
+        Property::RowGap(value) => Ok(vec![gap_row_declaration(value)?]),
+        Property::ColumnGap(value) => Ok(vec![gap_column_declaration(value)?]),
         Property::Gap(gap) => Ok(vec![
-            Declaration::GapRow(gap_value_to_taffy(&gap.row)?),
-            Declaration::GapColumn(gap_value_to_taffy(&gap.column)?),
+            gap_row_declaration(&gap.row)?,
+            gap_column_declaration(&gap.column)?,
         ]),
         Property::FlexGrow(value, _) => Ok(vec![Declaration::FlexGrow(*value)]),
         Property::FlexShrink(value, _) => Ok(vec![Declaration::FlexShrink(*value)]),
         Property::FlexBasis(value, _) => Ok(vec![Declaration::FlexBasis(
-            dimension_from_length_percentage_auto(value)?,
+            dimension_from_length_percentage_auto(value)?.into_dimension()?,
         )]),
         Property::Flex(flex, _) => flex_shorthand_declarations(flex),
         Property::GridTemplateColumns(track_sizing) => Ok(vec![Declaration::GridTemplateColumns(
@@ -767,6 +843,104 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
             Ok(vec![Declaration::GridRowEnd(grid_placement_from_css(end)?)])
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+fn inset_top_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_auto_value_from_css(value)? {
+        LengthPercentageAutoValue::Value(value) => Ok(Declaration::InsetTop(value)),
+        LengthPercentageAutoValue::Calc(value) => Ok(Declaration::InsetTopCalc(value)),
+    }
+}
+
+fn inset_right_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_auto_value_from_css(value)? {
+        LengthPercentageAutoValue::Value(value) => Ok(Declaration::InsetRight(value)),
+        LengthPercentageAutoValue::Calc(value) => Ok(Declaration::InsetRightCalc(value)),
+    }
+}
+
+fn inset_bottom_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_auto_value_from_css(value)? {
+        LengthPercentageAutoValue::Value(value) => Ok(Declaration::InsetBottom(value)),
+        LengthPercentageAutoValue::Calc(value) => Ok(Declaration::InsetBottomCalc(value)),
+    }
+}
+
+fn inset_left_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_auto_value_from_css(value)? {
+        LengthPercentageAutoValue::Value(value) => Ok(Declaration::InsetLeft(value)),
+        LengthPercentageAutoValue::Calc(value) => Ok(Declaration::InsetLeftCalc(value)),
+    }
+}
+
+fn margin_top_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_auto_value_from_css(value)? {
+        LengthPercentageAutoValue::Value(value) => Ok(Declaration::MarginTop(value)),
+        LengthPercentageAutoValue::Calc(value) => Ok(Declaration::MarginTopCalc(value)),
+    }
+}
+
+fn margin_right_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_auto_value_from_css(value)? {
+        LengthPercentageAutoValue::Value(value) => Ok(Declaration::MarginRight(value)),
+        LengthPercentageAutoValue::Calc(value) => Ok(Declaration::MarginRightCalc(value)),
+    }
+}
+
+fn margin_bottom_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_auto_value_from_css(value)? {
+        LengthPercentageAutoValue::Value(value) => Ok(Declaration::MarginBottom(value)),
+        LengthPercentageAutoValue::Calc(value) => Ok(Declaration::MarginBottomCalc(value)),
+    }
+}
+
+fn margin_left_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_auto_value_from_css(value)? {
+        LengthPercentageAutoValue::Value(value) => Ok(Declaration::MarginLeft(value)),
+        LengthPercentageAutoValue::Calc(value) => Ok(Declaration::MarginLeftCalc(value)),
+    }
+}
+
+fn padding_top_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_padding_value_from_css(value)? {
+        LengthPercentageValue::Value(value) => Ok(Declaration::PaddingTop(value)),
+        LengthPercentageValue::Calc(value) => Ok(Declaration::PaddingTopCalc(value)),
+    }
+}
+
+fn padding_right_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_padding_value_from_css(value)? {
+        LengthPercentageValue::Value(value) => Ok(Declaration::PaddingRight(value)),
+        LengthPercentageValue::Calc(value) => Ok(Declaration::PaddingRightCalc(value)),
+    }
+}
+
+fn padding_bottom_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_padding_value_from_css(value)? {
+        LengthPercentageValue::Value(value) => Ok(Declaration::PaddingBottom(value)),
+        LengthPercentageValue::Calc(value) => Ok(Declaration::PaddingBottomCalc(value)),
+    }
+}
+
+fn padding_left_declaration(value: &LengthPercentageOrAuto) -> Result<Declaration, StyleError> {
+    match length_percentage_padding_value_from_css(value)? {
+        LengthPercentageValue::Value(value) => Ok(Declaration::PaddingLeft(value)),
+        LengthPercentageValue::Calc(value) => Ok(Declaration::PaddingLeftCalc(value)),
+    }
+}
+
+fn gap_row_declaration(value: &GapValue) -> Result<Declaration, StyleError> {
+    match gap_value_from_css(value)? {
+        LengthPercentageValue::Value(value) => Ok(Declaration::GapRow(value)),
+        LengthPercentageValue::Calc(value) => Ok(Declaration::GapRowCalc(value)),
+    }
+}
+
+fn gap_column_declaration(value: &GapValue) -> Result<Declaration, StyleError> {
+    match gap_value_from_css(value)? {
+        LengthPercentageValue::Value(value) => Ok(Declaration::GapColumn(value)),
+        LengthPercentageValue::Calc(value) => Ok(Declaration::GapColumnCalc(value)),
     }
 }
 
@@ -823,23 +997,39 @@ fn position_from_css(position: &CssPosition) -> TaffyPosition {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DimensionValue {
+    Dimension(Dimension),
+    Calc(LengthPercentageCalc),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LengthPercentageValue {
+    Value(TaffyLengthPercentage),
+    Calc(LengthPercentageCalc),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LengthPercentageAutoValue {
+    Value(TaffyLengthPercentageAuto),
+    Calc(LengthPercentageCalc),
+}
+
+impl DimensionValue {
+    fn into_dimension(self) -> Result<Dimension, StyleError> {
+        match self {
+            Self::Dimension(value) => Ok(value),
+            Self::Calc(value) => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
+        }
+    }
+}
+
 fn length_percentage_to_taffy(
     value: &LengthPercentage,
 ) -> Result<TaffyLengthPercentage, StyleError> {
-    match value {
-        LengthPercentage::Dimension(length) => {
-            if let Some(value) = length.to_px() {
-                Ok(TaffyLengthPercentage::Length(value as f32))
-            } else if let Some(value) = viewport_length_to_percent(length) {
-                Ok(TaffyLengthPercentage::Percent(value))
-            } else {
-                Err(StyleError::UnsupportedValue(format!("{value:?}")))
-            }
-        }
-        LengthPercentage::Percentage(percentage) => {
-            Ok(TaffyLengthPercentage::Percent(percentage.0))
-        }
-        _ => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
+    match length_percentage_value_from_css(value)? {
+        LengthPercentageValue::Value(value) => Ok(value),
+        LengthPercentageValue::Calc(_) => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
     }
 }
 
@@ -875,49 +1065,141 @@ fn viewport_length_to_percent(value: &LengthValue) -> Option<f32> {
     Some(percent / 100.0)
 }
 
-fn length_percentage_auto_to_taffy(
-    value: &LengthPercentageOrAuto,
-) -> Result<TaffyLengthPercentageAuto, StyleError> {
+fn length_percentage_calc_from_css(value: &LengthPercentage) -> Option<LengthPercentageCalc> {
     match value {
-        LengthPercentageOrAuto::Auto => Ok(TaffyLengthPercentageAuto::Auto),
+        LengthPercentage::Dimension(length) => {
+            if let Some(px) = length.to_px() {
+                Some(LengthPercentageCalc::new(0.0, px as f32))
+            } else {
+                viewport_length_to_percent(length)
+                    .map(|percent| LengthPercentageCalc::new(percent, 0.0))
+            }
+        }
+        LengthPercentage::Percentage(percentage) => {
+            Some(LengthPercentageCalc::new(percentage.0, 0.0))
+        }
+        LengthPercentage::Calc(calc) => length_percentage_calc_from_calc(calc),
+    }
+}
+
+fn length_percentage_calc_from_calc(
+    value: &CssCalc<LengthPercentage>,
+) -> Option<LengthPercentageCalc> {
+    match value {
+        CssCalc::Value(value) => length_percentage_calc_from_css(value),
+        CssCalc::Sum(left, right) => {
+            let left = length_percentage_calc_from_calc(left)?;
+            let right = length_percentage_calc_from_calc(right)?;
+            Some(LengthPercentageCalc::new(
+                left.percent + right.percent,
+                left.px + right.px,
+            ))
+        }
+        CssCalc::Product(factor, value) => {
+            let value = length_percentage_calc_from_calc(value)?;
+            Some(LengthPercentageCalc::new(
+                value.percent * *factor,
+                value.px * *factor,
+            ))
+        }
+        CssCalc::Function(function) => length_percentage_calc_from_math_function(function),
+        CssCalc::Number(_) => None,
+    }
+}
+
+fn length_percentage_calc_from_math_function(
+    value: &CssMathFunction<LengthPercentage>,
+) -> Option<LengthPercentageCalc> {
+    match value {
+        CssMathFunction::Calc(value) => length_percentage_calc_from_calc(value),
+        _ => None,
+    }
+}
+
+fn dimension_value_from_length_percentage(
+    value: &LengthPercentage,
+) -> Result<DimensionValue, StyleError> {
+    let calc = length_percentage_calc_from_css(value)
+        .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}")))?;
+    if calc.percent != 0.0 && calc.px != 0.0 {
+        return Ok(DimensionValue::Calc(calc));
+    }
+    if calc.percent != 0.0 {
+        Ok(DimensionValue::Dimension(Dimension::Percent(calc.percent)))
+    } else {
+        Ok(DimensionValue::Dimension(Dimension::Length(calc.px)))
+    }
+}
+
+fn length_percentage_value_from_css(
+    value: &LengthPercentage,
+) -> Result<LengthPercentageValue, StyleError> {
+    let calc = length_percentage_calc_from_css(value)
+        .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}")))?;
+    if calc.percent != 0.0 && calc.px != 0.0 {
+        return Ok(LengthPercentageValue::Calc(calc));
+    }
+    if calc.percent != 0.0 {
+        Ok(LengthPercentageValue::Value(
+            TaffyLengthPercentage::Percent(calc.percent),
+        ))
+    } else {
+        Ok(LengthPercentageValue::Value(TaffyLengthPercentage::Length(
+            calc.px,
+        )))
+    }
+}
+
+fn length_percentage_auto_value_from_css(
+    value: &LengthPercentageOrAuto,
+) -> Result<LengthPercentageAutoValue, StyleError> {
+    match value {
+        LengthPercentageOrAuto::Auto => Ok(LengthPercentageAutoValue::Value(
+            TaffyLengthPercentageAuto::Auto,
+        )),
         LengthPercentageOrAuto::LengthPercentage(value) => {
-            Ok(length_percentage_to_taffy(value)?.into())
+            match length_percentage_value_from_css(value)? {
+                LengthPercentageValue::Value(value) => {
+                    Ok(LengthPercentageAutoValue::Value(value.into()))
+                }
+                LengthPercentageValue::Calc(value) => Ok(LengthPercentageAutoValue::Calc(value)),
+            }
         }
     }
 }
 
-fn length_percentage_auto_to_taffy_padding(
+fn length_percentage_padding_value_from_css(
     value: &LengthPercentageOrAuto,
-) -> Result<TaffyLengthPercentage, StyleError> {
+) -> Result<LengthPercentageValue, StyleError> {
     match value {
-        LengthPercentageOrAuto::LengthPercentage(value) => length_percentage_to_taffy(value),
+        LengthPercentageOrAuto::LengthPercentage(value) => length_percentage_value_from_css(value),
         LengthPercentageOrAuto::Auto => Err(StyleError::UnsupportedValue("auto".to_string())),
     }
 }
 
-fn dimension_from_css_size(size: &CssSize) -> Result<Dimension, StyleError> {
+fn dimension_from_css_size(size: &CssSize) -> Result<DimensionValue, StyleError> {
     match size {
-        CssSize::Auto => Ok(Dimension::Auto),
-        CssSize::LengthPercentage(value) => Ok(length_percentage_to_taffy(value)?.into()),
+        CssSize::Auto => Ok(DimensionValue::Dimension(Dimension::Auto)),
+        CssSize::LengthPercentage(value) => dimension_value_from_length_percentage(value),
         _ => Err(StyleError::UnsupportedValue(format!("{size:?}"))),
     }
 }
 
-fn dimension_from_css_max_size(size: &CssMaxSize) -> Result<Dimension, StyleError> {
+fn dimension_from_css_max_size(size: &CssMaxSize) -> Result<DimensionValue, StyleError> {
     match size {
-        CssMaxSize::None => Ok(Dimension::Auto),
-        CssMaxSize::LengthPercentage(value) => Ok(length_percentage_to_taffy(value)?.into()),
+        CssMaxSize::None => Ok(DimensionValue::Dimension(Dimension::Auto)),
+        CssMaxSize::LengthPercentage(value) => dimension_value_from_length_percentage(value),
         _ => Err(StyleError::UnsupportedValue(format!("{size:?}"))),
     }
 }
 
 fn dimension_from_length_percentage_auto(
     value: &LengthPercentageOrAuto,
-) -> Result<Dimension, StyleError> {
+) -> Result<DimensionValue, StyleError> {
     match value {
-        LengthPercentageOrAuto::Auto => Ok(Dimension::Auto),
+        LengthPercentageOrAuto::Auto => Ok(DimensionValue::Dimension(Dimension::Auto)),
         LengthPercentageOrAuto::LengthPercentage(value) => {
-            Ok(length_percentage_to_taffy(value)?.into())
+            dimension_value_from_length_percentage(value)
         }
     }
 }
@@ -926,7 +1208,9 @@ fn flex_shorthand_declarations(flex: &CssFlex) -> Result<Vec<Declaration>, Style
     Ok(vec![
         Declaration::FlexGrow(flex.grow),
         Declaration::FlexShrink(flex.shrink),
-        Declaration::FlexBasis(dimension_from_length_percentage_auto(&flex.basis)?),
+        Declaration::FlexBasis(
+            dimension_from_length_percentage_auto(&flex.basis)?.into_dimension()?,
+        ),
     ])
 }
 
@@ -1025,10 +1309,12 @@ fn self_position_to_taffy(position: SelfPosition) -> TaffyAlignItems {
     }
 }
 
-fn gap_value_to_taffy(value: &GapValue) -> Result<TaffyLengthPercentage, StyleError> {
+fn gap_value_from_css(value: &GapValue) -> Result<LengthPercentageValue, StyleError> {
     match value {
-        GapValue::Normal => Ok(TaffyLengthPercentage::Length(0.0)),
-        GapValue::LengthPercentage(value) => length_percentage_to_taffy(value),
+        GapValue::Normal => Ok(LengthPercentageValue::Value(TaffyLengthPercentage::Length(
+            0.0,
+        ))),
+        GapValue::LengthPercentage(value) => length_percentage_value_from_css(value),
     }
 }
 
@@ -1245,50 +1531,196 @@ fn apply_declaration(
                 style.layout.taffy.position = TaffyPosition::Absolute;
             }
             style.layout.taffy.inset.top = *value;
+            style.layout.calc.inset_top = None;
+        }
+        Declaration::InsetTopCalc(value) => {
+            if !*position_explicit {
+                style.layout.taffy.position = TaffyPosition::Absolute;
+            }
+            style.layout.taffy.inset.top = length_percentage_auto_hint_from_calc(*value);
+            style.layout.calc.inset_top = Some(*value);
         }
         Declaration::InsetRight(value) => {
             if !*position_explicit {
                 style.layout.taffy.position = TaffyPosition::Absolute;
             }
             style.layout.taffy.inset.right = *value;
+            style.layout.calc.inset_right = None;
+        }
+        Declaration::InsetRightCalc(value) => {
+            if !*position_explicit {
+                style.layout.taffy.position = TaffyPosition::Absolute;
+            }
+            style.layout.taffy.inset.right = length_percentage_auto_hint_from_calc(*value);
+            style.layout.calc.inset_right = Some(*value);
         }
         Declaration::InsetBottom(value) => {
             if !*position_explicit {
                 style.layout.taffy.position = TaffyPosition::Absolute;
             }
             style.layout.taffy.inset.bottom = *value;
+            style.layout.calc.inset_bottom = None;
+        }
+        Declaration::InsetBottomCalc(value) => {
+            if !*position_explicit {
+                style.layout.taffy.position = TaffyPosition::Absolute;
+            }
+            style.layout.taffy.inset.bottom = length_percentage_auto_hint_from_calc(*value);
+            style.layout.calc.inset_bottom = Some(*value);
         }
         Declaration::InsetLeft(value) => {
             if !*position_explicit {
                 style.layout.taffy.position = TaffyPosition::Absolute;
             }
             style.layout.taffy.inset.left = *value;
+            style.layout.calc.inset_left = None;
         }
-        Declaration::Width(value) => style.layout.taffy.size.width = *value,
-        Declaration::Height(value) => style.layout.taffy.size.height = *value,
-        Declaration::MinWidth(value) => style.layout.taffy.min_size.width = *value,
-        Declaration::MinHeight(value) => style.layout.taffy.min_size.height = *value,
-        Declaration::MaxWidth(value) => style.layout.taffy.max_size.width = *value,
-        Declaration::MaxHeight(value) => style.layout.taffy.max_size.height = *value,
-        Declaration::MarginTop(value) => style.layout.taffy.margin.top = *value,
-        Declaration::MarginRight(value) => style.layout.taffy.margin.right = *value,
-        Declaration::MarginBottom(value) => style.layout.taffy.margin.bottom = *value,
-        Declaration::MarginLeft(value) => style.layout.taffy.margin.left = *value,
-        Declaration::PaddingTop(value) => style.layout.taffy.padding.top = *value,
-        Declaration::PaddingRight(value) => style.layout.taffy.padding.right = *value,
-        Declaration::PaddingBottom(value) => style.layout.taffy.padding.bottom = *value,
-        Declaration::PaddingLeft(value) => style.layout.taffy.padding.left = *value,
+        Declaration::InsetLeftCalc(value) => {
+            if !*position_explicit {
+                style.layout.taffy.position = TaffyPosition::Absolute;
+            }
+            style.layout.taffy.inset.left = length_percentage_auto_hint_from_calc(*value);
+            style.layout.calc.inset_left = Some(*value);
+        }
+        Declaration::Width(value) => {
+            style.layout.taffy.size.width = *value;
+            style.layout.calc.width = None;
+        }
+        Declaration::WidthCalc(value) => {
+            style.layout.taffy.size.width = dimension_hint_from_calc(*value);
+            style.layout.calc.width = Some(*value);
+        }
+        Declaration::Height(value) => {
+            style.layout.taffy.size.height = *value;
+            style.layout.calc.height = None;
+        }
+        Declaration::HeightCalc(value) => {
+            style.layout.taffy.size.height = dimension_hint_from_calc(*value);
+            style.layout.calc.height = Some(*value);
+        }
+        Declaration::MinWidth(value) => {
+            style.layout.taffy.min_size.width = *value;
+            style.layout.calc.min_width = None;
+        }
+        Declaration::MinWidthCalc(value) => {
+            style.layout.taffy.min_size.width = dimension_hint_from_calc(*value);
+            style.layout.calc.min_width = Some(*value);
+        }
+        Declaration::MinHeight(value) => {
+            style.layout.taffy.min_size.height = *value;
+            style.layout.calc.min_height = None;
+        }
+        Declaration::MinHeightCalc(value) => {
+            style.layout.taffy.min_size.height = dimension_hint_from_calc(*value);
+            style.layout.calc.min_height = Some(*value);
+        }
+        Declaration::MaxWidth(value) => {
+            style.layout.taffy.max_size.width = *value;
+            style.layout.calc.max_width = None;
+        }
+        Declaration::MaxWidthCalc(value) => {
+            style.layout.taffy.max_size.width = dimension_hint_from_calc(*value);
+            style.layout.calc.max_width = Some(*value);
+        }
+        Declaration::MaxHeight(value) => {
+            style.layout.taffy.max_size.height = *value;
+            style.layout.calc.max_height = None;
+        }
+        Declaration::MaxHeightCalc(value) => {
+            style.layout.taffy.max_size.height = dimension_hint_from_calc(*value);
+            style.layout.calc.max_height = Some(*value);
+        }
+        Declaration::MarginTop(value) => {
+            style.layout.taffy.margin.top = *value;
+            style.layout.calc.margin_top = None;
+        }
+        Declaration::MarginTopCalc(value) => {
+            style.layout.taffy.margin.top = length_percentage_auto_hint_from_calc(*value);
+            style.layout.calc.margin_top = Some(*value);
+        }
+        Declaration::MarginRight(value) => {
+            style.layout.taffy.margin.right = *value;
+            style.layout.calc.margin_right = None;
+        }
+        Declaration::MarginRightCalc(value) => {
+            style.layout.taffy.margin.right = length_percentage_auto_hint_from_calc(*value);
+            style.layout.calc.margin_right = Some(*value);
+        }
+        Declaration::MarginBottom(value) => {
+            style.layout.taffy.margin.bottom = *value;
+            style.layout.calc.margin_bottom = None;
+        }
+        Declaration::MarginBottomCalc(value) => {
+            style.layout.taffy.margin.bottom = length_percentage_auto_hint_from_calc(*value);
+            style.layout.calc.margin_bottom = Some(*value);
+        }
+        Declaration::MarginLeft(value) => {
+            style.layout.taffy.margin.left = *value;
+            style.layout.calc.margin_left = None;
+        }
+        Declaration::MarginLeftCalc(value) => {
+            style.layout.taffy.margin.left = length_percentage_auto_hint_from_calc(*value);
+            style.layout.calc.margin_left = Some(*value);
+        }
+        Declaration::PaddingTop(value) => {
+            style.layout.taffy.padding.top = *value;
+            style.layout.calc.padding_top = None;
+        }
+        Declaration::PaddingTopCalc(value) => {
+            style.layout.taffy.padding.top = length_percentage_hint_from_calc(*value);
+            style.layout.calc.padding_top = Some(*value);
+        }
+        Declaration::PaddingRight(value) => {
+            style.layout.taffy.padding.right = *value;
+            style.layout.calc.padding_right = None;
+        }
+        Declaration::PaddingRightCalc(value) => {
+            style.layout.taffy.padding.right = length_percentage_hint_from_calc(*value);
+            style.layout.calc.padding_right = Some(*value);
+        }
+        Declaration::PaddingBottom(value) => {
+            style.layout.taffy.padding.bottom = *value;
+            style.layout.calc.padding_bottom = None;
+        }
+        Declaration::PaddingBottomCalc(value) => {
+            style.layout.taffy.padding.bottom = length_percentage_hint_from_calc(*value);
+            style.layout.calc.padding_bottom = Some(*value);
+        }
+        Declaration::PaddingLeft(value) => {
+            style.layout.taffy.padding.left = *value;
+            style.layout.calc.padding_left = None;
+        }
+        Declaration::PaddingLeftCalc(value) => {
+            style.layout.taffy.padding.left = length_percentage_hint_from_calc(*value);
+            style.layout.calc.padding_left = Some(*value);
+        }
         Declaration::FlexDirection(value) => style.layout.taffy.flex_direction = *value,
         Declaration::FlexWrap(value) => style.layout.taffy.flex_wrap = *value,
         Declaration::JustifyContent(value) => style.layout.taffy.justify_content = *value,
         Declaration::AlignItems(value) => style.layout.taffy.align_items = *value,
         Declaration::AlignSelf(value) => style.layout.taffy.align_self = *value,
         Declaration::AlignContent(value) => style.layout.taffy.align_content = *value,
-        Declaration::GapRow(value) => style.layout.taffy.gap.height = *value,
-        Declaration::GapColumn(value) => style.layout.taffy.gap.width = *value,
+        Declaration::GapRow(value) => {
+            style.layout.taffy.gap.height = *value;
+            style.layout.calc.gap_row = None;
+        }
+        Declaration::GapRowCalc(value) => {
+            style.layout.taffy.gap.height = length_percentage_hint_from_calc(*value);
+            style.layout.calc.gap_row = Some(*value);
+        }
+        Declaration::GapColumn(value) => {
+            style.layout.taffy.gap.width = *value;
+            style.layout.calc.gap_column = None;
+        }
+        Declaration::GapColumnCalc(value) => {
+            style.layout.taffy.gap.width = length_percentage_hint_from_calc(*value);
+            style.layout.calc.gap_column = Some(*value);
+        }
         Declaration::FlexGrow(value) => style.layout.taffy.flex_grow = *value,
         Declaration::FlexShrink(value) => style.layout.taffy.flex_shrink = *value,
-        Declaration::FlexBasis(value) => style.layout.taffy.flex_basis = *value,
+        Declaration::FlexBasis(value) => {
+            style.layout.taffy.flex_basis = *value;
+        }
         Declaration::GridTemplateColumns(value) => {
             style.layout.taffy.grid_template_columns = value.clone();
         }
@@ -1302,6 +1734,29 @@ fn apply_declaration(
         Declaration::GridRowStart(value) => style.layout.taffy.grid_row.start = *value,
         Declaration::GridRowEnd(value) => style.layout.taffy.grid_row.end = *value,
         _ => unreachable!("visual declarations are handled before the layout match"),
+    }
+}
+
+fn dimension_hint_from_calc(value: LengthPercentageCalc) -> Dimension {
+    if value.percent != 0.0 {
+        Dimension::Percent(value.percent)
+    } else {
+        Dimension::Length(value.px)
+    }
+}
+
+fn length_percentage_hint_from_calc(value: LengthPercentageCalc) -> TaffyLengthPercentage {
+    if value.percent != 0.0 {
+        TaffyLengthPercentage::Percent(value.percent)
+    } else {
+        TaffyLengthPercentage::Length(value.px)
+    }
+}
+
+fn length_percentage_auto_hint_from_calc(value: LengthPercentageCalc) -> TaffyLengthPercentageAuto {
+    match length_percentage_hint_from_calc(value) {
+        TaffyLengthPercentage::Length(value) => TaffyLengthPercentageAuto::Length(value),
+        TaffyLengthPercentage::Percent(value) => TaffyLengthPercentageAuto::Percent(value),
     }
 }
 
@@ -1405,6 +1860,55 @@ mod tests {
     }
 
     #[test]
+    fn parser_collects_style_rules_inside_top_level_at_rules() {
+        let stylesheet = parse_stylesheet(
+            "@media (min-width: 640px) { .card { width: 800px; } }
+             @font-face { font-family: \"Demo\"; src: url(\"demo.woff2\"); }
+             .card { width: 640px; }",
+        )
+        .expect("stylesheet with at-rules should parse all style rules");
+
+        let widths = stylesheet
+            .rules
+            .iter()
+            .filter_map(|rule| match rule.declarations.first() {
+                Some(Declaration::Width(Dimension::Length(value))) => Some(*value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(stylesheet.rules.len(), 2);
+        assert!(widths.contains(&640.0));
+        assert!(widths.contains(&800.0));
+    }
+
+    #[test]
+    fn parser_collects_style_rules_inside_nested_media_blocks() {
+        let stylesheet = parse_stylesheet(
+            ".card {
+                width: 640px;
+                @media (min-width: 640px) {
+                    width: 800px;
+                }
+            }",
+        )
+        .expect("nested media rules should parse into style rules");
+
+        let widths = stylesheet
+            .rules
+            .iter()
+            .filter_map(|rule| match rule.declarations.first() {
+                Some(Declaration::Width(Dimension::Length(value))) => Some(*value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(stylesheet.rules.len(), 2);
+        assert!(widths.contains(&640.0));
+        assert!(widths.contains(&800.0));
+    }
+
+    #[test]
     fn inset_shorthand_expands_through_existing_absolute_position_pipeline() {
         let stylesheet =
             parse_stylesheet(".card { inset: 0; }").expect("inset shorthand should parse");
@@ -1486,6 +1990,41 @@ mod tests {
             .expect_err("unsupported flex shorthand should fail clearly");
 
         assert!(matches!(error, StyleError::UnsupportedValue(_)));
+    }
+
+    #[test]
+    fn calc_width_values_resolve_in_viewport_layout() {
+        let stylesheet = parse_stylesheet(
+            ".panel {
+                width: calc(100% - 56px);
+                height: 40px;
+            }",
+        )
+        .expect("calc size declarations should parse");
+        let tree = Node::element("div").with_class("panel").into();
+        let scene = build_render_tree_in_viewport(&tree, &stylesheet, 640, 360);
+
+        assert!((scene.layout.width - 584.0).abs() < 0.01);
+        assert!((scene.layout.height - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn calc_inset_values_resolve_in_viewport_layout() {
+        let stylesheet = parse_stylesheet(
+            ".panel {
+                top: calc(100% - 56px);
+                left: 0;
+                width: 24px;
+                height: 24px;
+            }",
+        )
+        .expect("calc inset declarations should parse");
+        let tree = Node::element("div")
+            .with_child(Node::element("div").with_class("panel").into())
+            .into();
+        let scene = build_render_tree_in_viewport(&tree, &stylesheet, 640, 360);
+
+        assert!((scene.children[0].layout.y - 304.0).abs() < 0.01);
     }
 
     #[test]
@@ -2065,6 +2604,36 @@ mod tests {
     }
 
     #[test]
+    fn nested_selectors_participate_in_render_tree_style_resolution() {
+        let stylesheet = parse_stylesheet(
+            ".button {
+                .hover-text { color: #2563eb; }
+                & > .icon { background-color: #0f172a; }
+            }",
+        )
+        .expect("nested selectors should parse");
+        let tree = Node::element("button")
+            .with_class("button")
+            .with_child(Node::element("span").with_class("hover-text").into())
+            .with_child(Node::element("span").with_class("icon").into())
+            .with_child(
+                Node::element("div")
+                    .with_class("wrapper")
+                    .with_child(Node::element("span").with_class("icon").into())
+                    .into(),
+            )
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        assert_eq!(scene.children[0].style.foreground, Color::rgb(37, 99, 235));
+        assert_eq!(
+            scene.children[1].style.background,
+            Some(Color::rgb(15, 23, 42))
+        );
+        assert_eq!(scene.children[2].children[0].style.background, None);
+    }
+
+    #[test]
     fn generated_content_pseudo_elements_render_before_and_after_text() {
         let stylesheet = parse_stylesheet(
             ".badge::before { content: \"[\"; color: #2563eb; }
@@ -2210,6 +2779,60 @@ mod tests {
                 ],
             })]
         );
+    }
+
+    #[test]
+    fn parser_supports_mixed_calc_gradient_stops() {
+        let stylesheet = parse_stylesheet(
+            ".card {
+                width: 320px;
+                height: 16px;
+                background-image: linear-gradient(
+                    to right,
+                    #111111 0%,
+                    #222222 calc(100% - 56px),
+                    #333333 100%
+                );
+            }",
+        )
+        .expect("mixed calc gradient stops should parse");
+        let tree = Node::element("div").with_class("card").into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        let BackgroundLayer::LinearGradient(gradient) = &scene.style.background_layers[0] else {
+            panic!("expected a linear gradient background layer");
+        };
+        assert_eq!(gradient.stops.len(), 3);
+        assert_eq!(
+            gradient.stops[1].position,
+            LengthPercentageValue {
+                px: -56.0,
+                fraction: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn parser_supports_hard_stop_gradients_with_calc_segments() {
+        let stylesheet = parse_stylesheet(
+            ".card {
+                width: 320px;
+                height: 16px;
+                background:
+                    linear-gradient(
+                        90deg,
+                        #1a1d22 0 44px,
+                        #252b33 44px 140px,
+                        #0000 140px calc(100% - 56px),
+                        #272d35 calc(100% - 56px) 100%
+                    );
+            }",
+        )
+        .expect("hard-stop gradient with calc segments should parse");
+        let tree = Node::element("div").with_class("card").into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        assert_eq!(scene.style.background_layers.len(), 1);
     }
 
     #[test]
