@@ -30,6 +30,7 @@ use crate::{gradient::rasterize_background_layer_texture_uncached, shadow::shado
 
 const MAX_TEXT_TEXTURE_CACHE_ENTRIES: usize = 256;
 const MAX_COLOR_TEXTURE_CACHE_ENTRIES: usize = 512;
+const MIN_VERTEX_BUFFER_CAPACITY_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug)]
 struct BackendCapabilities {
@@ -250,6 +251,70 @@ struct PreparedGpuScene {
     projected_textures: Vec<PreparedProjectedTextureCommand>,
 }
 
+struct ReusableVertexBuffer {
+    buffer: wgpu::Buffer,
+    capacity_bytes: usize,
+}
+
+fn next_vertex_buffer_capacity(required_bytes: usize) -> usize {
+    let required = required_bytes.max(1);
+    required
+        .checked_next_power_of_two()
+        .unwrap_or(required)
+        .max(MIN_VERTEX_BUFFER_CAPACITY_BYTES)
+}
+
+impl ReusableVertexBuffer {
+    fn with_capacity(device: &wgpu::Device, label: &str, required_bytes: usize) -> Self {
+        let capacity_bytes = next_vertex_buffer_capacity(required_bytes);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: capacity_bytes as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            buffer,
+            capacity_bytes,
+        }
+    }
+
+    fn ensure_capacity(&mut self, device: &wgpu::Device, label: &str, required_bytes: usize) {
+        if required_bytes <= self.capacity_bytes {
+            return;
+        }
+        *self = Self::with_capacity(device, label, required_bytes);
+    }
+}
+
+fn upload_instance_buffer<T: Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    slot: &mut Option<ReusableVertexBuffer>,
+    label: &str,
+    instances: &[T],
+) {
+    if instances.is_empty() {
+        return;
+    }
+    let bytes = bytemuck::cast_slice(instances);
+    let required_bytes = bytes.len();
+
+    if let Some(buffer) = slot.as_mut() {
+        buffer.ensure_capacity(device, label, required_bytes);
+    } else {
+        *slot = Some(ReusableVertexBuffer::with_capacity(
+            device,
+            label,
+            required_bytes,
+        ));
+    }
+
+    if let Some(buffer) = slot.as_ref() {
+        queue.write_buffer(&buffer.buffer, 0, bytes);
+    }
+}
+
 pub(crate) enum GpuPresentOutcome {
     Presented { paint_us: u64, present_us: u64 },
     Skipped,
@@ -276,6 +341,11 @@ pub(crate) struct GpuRuntimeBackend {
     color_sampler: wgpu::Sampler,
     text_textures: HashMap<TextTextureKey, CachedTextTexture>,
     color_textures: HashMap<ColorTextureKey, CachedColorTexture>,
+    fill_instance_buffer: Option<ReusableVertexBuffer>,
+    border_instance_buffer: Option<ReusableVertexBuffer>,
+    text_instance_buffer: Option<ReusableVertexBuffer>,
+    color_texture_instance_buffer: Option<ReusableVertexBuffer>,
+    projected_texture_instance_buffer: Option<ReusableVertexBuffer>,
     next_texture_use: u64,
 }
 
@@ -474,6 +544,11 @@ impl GpuRuntimeBackend {
             color_sampler,
             text_textures: HashMap::new(),
             color_textures: HashMap::new(),
+            fill_instance_buffer: None,
+            border_instance_buffer: None,
+            text_instance_buffer: None,
+            color_texture_instance_buffer: None,
+            projected_texture_instance_buffer: None,
             next_texture_use: 0,
         })
     }
@@ -547,61 +622,57 @@ impl GpuRuntimeBackend {
             self.ensure_color_texture(&projected_texture.key, projected_texture.raster.as_ref());
         }
 
-        let fill_buffer = (!prepared.fills.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("cssimpler gpu fills"),
-                    contents: bytemuck::cast_slice(&prepared.fills),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
-        let border_buffer = (!prepared.borders.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("cssimpler gpu borders"),
-                    contents: bytemuck::cast_slice(&prepared.borders),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
         let text_instances = prepared
             .texts
             .iter()
             .map(|command| command.instance)
             .collect::<Vec<_>>();
-        let text_buffer = (!text_instances.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("cssimpler gpu texts"),
-                    contents: bytemuck::cast_slice(&text_instances),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
         let color_texture_instances = prepared
             .color_textures
             .iter()
             .map(|command| command.instance)
             .collect::<Vec<_>>();
-        let color_texture_buffer = (!color_texture_instances.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("cssimpler gpu color textures"),
-                    contents: bytemuck::cast_slice(&color_texture_instances),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
         let projected_texture_instances = prepared
             .projected_textures
             .iter()
             .map(|command| command.instance)
             .collect::<Vec<_>>();
-        let projected_texture_buffer = (!projected_texture_instances.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("cssimpler gpu projected textures"),
-                    contents: bytemuck::cast_slice(&projected_texture_instances),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
+
+        upload_instance_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.fill_instance_buffer,
+            "cssimpler gpu fills",
+            &prepared.fills,
+        );
+        upload_instance_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.border_instance_buffer,
+            "cssimpler gpu borders",
+            &prepared.borders,
+        );
+        upload_instance_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.text_instance_buffer,
+            "cssimpler gpu texts",
+            &text_instances,
+        );
+        upload_instance_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.color_texture_instance_buffer,
+            "cssimpler gpu color textures",
+            &color_texture_instances,
+        );
+        upload_instance_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.projected_texture_instance_buffer,
+            "cssimpler gpu projected textures",
+            &projected_texture_instances,
+        );
 
         let Some(surface_texture) = self.acquire_surface_texture()? else {
             return Ok(GpuPresentOutcome::Skipped);
@@ -639,13 +710,13 @@ impl GpuRuntimeBackend {
                         instance_start,
                         instance_count,
                     } => {
-                        let Some(fill_buffer) = fill_buffer.as_ref() else {
+                        let Some(fill_buffer) = self.fill_instance_buffer.as_ref() else {
                             command_index += 1;
                             continue;
                         };
                         apply_scissor(&mut render_pass, *scissor);
                         render_pass.set_pipeline(&self.fill_pipeline);
-                        render_pass.set_vertex_buffer(0, fill_buffer.slice(..));
+                        render_pass.set_vertex_buffer(0, fill_buffer.buffer.slice(..));
                         render_pass.draw(0..6, *instance_start..*instance_start + *instance_count);
                     }
                     GpuPaintCommand::Border {
@@ -653,13 +724,13 @@ impl GpuRuntimeBackend {
                         instance_start,
                         instance_count,
                     } => {
-                        let Some(border_buffer) = border_buffer.as_ref() else {
+                        let Some(border_buffer) = self.border_instance_buffer.as_ref() else {
                             command_index += 1;
                             continue;
                         };
                         apply_scissor(&mut render_pass, *scissor);
                         render_pass.set_pipeline(&self.border_pipeline);
-                        render_pass.set_vertex_buffer(0, border_buffer.slice(..));
+                        render_pass.set_vertex_buffer(0, border_buffer.buffer.slice(..));
                         render_pass.draw(0..6, *instance_start..*instance_start + *instance_count);
                     }
                     GpuPaintCommand::Text {
@@ -667,7 +738,7 @@ impl GpuRuntimeBackend {
                         instance_start,
                         instance_count,
                     } => {
-                        let Some(text_buffer) = text_buffer.as_ref() else {
+                        let Some(text_buffer) = self.text_instance_buffer.as_ref() else {
                             command_index += 1;
                             continue;
                         };
@@ -684,7 +755,7 @@ impl GpuRuntimeBackend {
                         apply_scissor(&mut render_pass, *scissor);
                         render_pass.set_pipeline(&self.text_pipeline);
                         render_pass.set_bind_group(1, &texture.bind_group, &[]);
-                        render_pass.set_vertex_buffer(0, text_buffer.slice(..));
+                        render_pass.set_vertex_buffer(0, text_buffer.buffer.slice(..));
                         render_pass.draw(0..6, *instance_start..*instance_start + *instance_count);
                     }
                     GpuPaintCommand::ColorTexture {
@@ -692,7 +763,8 @@ impl GpuRuntimeBackend {
                         instance_start,
                         instance_count,
                     } => {
-                        let Some(color_texture_buffer) = color_texture_buffer.as_ref() else {
+                        let Some(color_texture_buffer) = self.color_texture_instance_buffer.as_ref()
+                        else {
                             command_index += 1;
                             continue;
                         };
@@ -711,7 +783,7 @@ impl GpuRuntimeBackend {
                         apply_scissor(&mut render_pass, *scissor);
                         render_pass.set_pipeline(&self.color_texture_pipeline);
                         render_pass.set_bind_group(1, &texture.bind_group, &[]);
-                        render_pass.set_vertex_buffer(0, color_texture_buffer.slice(..));
+                        render_pass.set_vertex_buffer(0, color_texture_buffer.buffer.slice(..));
                         render_pass.draw(0..6, *instance_start..*instance_start + *instance_count);
                     }
                     GpuPaintCommand::ProjectedTexture {
@@ -719,7 +791,8 @@ impl GpuRuntimeBackend {
                         instance_start,
                         instance_count,
                     } => {
-                        let Some(projected_texture_buffer) = projected_texture_buffer.as_ref()
+                        let Some(projected_texture_buffer) =
+                            self.projected_texture_instance_buffer.as_ref()
                         else {
                             command_index += 1;
                             continue;
@@ -739,7 +812,10 @@ impl GpuRuntimeBackend {
                         apply_scissor(&mut render_pass, *scissor);
                         render_pass.set_pipeline(&self.projected_texture_pipeline);
                         render_pass.set_bind_group(1, &texture.bind_group, &[]);
-                        render_pass.set_vertex_buffer(0, projected_texture_buffer.slice(..));
+                        render_pass.set_vertex_buffer(
+                            0,
+                            projected_texture_buffer.buffer.slice(..),
+                        );
                         render_pass.draw(0..6, *instance_start..*instance_start + *instance_count);
                     }
                 }
