@@ -65,7 +65,7 @@ const MAX_SUBTREE_SURFACE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_TEMP_BYTES: usize = 8 * 1024 * 1024;
 const MIN_PARALLEL_RENDER_PIXELS: usize = 640 * 480;
-const MIN_INCREMENTAL_PIXELS_PER_WORKER: usize = 160 * 160;
+const MIN_INCREMENTAL_PIXELS_PER_WORKER: usize = 200 * 200;
 const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 80;
 const MAX_RENDER_WORKERS: usize = 12;
 const SCENE_TRAVERSAL_COST_PER_NODE: usize = 96;
@@ -1571,11 +1571,16 @@ fn render_scene_update_internal(
         planned_dirty_jobs.len(),
         incremental_worker_count,
     );
+    let incremental_fallback_scene_passes = incremental_scene_passes_for_full_redraw_heuristic(
+        dirty_region_count,
+        planned_dirty_jobs.len(),
+        incremental_worker_count,
+    );
     if let Some(reason) = should_full_redraw(
         dirty_region_count,
         dirty_pixels,
         scene_diff.current_bounds.node_count,
-        incremental_dirty_jobs,
+        incremental_fallback_scene_passes,
         width,
         height,
     ) {
@@ -1777,18 +1782,53 @@ fn distribute_dirty_render_jobs(
     worker_count: usize,
 ) -> Vec<Vec<DirtyRenderJob>> {
     let worker_count = worker_count.max(1).min(dirty_jobs.len().max(1));
-    let mut groups = vec![Vec::new(); worker_count];
-    let mut loads = vec![0_usize; worker_count];
     let mut jobs = dirty_jobs.to_vec();
-    jobs.sort_by(|left, right| right.pixel_count.cmp(&left.pixel_count));
+    jobs.sort_by(|left, right| {
+        left.clip
+            .y0
+            .total_cmp(&right.clip.y0)
+            .then_with(|| left.clip.x0.total_cmp(&right.clip.x0))
+            .then_with(|| right.pixel_count.cmp(&left.pixel_count))
+    });
 
-    for job in jobs {
-        let Some((target_index, _)) = loads.iter().enumerate().min_by_key(|(_, load)| **load)
-        else {
+    let mut groups = Vec::with_capacity(worker_count);
+    let mut start = 0;
+    let mut remaining_pixels = jobs.iter().map(|job| job.pixel_count).sum::<usize>();
+
+    for group_index in 0..worker_count {
+        if start >= jobs.len() {
             break;
-        };
-        loads[target_index] = loads[target_index].saturating_add(job.pixel_count);
-        groups[target_index].push(job);
+        }
+        let remaining_workers = worker_count - group_index;
+        if remaining_workers == 1 {
+            groups.push(jobs[start..].to_vec());
+            break;
+        }
+
+        let target_load = remaining_pixels.div_ceil(remaining_workers).max(1);
+        let mut end = start;
+        let mut load = 0_usize;
+        while end < jobs.len() {
+            let next_load = load.saturating_add(jobs[end].pixel_count);
+            let jobs_left_after = jobs.len().saturating_sub(end + 1);
+            let workers_left_after = remaining_workers - 1;
+            let enough_jobs_for_remaining = jobs_left_after >= workers_left_after;
+            if end > start && next_load > target_load && enough_jobs_for_remaining {
+                break;
+            }
+            load = next_load;
+            end += 1;
+            if load >= target_load && enough_jobs_for_remaining {
+                break;
+            }
+        }
+        if end == start {
+            end = (start + 1).min(jobs.len());
+            load = jobs[start].pixel_count;
+        }
+        groups.push(jobs[start..end].to_vec());
+        start = end;
+        remaining_pixels = remaining_pixels.saturating_sub(load);
     }
 
     groups
@@ -1846,6 +1886,18 @@ fn incremental_scene_pass_count(
 ) -> usize {
     if worker_count > 1 {
         dirty_job_count.max(1)
+    } else {
+        dirty_region_count.max(1)
+    }
+}
+
+fn incremental_scene_passes_for_full_redraw_heuristic(
+    dirty_region_count: usize,
+    dirty_job_count: usize,
+    worker_count: usize,
+) -> usize {
+    if worker_count > 1 {
+        dirty_job_count.div_ceil(worker_count.max(1)).max(1)
     } else {
         dirty_region_count.max(1)
     }
@@ -3691,7 +3743,9 @@ fn should_full_redraw(
     }
 
     let full_pixels = width.saturating_mul(height);
-    if dirty_pixels > (full_pixels as f32 * MAX_INCREMENTAL_DIRTY_AREA_RATIO) as usize {
+    if dirty_region_count > 1
+        && dirty_pixels > (full_pixels as f32 * MAX_INCREMENTAL_DIRTY_AREA_RATIO) as usize
+    {
         return Some(FramePaintReason::DirtyAreaLimit);
     }
 
@@ -4389,11 +4443,13 @@ mod tests {
     use crate::{
         ClipRect, DirtyRenderJob, FramePaintMode, FramePaintReason, MouseEventKind, ViewportSize,
         WindowConfig, blend_pixel, build_incremental_render_jobs, coalesce_dirty_regions,
-        dirty_regions_between_scenes, dispatch_click, dispatch_hover_transition_events,
-        dispatch_mouse_event, distribute_dirty_render_jobs, drawable_viewport_size,
-        hit_test_element_path, pack_rgb, render_scene_update,
+        dirty_job_group_rows, dirty_regions_between_scenes, dispatch_click,
+        dispatch_hover_transition_events, dispatch_mouse_event, distribute_dirty_render_jobs,
+        drawable_viewport_size, hit_test_element_path,
+        incremental_scene_passes_for_full_redraw_heuristic, pack_rgb, render_scene_update,
         render_scene_update_internal_from_roots, render_to_buffer, resize_buffer,
         scenes_match_visuals, should_present_frame, should_present_scene, should_suspend_updates,
+        should_full_redraw,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -7140,6 +7196,71 @@ mod tests {
     }
 
     #[test]
+    fn incremental_fallback_pass_estimate_scales_with_parallel_workers() {
+        assert_eq!(
+            incremental_scene_passes_for_full_redraw_heuristic(5, 21, 4),
+            6
+        );
+        assert_eq!(
+            incremental_scene_passes_for_full_redraw_heuristic(5, 21, 1),
+            5
+        );
+    }
+
+    #[test]
+    fn fragmented_damage_fallback_uses_parallel_pass_estimate_instead_of_total_jobs() {
+        let dirty_region_count = 24;
+        let dirty_pixels = 40_000;
+        let scene_node_count = 800;
+        let width = 960;
+        let height = 540;
+        let total_job_passes = 64;
+        let worker_count = 8;
+        let parallel_estimated_passes = incremental_scene_passes_for_full_redraw_heuristic(
+            dirty_region_count,
+            total_job_passes,
+            worker_count,
+        );
+
+        assert_eq!(
+            should_full_redraw(
+                dirty_region_count,
+                dirty_pixels,
+                scene_node_count,
+                total_job_passes,
+                width,
+                height,
+            ),
+            Some(FramePaintReason::FragmentedDamage)
+        );
+        assert_eq!(
+            should_full_redraw(
+                dirty_region_count,
+                dirty_pixels,
+                scene_node_count,
+                parallel_estimated_passes,
+                width,
+                height,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn single_large_region_does_not_force_dirty_area_limit() {
+        let decision = should_full_redraw(1, 900_000, 200, 2, 1_000, 1_000);
+
+        assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn multiple_large_regions_can_still_trigger_dirty_area_limit() {
+        let decision = should_full_redraw(2, 900_000, 200, 2, 1_000, 1_000);
+
+        assert_eq!(decision, Some(FramePaintReason::DirtyAreaLimit));
+    }
+
+    #[test]
     fn incremental_render_job_distribution_keeps_worker_loads_close() {
         let jobs = vec![
             DirtyRenderJob {
@@ -7189,6 +7310,61 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert!(loads.iter().all(|&load| load >= 12800));
         assert!(loads.iter().all(|&load| load <= 16000));
+    }
+
+    #[test]
+    fn incremental_render_job_distribution_keeps_worker_row_spans_tight() {
+        let jobs = vec![
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 120.0,
+                    y1: 80.0,
+                },
+                pixel_count: 9600,
+            },
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 0.0,
+                    y0: 80.0,
+                    x1: 120.0,
+                    y1: 160.0,
+                },
+                pixel_count: 9600,
+            },
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 0.0,
+                    y0: 320.0,
+                    x1: 120.0,
+                    y1: 400.0,
+                },
+                pixel_count: 9600,
+            },
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 0.0,
+                    y0: 400.0,
+                    x1: 120.0,
+                    y1: 480.0,
+                },
+                pixel_count: 9600,
+            },
+        ];
+
+        let groups = distribute_dirty_render_jobs(&jobs, 2);
+        let row_spans = groups
+            .iter()
+            .map(|group| {
+                dirty_job_group_rows(group)
+                    .expect("dirty render groups should only contain non-empty row spans")
+                    .len()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(groups.len(), 2);
+        assert!(row_spans.iter().all(|&rows| rows <= 160));
     }
 
     #[test]
