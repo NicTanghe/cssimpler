@@ -918,6 +918,63 @@ Acceptance
 
 ---
 
+# Epic O - Viewport units and root parity
+
+## O1. `:root` selector support
+Depends: C1, C3  
+Status: planned  
+
+Purpose:
+- Add `:root` as a first-class supported pseudo-class in the controlled selector subset
+
+Support:
+- `:root` selector matching for the document root element
+- Deterministic behavior consistent with existing `.class`, `#id`, `tag`, `[attr]`, `:hover`, and `:active` support
+
+Acceptance
+- `:root { ... }` parses and resolves against the root element
+- Selector tests cover root and non-root matching cases
+- Unsupported pseudo-classes still fail clearly
+
+---
+
+## O2. Root auto-stretch in viewport mode
+Depends: D2, D3, E1  
+Status: planned  
+
+Purpose:
+- Make default root sizing browser-like in viewport mode so the app root fills the viewport when not explicitly sized
+
+Rules:
+- In viewport mode, if root width and/or height are not explicitly set, default to viewport fill behavior (equivalent to `width: 100%` and `height: 100%`)
+- Explicit root sizes must continue to override defaults
+- Non-viewport sizing modes must keep current deterministic behavior
+
+Acceptance
+- Root no longer shrinks to content by default in viewport mode
+- A small child panel example still renders inside a viewport-filling root container
+- Layout tests cover explicit-size override and implicit auto-stretch cases
+
+---
+
+## O3. Min/max size declarations or strict diagnostics
+Depends: C1, C2, D1  
+Status: planned  
+
+Purpose:
+- Remove silent no-op behavior for min/max sizing declarations so authors get deterministic outcomes
+
+Support:
+- Preferred path: implement `min-width`, `min-height`, `max-width`, and `max-height`
+- Acceptable fallback: emit explicit warnings or errors for unsupported min/max declarations instead of dropping them silently
+
+Acceptance
+- `min-height: 100vh` is either enforced in layout or reported with an explicit warning/error
+- Unsupported declarations are never silently ignored
+- Tests cover declaration handling and diagnostic behavior
+
+---
+
 # Constraints (explicit)
 
 - Rust-only (no JS, no webview)  
