@@ -58,14 +58,16 @@ use self::{
 
 const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 32;
 const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.85;
+const SINGLE_REGION_MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.94;
 const DIRTY_BRANCH_COLLAPSE_THRESHOLD: usize = 3;
-const DIRTY_BRANCH_COLLAPSE_MAX_AREA_RATIO: f32 = 2.5;
+const DIRTY_BRANCH_COLLAPSE_MAX_AREA_RATIO: f32 = 1.5;
 const DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO: f32 = 1.35;
 const MAX_SUBTREE_SURFACE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_TEMP_BYTES: usize = 8 * 1024 * 1024;
 const MIN_PARALLEL_RENDER_PIXELS: usize = 640 * 480;
 const MIN_INCREMENTAL_PIXELS_PER_WORKER: usize = 200 * 200;
+const MIN_INCREMENTAL_JOBS_PER_WORKER: usize = 3;
 const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 80;
 const MAX_RENDER_WORKERS: usize = 12;
 const SCENE_TRAVERSAL_COST_PER_NODE: usize = 96;
@@ -1850,12 +1852,17 @@ fn incremental_render_worker_count(dirty_jobs: &[DirtyRenderJob]) -> usize {
     let max_workers_from_pixels = total_dirty_pixels
         .div_ceil(MIN_INCREMENTAL_PIXELS_PER_WORKER)
         .max(1);
+    let max_workers_from_jobs = dirty_jobs
+        .len()
+        .div_ceil(MIN_INCREMENTAL_JOBS_PER_WORKER)
+        .max(1);
     thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
         .min(MAX_RENDER_WORKERS)
         .min(dirty_jobs.len())
         .min(max_workers_from_pixels)
+        .min(max_workers_from_jobs)
         .max(1)
 }
 
@@ -3743,10 +3750,14 @@ fn should_full_redraw(
     }
 
     let full_pixels = width.saturating_mul(height);
-    if dirty_region_count > 1
-        && dirty_pixels > (full_pixels as f32 * MAX_INCREMENTAL_DIRTY_AREA_RATIO) as usize
-    {
-        return Some(FramePaintReason::DirtyAreaLimit);
+    if full_pixels > 0 {
+        let dirty_ratio = dirty_pixels as f32 / full_pixels as f32;
+        if dirty_ratio > MAX_INCREMENTAL_DIRTY_AREA_RATIO
+            && (dirty_region_count > 1
+                || dirty_ratio > SINGLE_REGION_MAX_INCREMENTAL_DIRTY_AREA_RATIO)
+        {
+            return Some(FramePaintReason::DirtyAreaLimit);
+        }
     }
 
     let traversal_cost = scene_node_count
@@ -7261,6 +7272,13 @@ mod tests {
     }
 
     #[test]
+    fn single_near_full_region_can_trigger_dirty_area_limit() {
+        let decision = should_full_redraw(1, 950_001, 200, 2, 1_000, 1_000);
+
+        assert_eq!(decision, Some(FramePaintReason::DirtyAreaLimit));
+    }
+
+    #[test]
     fn incremental_render_job_distribution_keeps_worker_loads_close() {
         let jobs = vec![
             DirtyRenderJob {
@@ -7365,6 +7383,26 @@ mod tests {
 
         assert_eq!(groups.len(), 2);
         assert!(row_spans.iter().all(|&rows| rows <= 160));
+    }
+
+    #[test]
+    fn incremental_worker_count_keeps_multiple_jobs_per_worker() {
+        let jobs = vec![
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 120.0,
+                    y1: 80.0,
+                },
+                pixel_count: 9600,
+            };
+            14
+        ];
+
+        let workers = super::incremental_render_worker_count(&jobs);
+
+        assert!(workers <= 5);
     }
 
     #[test]
