@@ -975,6 +975,28 @@ Acceptance
 
 ---
 
+# Epic P - Flex shorthand parity and layout determinism
+
+## P1. `flex` shorthand expansion into existing longhand pipeline
+Depends: L3, D1  
+Status: planned  
+
+Purpose:
+- Eliminate silent no-op behavior for `flex` shorthand so common flex layouts behave as authored
+
+Support:
+- Parse and expand `flex` shorthand values into existing longhand declarations (`flex-grow`, `flex-shrink`, `flex-basis`)
+- Ensure shorthand paths reuse the same Taffy mapping used by longhands (no duplicate layout logic)
+- Cover common authoring patterns used in app shells and panel layouts (`flex: 1`, `flex: auto`, `flex: none`, and explicit triple forms)
+
+Acceptance
+- `.workspace { flex: 1; }` behaves the same as `flex-grow: 1; flex-shrink: 1; flex-basis: 0%`
+- Column flex layouts correctly push fixed-size footers to the bottom when middle content uses shorthand growth
+- Unsupported shorthand values are never silently ignored (clear diagnostic or explicit rejection)
+- Parser and layout tests lock in shorthand expansion behavior
+
+---
+
 # Constraints (explicit)
 
 - Rust-only (no JS, no webview)  
@@ -1006,7 +1028,8 @@ Acceptance
 14. J1 + J2 + J3 (generic attributes, macro support, attribute lookup)  
 15. K1 + K2 + K3 (richer selectors and interactive state)  
 16. L1 + L2 + L3 (custom properties, `var()`, shorthand coverage)  
-17. M1 + M2 + M3 + M4 (text effects, transitions, generated content)  
+17. P1 (`flex` shorthand parity and deterministic layout behavior)  
+18. M1 + M2 + M3 + M4 (text effects, transitions, generated content)  
 Polish: styling depth, performance  
 
 ---

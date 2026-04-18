@@ -16,7 +16,9 @@ use lightningcss::properties::align::{
     SelfPosition,
 };
 use lightningcss::properties::display::{Display as CssDisplay, DisplayInside, DisplayKeyword};
-use lightningcss::properties::flex::{FlexDirection as CssFlexDirection, FlexWrap as CssFlexWrap};
+use lightningcss::properties::flex::{
+    Flex as CssFlex, FlexDirection as CssFlexDirection, FlexWrap as CssFlexWrap,
+};
 use lightningcss::properties::grid::{
     GridColumn as CssGridColumn, GridLine as CssGridLine, GridRow as CssGridRow, RepeatCount,
     TrackBreadth, TrackListItem, TrackSize, TrackSizing as CssTrackSizing,
@@ -700,6 +702,7 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
         Property::FlexBasis(value, _) => Ok(vec![Declaration::FlexBasis(
             dimension_from_length_percentage_auto(value)?,
         )]),
+        Property::Flex(flex, _) => flex_shorthand_declarations(flex),
         Property::GridTemplateColumns(track_sizing) => Ok(vec![Declaration::GridTemplateColumns(
             track_sizing_from_css(track_sizing)?,
         )]),
@@ -876,6 +879,14 @@ fn dimension_from_length_percentage_auto(
             Ok(length_percentage_to_taffy(value)?.into())
         }
     }
+}
+
+fn flex_shorthand_declarations(flex: &CssFlex) -> Result<Vec<Declaration>, StyleError> {
+    Ok(vec![
+        Declaration::FlexGrow(flex.grow),
+        Declaration::FlexShrink(flex.shrink),
+        Declaration::FlexBasis(dimension_from_length_percentage_auto(&flex.basis)?),
+    ])
 }
 
 fn flex_direction_from_css(direction: &CssFlexDirection) -> FlexDirection {
@@ -1368,6 +1379,59 @@ mod tests {
             resolved.layout.taffy.inset.left,
             TaffyLengthPercentageAuto::Length(0.0)
         );
+    }
+
+    #[test]
+    fn flex_shorthand_matches_existing_longhand_pipeline_for_flex_one() {
+        let shorthand_stylesheet =
+            parse_stylesheet(".workspace { flex: 1; }").expect("flex shorthand should parse");
+        let longhand_stylesheet = parse_stylesheet(
+            ".workspace { flex-grow: 1; flex-shrink: 1; flex-basis: 0%; }",
+        )
+        .expect("flex longhand should parse");
+        let element = Node::element("main").with_class("workspace");
+        let shorthand = resolve_style(&element, &shorthand_stylesheet);
+        let longhand = resolve_style(&element, &longhand_stylesheet);
+
+        assert_eq!(shorthand.layout.taffy.flex_grow, longhand.layout.taffy.flex_grow);
+        assert_eq!(
+            shorthand.layout.taffy.flex_shrink,
+            longhand.layout.taffy.flex_shrink
+        );
+        assert_eq!(shorthand.layout.taffy.flex_basis, longhand.layout.taffy.flex_basis);
+    }
+
+    #[test]
+    fn flex_shorthand_supports_auto_none_and_explicit_triple_forms() {
+        let stylesheet = parse_stylesheet(
+            ".auto { flex: auto; }
+             .none { flex: none; }
+             .triple { flex: 2 0 24px; }",
+        )
+        .expect("flex shorthand variants should parse");
+
+        let auto = resolve_style(&Node::element("div").with_class("auto"), &stylesheet);
+        assert_eq!(auto.layout.taffy.flex_grow, 1.0);
+        assert_eq!(auto.layout.taffy.flex_shrink, 1.0);
+        assert_eq!(auto.layout.taffy.flex_basis, Dimension::Auto);
+
+        let none = resolve_style(&Node::element("div").with_class("none"), &stylesheet);
+        assert_eq!(none.layout.taffy.flex_grow, 0.0);
+        assert_eq!(none.layout.taffy.flex_shrink, 0.0);
+        assert_eq!(none.layout.taffy.flex_basis, Dimension::Auto);
+
+        let triple = resolve_style(&Node::element("div").with_class("triple"), &stylesheet);
+        assert_eq!(triple.layout.taffy.flex_grow, 2.0);
+        assert_eq!(triple.layout.taffy.flex_shrink, 0.0);
+        assert_eq!(triple.layout.taffy.flex_basis, Dimension::Length(24.0));
+    }
+
+    #[test]
+    fn unsupported_flex_shorthand_values_fail_clearly() {
+        let error = parse_stylesheet(".workspace { flex: 1 1 calc(100% - 20px); }")
+            .expect_err("unsupported flex shorthand should fail clearly");
+
+        assert!(matches!(error, StyleError::UnsupportedValue(_)));
     }
 
     #[test]
@@ -2167,6 +2231,36 @@ mod tests {
         assert_eq!(scene.children[0].layout.y, 10.0);
         assert_eq!(scene.children[1].layout.x, 64.0);
         assert_eq!(scene.children[1].layout.y, 10.0);
+    }
+
+    #[test]
+    fn column_flex_layout_with_shorthand_growth_pushes_footer_to_the_bottom() {
+        let stylesheet = parse_stylesheet(
+            "#app {
+                display: flex;
+                flex-direction: column;
+                width: 180px;
+                height: 120px;
+            }
+            .workspace {
+                flex: 1;
+            }
+            .footer {
+                height: 20px;
+            }",
+        )
+        .expect("column flex shorthand stylesheet should parse");
+        let tree = Node::element("div")
+            .with_id("app")
+            .with_child(Node::element("main").with_class("workspace").into())
+            .with_child(Node::element("footer").with_class("footer").into())
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        assert_eq!(scene.layout.height, 120.0);
+        assert_eq!(scene.children[0].layout.height, 100.0);
+        assert_eq!(scene.children[1].layout.y, 100.0);
+        assert_eq!(scene.children[1].layout.height, 20.0);
     }
 
     #[test]

@@ -64,6 +64,7 @@ const MAX_RENDER_WORKERS: usize = 12;
 const SCENE_TRAVERSAL_COST_PER_NODE: usize = 96;
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 const MAX_SUBTREE_SURFACE_CACHE_ENTRIES: usize = 64;
+const MAX_WORKER_BUFFER_POOL_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FramePaintMode {
@@ -203,6 +204,32 @@ fn worker_buffer_pool() -> &'static Mutex<Vec<Vec<u32>>> {
     WORKER_BUFFER_POOL.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn buffer_storage_bytes(capacity: usize) -> usize {
+    capacity.saturating_mul(size_of::<u32>())
+}
+
+fn worker_buffer_pool_reserved_bytes(pool: &[Vec<u32>]) -> usize {
+    pool.iter()
+        .map(|buffer| buffer_storage_bytes(buffer.capacity()))
+        .sum()
+}
+
+fn trim_worker_buffer_pool_to_budget(pool: &mut Vec<Vec<u32>>, budget_bytes: usize) {
+    let mut reserved_bytes = worker_buffer_pool_reserved_bytes(pool);
+    if reserved_bytes <= budget_bytes {
+        return;
+    }
+
+    // Drop the largest retained buffers first so we keep reuse for common sizes.
+    pool.sort_by_key(|buffer| buffer.capacity());
+    while reserved_bytes > budget_bytes {
+        let Some(buffer) = pool.pop() else {
+            break;
+        };
+        reserved_bytes = reserved_bytes.saturating_sub(buffer_storage_bytes(buffer.capacity()));
+    }
+}
+
 fn acquire_worker_buffers(lengths: &[usize]) -> Vec<Vec<u32>> {
     let mut pool = worker_buffer_pool()
         .lock()
@@ -224,6 +251,7 @@ fn release_worker_buffers(buffers: Vec<Vec<u32>>) {
         .lock()
         .expect("worker buffer pool mutex should not be poisoned");
     pool.extend(buffers);
+    trim_worker_buffer_pool_to_budget(&mut pool, MAX_WORKER_BUFFER_POOL_BYTES);
 }
 
 fn subtree_surface_cache() -> &'static Mutex<SubtreeSurfaceCache> {
@@ -6347,6 +6375,42 @@ mod tests {
         let config = WindowConfig::new("cssimpler", 960, 540);
 
         assert!(config.middle_button_auto_scroll);
+    }
+
+    #[test]
+    fn worker_buffer_pool_trim_keeps_buffers_when_under_budget() {
+        let mut pool = vec![Vec::<u32>::with_capacity(8), Vec::<u32>::with_capacity(16)];
+
+        super::trim_worker_buffer_pool_to_budget(&mut pool, super::buffer_storage_bytes(24));
+
+        assert_eq!(
+            pool.iter().map(Vec::capacity).collect::<Vec<_>>(),
+            vec![8, 16]
+        );
+        assert_eq!(
+            super::worker_buffer_pool_reserved_bytes(&pool),
+            super::buffer_storage_bytes(24)
+        );
+    }
+
+    #[test]
+    fn worker_buffer_pool_trim_discards_largest_buffers_first() {
+        let mut pool = vec![
+            Vec::<u32>::with_capacity(24),
+            Vec::<u32>::with_capacity(8),
+            Vec::<u32>::with_capacity(16),
+        ];
+
+        super::trim_worker_buffer_pool_to_budget(&mut pool, super::buffer_storage_bytes(24));
+
+        assert_eq!(
+            pool.iter().map(Vec::capacity).collect::<Vec<_>>(),
+            vec![8, 16]
+        );
+        assert_eq!(
+            super::worker_buffer_pool_reserved_bytes(&pool),
+            super::buffer_storage_bytes(24)
+        );
     }
 
     #[test]
