@@ -220,7 +220,7 @@ fn build_hud(state: &TextStressState) -> Node {
         <section id="hud" class="hud">
             <div class="control-row">
                 <button class="generate-button" type="button" onclick={generate_random_text}>
-                    {"Generate random text"}
+                    Generate random text
                 </button>
             </div>
             {build_metric_row(state)}

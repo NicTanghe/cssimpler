@@ -29,30 +29,30 @@ fn build_ui() -> cssimpler::core::Node {
         <div id="app">
             <section class="hero-card">
                 <p class="eyebrow">
-                    {"Example / Epoch E"}
+                    Example / Epoch E
                 </p>
                 <h1 class="title">
-                    {"Drop shadow, rounded corners, border, and clipping"}
+                    Drop shadow, rounded corners, border, and clipping
                 </h1>
                 <p class="copy">
-                    {"The main card uses box-shadow and border-radius, while the preview strip clips overflowing content."}
+                    The main card uses box-shadow and border-radius, while the preview strip clips overflowing content.
                 </p>
                 <div class="preview-frame">
                     <div class="preview-strip">
-                        <p class="pill pill-a">{"shadow"}</p>
-                        <p class="pill pill-b">{"radius"}</p>
-                        <p class="pill pill-c">{"border"}</p>
-                        <p class="pill pill-d">{"overflow"}</p>
-                        <p class="pill pill-a">{"clip"}</p>
-                        <p class="pill pill-b">{"native"}</p>
+                        <p class="pill pill-a">shadow</p>
+                        <p class="pill pill-b">radius</p>
+                        <p class="pill pill-c">border</p>
+                        <p class="pill pill-d">overflow</p>
+                        <p class="pill pill-a">clip</p>
+                        <p class="pill pill-b">native</p>
                     </div>
                 </div>
                 <div class="action-row">
                     <div class="ghost-button">
-                        {"Secondary surface"}
+                        Secondary surface
                     </div>
                     <div class="primary-button">
-                        {"Primary shadow"}
+                        Primary shadow
                     </div>
                 </div>
             </section>

@@ -127,7 +127,16 @@ pub fn layout_resolved_render_tree_in_viewport(
         width: AvailableSpace::Definite(width.max(1) as f32),
         height: AvailableSpace::Definite(height.max(1) as f32),
     });
-    layout_resolved_render_tree(resolved, available_space)
+    if viewport.is_some() {
+        let mut stretched_root = resolved.root().clone();
+        auto_stretch_root_to_viewport(&mut stretched_root.style.layout.taffy);
+        let stretched = ResolvedRenderTree {
+            root: stretched_root,
+        };
+        layout_resolved_render_tree(&stretched, available_space)
+    } else {
+        layout_resolved_render_tree(resolved, available_space)
+    }
 }
 
 pub fn extract_render_tree(layout: &mut LaidOutRenderTree) -> RenderNode {

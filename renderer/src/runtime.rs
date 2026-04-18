@@ -24,9 +24,9 @@ use super::{
     ElementInteractionState, ElementPath, FrameInfo, FrameTimingStats, MouseEventKind,
     RedrawSchedule, RendererError, Result, SceneProvider, WindowConfig,
     dispatch_hover_transition_events, dispatch_mouse_event, drawable_viewport_size, duration_to_us,
-    record_frame_timing_stats, redraw_auto_scroll_indicator_regions, render_scene_update_internal,
-    render_to_buffer_internal, resize_buffer, scrollbar, settle_element_interaction,
-    should_present_frame, should_suspend_updates,
+    pack_rgb, record_frame_timing_stats, redraw_auto_scroll_indicator_regions,
+    render_scene_update_internal, render_to_buffer_internal, resize_buffer, scrollbar,
+    settle_element_interaction, should_present_frame, should_suspend_updates,
 };
 
 pub(super) fn run_with_scene_provider<P>(config: WindowConfig, scene_provider: P) -> Result<()>
@@ -587,7 +587,17 @@ where
             if let Some(surface) = self.surface.as_mut() {
                 match surface.buffer_mut() {
                     Ok(mut target) => {
-                        target.copy_from_slice(&self.buffer);
+                        let target_width = target.width().get() as usize;
+                        let target_height = target.height().get() as usize;
+                        copy_render_buffer_into_surface(
+                            &mut target,
+                            target_width,
+                            target_height,
+                            &self.buffer,
+                            self.buffer_width,
+                            self.buffer_height,
+                            pack_rgb(self.config.clear_color),
+                        );
                         if let Err(error) = target.present() {
                             self.fail(event_loop, error);
                             return;
@@ -789,6 +799,34 @@ where
     }
 }
 
+fn copy_render_buffer_into_surface(
+    target: &mut [u32],
+    target_width: usize,
+    target_height: usize,
+    source: &[u32],
+    source_width: usize,
+    source_height: usize,
+    clear: u32,
+) {
+    debug_assert_eq!(target.len(), target_width.saturating_mul(target_height));
+    debug_assert_eq!(source.len(), source_width.saturating_mul(source_height));
+
+    if target_width == source_width && target_height == source_height {
+        target.copy_from_slice(source);
+        return;
+    }
+
+    target.fill(clear);
+    let copy_width = source_width.min(target_width);
+    let copy_height = source_height.min(target_height);
+    for row in 0..copy_height {
+        let src_row = row * source_width;
+        let dst_row = row * target_width;
+        target[dst_row..dst_row + copy_width]
+            .copy_from_slice(&source[src_row..src_row + copy_width]);
+    }
+}
+
 fn normalize_modifiers(state: ModifiersState) -> KeyboardModifiers {
     KeyboardModifiers {
         shift: state.shift_key(),
@@ -864,8 +902,9 @@ mod tests {
     };
 
     use super::{
-        normalize_button_state, normalize_key_location, normalize_logical_key, normalize_modifiers,
-        normalize_physical_key, normalize_pointer_button, normalize_scroll_delta,
+        copy_render_buffer_into_surface, normalize_button_state, normalize_key_location,
+        normalize_logical_key, normalize_modifiers, normalize_physical_key,
+        normalize_pointer_button, normalize_scroll_delta,
     };
 
     #[test]
@@ -938,5 +977,21 @@ mod tests {
             normalize_button_state(ElementState::Released),
             ButtonState::Released
         );
+    }
+
+    #[test]
+    fn blit_to_surface_copies_rows_when_target_is_wider() {
+        let source = vec![1, 2, 3, 4, 5, 6];
+        let mut target = vec![9; 10];
+        copy_render_buffer_into_surface(&mut target, 5, 2, &source, 3, 2, 0);
+        assert_eq!(target, vec![1, 2, 3, 0, 0, 4, 5, 6, 0, 0]);
+    }
+
+    #[test]
+    fn blit_to_surface_copies_rows_when_target_is_narrower() {
+        let source = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let mut target = vec![9; 6];
+        copy_render_buffer_into_surface(&mut target, 3, 2, &source, 4, 2, 0);
+        assert_eq!(target, vec![1, 2, 3, 5, 6, 7]);
     }
 }

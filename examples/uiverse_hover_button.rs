@@ -26,18 +26,18 @@ fn build_ui(_state: &()) -> Node {
         <div id="app">
             <section class="spotlight">
                 <p class="kicker">
-                    {"Uiverse-inspired hover reveal"}
+                    Uiverse-inspired hover reveal
                 </p>
                 {build_button()}
                 <p class="note">
-                    {"The outlined label stays centered while the neon fill sweeps across on hover."}
+                    The outlined label stays centered while the neon fill sweeps across on hover.
                 </p>
                 <p class="kicker">
-                    {"Uiverse-inspired glass card"}
+                    Uiverse-inspired glass card
                 </p>
                 {build_card()}
                 <p class="note">
-                    {"A frosted panel, floating badge stack, and compact social actions sit on top of a mint neon base."}
+                    A frosted panel, floating badge stack, and compact social actions sit on top of a mint neon base.
                 </p>
             </section>
         </div>
@@ -87,9 +87,9 @@ fn build_card() -> Node {
                     </div>
                     <div class="glass"></div>
                     <div class="content">
-                        <span class="title">{"UIVERSE (3D UI)"}</span>
+                        <span class="title">UIVERSE (3D UI)</span>
                         <span class="text">
-                            {"Create, share, and use beautiful custom elements made with CSS"}
+                            Create, share, and use beautiful custom elements made with CSS
                         </span>
                     </div>
                     <div class="bottom">
@@ -111,7 +111,7 @@ fn build_card() -> Node {
                             </button>
                         </div>
                         <div class="view-more">
-                            <button class="view-more-button" type="button">{"View more"}</button>
+                            <button class="view-more-button" type="button">View more</button>
                             <svg class="svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
                                 <path d="m6 9 6 6 6-6"></path>
                             </svg>

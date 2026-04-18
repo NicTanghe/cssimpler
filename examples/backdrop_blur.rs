@@ -30,22 +30,22 @@ fn build_ui(_state: &()) -> Node {
                     <div class="column column-d"></div>
                     <div class="column column-e"></div>
 
-                    <span class="echo echo-one">{"SHARP"}</span>
-                    <span class="echo echo-two">{"TYPE"}</span>
-                    <span class="echo echo-three">{"COLOR"}</span>
+                    <span class="echo echo-one">SHARP</span>
+                    <span class="echo echo-two">TYPE</span>
+                    <span class="echo echo-three">COLOR</span>
 
                     <div class="chip-row chip-row-top">
-                        <span class="chip chip-cyan">{"NEON"}</span>
-                        <span class="chip chip-lime">{"GLASS"}</span>
-                        <span class="chip chip-pink">{"FROST"}</span>
-                        <span class="chip chip-gold">{"FOCUS"}</span>
+                        <span class="chip chip-cyan">NEON</span>
+                        <span class="chip chip-lime">GLASS</span>
+                        <span class="chip chip-pink">FROST</span>
+                        <span class="chip chip-gold">FOCUS</span>
                     </div>
 
                     <div class="chip-row chip-row-bottom">
-                        <span class="chip chip-ink">{"PIXELS"}</span>
-                        <span class="chip chip-coral">{"EDGES"}</span>
-                        <span class="chip chip-blue">{"LAYERS"}</span>
-                        <span class="chip chip-white">{"DEPTH"}</span>
+                        <span class="chip chip-ink">PIXELS</span>
+                        <span class="chip chip-coral">EDGES</span>
+                        <span class="chip chip-blue">LAYERS</span>
+                        <span class="chip chip-white">DEPTH</span>
                     </div>
 
                     <div class="orb orb-a"></div>
@@ -55,13 +55,13 @@ fn build_ui(_state: &()) -> Node {
 
                 <section class="comparison">
                     <article class="panel tint-panel">
-                        <p class="badge">{"Tint only"}</p>
-                        <h1 class="title">{"No backdrop filter"}</h1>
+                        <p class="badge">Tint only</p>
+                        <h1 class="title">No backdrop filter</h1>
                         <p class="body">
-                            {"This card uses the same translucent fill, but the sharp bars and labels behind it stay crisp."}
+                            This card uses the same translucent fill, but the sharp bars and labels behind it stay crisp.
                         </p>
                         <div class="code-chip">
-                            {"background: rgba(255, 255, 255, 0.18)"}
+                            background: rgba(255, 255, 255, 0.18)
                         </div>
                         <div class="mini-row">
                             <span class="mini mini-cyan"></span>
@@ -71,13 +71,13 @@ fn build_ui(_state: &()) -> Node {
                     </article>
 
                     <article class="panel blur-panel">
-                        <p class="badge">{"Backdrop blur"}</p>
-                        <h1 class="title">{"Actual frosted glass"}</h1>
+                        <p class="badge">Backdrop blur</p>
+                        <h1 class="title">Actual frosted glass</h1>
                         <p class="body">
-                            {"This card keeps the same tint, then adds backdrop-filter so the content behind it softens inside the rounded bounds."}
+                            This card keeps the same tint, then adds backdrop-filter so the content behind it softens inside the rounded bounds.
                         </p>
                         <div class="code-chip emphasis">
-                            {"backdrop-filter: blur(14px)"}
+                            backdrop-filter: blur(14px)
                         </div>
                         <div class="mini-row">
                             <span class="mini mini-cyan"></span>
@@ -88,7 +88,7 @@ fn build_ui(_state: &()) -> Node {
                 </section>
 
                 <p class="footer-note">
-                    {"Both cards use the same translucent background. Only the right card adds backdrop-filter blur."}
+                    Both cards use the same translucent background. Only the right card adds backdrop-filter blur.
                 </p>
             </section>
         </div>

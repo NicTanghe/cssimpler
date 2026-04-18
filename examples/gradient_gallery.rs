@@ -107,10 +107,10 @@ fn build_ui(state: &GalleryState) -> Node {
             <section class="hero">
                 <div class="hero-copy">
                     <p class="eyebrow">
-                        {"Example / Gradient gallery"}
+                        Example / Gradient gallery
                     </p>
                     <h1 class="hero-title">
-                        {"All supported gradient types in one scene"}
+                        All supported gradient types in one scene
                     </h1>
                     <p class="hero-note">
                         {format!(
@@ -124,34 +124,34 @@ fn build_ui(state: &GalleryState) -> Node {
             </section>
             <section class="gallery">
                 <article class="swatch linear-card">
-                    <p class="swatch-type">{"linear-gradient"}</p>
-                    <h2 class="swatch-title">{"Linear dusk blend"}</h2>
-                    <p class="swatch-note">{"A diagonal ramp that makes interpolation differences easy to spot."}</p>
+                    <p class="swatch-type">linear-gradient</p>
+                    <h2 class="swatch-title">Linear dusk blend</h2>
+                    <p class="swatch-note">A diagonal ramp that makes interpolation differences easy to spot.</p>
                 </article>
                 <article class="swatch repeating-linear-card">
-                    <p class="swatch-type">{"repeating-linear-gradient"}</p>
-                    <h2 class="swatch-title">{"Looped ribbon"}</h2>
-                    <p class="swatch-note">{"Repeating stripes keep the stop layout fixed while the blend mode changes."}</p>
+                    <p class="swatch-type">repeating-linear-gradient</p>
+                    <h2 class="swatch-title">Looped ribbon</h2>
+                    <p class="swatch-note">Repeating stripes keep the stop layout fixed while the blend mode changes.</p>
                 </article>
                 <article class="swatch radial-card">
-                    <p class="swatch-type">{"radial-gradient"}</p>
-                    <h2 class="swatch-title">{"Bloom core"}</h2>
-                    <p class="swatch-note">{"The center glow shows how each mode handles warm transitions."}</p>
+                    <p class="swatch-type">radial-gradient</p>
+                    <h2 class="swatch-title">Bloom core</h2>
+                    <p class="swatch-note">The center glow shows how each mode handles warm transitions.</p>
                 </article>
                 <article class="swatch repeating-radial-card">
-                    <p class="swatch-type">{"repeating-radial-gradient"}</p>
-                    <h2 class="swatch-title">{"Pulse bloom"}</h2>
-                    <p class="swatch-note">{"Repeated rings make subtle interpolation shifts much easier to compare."}</p>
+                    <p class="swatch-type">repeating-radial-gradient</p>
+                    <h2 class="swatch-title">Pulse bloom</h2>
+                    <p class="swatch-note">Repeated rings make subtle interpolation shifts much easier to compare.</p>
                 </article>
                 <article class="swatch conic-card">
-                    <p class="swatch-type">{"conic-gradient"}</p>
-                    <h2 class="swatch-title">{"Angular sweep"}</h2>
-                    <p class="swatch-note">{"A full rotation around the center shows how hues bridge across sectors."}</p>
+                    <p class="swatch-type">conic-gradient</p>
+                    <h2 class="swatch-title">Angular sweep</h2>
+                    <p class="swatch-note">A full rotation around the center shows how hues bridge across sectors.</p>
                 </article>
                 <article class="swatch repeating-conic-card">
-                    <p class="swatch-type">{"repeating-conic-gradient"}</p>
-                    <h2 class="swatch-title">{"Pinwheel loop"}</h2>
-                    <p class="swatch-note">{"Short repeated sectors highlight the difference between perceptual and linear blends."}</p>
+                    <p class="swatch-type">repeating-conic-gradient</p>
+                    <h2 class="swatch-title">Pinwheel loop</h2>
+                    <p class="swatch-note">Short repeated sectors highlight the difference between perceptual and linear blends.</p>
                 </article>
             </section>
         </div>

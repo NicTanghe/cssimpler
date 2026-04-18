@@ -37,13 +37,13 @@ fn build_ui(state: &DemoState) -> cssimpler::core::Node {
         <div id="app">
             <section class="card">
                 <h1 class="title">
-                    {"Increment button demo"}
+                    Increment button demo
                 </h1>
                 <p class="subtitle">
                     {format!("count {}", state.click_count)}
                 </p>
                 <button class="button" onclick={increment}>
-                    {"Increment"}
+                    Increment
                 </button>
                 <p class="meta">
                     {format!("frame {}  dt={}ms", state.frame_index, state.last_frame_ms)}

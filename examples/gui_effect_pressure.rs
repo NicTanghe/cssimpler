@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use cssimpler::app::{App, Invalidation, Refresh, RuntimeStats, latest_runtime_stats};
+use cssimpler::app::{App, Invalidation, Refresh, RenderMode, RuntimeStats, latest_runtime_stats};
 use cssimpler::core::Node;
 use cssimpler::renderer::{
     FrameInfo, FramePaintMode, FramePaintReason, FrameTimingStats, WindowConfig,
@@ -252,6 +252,7 @@ fn main() -> Result<()> {
     }
 
     App::new(EffectStressState::default(), stylesheet(), update, build_ui)
+        .with_render_mode(RenderMode::EveryFrame)
         .run(config)
         .map_err(Into::into)
 }
@@ -1019,13 +1020,13 @@ fn build_ui_hero(state: &EffectStressState) -> Node {
         <section class="hero">
             <div class="hero-copy">
                 <p class="eyebrow">
-                    {"Example / GUI effect pressure"}
+                    Example / GUI effect pressure
                 </p>
                 <h1 class="hero-title">
-                    {"Effect-heavy animated wall"}
+                    Effect-heavy animated wall
                 </h1>
                 <p class="hero-note">
-                    {"This scene keeps text tiny on purpose and puts the pressure into gradients, glows, box shadows, and a narrow moving band of live effect pods."}
+                    This scene keeps text tiny on purpose and puts the pressure into gradients, glows, box shadows, and a narrow moving band of live effect pods.
                 </p>
             </div>
             {build_metric_row(state)}

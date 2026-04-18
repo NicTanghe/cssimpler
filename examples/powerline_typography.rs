@@ -41,36 +41,36 @@ fn build_ui(state: &DemoState) -> Node {
         <div id="app">
             <section class="hero">
                 <p class="eyebrow">
-                    {"H5 / arbitrary font demo"}
+                    H5 / arbitrary font demo
                 </p>
                 <h1 class="hero-title">
-                    {"Project-local Powerline font registration"}
+                    Project-local Powerline font registration
                 </h1>
                 <p class="hero-copy">
-                    {"The left panel keeps the Windows-friendly system stack. The right panel registers a bundled TTF from examples/assets and uses it for both layout and paint."}
+                    The left panel keeps the Windows-friendly system stack. The right panel registers a bundled TTF from examples/assets and uses it for both layout and paint.
                 </p>
             </section>
             <section class="comparison-grid">
                 <article class="panel panel-system">
                     <p class="panel-label">
-                        {"System font baseline"}
+                        System font baseline
                     </p>
                     <h2 class="panel-title">
-                        {"Segoe UI / Arial / sans-serif"}
+                        Segoe UI / Arial / sans-serif
                     </h2>
                     <p class="panel-copy">
-                        {"This sample keeps the normal desktop stack so you can compare the metrics and texture against the bundled font card."}
+                        This sample keeps the normal desktop stack so you can compare the metrics and texture against the bundled font card.
                     </p>
                     <p class="system-line">
-                        {"Library review queue 0123456789"}
+                        Library review queue 0123456789
                     </p>
                     <p class="system-line system-line-soft">
-                        {"Wrapped layout should stay proportional here."}
+                        Wrapped layout should stay proportional here.
                     </p>
                 </article>
                 <article class="panel panel-bundled">
                     <p class="panel-label panel-label-bundled">
-                        {"Bundled asset"}
+                        Bundled asset
                     </p>
                     <h2 class="panel-title panel-title-bundled">
                         {state.bundled_family.clone()}
@@ -79,28 +79,28 @@ fn build_ui(state: &DemoState) -> Node {
                         {format!("Loaded from {DEMO_FONT_ASSET} at startup.")}
                     </p>
                     <p class="powerline-line">
-                        {"repo   main    cargo test   pass"}
+                        "repo   main    cargo test   pass"
                     </p>
                     <p class="powerline-line powerline-line-soft">
-                        {"Glyph coverage now comes from the registered TTF instead of the bitmap fallback."}
+                        Glyph coverage now comes from the registered TTF instead of the bitmap fallback.
                     </p>
                 </article>
             </section>
             <section class="notes">
                 <article class="note-card">
                     <p class="note-label">
-                        {"Why this matters"}
+                        Why this matters
                     </p>
                     <p class="note-copy">
-                        {"Changing font family changes text measurement, wrapping, and the final pixels. H5 is about proving the engine owns that end-to-end."}
+                        Changing font family changes text measurement, wrapping, and the final pixels. H5 is about proving the engine owns that end-to-end.
                     </p>
                 </article>
                 <article class="note-card">
                     <p class="note-label">
-                        {"Bundled font"}
+                        Bundled font
                     </p>
                     <p class="note-copy">
-                        {"Anonymice Powerline ships with the repo so the demo does not depend on system installation state."}
+                        Anonymice Powerline ships with the repo so the demo does not depend on system installation state.
                     </p>
                 </article>
             </section>

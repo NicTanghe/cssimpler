@@ -1267,11 +1267,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use cssimpler_core::{
-        AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, ElementNode,
-        GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
-        LengthPercentageValue, LinearGradient, Node, RadialShape, ScrollbarWidth, ShapeExtent,
-        TransformMatrix3d, TransformOperation, TransformOrigin, TransformStyleMode,
-        TransitionPropertyName, TransitionTimingFunction, fonts::TextTransform,
+        AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient,
+        ElementInteractionState, ElementNode, GradientDirection, GradientHorizontal,
+        GradientInterpolation, GradientPoint, GradientStop, LengthPercentageValue, LinearGradient,
+        Node, RadialShape, ScrollbarWidth, ShapeExtent, TransformMatrix3d, TransformOperation,
+        TransformOrigin, TransformStyleMode, TransitionPropertyName, TransitionTimingFunction,
+        fonts::TextTransform,
     };
     use taffy::prelude::{
         AlignItems as TaffyAlignItems, Dimension, Display as TaffyDisplay,
@@ -1282,8 +1283,10 @@ mod tests {
 
     use super::{
         Declaration, ElementRef, Selector, ShadowDeclaration, StyleError, StyleRule, Stylesheet,
-        build_render_tree, build_render_tree_in_viewport, parse_stylesheet,
-        rebuild_render_tree_with_cached_layout, resolve_element_tree, resolve_style, to_taffy,
+        build_render_tree, build_render_tree_in_viewport, extract_render_tree,
+        layout_resolved_render_tree_in_viewport, parse_stylesheet,
+        rebuild_render_tree_with_cached_layout, resolve_element_tree,
+        resolve_render_tree_with_interaction_at_root, resolve_style, to_taffy,
     };
 
     #[test]
@@ -2510,6 +2513,40 @@ mod tests {
             .with_child(Node::element("section").with_class("panel").into())
             .into();
         let scene = build_render_tree_in_viewport(&tree, &stylesheet, 640, 360);
+
+        assert_eq!(scene.layout.width, 640.0);
+        assert_eq!(scene.layout.height, 360.0);
+        assert_eq!(scene.children[0].layout.x, 8.0);
+        assert_eq!(scene.children[0].layout.y, 8.0);
+    }
+
+    #[test]
+    fn viewport_layout_auto_stretches_unsized_roots_in_resolved_layout_path() {
+        let stylesheet = parse_stylesheet(
+            "#app {
+                display: flex;
+                padding: 8px;
+                background-color: #ffffff;
+            }
+            .panel {
+                width: 120px;
+                height: 40px;
+                background-color: #0f172a;
+            }",
+        )
+        .expect("viewport stylesheet should parse");
+        let tree = Node::element("div")
+            .with_id("app")
+            .with_child(Node::element("section").with_class("panel").into())
+            .into();
+        let resolved = resolve_render_tree_with_interaction_at_root(
+            &tree,
+            &stylesheet,
+            &ElementInteractionState::default(),
+            0,
+        );
+        let mut layout = layout_resolved_render_tree_in_viewport(&resolved, Some((640, 360)));
+        let scene = extract_render_tree(&mut layout);
 
         assert_eq!(scene.layout.width, 640.0);
         assert_eq!(scene.layout.height, 360.0);

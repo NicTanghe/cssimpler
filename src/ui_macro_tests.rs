@@ -29,7 +29,7 @@ fn ui_macro_builds_nested_nodes_from_html_like_input() {
 fn ui_macro_supports_event_binding() {
     let tree = ui! {
         <button onclick={increment}>
-            {"click"}
+            click
         </button>
     };
 
@@ -39,6 +39,24 @@ fn ui_macro_supports_event_binding() {
             assert_eq!(button.children.len(), 1);
         }
         Node::Text(_) => panic!("expected button element"),
+    }
+}
+
+#[test]
+fn ui_macro_supports_plain_text_children_without_braces() {
+    let tree = ui! {
+        <h1>This is a Heading</h1>
+    };
+
+    match tree {
+        Node::Element(heading) => {
+            assert_eq!(heading.children.len(), 1);
+            let Node::Text(text) = &heading.children[0] else {
+                panic!("expected heading text node");
+            };
+            assert_eq!(text, "This is a Heading");
+        }
+        Node::Text(_) => panic!("expected heading element"),
     }
 }
 
@@ -57,7 +75,7 @@ fn ui_macro_supports_requested_mouse_event_bindings() {
             onmouseover={increment}
             onmouseup={increment}
         >
-            {"click"}
+            click
         </button>
     };
 
@@ -82,7 +100,7 @@ fn ui_macro_supports_requested_mouse_event_bindings() {
 fn ui_macro_supports_generic_and_dashed_attributes() {
     let tree = ui! {
         <button type="button" data-text="uiverse" aria-hidden="true" onclick={increment}>
-            {"click"}
+            click
         </button>
     };
 

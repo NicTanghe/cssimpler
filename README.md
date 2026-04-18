@@ -50,8 +50,8 @@ If you know HTML and CSS, you already know this library.
 ui! {
     <body style="background: var(--bg); color: var(--text);">
         <div class="container">
-            <h1>"Hello, world"</h1>
-            <p>"This is just HTML and CSS."</p>
+            <h1>Hello, world</h1>
+            <p>This is just HTML and CSS.</p>
         </div>
     </body>
 }
@@ -118,7 +118,7 @@ fn build_ui(_state: &()) -> Node {
         <div class="card">
             <p>{format!("count: {count}")}</p>
             <button class="button" type="button" onclick={increment}>
-                {"Increment"}
+                Increment
             </button>
         </div>
     }

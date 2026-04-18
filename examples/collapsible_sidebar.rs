@@ -200,14 +200,14 @@ fn build_sidebar_header(state: &SidebarState) -> Node {
         <div class="sidebar-header">
             <div class="sidebar-copy">
                 <p class="sidebar-kicker">
-                    {"Segoe UI demo"}
+                    Segoe UI demo
                 </p>
                 <h2 class="sidebar-title">
-                    {"Collections"}
+                    Collections
                 </h2>
             </div>
             <button class="rail-toggle" onclick={toggle_sidebar}>
-                {"<"}
+                "<"
             </button>
         </div>
     }
@@ -248,7 +248,7 @@ fn build_queue_panel(state: &SidebarState) -> Node {
         .with_child(ui! {
             <div class="queue-header">
                 <p class="queue-kicker">
-                    {"Left panel queue"}
+                    Left panel queue
                 </p>
                 <p class="queue-meta">
                     {state.queue_count_label()}
@@ -290,42 +290,42 @@ fn build_content(state: &SidebarState) -> Node {
         <section class="content">
             <div class="content-card">
                 <p class="panel-kicker">
-                    {"What this scene shows"}
+                    What this scene shows
                 </p>
                 <h2 class="panel-title">
-                    {"A collapsible menu with a real engine-owned queue scrollbar"}
+                    A collapsible menu with a real engine-owned queue scrollbar
                 </h2>
                 <p class="panel-copy">
-                    {"Add a card, scroll the queue, or collapse the rail. The sidebar now uses the built-in scrollbar instead of the old fake thumb."}
+                    Add a card, scroll the queue, or collapse the rail. The sidebar now uses the built-in scrollbar instead of the old fake thumb.
                 </p>
                 <div class="content-actions">
                     <button class="primary-button content-button" onclick={queue_random_card}>
-                        {"Add random card"}
+                        Add random card
                     </button>
                 </div>
                 <div class="feature-row">
-                    <p class="feature-chip feature-chip-a">{"collapse"}</p>
-                    <p class="feature-chip feature-chip-b">{"add card"}</p>
-                    <p class="feature-chip feature-chip-c">{"scrollbar"}</p>
+                    <p class="feature-chip feature-chip-a">collapse</p>
+                    <p class="feature-chip feature-chip-b">add card</p>
+                    <p class="feature-chip feature-chip-c">scrollbar</p>
                 </div>
             </div>
             <div class="content-grid">
                 <article class="detail-card detail-card-a">
-                    <p class="detail-label">{"Queue status"}</p>
+                    <p class="detail-label">Queue status</p>
                     <p class="detail-value">
                         {state.queue_status_label()}
                     </p>
                 </article>
                 <article class="detail-card detail-card-b">
-                    <p class="detail-label">{"Scroll interaction"}</p>
+                    <p class="detail-label">Scroll interaction</p>
                     <p class="detail-value">
                         {state.queue_interaction_label()}
                     </p>
                 </article>
                 <article class="detail-card detail-card-c">
-                    <p class="detail-label">{"Font note"}</p>
+                    <p class="detail-label">Font note</p>
                     <p class="detail-value">
-                        {"Uses Segoe UI when the Windows fonts are available."}
+                        Uses Segoe UI when the Windows fonts are available.
                     </p>
                 </article>
             </div>

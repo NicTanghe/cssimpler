@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Delimiter, TokenStream as TokenStream2, TokenTree};
 use quote::quote;
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
@@ -84,6 +84,7 @@ impl Parse for Element {
 enum Child {
     Element(Element),
     Expression(Expr),
+    Text(String),
 }
 
 impl Parse for Child {
@@ -98,7 +99,18 @@ impl Parse for Child {
             return Ok(Self::Expression(content.parse()?));
         }
 
-        Err(input.error("expected a child element or a braced Rust expression"))
+        let mut text_tokens = Vec::new();
+        while !input.is_empty() && !input.peek(Token![<]) && !input.peek(syn::token::Brace) {
+            text_tokens.push(input.parse::<TokenTree>()?);
+        }
+
+        if text_tokens.is_empty() {
+            return Err(input.error(
+                "expected a child element, text, or a braced Rust expression",
+            ));
+        }
+
+        Ok(Self::Text(tokens_to_text(&text_tokens)))
     }
 }
 
@@ -176,6 +188,67 @@ fn is_closing_tag(input: ParseStream<'_>) -> bool {
     input.peek(Token![<]) && input.peek2(Token![/])
 }
 
+fn tokens_to_text(tokens: &[TokenTree]) -> String {
+    let mut text = String::new();
+
+    for token in tokens {
+        let segment = token_to_text(token);
+        if segment.is_empty() {
+            continue;
+        }
+
+        if let (Some(prev), Some(next)) = (text.chars().last(), segment.chars().next()) {
+            if needs_space_between(prev, next) {
+                text.push(' ');
+            }
+        }
+
+        text.push_str(&segment);
+    }
+
+    text
+}
+
+fn token_to_text(token: &TokenTree) -> String {
+    match token {
+        TokenTree::Ident(ident) => ident.to_string(),
+        TokenTree::Literal(literal) => {
+            let raw = literal.to_string();
+            match syn::parse_str::<LitStr>(&raw) {
+                Ok(string_literal) => string_literal.value(),
+                Err(_) => raw,
+            }
+        }
+        TokenTree::Punct(punctuation) => punctuation.as_char().to_string(),
+        TokenTree::Group(group) => {
+            let inner_tokens: Vec<_> = group.stream().into_iter().collect();
+            let inner = tokens_to_text(&inner_tokens);
+
+            match group.delimiter() {
+                Delimiter::Parenthesis => format!("({inner})"),
+                Delimiter::Bracket => format!("[{inner}]"),
+                Delimiter::Brace => format!("{{{inner}}}"),
+                Delimiter::None => inner,
+            }
+        }
+    }
+}
+
+fn needs_space_between(previous: char, next: char) -> bool {
+    !(is_no_space_after(previous) || is_no_space_before(next))
+}
+
+fn is_no_space_before(ch: char) -> bool {
+    matches!(
+        ch,
+        ',' | '.' | ';' | ':' | '!' | '?' | '%' | ')' | ']' | '}' | '>' | '/' | '-'
+    )
+}
+
+fn is_no_space_after(ch: char) -> bool {
+    matches!(ch, '(' | '[' | '{' | '<' | '/' | '-')
+}
+
 fn expand_element(element: &Element) -> Result<TokenStream2> {
     let tag = element.tag.to_string();
     let mut builder = quote!(::cssimpler_core::Node::element(#tag));
@@ -203,6 +276,7 @@ fn expand_child(child: &Child) -> Result<TokenStream2> {
     match child {
         Child::Element(element) => expand_element(element),
         Child::Expression(expression) => Ok(quote!(::cssimpler_core::into_node(#expression))),
+        Child::Text(text) => Ok(quote!(::cssimpler_core::Node::text(#text))),
     }
 }
 
@@ -254,7 +328,7 @@ mod tests {
     use syn::{parse_quote, parse_str};
 
     use super::{
-        Attribute, AttributeName, AttributeValue, UiRoot, expand_attribute, expand_element,
+        Attribute, AttributeName, AttributeValue, Child, UiRoot, expand_attribute, expand_element,
     };
 
     #[test]
@@ -270,6 +344,38 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["data-text", "aria-hidden", "type"]);
+    }
+
+    #[test]
+    fn parser_accepts_plain_text_children_without_braces() {
+        let root: UiRoot =
+            parse_str(r#"<h1>This is a Heading</h1>"#).expect("ui markup should parse");
+        assert_eq!(root.element.children.len(), 1);
+
+        match &root.element.children[0] {
+            Child::Text(text) => assert_eq!(text, "This is a Heading"),
+            _ => panic!("expected plain text child"),
+        }
+    }
+
+    #[test]
+    fn parser_normalizes_plain_text_punctuation_without_extra_spacing() {
+        let root: UiRoot = parse_str(r#"<p>end-to-end, really.</p>"#).expect("ui markup parse");
+        let Child::Text(text) = &root.element.children[0] else {
+            panic!("expected text child");
+        };
+
+        assert_eq!(text, "end-to-end, really.");
+    }
+
+    #[test]
+    fn parser_supports_plain_string_literal_children() {
+        let root: UiRoot = parse_str(r#"<p>"Hello"</p>"#).expect("ui markup parse");
+        let Child::Text(text) = &root.element.children[0] else {
+            panic!("expected text child");
+        };
+
+        assert_eq!(text, "Hello");
     }
 
     #[test]
