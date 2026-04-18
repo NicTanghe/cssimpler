@@ -25,6 +25,10 @@ const TRANSFORMED_EDGE_FINE_COVERAGE_SAMPLES: [(f32, f32); 16] = [
     (0.625, 0.875),
     (0.875, 0.875),
 ];
+const DASH_LENGTH_MULTIPLIER: f32 = 3.0;
+const DASH_GAP_LENGTH_MULTIPLIER: f32 = 2.0;
+const DASH_MIN_LENGTH: f32 = 2.0;
+const DASH_MIN_GAP: f32 = 1.0;
 
 pub(crate) fn draw_rounded_rect(
     buffer: &mut [u32],
@@ -127,6 +131,33 @@ pub(crate) fn draw_rounded_ring(
                     prepared_color,
                 );
             }
+        }
+    }
+}
+
+pub(crate) fn draw_dashed_rounded_ring(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    outer_layout: LayoutBox,
+    outer_radius: CornerRadius,
+    inner: Option<(LayoutBox, CornerRadius)>,
+    color: Color,
+    clip: ClipRect,
+) {
+    let Some((x0, y0, x1, y1)) = pixel_bounds(outer_layout, clip, width, height) else {
+        return;
+    };
+
+    let prepared_color = PreparedBlendColor::new(color);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let sample_x = x as f32 + 0.5;
+            let sample_y = y as f32 + 0.5;
+            if !dashed_ring_contains_point(sample_x, sample_y, outer_layout, outer_radius, inner) {
+                continue;
+            }
+            blend_prepared_pixel(buffer, width, height, x, y, prepared_color);
         }
     }
 }
@@ -358,6 +389,20 @@ pub(crate) fn transformed_rounded_ring_coverage(
             && inner.is_none_or(|(inner_layout, inner_radius)| {
                 !point_in_rounded_rect(source_x, source_y, inner_layout, inner_radius)
             })
+    })
+}
+
+pub(crate) fn transformed_dashed_rounded_ring_coverage(
+    outer_layout: LayoutBox,
+    outer_radius: CornerRadius,
+    inner: Option<(LayoutBox, CornerRadius)>,
+    inverse: AffineTransform,
+    clip_state: &ClipState,
+    x: i32,
+    y: i32,
+) -> u8 {
+    transformed_shape_coverage(inverse, clip_state, x, y, |source_x, source_y| {
+        dashed_ring_contains_point(source_x, source_y, outer_layout, outer_radius, inner)
     })
 }
 
@@ -650,6 +695,84 @@ pub(crate) fn expand_corner_radius(
     }
 }
 
+fn dashed_ring_contains_point(
+    x: f32,
+    y: f32,
+    outer_layout: LayoutBox,
+    outer_radius: CornerRadius,
+    inner: Option<(LayoutBox, CornerRadius)>,
+) -> bool {
+    point_in_rounded_rect(x, y, outer_layout, outer_radius)
+        && inner.is_none_or(|(inner_layout, inner_radius)| {
+            !point_in_rounded_rect(x, y, inner_layout, inner_radius)
+        })
+        && point_in_dashed_segment(x, y, outer_layout, inner)
+}
+
+fn point_in_dashed_segment(
+    x: f32,
+    y: f32,
+    outer_layout: LayoutBox,
+    inner: Option<(LayoutBox, CornerRadius)>,
+) -> bool {
+    let width = outer_layout.width.max(0.0);
+    let height = outer_layout.height.max(0.0);
+    let perimeter = (2.0 * (width + height)).max(1.0);
+    if perimeter <= f32::EPSILON {
+        return true;
+    }
+
+    let (dash_length, cycle_length) = dash_cycle_lengths(outer_layout, inner);
+    if cycle_length <= dash_length {
+        return true;
+    }
+
+    let perimeter_position = perimeter_position_from_point(x, y, outer_layout);
+    let cycle_position = perimeter_position.rem_euclid(cycle_length);
+    cycle_position < dash_length
+}
+
+fn dash_cycle_lengths(
+    outer_layout: LayoutBox,
+    inner: Option<(LayoutBox, CornerRadius)>,
+) -> (f32, f32) {
+    let average_border_width = inner
+        .map(|(inner_layout, _)| {
+            let horizontal = (outer_layout.width - inner_layout.width).max(0.0) * 0.5;
+            let vertical = (outer_layout.height - inner_layout.height).max(0.0) * 0.5;
+            ((horizontal + vertical) * 0.5).max(1.0)
+        })
+        .unwrap_or(1.0);
+    let dash_length = (average_border_width * DASH_LENGTH_MULTIPLIER).max(DASH_MIN_LENGTH);
+    let dash_gap = (average_border_width * DASH_GAP_LENGTH_MULTIPLIER).max(DASH_MIN_GAP);
+    (dash_length, dash_length + dash_gap)
+}
+
+fn perimeter_position_from_point(x: f32, y: f32, layout: LayoutBox) -> f32 {
+    let left = layout.x;
+    let top = layout.y;
+    let right = layout.x + layout.width.max(0.0);
+    let bottom = layout.y + layout.height.max(0.0);
+    let clamped_x = x.clamp(left, right);
+    let clamped_y = y.clamp(top, bottom);
+    let dist_top = (clamped_y - top).abs();
+    let dist_right = (right - clamped_x).abs();
+    let dist_bottom = (bottom - clamped_y).abs();
+    let dist_left = (clamped_x - left).abs();
+    let width = (right - left).max(0.0);
+    let height = (bottom - top).max(0.0);
+
+    if dist_top <= dist_right && dist_top <= dist_bottom && dist_top <= dist_left {
+        clamped_x - left
+    } else if dist_right <= dist_bottom && dist_right <= dist_left {
+        width + (clamped_y - top)
+    } else if dist_bottom <= dist_left {
+        width + height + (right - clamped_x)
+    } else {
+        (2.0 * width) + height + (bottom - clamped_y)
+    }
+}
+
 fn layout_contains(layout: LayoutBox, x: f32, y: f32) -> bool {
     x >= layout.x && x < layout.x + layout.width && y >= layout.y && y < layout.y + layout.height
 }
@@ -687,7 +810,7 @@ mod tests {
     use cssimpler_core::{Color, CornerRadius, LayoutBox};
 
     use super::{
-        draw_rounded_ring, point_in_rounded_rect, rounded_rect_row_span,
+        draw_dashed_rounded_ring, draw_rounded_ring, point_in_rounded_rect, rounded_rect_row_span,
         transformed_rounded_rect_coverage, transformed_rounded_ring_coverage,
     };
     use crate::transform::{AffineTransform, ClipState};
@@ -754,6 +877,37 @@ mod tests {
                 assert_eq!(buffer[y * 12 + x] == accent, expected);
             }
         }
+    }
+
+    #[test]
+    fn dashed_ring_includes_visible_gaps_on_the_top_edge() {
+        let outer_layout = LayoutBox::new(1.0, 1.0, 10.0, 10.0);
+        let inner_layout = LayoutBox::new(3.0, 3.0, 6.0, 6.0);
+        let color = Color::rgb(40, 120, 220);
+        let mut buffer = vec![pack_rgb(Color::WHITE); 12 * 12];
+
+        draw_dashed_rounded_ring(
+            &mut buffer,
+            12,
+            12,
+            outer_layout,
+            CornerRadius::default(),
+            Some((inner_layout, CornerRadius::default())),
+            color,
+            ClipRect::full(12.0, 12.0),
+        );
+
+        let accent = pack_rgb(color);
+        let white = pack_rgb(Color::WHITE);
+        let top_row = &buffer[12 + 1..12 + 11];
+        assert!(
+            top_row.contains(&accent),
+            "dashed borders should still paint visible border segments"
+        );
+        assert!(
+            top_row.contains(&white),
+            "dashed borders should leave visible gaps between segments"
+        );
     }
 
     #[test]

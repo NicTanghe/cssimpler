@@ -3,8 +3,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
-    Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, LayoutStyle,
-    OverflowMode, ScrollbarWidth, Style, SvgPaint, TransformOperation, TransformOrigin,
+    BorderLineStyle, Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath,
+    LayoutStyle, OverflowMode, ScrollbarWidth, Style, SvgPaint, TransformOperation, TransformOrigin,
     TransformStyleMode, TransitionPropertyName, TransitionTimingFunction,
     fonts::{TextStyle, TextTransform},
 };
@@ -23,10 +23,10 @@ use lightningcss::properties::grid::{
 };
 use lightningcss::properties::overflow::OverflowKeyword as CssOverflowKeyword;
 use lightningcss::properties::position::Position as CssPosition;
-use lightningcss::properties::size::Size as CssSize;
+use lightningcss::properties::size::{MaxSize as CssMaxSize, Size as CssSize};
 use lightningcss::rules::CssRule;
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
-use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto};
+use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto, LengthValue};
 use taffy::geometry::Line;
 use taffy::prelude::{
     AlignContent as TaffyAlignContent, AlignItems as TaffyAlignItems, AlignSelf as TaffyAlignSelf,
@@ -368,6 +368,7 @@ pub enum Declaration {
     BorderRightWidth(f32),
     BorderBottomWidth(f32),
     BorderLeftWidth(f32),
+    BorderLineStyle(BorderLineStyle),
     BorderColor(Option<Color>),
     BoxShadows(Vec<ShadowDeclaration>),
     TextShadows(Vec<ShadowDeclaration>),
@@ -391,6 +392,10 @@ pub enum Declaration {
     InsetLeft(TaffyLengthPercentageAuto),
     Width(Dimension),
     Height(Dimension),
+    MinWidth(Dimension),
+    MinHeight(Dimension),
+    MaxWidth(Dimension),
+    MaxHeight(Dimension),
     MarginTop(TaffyLengthPercentageAuto),
     MarginRight(TaffyLengthPercentageAuto),
     MarginBottom(TaffyLengthPercentageAuto),
@@ -622,6 +627,16 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
         ]),
         Property::Width(size) => Ok(vec![Declaration::Width(dimension_from_css_size(size)?)]),
         Property::Height(size) => Ok(vec![Declaration::Height(dimension_from_css_size(size)?)]),
+        Property::MinWidth(size) => Ok(vec![Declaration::MinWidth(dimension_from_css_size(size)?)]),
+        Property::MinHeight(size) => {
+            Ok(vec![Declaration::MinHeight(dimension_from_css_size(size)?)])
+        }
+        Property::MaxWidth(size) => {
+            Ok(vec![Declaration::MaxWidth(dimension_from_css_max_size(size)?)])
+        }
+        Property::MaxHeight(size) => {
+            Ok(vec![Declaration::MaxHeight(dimension_from_css_max_size(size)?)])
+        }
         Property::Margin(margin) => Ok(vec![
             Declaration::MarginTop(length_percentage_auto_to_taffy(&margin.top)?),
             Declaration::MarginRight(length_percentage_auto_to_taffy(&margin.right)?),
@@ -768,17 +783,52 @@ fn length_percentage_to_taffy(
     value: &LengthPercentage,
 ) -> Result<TaffyLengthPercentage, StyleError> {
     match value {
-        LengthPercentage::Dimension(length) => Ok(TaffyLengthPercentage::Length(
-            length
-                .to_px()
-                .map(|value| value as f32)
-                .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}")))?,
-        )),
+        LengthPercentage::Dimension(length) => {
+            if let Some(value) = length.to_px() {
+                Ok(TaffyLengthPercentage::Length(value as f32))
+            } else if let Some(value) = viewport_length_to_percent(length) {
+                Ok(TaffyLengthPercentage::Percent(value))
+            } else {
+                Err(StyleError::UnsupportedValue(format!("{value:?}")))
+            }
+        }
         LengthPercentage::Percentage(percentage) => {
             Ok(TaffyLengthPercentage::Percent(percentage.0))
         }
         _ => Err(StyleError::UnsupportedValue(format!("{value:?}"))),
     }
+}
+
+fn viewport_length_to_percent(value: &LengthValue) -> Option<f32> {
+    let percent = match value {
+        LengthValue::Vw(value)
+        | LengthValue::Lvw(value)
+        | LengthValue::Svw(value)
+        | LengthValue::Dvw(value)
+        | LengthValue::Vh(value)
+        | LengthValue::Lvh(value)
+        | LengthValue::Svh(value)
+        | LengthValue::Dvh(value)
+        | LengthValue::Vi(value)
+        | LengthValue::Svi(value)
+        | LengthValue::Lvi(value)
+        | LengthValue::Dvi(value)
+        | LengthValue::Vb(value)
+        | LengthValue::Svb(value)
+        | LengthValue::Lvb(value)
+        | LengthValue::Dvb(value)
+        | LengthValue::Vmin(value)
+        | LengthValue::Svmin(value)
+        | LengthValue::Lvmin(value)
+        | LengthValue::Dvmin(value)
+        | LengthValue::Vmax(value)
+        | LengthValue::Svmax(value)
+        | LengthValue::Lvmax(value)
+        | LengthValue::Dvmax(value) => *value,
+        _ => return None,
+    };
+
+    Some(percent / 100.0)
 }
 
 fn length_percentage_auto_to_taffy(
@@ -805,6 +855,14 @@ fn dimension_from_css_size(size: &CssSize) -> Result<Dimension, StyleError> {
     match size {
         CssSize::Auto => Ok(Dimension::Auto),
         CssSize::LengthPercentage(value) => Ok(length_percentage_to_taffy(value)?.into()),
+        _ => Err(StyleError::UnsupportedValue(format!("{size:?}"))),
+    }
+}
+
+fn dimension_from_css_max_size(size: &CssMaxSize) -> Result<Dimension, StyleError> {
+    match size {
+        CssMaxSize::None => Ok(Dimension::Auto),
+        CssMaxSize::LengthPercentage(value) => Ok(length_percentage_to_taffy(value)?.into()),
         _ => Err(StyleError::UnsupportedValue(format!("{size:?}"))),
     }
 }
@@ -1151,6 +1209,10 @@ fn apply_declaration(style: &mut Style, position_explicit: &mut bool, declaratio
         }
         Declaration::Width(value) => style.layout.taffy.size.width = *value,
         Declaration::Height(value) => style.layout.taffy.size.height = *value,
+        Declaration::MinWidth(value) => style.layout.taffy.min_size.width = *value,
+        Declaration::MinHeight(value) => style.layout.taffy.min_size.height = *value,
+        Declaration::MaxWidth(value) => style.layout.taffy.max_size.width = *value,
+        Declaration::MaxHeight(value) => style.layout.taffy.max_size.height = *value,
         Declaration::MarginTop(value) => style.layout.taffy.margin.top = *value,
         Declaration::MarginRight(value) => style.layout.taffy.margin.right = *value,
         Declaration::MarginBottom(value) => style.layout.taffy.margin.bottom = *value,
@@ -1306,6 +1368,62 @@ mod tests {
             resolved.layout.taffy.inset.left,
             TaffyLengthPercentageAuto::Length(0.0)
         );
+    }
+
+    #[test]
+    fn parser_and_resolution_support_min_and_max_sizes() {
+        let stylesheet = parse_stylesheet(
+            ".panel {
+                min-width: 120px;
+                min-height: 50px;
+                max-width: 180px;
+                max-height: 90px;
+            }",
+        )
+        .expect("min/max size declarations should parse");
+        let element = Node::element("section").with_class("panel");
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(
+            resolved.layout.taffy.min_size.width,
+            Dimension::Length(120.0)
+        );
+        assert_eq!(
+            resolved.layout.taffy.min_size.height,
+            Dimension::Length(50.0)
+        );
+        assert_eq!(
+            resolved.layout.taffy.max_size.width,
+            Dimension::Length(180.0)
+        );
+        assert_eq!(
+            resolved.layout.taffy.max_size.height,
+            Dimension::Length(90.0)
+        );
+    }
+
+    #[test]
+    fn parser_and_resolution_support_viewport_size_units() {
+        let stylesheet = parse_stylesheet(
+            ".panel {
+                width: 100vw;
+                height: 100vh;
+                min-width: 50dvw;
+                min-height: 50dvh;
+                max-width: 100vw;
+                max-height: 100vh;
+            }",
+        )
+        .expect("viewport size declarations should parse");
+        let element = Node::element("section").with_class("panel");
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.layout.taffy.size.width, Dimension::Percent(1.0));
+        assert_eq!(resolved.layout.taffy.size.height, Dimension::Percent(1.0));
+        assert_eq!(resolved.layout.taffy.min_size.width, Dimension::Percent(0.5));
+        assert_eq!(resolved.layout.taffy.min_size.height, Dimension::Percent(0.5));
+        assert_eq!(resolved.layout.taffy.max_size.width, Dimension::Percent(1.0));
+        assert_eq!(resolved.layout.taffy.max_size.height, Dimension::Percent(1.0));
     }
 
     #[test]
@@ -2273,6 +2391,61 @@ mod tests {
         assert_eq!(scene.children[0].layout.x, 12.0);
         assert_eq!(scene.children[0].layout.y, 12.0);
         assert_eq!(scene.children[0].layout.width, 616.0);
+    }
+
+    #[test]
+    fn viewport_layout_auto_stretches_unsized_roots() {
+        let stylesheet = parse_stylesheet(
+            "#app {
+                display: flex;
+                padding: 8px;
+                background-color: #ffffff;
+            }
+            .panel {
+                width: 120px;
+                height: 40px;
+                background-color: #0f172a;
+            }",
+        )
+        .expect("viewport stylesheet should parse");
+        let tree = Node::element("div")
+            .with_id("app")
+            .with_child(Node::element("section").with_class("panel").into())
+            .into();
+        let scene = build_render_tree_in_viewport(&tree, &stylesheet, 640, 360);
+
+        assert_eq!(scene.layout.width, 640.0);
+        assert_eq!(scene.layout.height, 360.0);
+        assert_eq!(scene.children[0].layout.x, 8.0);
+        assert_eq!(scene.children[0].layout.y, 8.0);
+    }
+
+    #[test]
+    fn viewport_layout_preserves_explicit_root_sizes() {
+        let stylesheet = parse_stylesheet(
+            "#app {
+                width: 320px;
+                height: 180px;
+                padding: 8px;
+                background-color: #ffffff;
+            }
+            .panel {
+                width: 120px;
+                height: 40px;
+                background-color: #0f172a;
+            }",
+        )
+        .expect("viewport stylesheet should parse");
+        let tree = Node::element("div")
+            .with_id("app")
+            .with_child(Node::element("section").with_class("panel").into())
+            .into();
+        let scene = build_render_tree_in_viewport(&tree, &stylesheet, 640, 360);
+
+        assert_eq!(scene.layout.width, 320.0);
+        assert_eq!(scene.layout.height, 180.0);
+        assert_eq!(scene.children[0].layout.x, 8.0);
+        assert_eq!(scene.children[0].layout.y, 8.0);
     }
 
     #[test]

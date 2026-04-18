@@ -280,7 +280,7 @@ fn build_render_tree_with_available_space(
         panic!("render tree roots must be elements");
     };
 
-    let resolved = resolve_element_tree(
+    let mut resolved = resolve_element_tree(
         root_element,
         stylesheet,
         None,
@@ -290,6 +290,9 @@ fn build_render_tree_with_available_space(
         interaction,
         &ElementPath::root(root_index),
     );
+    if available_space_override.is_some() {
+        auto_stretch_root_to_viewport(&mut resolved.style.layout.taffy);
+    }
     let mut taffy = TaffyTree::<LeafMeasureContext>::new();
     let layout_tree = build_layout_tree(&resolved, &mut taffy);
     let available_space = available_space_override
@@ -307,6 +310,15 @@ fn build_render_tree_with_available_space(
         .expect("resolved layout should be valid for taffy");
 
     render_node_from_layout(&layout_tree, &mut taffy, 0.0, 0.0)
+}
+
+fn auto_stretch_root_to_viewport(style: &mut TaffyStyle) {
+    if matches!(style.size.width, Dimension::Auto) {
+        style.size.width = Dimension::Percent(1.0);
+    }
+    if matches!(style.size.height, Dimension::Auto) {
+        style.size.height = Dimension::Percent(1.0);
+    }
 }
 
 fn build_layout_tree(

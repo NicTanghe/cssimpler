@@ -330,7 +330,7 @@ fn unresolved_property_error(property_name: &str, value_css: &str, reason: &str)
 
 #[cfg(test)]
 mod tests {
-    use cssimpler_core::{Color, Node};
+    use cssimpler_core::{BorderLineStyle, Color, Node};
     use taffy::prelude::{
         LengthPercentageAuto as TaffyLengthPercentageAuto, Position as TaffyPosition,
     };
@@ -405,6 +405,18 @@ mod tests {
 
         assert_eq!(resolved.visual.border.widths.right, 6.0);
         assert_eq!(resolved.visual.border.color, Color::rgb(221, 238, 255));
+    }
+
+    #[test]
+    fn dashed_border_shorthands_preserve_line_style() {
+        let stylesheet = parse_stylesheet(".pane { border: 1px dashed #4d5b73; }")
+            .expect("dashed border stylesheet should parse");
+        let element = Node::element("div").with_class("pane");
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.visual.border.widths.top, 1.0);
+        assert_eq!(resolved.visual.border.color, Color::rgb(77, 91, 115));
+        assert_eq!(resolved.visual.border.line_style, BorderLineStyle::Dashed);
     }
 
     #[test]

@@ -52,6 +52,7 @@ pub enum SimpleSelector {
     Tag(String),
     AttributeExists(String),
     AttributeEquals { name: String, value: String },
+    Root,
     Hover,
     Active,
 }
@@ -99,6 +100,7 @@ impl SimpleSelector {
             Self::AttributeEquals { name, value } => {
                 element.attribute(name) == Some(value.as_str())
             }
+            Self::Root => element_path.children.is_empty(),
             Self::Hover => interaction.is_hovered(element_path),
             Self::Active => interaction.is_active(element_path),
         }
@@ -457,6 +459,10 @@ fn extract_simple_selector(
     selector: &LightningSelector<'_>,
     component: &Component<'_>,
 ) -> Result<(Option<SimpleSelector>, Option<PseudoElementKind>), StyleError> {
+    if component.to_css_string() == ":root" {
+        return Ok((Some(SimpleSelector::Root), None));
+    }
+
     match component {
         Component::Class(name) => Ok((Some(SimpleSelector::Class(name.0.to_string())), None)),
         Component::ID(name) => Ok((Some(SimpleSelector::Id(name.0.to_string())), None)),
@@ -599,6 +605,16 @@ mod tests {
         assert!(SimpleSelector::Class("card".to_string()).matches(element));
         assert!(SimpleSelector::Id("hero".to_string()).matches(element));
         assert!(SimpleSelector::Tag("div".to_string()).matches(element));
+        assert!(SimpleSelector::Root.matches_with_interaction(
+            element,
+            &ElementPath::root(0),
+            &ElementInteractionState::default()
+        ));
+        assert!(!SimpleSelector::Root.matches_with_interaction(
+            element,
+            &ElementPath::root(0).with_child(0),
+            &ElementInteractionState::default()
+        ));
         assert!(!SimpleSelector::Class("ghost".to_string()).matches(element));
     }
 
@@ -806,6 +822,46 @@ mod tests {
                 SimpleSelector::Class("button".to_string()),
                 SimpleSelector::Active,
             ])
+        );
+    }
+
+    #[test]
+    fn parser_supports_root_pseudo_class() {
+        let stylesheet = parse_stylesheet(":root { width: 120px; }")
+            .expect(":root pseudo class should parse");
+
+        assert_eq!(
+            stylesheet.rules[0].selector,
+            Selector::compound(vec![SimpleSelector::Root])
+        );
+    }
+
+    #[test]
+    fn root_pseudo_class_participates_in_style_resolution() {
+        let stylesheet = parse_stylesheet(":root { width: 120px; }")
+            .expect(":root pseudo class should parse");
+        let root = Node::element("div");
+        let child = Node::element("span");
+        let root_style = resolve_style_with_interaction(
+            &root,
+            &stylesheet,
+            &ElementInteractionState::default(),
+            &ElementPath::root(0),
+        );
+        let child_style = resolve_style_with_interaction(
+            &child,
+            &stylesheet,
+            &ElementInteractionState::default(),
+            &ElementPath::root(0).with_child(0),
+        );
+
+        assert_eq!(
+            root_style.layout.taffy.size.width,
+            taffy::prelude::Dimension::Length(120.0)
+        );
+        assert_eq!(
+            child_style.layout.taffy.size.width,
+            taffy::prelude::Dimension::Auto
         );
     }
 
