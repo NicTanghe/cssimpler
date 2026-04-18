@@ -281,6 +281,7 @@ impl CornerRadius {
 pub struct BorderStyle {
     pub color: Color,
     pub widths: Insets,
+    pub line_style: BorderLineStyle,
 }
 
 impl Default for BorderStyle {
@@ -288,8 +289,16 @@ impl Default for BorderStyle {
         Self {
             color: Color::BLACK,
             widths: Insets::ZERO,
+            line_style: BorderLineStyle::Solid,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BorderLineStyle {
+    #[default]
+    Solid,
+    Dashed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

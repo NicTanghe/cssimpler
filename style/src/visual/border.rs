@@ -1,4 +1,4 @@
-use cssimpler_core::{Color, Style};
+use cssimpler_core::{BorderLineStyle, Color, Style};
 use lightningcss::properties::border::{
     Border, BorderBottom, BorderLeft, BorderRight, BorderSideWidth as CssBorderSideWidth,
     BorderTop, BorderWidth, LineStyle as CssLineStyle,
@@ -65,6 +65,7 @@ pub(super) fn border_shorthand_declarations(
             Declaration::BorderRightWidth(0.0),
             Declaration::BorderBottomWidth(0.0),
             Declaration::BorderLeftWidth(0.0),
+            Declaration::BorderLineStyle(BorderLineStyle::Solid),
         ]);
     }
 
@@ -74,6 +75,7 @@ pub(super) fn border_shorthand_declarations(
         Declaration::BorderRightWidth(width),
         Declaration::BorderBottomWidth(width),
         Declaration::BorderLeftWidth(width),
+        Declaration::BorderLineStyle(border_line_style_from_css(border.style)),
         Declaration::BorderColor(color::color_from_css_optional(&border.color)?),
     ])
 }
@@ -189,6 +191,10 @@ pub(super) fn apply_border_color(style: &mut Style, color: Option<Color>) {
     style.visual.border.color = color.unwrap_or(style.visual.foreground);
 }
 
+pub(super) fn apply_border_line_style(style: &mut Style, line_style: BorderLineStyle) {
+    style.visual.border.line_style = line_style;
+}
+
 #[derive(Clone, Copy)]
 enum BorderSide {
     Top,
@@ -275,6 +281,7 @@ where
 
     Ok(vec![
         border_width_declaration(side, border_width_to_px(border.width())?),
+        Declaration::BorderLineStyle(border_line_style_from_css(border.line_style())),
         Declaration::BorderColor(color::color_from_css_optional(border.color())?),
     ])
 }
@@ -314,5 +321,13 @@ fn border_width_declaration(side: BorderSide, value: f32) -> Declaration {
         BorderSide::Right => Declaration::BorderRightWidth(value),
         BorderSide::Bottom => Declaration::BorderBottomWidth(value),
         BorderSide::Left => Declaration::BorderLeftWidth(value),
+    }
+}
+
+fn border_line_style_from_css(line_style: CssLineStyle) -> BorderLineStyle {
+    if matches!(line_style, CssLineStyle::Dashed) {
+        BorderLineStyle::Dashed
+    } else {
+        BorderLineStyle::Solid
     }
 }

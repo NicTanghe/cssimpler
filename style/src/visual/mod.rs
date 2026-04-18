@@ -159,6 +159,10 @@ pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) ->
             border::apply_border_left_width(style, *value);
             true
         }
+        Declaration::BorderLineStyle(line_style) => {
+            border::apply_border_line_style(style, *line_style);
+            true
+        }
         Declaration::BorderColor(color) => {
             border::apply_border_color(style, *color);
             true

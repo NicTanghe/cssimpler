@@ -27,10 +27,10 @@ use self::{
     },
     shapes::{
         clip_pixel_bounds, draw_axis_aligned_opaque_rect, draw_axis_aligned_opaque_ring,
-        draw_rounded_rect, draw_rounded_ring, inset_corner_radius, inset_layout, layout_clip,
-        non_empty_layout_clip, offset_layout, snap_clip_to_pixel_grid,
-        transformed_rounded_rect_coverage, transformed_rounded_ring_coverage,
-        union_optional_bounds,
+        draw_dashed_rounded_ring, draw_rounded_rect, draw_rounded_ring, inset_corner_radius,
+        inset_layout, layout_clip, non_empty_layout_clip, offset_layout, snap_clip_to_pixel_grid,
+        transformed_dashed_rounded_ring_coverage, transformed_rounded_rect_coverage,
+        transformed_rounded_ring_coverage, union_optional_bounds,
     },
     transform::{
         AffineTransform, ClipState, PerspectiveContext, node_local_transform_matrix,
@@ -39,9 +39,9 @@ use self::{
     },
 };
 use cssimpler_core::{
-    Color, ElementInteractionState, ElementPath, EventHandler, ExtractedScene, LayoutBox,
-    LinearRgba, RenderKind, RenderNode, Transform2D, TransformMatrix3d, TransformStyleMode,
-    VisualStyle,
+    BorderLineStyle, Color, ElementInteractionState, ElementPath, EventHandler, ExtractedScene,
+    LayoutBox, LinearRgba, RenderKind, RenderNode, Transform2D, TransformMatrix3d,
+    TransformStyleMode, VisualStyle,
 };
 use softbuffer::SoftBufferError;
 use winit::error::{EventLoopError, OsError};
@@ -71,6 +71,7 @@ const MAX_RENDER_WORKERS: usize = 12;
 const SCENE_TRAVERSAL_COST_PER_NODE: usize = 96;
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 const MAX_SUBTREE_SURFACE_CACHE_ENTRIES: usize = 64;
+const MAX_WORKER_BUFFER_POOL_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FramePaintMode {
@@ -210,6 +211,32 @@ fn worker_buffer_pool() -> &'static Mutex<Vec<Vec<u32>>> {
     WORKER_BUFFER_POOL.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn buffer_storage_bytes(capacity: usize) -> usize {
+    capacity.saturating_mul(size_of::<u32>())
+}
+
+fn worker_buffer_pool_reserved_bytes(pool: &[Vec<u32>]) -> usize {
+    pool.iter()
+        .map(|buffer| buffer_storage_bytes(buffer.capacity()))
+        .sum()
+}
+
+fn trim_worker_buffer_pool_to_budget(pool: &mut Vec<Vec<u32>>, budget_bytes: usize) {
+    let mut reserved_bytes = worker_buffer_pool_reserved_bytes(pool);
+    if reserved_bytes <= budget_bytes {
+        return;
+    }
+
+    // Drop the largest retained buffers first so we keep reuse for common sizes.
+    pool.sort_by_key(|buffer| buffer.capacity());
+    while reserved_bytes > budget_bytes {
+        let Some(buffer) = pool.pop() else {
+            break;
+        };
+        reserved_bytes = reserved_bytes.saturating_sub(buffer_storage_bytes(buffer.capacity()));
+    }
+}
+
 fn acquire_worker_buffers(lengths: &[usize]) -> Vec<Vec<u32>> {
     let mut pool = worker_buffer_pool()
         .lock()
@@ -231,6 +258,7 @@ fn release_worker_buffers(buffers: Vec<Vec<u32>>) {
         .lock()
         .expect("worker buffer pool mutex should not be poisoned");
     pool.extend(buffers);
+    trim_worker_buffer_pool_to_budget(&mut pool, MAX_WORKER_BUFFER_POOL_BYTES);
 }
 
 fn subtree_surface_cache() -> &'static Mutex<SubtreeSurfaceCache> {
@@ -3001,26 +3029,42 @@ fn draw_background_and_border(
             node.style.corner_radius,
             node.style.border.widths,
         );
-        if !draw_axis_aligned_opaque_ring(
-            buffer,
-            width,
-            height,
-            node.layout,
-            node.style.corner_radius,
-            Some((inner_layout, inner_radius)),
-            node.style.border.color,
-            clip,
-        ) {
-            draw_rounded_ring(
-                buffer,
-                width,
-                height,
-                node.layout,
-                node.style.corner_radius,
-                Some((inner_layout, inner_radius)),
-                node.style.border.color,
-                clip,
-            );
+        match node.style.border.line_style {
+            BorderLineStyle::Solid => {
+                if !draw_axis_aligned_opaque_ring(
+                    buffer,
+                    width,
+                    height,
+                    node.layout,
+                    node.style.corner_radius,
+                    Some((inner_layout, inner_radius)),
+                    node.style.border.color,
+                    clip,
+                ) {
+                    draw_rounded_ring(
+                        buffer,
+                        width,
+                        height,
+                        node.layout,
+                        node.style.corner_radius,
+                        Some((inner_layout, inner_radius)),
+                        node.style.border.color,
+                        clip,
+                    );
+                }
+            }
+            BorderLineStyle::Dashed => {
+                draw_dashed_rounded_ring(
+                    buffer,
+                    width,
+                    height,
+                    node.layout,
+                    node.style.corner_radius,
+                    Some((inner_layout, inner_radius)),
+                    node.style.border.color,
+                    clip,
+                );
+            }
         }
     }
 
@@ -3081,17 +3125,34 @@ fn draw_background_and_border_transformed(
             node.style.corner_radius,
             node.style.border.widths,
         );
-        draw_transformed_rounded_ring(
-            buffer,
-            width,
-            height,
-            node.layout,
-            node.style.corner_radius,
-            Some((inner_layout, inner_radius)),
-            node.style.border.color,
-            matrix,
-            clip_state,
-        );
+        match node.style.border.line_style {
+            BorderLineStyle::Solid => {
+                draw_transformed_rounded_ring(
+                    buffer,
+                    width,
+                    height,
+                    node.layout,
+                    node.style.corner_radius,
+                    Some((inner_layout, inner_radius)),
+                    node.style.border.color,
+                    matrix,
+                    clip_state,
+                );
+            }
+            BorderLineStyle::Dashed => {
+                draw_transformed_dashed_rounded_ring(
+                    buffer,
+                    width,
+                    height,
+                    node.layout,
+                    node.style.corner_radius,
+                    Some((inner_layout, inner_radius)),
+                    node.style.border.color,
+                    matrix,
+                    clip_state,
+                );
+            }
+        }
     }
 
     let fill_layout = if node.style.border.widths.is_zero() {
@@ -3212,6 +3273,57 @@ fn draw_transformed_rounded_ring(
     for y in y0.max(row_start)..y1.min(row_end) {
         for x in x0..x1 {
             let coverage = transformed_rounded_ring_coverage(
+                outer_layout,
+                outer_radius,
+                inner,
+                inverse,
+                clip_state,
+                x,
+                y,
+            );
+            if coverage == 0 {
+                continue;
+            }
+            blend_prepared_pixel_with_coverage(
+                buffer, width, height, x, y, prepared, color.a, coverage,
+            );
+        }
+    }
+}
+
+fn draw_transformed_dashed_rounded_ring(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    outer_layout: LayoutBox,
+    outer_radius: cssimpler_core::CornerRadius,
+    inner: Option<(LayoutBox, cssimpler_core::CornerRadius)>,
+    color: Color,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    if color.a == 0 {
+        return;
+    }
+
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+    let Some(bounds) = transform_layout_bounds(outer_layout, matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+    let prepared = PreparedBlendColor::new(color);
+    let rows = current_render_buffer_rows();
+    let row_start = rows.start.min(height) as i32;
+    let row_end = rows.end.min(height) as i32;
+    for y in y0.max(row_start)..y1.min(row_end) {
+        for x in x0..x1 {
+            let coverage = transformed_dashed_rounded_ring_coverage(
                 outer_layout,
                 outer_radius,
                 inner,
@@ -4265,8 +4377,9 @@ mod tests {
 
     use cssimpler_core::fonts::{FontFamily, TextStyle, TextTransform, register_font_file};
     use cssimpler_core::{
-        AnglePercentageValue, BackgroundLayer, BoxShadow, CircleRadius, Color, ConicGradient,
-        CornerRadius, ElementPath, ExtractedScene, GradientDirection, GradientHorizontal,
+        AnglePercentageValue, BackgroundLayer, BorderLineStyle, BoxShadow, CircleRadius, Color,
+        ConicGradient, CornerRadius, ElementPath, ExtractedScene, GradientDirection,
+        GradientHorizontal,
         GradientInterpolation, GradientPoint, GradientStop, GradientVertical, Insets, LayoutBox,
         LengthPercentageValue, LinearGradient, Overflow, RadialGradient, RadialShape, RenderNode,
         ShadowEffect, TextStrokeStyle, Transform2D, TransformMatrix3d, TransformOperation,
@@ -4672,6 +4785,7 @@ mod tests {
                 border: cssimpler_core::BorderStyle {
                     color: Color::rgb(15, 23, 42),
                     widths: Insets::all(1.0),
+                    line_style: BorderLineStyle::Solid,
                 },
                 ..VisualStyle::default()
             }),
@@ -4697,6 +4811,35 @@ mod tests {
     }
 
     #[test]
+    fn dashed_rectangular_border_leaves_visible_gaps() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(1.25, 1.25, 4.0, 4.0)).with_style(VisualStyle {
+                border: cssimpler_core::BorderStyle {
+                    color: Color::rgb(15, 23, 42),
+                    widths: Insets::all(1.0),
+                    line_style: BorderLineStyle::Dashed,
+                },
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 7 * 7];
+
+        render_to_buffer(&scene, &mut buffer, 7, 7, Color::WHITE);
+
+        let border = pack_rgb(Color::rgb(15, 23, 42));
+        let white = pack_rgb(Color::WHITE);
+        let top_edge = &buffer[7 + 1..7 + 5];
+        assert!(
+            top_edge.contains(&border),
+            "dashed borders should still draw border segments"
+        );
+        assert!(
+            top_edge.contains(&white),
+            "dashed borders should introduce gaps on straight edges"
+        );
+    }
+
+    #[test]
     fn opaque_border_fast_path_respects_fractional_overflow_clip_edges() {
         let scene = vec![
             RenderNode::container(LayoutBox::new(1.8, 0.0, 2.0, 4.0))
@@ -4710,6 +4853,7 @@ mod tests {
                             border: cssimpler_core::BorderStyle {
                                 color: Color::rgb(15, 23, 42),
                                 widths: Insets::all(1.0),
+                                line_style: BorderLineStyle::Solid,
                             },
                             ..VisualStyle::default()
                         },
@@ -5979,6 +6123,7 @@ mod tests {
                             border: cssimpler_core::BorderStyle {
                                 color: border,
                                 widths: Insets::all(6.0),
+                                line_style: BorderLineStyle::Solid,
                             },
                             corner_radius: CornerRadius::all(28.0),
                             transform_style: TransformStyleMode::Preserve3d,
@@ -6336,6 +6481,42 @@ mod tests {
         let config = WindowConfig::new("cssimpler", 960, 540);
 
         assert!(config.middle_button_auto_scroll);
+    }
+
+    #[test]
+    fn worker_buffer_pool_trim_keeps_buffers_when_under_budget() {
+        let mut pool = vec![Vec::<u32>::with_capacity(8), Vec::<u32>::with_capacity(16)];
+
+        super::trim_worker_buffer_pool_to_budget(&mut pool, super::buffer_storage_bytes(24));
+
+        assert_eq!(
+            pool.iter().map(Vec::capacity).collect::<Vec<_>>(),
+            vec![8, 16]
+        );
+        assert_eq!(
+            super::worker_buffer_pool_reserved_bytes(&pool),
+            super::buffer_storage_bytes(24)
+        );
+    }
+
+    #[test]
+    fn worker_buffer_pool_trim_discards_largest_buffers_first() {
+        let mut pool = vec![
+            Vec::<u32>::with_capacity(24),
+            Vec::<u32>::with_capacity(8),
+            Vec::<u32>::with_capacity(16),
+        ];
+
+        super::trim_worker_buffer_pool_to_budget(&mut pool, super::buffer_storage_bytes(24));
+
+        assert_eq!(
+            pool.iter().map(Vec::capacity).collect::<Vec<_>>(),
+            vec![8, 16]
+        );
+        assert_eq!(
+            super::worker_buffer_pool_reserved_bytes(&pool),
+            super::buffer_storage_bytes(24)
+        );
     }
 
     #[test]

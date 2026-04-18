@@ -378,10 +378,22 @@ fn build_render_tree_with_available_space(
     interaction: &ElementInteractionState,
     root_index: usize,
 ) -> RenderNode {
-    let resolved =
+    let mut resolved =
         resolve_render_tree_with_interaction_at_root(root, stylesheet, interaction, root_index);
+    if available_space_override.is_some() {
+        auto_stretch_root_to_viewport(&mut resolved.root.style.layout.taffy);
+    }
     let mut layout = layout_resolved_render_tree(&resolved, available_space_override);
     extract_render_tree(&mut layout)
+}
+
+fn auto_stretch_root_to_viewport(style: &mut TaffyStyle) {
+    if matches!(style.size.width, Dimension::Auto) {
+        style.size.width = Dimension::Percent(1.0);
+    }
+    if matches!(style.size.height, Dimension::Auto) {
+        style.size.height = Dimension::Percent(1.0);
+    }
 }
 
 fn build_layout_tree(

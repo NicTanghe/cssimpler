@@ -918,6 +918,85 @@ Acceptance
 
 ---
 
+# Epic O - Viewport units and root parity
+
+## O1. `:root` selector support
+Depends: C1, C3  
+Status: planned  
+
+Purpose:
+- Add `:root` as a first-class supported pseudo-class in the controlled selector subset
+
+Support:
+- `:root` selector matching for the document root element
+- Deterministic behavior consistent with existing `.class`, `#id`, `tag`, `[attr]`, `:hover`, and `:active` support
+
+Acceptance
+- `:root { ... }` parses and resolves against the root element
+- Selector tests cover root and non-root matching cases
+- Unsupported pseudo-classes still fail clearly
+
+---
+
+## O2. Root auto-stretch in viewport mode
+Depends: D2, D3, E1  
+Status: planned  
+
+Purpose:
+- Make default root sizing browser-like in viewport mode so the app root fills the viewport when not explicitly sized
+
+Rules:
+- In viewport mode, if root width and/or height are not explicitly set, default to viewport fill behavior (equivalent to `width: 100%` and `height: 100%`)
+- Explicit root sizes must continue to override defaults
+- Non-viewport sizing modes must keep current deterministic behavior
+
+Acceptance
+- Root no longer shrinks to content by default in viewport mode
+- A small child panel example still renders inside a viewport-filling root container
+- Layout tests cover explicit-size override and implicit auto-stretch cases
+
+---
+
+## O3. Min/max size declarations or strict diagnostics
+Depends: C1, C2, D1  
+Status: planned  
+
+Purpose:
+- Remove silent no-op behavior for min/max sizing declarations so authors get deterministic outcomes
+
+Support:
+- Preferred path: implement `min-width`, `min-height`, `max-width`, and `max-height`
+- Acceptable fallback: emit explicit warnings or errors for unsupported min/max declarations instead of dropping them silently
+
+Acceptance
+- `min-height: 100vh` is either enforced in layout or reported with an explicit warning/error
+- Unsupported declarations are never silently ignored
+- Tests cover declaration handling and diagnostic behavior
+
+---
+
+# Epic P - Flex shorthand parity and layout determinism
+
+## P1. `flex` shorthand expansion into existing longhand pipeline
+Depends: L3, D1  
+Status: planned  
+
+Purpose:
+- Eliminate silent no-op behavior for `flex` shorthand so common flex layouts behave as authored
+
+Support:
+- Parse and expand `flex` shorthand values into existing longhand declarations (`flex-grow`, `flex-shrink`, `flex-basis`)
+- Ensure shorthand paths reuse the same Taffy mapping used by longhands (no duplicate layout logic)
+- Cover common authoring patterns used in app shells and panel layouts (`flex: 1`, `flex: auto`, `flex: none`, and explicit triple forms)
+
+Acceptance
+- `.workspace { flex: 1; }` behaves the same as `flex-grow: 1; flex-shrink: 1; flex-basis: 0%`
+- Column flex layouts correctly push fixed-size footers to the bottom when middle content uses shorthand growth
+- Unsupported shorthand values are never silently ignored (clear diagnostic or explicit rejection)
+- Parser and layout tests lock in shorthand expansion behavior
+
+---
+
 # Constraints (explicit)
 
 - Rust-only (no JS, no webview)  
@@ -949,7 +1028,8 @@ Acceptance
 14. J1 + J2 + J3 (generic attributes, macro support, attribute lookup)  
 15. K1 + K2 + K3 (richer selectors and interactive state)  
 16. L1 + L2 + L3 (custom properties, `var()`, shorthand coverage)  
-17. M1 + M2 + M3 + M4 (text effects, transitions, generated content)  
+17. P1 (`flex` shorthand parity and deterministic layout behavior)  
+18. M1 + M2 + M3 + M4 (text effects, transitions, generated content)  
 Polish: styling depth, performance  
 
 ---
