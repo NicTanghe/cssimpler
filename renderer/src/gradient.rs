@@ -25,7 +25,6 @@ const MAX_STATIC_GRADIENT_LAYER_CACHE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_SINGLE_STATIC_GRADIENT_LAYER_CACHE_BYTES: usize = 6 * 1024 * 1024;
 const MIN_STATIC_GRADIENT_LAYER_CACHE_PIXELS: usize = 250_000;
 const MIN_STATIC_GRADIENT_LAYER_CACHE_REUSES: u8 = 2;
-const BINARY_ALPHA_PIXEL_FLAG: u32 = 1 << 24;
 
 #[derive(Clone)]
 struct CachedGradientLayer {
@@ -824,7 +823,7 @@ fn pack_binary_alpha_pixel(color: LinearRgba) -> u32 {
     if color.a <= f32::EPSILON {
         0
     } else {
-        BINARY_ALPHA_PIXEL_FLAG | pack_linear_rgb(LinearRgba { a: 1.0, ..color })
+        pack_linear_rgb(LinearRgba { a: 1.0, ..color })
     }
 }
 
@@ -894,7 +893,7 @@ fn draw_cached_gradient_layer(
                     if source == 0 {
                         continue;
                     }
-                    buffer[dest_row_start + x as usize] = source & 0x00FF_FFFF;
+                    buffer[dest_row_start + x as usize] = source;
                 }
             }
         }

@@ -24,9 +24,10 @@ use super::{
     ElementInteractionState, ElementPath, FrameInfo, FrameTimingStats, MouseEventKind,
     RedrawSchedule, RendererError, Result, SceneProvider, WindowConfig,
     dispatch_hover_transition_events, dispatch_mouse_event, drawable_viewport_size, duration_to_us,
-    pack_rgb, record_frame_timing_stats, redraw_auto_scroll_indicator_regions,
+    pack_softbuffer_rgb, record_frame_timing_stats, redraw_auto_scroll_indicator_regions,
     render_scene_update_internal, render_to_buffer_internal, resize_buffer, scrollbar,
     settle_element_interaction, should_present_frame, should_suspend_updates,
+    to_softbuffer_rgb_blue_noise,
 };
 
 pub(super) fn run_with_scene_provider<P>(config: WindowConfig, scene_provider: P) -> Result<()>
@@ -596,7 +597,7 @@ where
                             &self.buffer,
                             self.buffer_width,
                             self.buffer_height,
-                            pack_rgb(self.config.clear_color),
+                            pack_softbuffer_rgb(self.config.clear_color),
                         );
                         if let Err(error) = target.present() {
                             self.fail(event_loop, error);
@@ -812,7 +813,13 @@ fn copy_render_buffer_into_surface(
     debug_assert_eq!(source.len(), source_width.saturating_mul(source_height));
 
     if target_width == source_width && target_height == source_height {
-        target.copy_from_slice(source);
+        for row in 0..source_height {
+            let row_start = row * source_width;
+            for column in 0..source_width {
+                let index = row_start + column;
+                target[index] = to_softbuffer_rgb_blue_noise(source[index], column, row);
+            }
+        }
         return;
     }
 
@@ -822,8 +829,10 @@ fn copy_render_buffer_into_surface(
     for row in 0..copy_height {
         let src_row = row * source_width;
         let dst_row = row * target_width;
-        target[dst_row..dst_row + copy_width]
-            .copy_from_slice(&source[src_row..src_row + copy_width]);
+        for column in 0..copy_width {
+            target[dst_row + column] =
+                to_softbuffer_rgb_blue_noise(source[src_row + column], column, row);
+        }
     }
 }
 
@@ -891,6 +900,7 @@ fn normalize_physical_key(key: PhysicalKey) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use cssimpler_core::Color;
     use winit::dpi::PhysicalPosition;
     use winit::event::{ElementState, MouseScrollDelta};
     use winit::keyboard::{
@@ -900,6 +910,7 @@ mod tests {
     use crate::input::{
         ButtonState, KeyIdentity, KeyLocation, KeyboardModifiers, PointerButton, ScrollDelta,
     };
+    use crate::{pack_rgb, to_softbuffer_rgb_blue_noise};
 
     use super::{
         copy_render_buffer_into_surface, normalize_button_state, normalize_key_location,
@@ -981,17 +992,57 @@ mod tests {
 
     #[test]
     fn blit_to_surface_copies_rows_when_target_is_wider() {
-        let source = vec![1, 2, 3, 4, 5, 6];
+        let source = vec![
+            pack_rgb(Color::rgb(1, 2, 3)),
+            pack_rgb(Color::rgb(4, 5, 6)),
+            pack_rgb(Color::rgb(7, 8, 9)),
+            pack_rgb(Color::rgb(10, 11, 12)),
+            pack_rgb(Color::rgb(13, 14, 15)),
+            pack_rgb(Color::rgb(16, 17, 18)),
+        ];
         let mut target = vec![9; 10];
         copy_render_buffer_into_surface(&mut target, 5, 2, &source, 3, 2, 0);
-        assert_eq!(target, vec![1, 2, 3, 0, 0, 4, 5, 6, 0, 0]);
+        assert_eq!(
+            target,
+            vec![
+                to_softbuffer_rgb_blue_noise(source[0], 0, 0),
+                to_softbuffer_rgb_blue_noise(source[1], 1, 0),
+                to_softbuffer_rgb_blue_noise(source[2], 2, 0),
+                0,
+                0,
+                to_softbuffer_rgb_blue_noise(source[3], 0, 1),
+                to_softbuffer_rgb_blue_noise(source[4], 1, 1),
+                to_softbuffer_rgb_blue_noise(source[5], 2, 1),
+                0,
+                0,
+            ]
+        );
     }
 
     #[test]
     fn blit_to_surface_copies_rows_when_target_is_narrower() {
-        let source = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let source = vec![
+            pack_rgb(Color::rgb(1, 2, 3)),
+            pack_rgb(Color::rgb(4, 5, 6)),
+            pack_rgb(Color::rgb(7, 8, 9)),
+            pack_rgb(Color::rgb(10, 11, 12)),
+            pack_rgb(Color::rgb(13, 14, 15)),
+            pack_rgb(Color::rgb(16, 17, 18)),
+            pack_rgb(Color::rgb(19, 20, 21)),
+            pack_rgb(Color::rgb(22, 23, 24)),
+        ];
         let mut target = vec![9; 6];
         copy_render_buffer_into_surface(&mut target, 3, 2, &source, 4, 2, 0);
-        assert_eq!(target, vec![1, 2, 3, 5, 6, 7]);
+        assert_eq!(
+            target,
+            vec![
+                to_softbuffer_rgb_blue_noise(source[0], 0, 0),
+                to_softbuffer_rgb_blue_noise(source[1], 1, 0),
+                to_softbuffer_rgb_blue_noise(source[2], 2, 0),
+                to_softbuffer_rgb_blue_noise(source[4], 0, 1),
+                to_softbuffer_rgb_blue_noise(source[5], 1, 1),
+                to_softbuffer_rgb_blue_noise(source[6], 2, 1),
+            ]
+        );
     }
 }

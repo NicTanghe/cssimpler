@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 mod backdrop;
+mod color;
 mod fonts;
 mod gradient;
 mod input;
@@ -17,6 +18,7 @@ mod runtime;
 mod scrollbar;
 mod shadow;
 mod shapes;
+mod softbuffer_dither;
 mod svg;
 mod transform;
 
@@ -50,6 +52,10 @@ pub use self::input::{
     ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
     PointerButton, PointerPosition, ScrollDelta, TextInputEvent, ViewportEvent,
 };
+pub(crate) use self::color::{
+    pack_linear_rgb, pack_rgb, pack_softbuffer_rgb, unpack_linear_rgb, unpack_rgb,
+};
+pub(crate) use self::softbuffer_dither::to_softbuffer_rgb_blue_noise;
 #[cfg(test)]
 use self::{
     shadow::cached_shadow_mask,
@@ -411,8 +417,8 @@ fn extract_surface_from_mattes(
 
     let mut pixels = Vec::with_capacity(pixel_count);
     for index in 0..pixel_count {
-        let black = unpack_rgb(black_buffer[index]).to_linear_rgba();
-        let white = unpack_rgb(white_buffer[index]).to_linear_rgba();
+        let black = unpack_linear_rgb(black_buffer[index]);
+        let white = unpack_linear_rgb(white_buffer[index]);
         let alpha_r = 1.0 - (white.r - black.r).clamp(0.0, 1.0);
         let alpha_g = 1.0 - (white.g - black.g).clamp(0.0, 1.0);
         let alpha_b = 1.0 - (white.b - black.b).clamp(0.0, 1.0);
@@ -4230,7 +4236,7 @@ fn blend_mask_row_scalar(
 
         let alpha = alpha as f32 / 255.0;
         let inverse_alpha = 1.0 - alpha;
-        let destination = unpack_rgb(*pixel).to_linear_rgba();
+        let destination = unpack_linear_rgb(*pixel);
         *pixel = pack_linear_rgb(LinearRgba {
             r: color.linear.r * alpha + destination.r * inverse_alpha,
             g: color.linear.g * alpha + destination.g * inverse_alpha,
@@ -4384,7 +4390,7 @@ fn buffer_pixel_index(width: usize, height: usize, x: i32, y: i32) -> Option<usi
 }
 
 fn blend_linear_over(buffer: &mut [u32], index: usize, source: LinearRgba) {
-    let destination = unpack_rgb(buffer[index]).to_linear_rgba();
+    let destination = unpack_linear_rgb(buffer[index]);
     let alpha = source.a;
     let inverse_alpha = 1.0 - alpha;
     let blended = LinearRgba {
@@ -4398,7 +4404,7 @@ fn blend_linear_over(buffer: &mut [u32], index: usize, source: LinearRgba) {
 }
 
 fn blend_premultiplied_linear_over(buffer: &mut [u32], index: usize, source: LinearRgba) {
-    let destination = unpack_rgb(buffer[index]).to_linear_rgba();
+    let destination = unpack_linear_rgb(buffer[index]);
     let inverse_alpha = 1.0 - source.a;
     let blended = LinearRgba {
         r: source.r + destination.r * inverse_alpha,
@@ -4416,22 +4422,6 @@ fn scale_alpha(coverage: u8, alpha: u8) -> u8 {
     } else {
         ((u16::from(coverage) * u16::from(alpha) + 127) / 255) as u8
     }
-}
-
-fn pack_linear_rgb(color: LinearRgba) -> u32 {
-    pack_rgb(Color::from_linear_rgba(LinearRgba { a: 1.0, ..color }))
-}
-
-fn pack_rgb(color: Color) -> u32 {
-    ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32
-}
-
-fn unpack_rgb(pixel: u32) -> Color {
-    Color::rgb(
-        ((pixel >> 16) & 0xFF) as u8,
-        ((pixel >> 8) & 0xFF) as u8,
-        (pixel & 0xFF) as u8,
-    )
 }
 
 #[cfg(test)]
@@ -4460,7 +4450,7 @@ mod tests {
         incremental_scene_passes_for_full_redraw_heuristic, pack_rgb, render_scene_update,
         render_scene_update_internal_from_roots, render_to_buffer, resize_buffer,
         scenes_match_visuals, should_present_frame, should_present_scene, should_suspend_updates,
-        should_full_redraw,
+        should_full_redraw, unpack_rgb,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -4970,7 +4960,7 @@ mod tests {
 
         render_to_buffer(&scene, &mut buffer, 3, 1, Color::BLACK);
 
-        assert_eq!(buffer[1], pack_rgb(Color::rgb(99, 99, 99)));
+        assert_eq!(unpack_rgb(buffer[1]), Color::rgb(99, 99, 99));
     }
 
     #[test]
@@ -4999,7 +4989,7 @@ mod tests {
 
         render_to_buffer(&scene, &mut buffer, 3, 1, Color::BLACK);
 
-        assert_eq!(buffer[1], pack_rgb(Color::rgb(188, 188, 188)));
+        assert_eq!(unpack_rgb(buffer[1]), Color::rgb(187, 187, 187));
     }
 
     #[test]
