@@ -378,6 +378,76 @@ Acceptance:
 
 ---
 
+# Epic AB - CPU precision and softbuffer quantization mitigation
+
+## AB1. Internal `R10G10B10A2` CPU color storage
+Depends: E2, G1  
+Status: shipped
+
+Purpose:
+- Raise internal CPU renderer precision while keeping the current software backend and `u32` storage footprint
+
+Should have been an extension:
+- This should have extended E2 because it upgrades the renderer's internal color representation without changing author-facing APIs
+
+Support:
+- Internal pixel packing moved from 8-bit RGB to `R10G10B10A2`
+- Linear blending and intermediate sampling decode from the 10-bit storage path
+- Conversion helpers centralized in a dedicated renderer color module
+
+Acceptance:
+- Render buffers remain `u32` per pixel
+- Internal blend/read/write paths no longer quantize immediately to 8-bit RGB
+- Existing renderer behavior remains deterministic and testable
+
+---
+
+## AB2. Present-time blue-noise dithering for softbuffer output
+Depends: AB1, X3  
+Status: shipped
+
+Purpose:
+- Reduce visible gradient banding caused by mandatory softbuffer 8-bit presentation, without introducing temporal shimmer
+
+Should have been an extension:
+- This should have extended X3 and E2 because it modifies the final present conversion path rather than the scene/render model
+
+Support:
+- Dedicated softbuffer-dither module applied only during CPU-buffer to softbuffer blit
+- Deterministic tiled blue-noise thresholding when converting 10-bit internal channels to 8-bit output
+- Channel decorrelation to avoid color-locked dither patterns
+- Zero-diff behavior for exact 8-bit anchor colors
+
+Acceptance:
+- Dithering is applied at present conversion boundaries, not throughout all renderer math
+- Exact 8-bit colors remain stable
+- Visual gradient contouring is reduced on softbuffer output compared to naive rounding
+
+---
+
+## AB3. Renderer module boundaries and regression coverage
+Depends: AB1, AB2  
+Status: shipped
+
+Purpose:
+- Keep color/quantization concerns maintainable by separating concerns instead of growing `renderer/src/lib.rs`
+
+Should have been an extension:
+- This should have extended E2 because it hardens renderer internals and testability as precision logic evolves
+
+Support:
+- Color packing/unpacking and channel conversion in `renderer/src/color.rs`
+- Softbuffer-limited output compensation in `renderer/src/softbuffer_dither.rs`
+- Runtime and gradient paths updated to use shared helpers
+- Unit coverage for channel mapping, noise tile validity, and blit conversion behavior
+
+Acceptance:
+- Precision and dithering logic are discoverable in dedicated modules
+- Renderer tests cover both the precision path and softbuffer conversion path
+- No regressions in existing renderer integration tests after the precision/dither changes
+
+---
+
 # Suggested implementation order (part 3)
 
 1. X1 + X2 + X3  
