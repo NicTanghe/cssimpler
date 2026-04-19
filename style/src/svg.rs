@@ -37,7 +37,7 @@ impl Default for SvgCascadeState {
 }
 
 pub(crate) fn is_supported_svg_tag(tag: &str) -> bool {
-    matches!(tag, "svg" | "g" | "path")
+    matches!(tag, "svg" | "g" | "path" | "circle")
 }
 
 pub(crate) fn seed_element_style(element: &ElementNode) -> Style {
@@ -51,6 +51,9 @@ pub(crate) fn seed_element_style(element: &ElementNode) -> Style {
             || name == "class"
             || name == "viewBox"
             || name == "d"
+            || name == "cx"
+            || name == "cy"
+            || name == "r"
             || name == "transform"
             || name == "stroke-linecap"
             || name == "stroke-linejoin"
@@ -242,7 +245,7 @@ fn collect_svg_paths(
     paths: &mut Vec<SvgPathInstance>,
 ) {
     match element.tag.as_str() {
-        "g" | "path" => {}
+        "g" | "path" | "circle" => {}
         "svg" => panic!("nested <svg> elements are not supported inside SVG subtrees"),
         _ => panic!("unsupported SVG tag <{}>", element.tag),
     }
@@ -307,6 +310,29 @@ fn collect_svg_paths(
                 .unwrap_or_else(|| panic!("supported <path> elements require a `d` attribute"));
             let geometry = parse_svg_path_data(data)
                 .unwrap_or_else(|error| panic!("unsupported SVG path data on <path>: {error}"));
+            paths.push(SvgPathInstance {
+                geometry: translate_svg_geometry(
+                    geometry,
+                    svg_state.translate_x,
+                    svg_state.translate_y,
+                ),
+                paint: svg_path_paint(svg_state, style.visual.foreground),
+            });
+        }
+        "circle" => {
+            for child in &element.children {
+                match child {
+                    Node::Text(text) if text.trim().is_empty() => {}
+                    _ => panic!("<circle> does not support child nodes"),
+                }
+            }
+
+            let geometry = parse_svg_circle_geometry(element).unwrap_or_else(|error| {
+                panic!("unsupported SVG circle geometry on <circle>: {error}")
+            });
+            let Some(geometry) = geometry else {
+                return;
+            };
             paths.push(SvgPathInstance {
                 geometry: translate_svg_geometry(
                     geometry,
@@ -400,6 +426,45 @@ fn parse_svg_translate_transform(value: &str) -> Result<(f32, f32), String> {
     }
 
     Ok((translate_x, translate_y))
+}
+
+fn parse_svg_circle_geometry(element: &ElementNode) -> Result<Option<SvgPathGeometry>, String> {
+    let center_x = parse_svg_shape_length_attribute(element, "cx")?.unwrap_or(0.0);
+    let center_y = parse_svg_shape_length_attribute(element, "cy")?.unwrap_or(0.0);
+    let radius = parse_svg_shape_length_attribute(element, "r")?.unwrap_or(0.0);
+    if radius <= f32::EPSILON {
+        return Ok(None);
+    }
+
+    const CIRCLE_SEGMENTS: usize = 48;
+    let mut points = Vec::with_capacity(CIRCLE_SEGMENTS);
+    for segment in 0..CIRCLE_SEGMENTS {
+        let angle = std::f32::consts::TAU * segment as f32 / CIRCLE_SEGMENTS as f32;
+        points.push(SvgPoint::new(
+            center_x + radius * angle.cos(),
+            center_y + radius * angle.sin(),
+        ));
+    }
+
+    Ok(Some(SvgPathGeometry::new(vec![SvgContour {
+        points,
+        closed: true,
+    }])))
+}
+
+fn parse_svg_shape_length_attribute(
+    element: &ElementNode,
+    attribute_name: &str,
+) -> Result<Option<f32>, String> {
+    let Some(value) = element.attribute(attribute_name) else {
+        return Ok(None);
+    };
+
+    numeric_svg_length_attribute(Some(value))
+        .ok_or_else(|| {
+            format!("`{attribute_name}` expects a numeric value or `px` length, got `{value}`")
+        })
+        .map(Some)
 }
 
 fn translate_svg_geometry(
@@ -1135,6 +1200,39 @@ mod tests {
         assert_eq!(bounds.min_y, 6.0);
         assert_eq!(bounds.max_x, 14.0);
         assert_eq!(bounds.max_y, 10.0);
+    }
+
+    #[test]
+    fn svg_circle_elements_render_as_closed_paths() {
+        let tree = Node::element("svg")
+            .with_attribute("viewBox", "0 0 24 24")
+            .with_child(
+                Node::element("circle")
+                    .with_attribute("cx", "12")
+                    .with_attribute("cy", "12")
+                    .with_attribute("r", "6")
+                    .into(),
+            )
+            .into();
+
+        let scene = build_render_tree(&tree, &Stylesheet::default());
+        let RenderKind::Svg(svg) = scene.kind else {
+            panic!("expected an SVG render node");
+        };
+        assert_eq!(svg.paths.len(), 1);
+
+        let contour = &svg.paths[0].geometry.contours[0];
+        assert!(contour.closed);
+        assert_eq!(contour.points.len(), 48);
+
+        let bounds = svg.paths[0]
+            .geometry
+            .bounds
+            .expect("circle geometry should have bounds");
+        assert!((bounds.min_x - 6.0).abs() < 0.01);
+        assert!((bounds.min_y - 6.0).abs() < 0.01);
+        assert!((bounds.max_x - 18.0).abs() < 0.01);
+        assert!((bounds.max_y - 18.0).abs() < 0.01);
     }
 
     #[test]

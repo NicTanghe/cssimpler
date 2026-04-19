@@ -47,7 +47,11 @@ pub(crate) fn unpack_linear_rgb(pixel: u32) -> LinearRgba {
 }
 
 pub(crate) fn unpack_rgb10(pixel: u32) -> (u16, u16, u16) {
-    (extract_red(pixel), extract_green(pixel), extract_blue(pixel))
+    (
+        extract_red(pixel),
+        extract_green(pixel),
+        extract_blue(pixel),
+    )
 }
 
 pub(crate) fn pack_softbuffer_rgb(color: Color) -> u32 {

@@ -827,8 +827,8 @@ mod tests {
 
     #[test]
     fn parser_supports_root_pseudo_class() {
-        let stylesheet = parse_stylesheet(":root { width: 120px; }")
-            .expect(":root pseudo class should parse");
+        let stylesheet =
+            parse_stylesheet(":root { width: 120px; }").expect(":root pseudo class should parse");
 
         assert_eq!(
             stylesheet.rules[0].selector,
@@ -838,8 +838,8 @@ mod tests {
 
     #[test]
     fn root_pseudo_class_participates_in_style_resolution() {
-        let stylesheet = parse_stylesheet(":root { width: 120px; }")
-            .expect(":root pseudo class should parse");
+        let stylesheet =
+            parse_stylesheet(":root { width: 120px; }").expect(":root pseudo class should parse");
         let root = Node::element("div");
         let child = Node::element("span");
         let root_style = resolve_style_with_interaction(

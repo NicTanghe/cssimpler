@@ -1,7 +1,7 @@
 use cssimpler_core::{CornerRadius, LayoutBox, LinearRgba};
 
 use super::shapes::{
-    clip_pixel_bounds, layout_clip, point_in_rounded_rect, transformed_rounded_rect_coverage,
+    clip_pixel_bounds, layout_clip, rounded_rect_coverage, transformed_rounded_rect_coverage,
 };
 use super::transform::{AffineTransform, ClipState, transform_layout_bounds};
 use super::{ClipRect, buffer_pixel_index, pack_linear_rgb, unpack_rgb};
@@ -38,13 +38,14 @@ pub(crate) fn draw_backdrop_blur(
 
     for y in y0..y1 {
         for x in x0..x1 {
-            if !point_in_rounded_rect(x as f32 + 0.5, y as f32 + 0.5, layout, radius) {
+            let coverage = rounded_rect_coverage(layout, radius, destination_bounds, x, y);
+            if coverage == 0 {
                 continue;
             }
             let Some(color) = snapshot.pixel_at_screen(x, y) else {
                 continue;
             };
-            blend_backdrop_pixel(buffer, width, height, x, y, color, u8::MAX);
+            blend_backdrop_pixel(buffer, width, height, x, y, color, coverage);
         }
     }
 }

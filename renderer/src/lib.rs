@@ -48,12 +48,12 @@ use cssimpler_core::{
 use softbuffer::SoftBufferError;
 use winit::error::{EventLoopError, OsError};
 
+pub(crate) use self::color::{
+    pack_linear_rgb, pack_rgb, pack_softbuffer_rgb, unpack_linear_rgb, unpack_rgb,
+};
 pub use self::input::{
     ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
     PointerButton, PointerPosition, ScrollDelta, TextInputEvent, ViewportEvent,
-};
-pub(crate) use self::color::{
-    pack_linear_rgb, pack_rgb, pack_softbuffer_rgb, unpack_linear_rgb, unpack_rgb,
 };
 pub(crate) use self::softbuffer_dither::to_softbuffer_rgb_blue_noise;
 #[cfg(test)]
@@ -4434,11 +4434,10 @@ mod tests {
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, BorderLineStyle, BoxShadow, CircleRadius, Color,
         ConicGradient, CornerRadius, ElementPath, ExtractedScene, GradientDirection,
-        GradientHorizontal,
-        GradientInterpolation, GradientPoint, GradientStop, GradientVertical, Insets, LayoutBox,
-        LengthPercentageValue, LinearGradient, Overflow, RadialGradient, RadialShape, RenderNode,
-        ShadowEffect, TextStrokeStyle, Transform2D, TransformMatrix3d, TransformOperation,
-        TransformStyleMode, VisualStyle,
+        GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop, GradientVertical,
+        Insets, LayoutBox, LengthPercentageValue, LinearGradient, Overflow, RadialGradient,
+        RadialShape, RenderNode, ShadowEffect, TextStrokeStyle, Transform2D, TransformMatrix3d,
+        TransformOperation, TransformStyleMode, VisualStyle,
     };
 
     use crate::{
@@ -4449,8 +4448,8 @@ mod tests {
         drawable_viewport_size, hit_test_element_path,
         incremental_scene_passes_for_full_redraw_heuristic, pack_rgb, render_scene_update,
         render_scene_update_internal_from_roots, render_to_buffer, resize_buffer,
-        scenes_match_visuals, should_present_frame, should_present_scene, should_suspend_updates,
-        should_full_redraw, unpack_rgb,
+        scenes_match_visuals, should_full_redraw, should_present_frame, should_present_scene,
+        should_suspend_updates, unpack_rgb,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -4776,6 +4775,63 @@ mod tests {
 
         assert_eq!(buffer[2 * 16 + 2], pack_rgb(Color::WHITE));
         assert_eq!(buffer[6 * 16 + 6], pack_rgb(Color::rgb(40, 120, 220)));
+    }
+
+    #[test]
+    fn rounded_gradient_background_emits_partial_edge_pixels() {
+        let layout = LayoutBox::new(2.0, 2.0, 8.0, 8.0);
+        let radius = CornerRadius::all(4.0);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 16.0, 16.0)).with_style(VisualStyle {
+                background: Some(Color::WHITE),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(layout).with_style(VisualStyle {
+                corner_radius: radius,
+                background_layers: vec![BackgroundLayer::LinearGradient(LinearGradient {
+                    direction: GradientDirection::Horizontal(GradientHorizontal::Right),
+                    interpolation: GradientInterpolation::LinearSrgb,
+                    repeating: false,
+                    stops: vec![
+                        GradientStop {
+                            color: Color::BLACK,
+                            position: LengthPercentageValue::from_fraction(0.0),
+                        },
+                        GradientStop {
+                            color: Color::BLACK,
+                            position: LengthPercentageValue::from_fraction(1.0),
+                        },
+                    ],
+                })],
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 16 * 16];
+
+        render_to_buffer(&scene, &mut buffer, 16, 16, Color::WHITE);
+
+        let white = pack_rgb(Color::WHITE);
+        let black = pack_rgb(Color::BLACK);
+        let clip = ClipRect::full(16.0, 16.0);
+        let mut observed_partial_edge = false;
+        for y in 0..16 {
+            for x in 0..16 {
+                let coverage = super::shapes::rounded_rect_coverage(layout, radius, clip, x, y);
+                if coverage == 0 || coverage == u8::MAX {
+                    continue;
+                }
+
+                let pixel = buffer[y as usize * 16 + x as usize];
+                assert_ne!(pixel, white);
+                assert_ne!(pixel, black);
+                observed_partial_edge = true;
+            }
+        }
+
+        assert!(
+            observed_partial_edge,
+            "rounded gradient rendering should produce at least one partially covered edge pixel"
+        );
     }
 
     #[test]

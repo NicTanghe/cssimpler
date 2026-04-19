@@ -1,10 +1,31 @@
 use cssimpler_core::{Color, CornerRadius, Insets, LayoutBox};
 
 use super::{
-    ClipRect, PreparedBlendColor, blend_prepared_pixel, current_render_buffer_rows, pack_rgb,
+    ClipRect, PreparedBlendColor, blend_prepared_pixel_with_coverage, current_render_buffer_rows,
+    pack_rgb,
     transform::{AffineTransform, ClipState},
 };
 
+const AXIS_ALIGNED_EDGE_COARSE_COVERAGE_SAMPLES: [(f32, f32); 4] =
+    [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+const AXIS_ALIGNED_EDGE_FINE_COVERAGE_SAMPLES: [(f32, f32); 16] = [
+    (0.125, 0.125),
+    (0.375, 0.125),
+    (0.625, 0.125),
+    (0.875, 0.125),
+    (0.125, 0.375),
+    (0.375, 0.375),
+    (0.625, 0.375),
+    (0.875, 0.375),
+    (0.125, 0.625),
+    (0.375, 0.625),
+    (0.625, 0.625),
+    (0.875, 0.625),
+    (0.125, 0.875),
+    (0.375, 0.875),
+    (0.625, 0.875),
+    (0.875, 0.875),
+];
 const TRANSFORMED_EDGE_COARSE_COVERAGE_SAMPLES: [(f32, f32); 4] =
     [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
 const TRANSFORMED_EDGE_FINE_COVERAGE_SAMPLES: [(f32, f32); 16] = [
@@ -45,8 +66,21 @@ pub(crate) fn draw_rounded_rect(
 
     let prepared_color = PreparedBlendColor::new(color);
     for y in y0..y1 {
-        if let Some((span_x0, span_x1)) = rounded_rect_row_span(layout, radius, y, x0, x1) {
-            blend_prepared_span_row(buffer, width, height, span_x0, span_x1, y, prepared_color);
+        for x in x0..x1 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            if coverage == 0 {
+                continue;
+            }
+            blend_prepared_pixel_with_coverage(
+                buffer,
+                width,
+                height,
+                x,
+                y,
+                prepared_color,
+                color.a,
+                coverage,
+            );
         }
     }
 }
@@ -87,50 +121,21 @@ pub(crate) fn draw_rounded_ring(
 
     let prepared_color = PreparedBlendColor::new(color);
     for y in y0..y1 {
-        let Some((outer_x0, outer_x1)) =
-            rounded_rect_row_span(outer_layout, outer_radius, y, x0, x1)
-        else {
-            continue;
-        };
-
-        let Some((inner_layout, inner_radius)) = inner else {
-            blend_prepared_span_row(buffer, width, height, outer_x0, outer_x1, y, prepared_color);
-            continue;
-        };
-
-        let inner_span = rounded_rect_row_span(inner_layout, inner_radius, y, outer_x0, outer_x1);
-        match inner_span {
-            Some((inner_x0, inner_x1)) => {
-                blend_prepared_span_row(
-                    buffer,
-                    width,
-                    height,
-                    outer_x0,
-                    inner_x0,
-                    y,
-                    prepared_color,
-                );
-                blend_prepared_span_row(
-                    buffer,
-                    width,
-                    height,
-                    inner_x1,
-                    outer_x1,
-                    y,
-                    prepared_color,
-                );
+        for x in x0..x1 {
+            let coverage = rounded_ring_coverage(outer_layout, outer_radius, inner, clip, x, y);
+            if coverage == 0 {
+                continue;
             }
-            None => {
-                blend_prepared_span_row(
-                    buffer,
-                    width,
-                    height,
-                    outer_x0,
-                    outer_x1,
-                    y,
-                    prepared_color,
-                );
-            }
+            blend_prepared_pixel_with_coverage(
+                buffer,
+                width,
+                height,
+                x,
+                y,
+                prepared_color,
+                color.a,
+                coverage,
+            );
         }
     }
 }
@@ -152,12 +157,21 @@ pub(crate) fn draw_dashed_rounded_ring(
     let prepared_color = PreparedBlendColor::new(color);
     for y in y0..y1 {
         for x in x0..x1 {
-            let sample_x = x as f32 + 0.5;
-            let sample_y = y as f32 + 0.5;
-            if !dashed_ring_contains_point(sample_x, sample_y, outer_layout, outer_radius, inner) {
+            let coverage =
+                dashed_rounded_ring_coverage(outer_layout, outer_radius, inner, clip, x, y);
+            if coverage == 0 {
                 continue;
             }
-            blend_prepared_pixel(buffer, width, height, x, y, prepared_color);
+            blend_prepared_pixel_with_coverage(
+                buffer,
+                width,
+                height,
+                x,
+                y,
+                prepared_color,
+                color.a,
+                coverage,
+            );
         }
     }
 }
@@ -375,6 +389,18 @@ pub(crate) fn transformed_rounded_rect_coverage(
     })
 }
 
+pub(crate) fn rounded_rect_coverage(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    clip: ClipRect,
+    x: i32,
+    y: i32,
+) -> u8 {
+    axis_aligned_shape_coverage(clip, x, y, |sample_x, sample_y| {
+        point_in_rounded_rect(sample_x, sample_y, layout, radius)
+    })
+}
+
 pub(crate) fn transformed_rounded_ring_coverage(
     outer_layout: LayoutBox,
     outer_radius: CornerRadius,
@@ -392,6 +418,22 @@ pub(crate) fn transformed_rounded_ring_coverage(
     })
 }
 
+pub(crate) fn rounded_ring_coverage(
+    outer_layout: LayoutBox,
+    outer_radius: CornerRadius,
+    inner: Option<(LayoutBox, CornerRadius)>,
+    clip: ClipRect,
+    x: i32,
+    y: i32,
+) -> u8 {
+    axis_aligned_shape_coverage(clip, x, y, |sample_x, sample_y| {
+        point_in_rounded_rect(sample_x, sample_y, outer_layout, outer_radius)
+            && inner.is_none_or(|(inner_layout, inner_radius)| {
+                !point_in_rounded_rect(sample_x, sample_y, inner_layout, inner_radius)
+            })
+    })
+}
+
 pub(crate) fn transformed_dashed_rounded_ring_coverage(
     outer_layout: LayoutBox,
     outer_radius: CornerRadius,
@@ -403,6 +445,19 @@ pub(crate) fn transformed_dashed_rounded_ring_coverage(
 ) -> u8 {
     transformed_shape_coverage(inverse, clip_state, x, y, |source_x, source_y| {
         dashed_ring_contains_point(source_x, source_y, outer_layout, outer_radius, inner)
+    })
+}
+
+pub(crate) fn dashed_rounded_ring_coverage(
+    outer_layout: LayoutBox,
+    outer_radius: CornerRadius,
+    inner: Option<(LayoutBox, CornerRadius)>,
+    clip: ClipRect,
+    x: i32,
+    y: i32,
+) -> u8 {
+    axis_aligned_shape_coverage(clip, x, y, |sample_x, sample_y| {
+        dashed_ring_contains_point(sample_x, sample_y, outer_layout, outer_radius, inner)
     })
 }
 
@@ -426,29 +481,6 @@ pub(crate) fn fill_opaque_span_rows(
         }
         let row_start = (y - rows.start) * width;
         buffer[row_start + x0 as usize..row_start + x1 as usize].fill(packed);
-    }
-}
-
-fn blend_prepared_span_row(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    x0: i32,
-    x1: i32,
-    y: i32,
-    color: PreparedBlendColor,
-) {
-    if x0 >= x1 {
-        return;
-    }
-
-    if color.linear.a >= 1.0 {
-        fill_opaque_span_rows(buffer, width, x0, x1, y, y + 1, color.packed);
-        return;
-    }
-
-    for x in x0..x1 {
-        blend_prepared_pixel(buffer, width, height, x, y, color);
     }
 }
 
@@ -488,6 +520,60 @@ fn transformed_shape_coverage(
     )
 }
 
+fn axis_aligned_shape_coverage(
+    clip: ClipRect,
+    x: i32,
+    y: i32,
+    contains: impl Fn(f32, f32) -> bool,
+) -> u8 {
+    let coarse_hits = axis_aligned_shape_sample_hits(
+        AXIS_ALIGNED_EDGE_COARSE_COVERAGE_SAMPLES,
+        clip,
+        x,
+        y,
+        &contains,
+    );
+    if coarse_hits == 0 {
+        return 0;
+    }
+    if coarse_hits == AXIS_ALIGNED_EDGE_COARSE_COVERAGE_SAMPLES.len() as u8 {
+        return u8::MAX;
+    }
+
+    let fine_hits = axis_aligned_shape_sample_hits(
+        AXIS_ALIGNED_EDGE_FINE_COVERAGE_SAMPLES,
+        clip,
+        x,
+        y,
+        contains,
+    );
+    coverage_from_sample_hits(
+        fine_hits,
+        AXIS_ALIGNED_EDGE_FINE_COVERAGE_SAMPLES.len() as u8,
+    )
+}
+
+fn axis_aligned_shape_sample_hits<const N: usize>(
+    samples: [(f32, f32); N],
+    clip: ClipRect,
+    x: i32,
+    y: i32,
+    contains: impl Fn(f32, f32) -> bool,
+) -> u8 {
+    let mut hits = 0_u8;
+    for (sample_x, sample_y) in samples {
+        let screen_x = x as f32 + sample_x;
+        let screen_y = y as f32 + sample_y;
+        if !clip.contains(screen_x, screen_y) {
+            continue;
+        }
+        if contains(screen_x, screen_y) {
+            hits += 1;
+        }
+    }
+    hits
+}
+
 fn transformed_shape_sample_hits<const N: usize>(
     samples: [(f32, f32); N],
     inverse: AffineTransform,
@@ -524,6 +610,7 @@ fn coverage_from_sample_hits(hits: u8, total_samples: u8) -> u8 {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn rounded_rect_row_span(
     layout: LayoutBox,
     radius: CornerRadius,
@@ -811,7 +898,8 @@ mod tests {
 
     use super::{
         draw_dashed_rounded_ring, draw_rounded_ring, point_in_rounded_rect, rounded_rect_row_span,
-        transformed_rounded_rect_coverage, transformed_rounded_ring_coverage,
+        rounded_ring_coverage, transformed_rounded_rect_coverage,
+        transformed_rounded_ring_coverage,
     };
     use crate::transform::{AffineTransform, ClipState};
     use crate::{ClipRect, pack_rgb};
@@ -863,18 +951,23 @@ mod tests {
         let accent = pack_rgb(Color::rgb(40, 120, 220));
         for y in 0..12 {
             for x in 0..12 {
-                let expected = point_in_rounded_rect(
-                    x as f32 + 0.5,
-                    y as f32 + 0.5,
+                let coverage = rounded_ring_coverage(
                     outer_layout,
                     outer_radius,
-                ) && !point_in_rounded_rect(
-                    x as f32 + 0.5,
-                    y as f32 + 0.5,
-                    inner_layout,
-                    inner_radius,
+                    Some((inner_layout, inner_radius)),
+                    ClipRect::full(12.0, 12.0),
+                    x as i32,
+                    y as i32,
                 );
-                assert_eq!(buffer[y * 12 + x] == accent, expected);
+                let pixel = buffer[y * 12 + x];
+                if coverage == 0 {
+                    assert_eq!(pixel, 0);
+                } else if coverage == u8::MAX {
+                    assert_eq!(pixel, accent);
+                } else {
+                    assert_ne!(pixel, 0);
+                    assert_ne!(pixel, accent);
+                }
             }
         }
     }

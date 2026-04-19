@@ -105,9 +105,7 @@ impl Parse for Child {
         }
 
         if text_tokens.is_empty() {
-            return Err(input.error(
-                "expected a child element, text, or a braced Rust expression",
-            ));
+            return Err(input.error("expected a child element, text, or a braced Rust expression"));
         }
 
         Ok(Self::Text(tokens_to_text(&text_tokens)))
