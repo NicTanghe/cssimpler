@@ -4,7 +4,7 @@ use anyhow::Result;
 use cssimpler::app::{App, Invalidation};
 use cssimpler::core::Node;
 use cssimpler::renderer::{FrameInfo, WindowConfig};
-use cssimpler::style::{parse_stylesheet, Stylesheet};
+use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
 
 const BUTTON_TEXT: &str = "uiverse";
@@ -139,12 +139,12 @@ fn stylesheet() -> &'static Stylesheet {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_card, build_ui, stylesheet, BUTTON_TEXT};
+    use super::{BUTTON_TEXT, build_card, build_ui, stylesheet};
     use cssimpler::app::{App, Invalidation};
     use cssimpler::core::fonts::layout_text_block;
     use cssimpler::core::{ElementInteractionState, ElementPath, Node, RenderKind, RenderNode};
     use cssimpler::renderer::{
-        render_scene_update, render_to_buffer, FrameInfo, SceneProvider, ViewportSize,
+        FrameInfo, SceneProvider, ViewportSize, render_scene_update, render_to_buffer,
     };
     use cssimpler::style::{build_render_tree_in_viewport_with_interaction, parse_stylesheet};
     use cssimpler::ui;
