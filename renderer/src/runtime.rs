@@ -596,7 +596,25 @@ where
                 self.config.clear_color,
                 glass_mode,
             );
-            if let Some(surface) = self.surface.as_mut() {
+            if self.native_glass_active && native_glass::uses_custom_presenter() {
+                let Some(window) = self.window.as_ref() else {
+                    return;
+                };
+                match native_glass::present(
+                    window,
+                    &self.buffer,
+                    self.buffer_width,
+                    self.buffer_height,
+                    self.scale_factor,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.fail(event_loop, RendererError::Surface(error));
+                        return;
+                    }
+                }
+            } else if let Some(surface) = self.surface.as_mut() {
                 match surface.buffer_mut() {
                     Ok(mut target) => {
                         let target_width = target.width().get() as usize;
@@ -681,11 +699,13 @@ where
 
         match native_glass::apply(window, tint) {
             Ok(true) => {
+                window.set_transparent(true);
                 self.native_glass_active = true;
                 self.native_glass_tint = Some(tint);
                 self.clear_native_glass_diagnostic();
             }
             Ok(false) => {
+                window.set_transparent(false);
                 self.native_glass_active = false;
                 self.native_glass_tint = None;
                 self.note_native_glass_diagnostic(
@@ -693,6 +713,7 @@ where
                 );
             }
             Err(error) => {
+                window.set_transparent(false);
                 self.native_glass_active = false;
                 self.native_glass_tint = None;
                 self.note_native_glass_diagnostic(format!(
@@ -709,7 +730,7 @@ where
 
         if let Some(window) = self.window.as_ref() {
             let _ = native_glass::clear(window);
-            window.set_transparent(self.config.glass_capable);
+            window.set_transparent(window_uses_native_glass(&self.config));
         }
         self.native_glass_active = false;
         self.native_glass_tint = None;
@@ -744,7 +765,7 @@ fn window_attributes_for_config(config: &WindowConfig) -> WindowAttributes {
         .with_title(config.title.clone())
         .with_inner_size(LogicalSize::new(config.width as f64, config.height as f64))
         .with_resizable(true)
-        .with_transparent(config.glass_capable)
+        .with_transparent(window_uses_native_glass(config))
         .with_decorations(config.decorations);
 
     #[cfg(target_os = "windows")]
@@ -758,6 +779,10 @@ fn window_attributes_for_config(config: &WindowConfig) -> WindowAttributes {
     }
 
     attributes
+}
+
+fn window_uses_native_glass(config: &WindowConfig) -> bool {
+    config.glass_capable && native_glass::requires_initial_transparency()
 }
 
 fn finish_window_setup(window: &Window, config: &WindowConfig) {
@@ -1151,8 +1176,9 @@ mod tests {
     use super::{
         copy_render_buffer_into_surface, non_transparent_damage_rects, normalize_button_state,
         normalize_key_location, normalize_logical_key, normalize_modifiers, normalize_physical_key,
-        normalize_pointer_button, normalize_scroll_delta,
+        normalize_pointer_button, normalize_scroll_delta, window_uses_native_glass,
     };
+    use crate::WindowConfig;
 
     #[test]
     fn modifiers_are_normalized_without_winit_types() {
@@ -1306,6 +1332,17 @@ mod tests {
         copy_render_buffer_into_surface(&mut target, 3, 1, &source, 3, 1, clear, false);
 
         assert_eq!(target[1], clear);
+    }
+
+    #[test]
+    fn glass_capable_windows_only_start_transparent_when_required_by_native_backend() {
+        let config = WindowConfig::new("glass", 320, 180).with_glass_capable(true);
+
+        #[cfg(target_os = "windows")]
+        assert!(window_uses_native_glass(&config));
+
+        #[cfg(not(target_os = "windows"))]
+        assert!(!window_uses_native_glass(&config));
     }
 
     #[test]

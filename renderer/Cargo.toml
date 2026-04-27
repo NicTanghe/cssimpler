@@ -13,3 +13,10 @@ winit.workspace = true
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["winuser"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", default-features = false }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFCGTypes"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGColorSpace", "CGDataProvider", "CGImage"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSObject", "NSString"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["CALayer", "CATransaction"] }
