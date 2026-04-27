@@ -14,6 +14,7 @@ mod color;
 mod fonts;
 mod gradient;
 mod input;
+mod native_glass;
 mod runtime;
 mod scrollbar;
 mod shadow;
@@ -30,9 +31,10 @@ use self::{
     shapes::{
         clip_pixel_bounds, draw_axis_aligned_opaque_rect, draw_axis_aligned_opaque_ring,
         draw_dashed_rounded_ring, draw_rounded_rect, draw_rounded_ring, inset_corner_radius,
-        inset_layout, layout_clip, non_empty_layout_clip, offset_layout, snap_clip_to_pixel_grid,
-        transformed_dashed_rounded_ring_coverage, transformed_rounded_rect_coverage,
-        transformed_rounded_ring_coverage, union_optional_bounds,
+        inset_layout, layout_clip, non_empty_layout_clip, offset_layout, rounded_rect_coverage,
+        snap_clip_to_pixel_grid, transformed_dashed_rounded_ring_coverage,
+        transformed_rounded_rect_coverage, transformed_rounded_ring_coverage,
+        union_optional_bounds,
     },
     transform::{
         AffineTransform, ClipState, PerspectiveContext, node_local_transform_matrix,
@@ -42,14 +44,15 @@ use self::{
 };
 use cssimpler_core::{
     BorderLineStyle, Color, ElementInteractionState, ElementPath, EventHandler, ExtractedScene,
-    LayoutBox, LinearRgba, RenderKind, RenderNode, Transform2D, TransformMatrix3d,
+    LayoutBox, LinearRgba, NativeMaterial, RenderKind, RenderNode, Transform2D, TransformMatrix3d,
     TransformStyleMode, VisualStyle,
 };
 use softbuffer::SoftBufferError;
 use winit::error::{EventLoopError, OsError};
 
 pub(crate) use self::color::{
-    pack_linear_rgb, pack_rgb, pack_softbuffer_rgb, unpack_linear_rgb, unpack_rgb,
+    is_transparent, pack_linear_rgb, pack_rgb, pack_softbuffer_rgb, pack_transparent,
+    unpack_linear_rgb, unpack_rgb,
 };
 pub use self::input::{
     ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
@@ -127,6 +130,12 @@ struct PaintStats {
     scene_passes: usize,
     mode: FramePaintMode,
     reason: FramePaintReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlassRenderMode {
+    Native,
+    Fallback,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -557,6 +566,7 @@ fn cached_promoted_surface(
             surface_width,
             surface_height,
             local_clip,
+            GlassRenderMode::Fallback,
             false,
         );
         draw_node_with_cached_bounds_internal(
@@ -566,6 +576,7 @@ fn cached_promoted_surface(
             surface_width,
             surface_height,
             local_clip,
+            GlassRenderMode::Fallback,
             false,
         );
     });
@@ -639,11 +650,13 @@ fn draw_cached_surface_transformed(
 
 fn node_can_use_promoted_surface(node: &RenderNode, cached_bounds: &CachedSubtreeBounds) -> bool {
     matches!(node.kind, RenderKind::Container)
+        && node.style.native_material != NativeMaterial::Glass
         && !node.style.transform.is_identity()
         && !node.style.transform.uses_depth()
         && node.style.perspective.is_none()
         && node.style.transform_style == TransformStyleMode::Flat
         && !cached_bounds.subtree_uses_backdrop_blur
+        && !cached_bounds.subtree_uses_native_glass
         && !cached_bounds.subtree_uses_depth
         && node.scrollbars.is_none()
         && !node.children.is_empty()
@@ -792,6 +805,8 @@ pub struct WindowConfig {
     pub clear_color: Color,
     pub frame_time: Duration,
     pub middle_button_auto_scroll: bool,
+    pub glass_capable: bool,
+    pub decorations: bool,
 }
 
 impl WindowConfig {
@@ -803,7 +818,19 @@ impl WindowConfig {
             clear_color: Color::rgb(248, 250, 252),
             frame_time: Duration::from_millis(16),
             middle_button_auto_scroll: true,
+            glass_capable: false,
+            decorations: true,
         }
+    }
+
+    pub fn with_glass_capable(mut self, glass_capable: bool) -> Self {
+        self.glass_capable = glass_capable;
+        self
+    }
+
+    pub fn with_decorations(mut self, decorations: bool) -> Self {
+        self.decorations = decorations;
+        self
     }
 }
 
@@ -1327,7 +1354,14 @@ pub fn render_to_buffer(
     clear_color: Color,
 ) {
     let extracted = ExtractedScene::from_render_roots(scene);
-    let _ = render_to_buffer_internal(&extracted, buffer, width, height, clear_color);
+    let _ = render_to_buffer_internal(
+        &extracted,
+        buffer,
+        width,
+        height,
+        clear_color,
+        GlassRenderMode::Fallback,
+    );
 }
 
 fn render_to_buffer_internal(
@@ -1336,8 +1370,17 @@ fn render_to_buffer_internal(
     width: usize,
     height: usize,
     clear_color: Color,
+    glass_mode: GlassRenderMode,
 ) -> PaintStats {
-    render_to_buffer_internal_with_cached_bounds(scene, None, buffer, width, height, clear_color)
+    render_to_buffer_internal_with_cached_bounds(
+        scene,
+        None,
+        buffer,
+        width,
+        height,
+        clear_color,
+        glass_mode,
+    )
 }
 
 fn render_to_buffer_internal_with_cached_bounds(
@@ -1347,6 +1390,7 @@ fn render_to_buffer_internal_with_cached_bounds(
     width: usize,
     height: usize,
     clear_color: Color,
+    glass_mode: GlassRenderMode,
 ) -> PaintStats {
     let owned_bounds;
     let cached_bounds = if let Some(cached_bounds) = cached_bounds {
@@ -1372,6 +1416,7 @@ fn render_to_buffer_internal_with_cached_bounds(
             width,
             height,
             clear_color,
+            glass_mode,
         );
     } else {
         render_to_buffer_parallel(
@@ -1382,6 +1427,7 @@ fn render_to_buffer_internal_with_cached_bounds(
             height,
             clear_color,
             worker_count,
+            glass_mode,
         );
     }
 
@@ -1404,12 +1450,13 @@ fn render_to_buffer_serial(
     width: usize,
     height: usize,
     clear_color: Color,
+    glass_mode: GlassRenderMode,
 ) {
     buffer.fill(pack_rgb(clear_color));
     let clip = ClipRect::full(width as f32, height as f32);
 
     for (node, cached_bounds) in scene.iter().zip(cached_bounds) {
-        draw_node_with_cached_bounds(node, cached_bounds, buffer, width, height, clip);
+        draw_node_with_cached_bounds(node, cached_bounds, buffer, width, height, clip, glass_mode);
     }
 }
 
@@ -1421,6 +1468,7 @@ fn render_to_buffer_parallel(
     height: usize,
     clear_color: Color,
     worker_count: usize,
+    glass_mode: GlassRenderMode,
 ) {
     let clear = pack_rgb(clear_color);
     let band_count = worker_count.max(1).min(height.max(1));
@@ -1473,6 +1521,7 @@ fn render_to_buffer_parallel(
                         width,
                         height,
                         band_clip,
+                        glass_mode,
                     );
                 });
             }));
@@ -1510,6 +1559,7 @@ pub fn render_scene_update(
         width,
         height,
         clear_color,
+        GlassRenderMode::Fallback,
     );
 }
 
@@ -1531,6 +1581,7 @@ fn render_scene_update_internal_from_roots(
         width,
         height,
         clear_color,
+        GlassRenderMode::Fallback,
     )
 }
 
@@ -1541,6 +1592,7 @@ fn render_scene_update_internal(
     width: usize,
     height: usize,
     clear_color: Color,
+    glass_mode: GlassRenderMode,
 ) -> PaintStats {
     let scene_diff = prepare_scene_diff(&previous_scene.roots, &scene.roots);
     let mut dirty_regions = scene_diff.dirty_regions;
@@ -1599,6 +1651,7 @@ fn render_scene_update_internal(
             width,
             height,
             clear_color,
+            glass_mode,
         );
         stats.dirty_regions = dirty_region_count;
         stats.dirty_jobs = incremental_dirty_jobs;
@@ -1617,6 +1670,7 @@ fn render_scene_update_internal(
             clear_color,
             &planned_dirty_jobs,
             incremental_worker_count,
+            glass_mode,
         );
         return PaintStats {
             workers: incremental_worker_count,
@@ -1642,6 +1696,7 @@ fn render_scene_update_internal(
             width,
             height,
             dirty_region,
+            glass_mode,
         );
     }
 
@@ -1666,6 +1721,7 @@ fn render_scene_update_parallel(
     clear_color: Color,
     dirty_jobs: &[DirtyRenderJob],
     worker_count: usize,
+    glass_mode: GlassRenderMode,
 ) {
     let worker_count = worker_count.max(1).min(dirty_jobs.len().max(1));
     let job_groups = distribute_dirty_render_jobs(dirty_jobs, worker_count);
@@ -1711,6 +1767,7 @@ fn render_scene_update_parallel(
                             width,
                             height,
                             job.clip,
+                            glass_mode,
                         );
                     }
                 });
@@ -1880,6 +1937,7 @@ fn draw_cached_root_indices(
     width: usize,
     height: usize,
     clip: ClipRect,
+    glass_mode: GlassRenderMode,
 ) {
     for &root_index in root_indices {
         let Some(node) = scene.get(root_index) else {
@@ -1888,7 +1946,7 @@ fn draw_cached_root_indices(
         let Some(bounds) = cached_bounds.get(root_index) else {
             continue;
         };
-        draw_node_with_cached_bounds(node, bounds, buffer, width, height, clip);
+        draw_node_with_cached_bounds(node, bounds, buffer, width, height, clip, glass_mode);
     }
 }
 
@@ -1950,6 +2008,7 @@ fn redraw_auto_scroll_indicator_regions(
     width: usize,
     height: usize,
     clear_color: Color,
+    glass_mode: GlassRenderMode,
 ) {
     let cached_bounds = cache_scene_subtree_bounds(scene);
     let mut bounds = Vec::new();
@@ -1981,6 +2040,7 @@ fn redraw_auto_scroll_indicator_regions(
             width,
             height,
             clip,
+            glass_mode,
         );
     }
 
@@ -2051,6 +2111,7 @@ struct CachedSubtreeBounds {
     bounds: Option<ClipRect>,
     subtree_uses_depth: bool,
     subtree_uses_backdrop_blur: bool,
+    subtree_uses_native_glass: bool,
     children: Vec<CachedSubtreeBounds>,
 }
 
@@ -2243,8 +2304,18 @@ fn draw_node_with_cached_bounds(
     width: usize,
     height: usize,
     clip: ClipRect,
+    glass_mode: GlassRenderMode,
 ) {
-    draw_node_with_cached_bounds_internal(node, cached_bounds, buffer, width, height, clip, true);
+    draw_node_with_cached_bounds_internal(
+        node,
+        cached_bounds,
+        buffer,
+        width,
+        height,
+        clip,
+        glass_mode,
+        true,
+    );
 }
 
 fn draw_node_with_cached_bounds_internal(
@@ -2254,6 +2325,7 @@ fn draw_node_with_cached_bounds_internal(
     width: usize,
     height: usize,
     clip: ClipRect,
+    glass_mode: GlassRenderMode,
     allow_surface_promotion: bool,
 ) {
     if clip.is_empty()
@@ -2274,6 +2346,7 @@ fn draw_node_with_cached_bounds_internal(
         clip,
         None,
         false,
+        glass_mode,
         allow_surface_promotion,
     );
 }
@@ -2298,6 +2371,7 @@ fn draw_node_contents(
         clip,
         parent_perspective,
         in_3d_context,
+        GlassRenderMode::Fallback,
         true,
     );
 }
@@ -2311,6 +2385,7 @@ fn draw_node_contents_internal(
     clip: ClipRect,
     parent_perspective: Option<PerspectiveContext>,
     in_3d_context: bool,
+    glass_mode: GlassRenderMode,
     allow_surface_promotion: bool,
 ) {
     if node_requires_projected_path(node) {
@@ -2324,10 +2399,13 @@ fn draw_node_contents_internal(
             parent_perspective,
             &ClipState::new(clip),
             in_3d_context,
+            glass_mode,
             allow_surface_promotion,
         );
         return;
     }
+
+    draw_glass_surface(node, buffer, width, height, clip, glass_mode);
 
     backdrop::draw_backdrop_blur(
         buffer,
@@ -2408,6 +2486,7 @@ fn draw_node_contents_internal(
                 child_clip,
                 child_perspective,
                 child_context,
+                glass_mode,
                 allow_surface_promotion,
             );
         } else {
@@ -2421,6 +2500,7 @@ fn draw_node_contents_internal(
                 child_perspective,
                 &ClipState::new(child_clip),
                 child_context,
+                glass_mode,
                 allow_surface_promotion,
             );
         }
@@ -2925,6 +3005,7 @@ fn draw_node_transformed(
         parent_perspective,
         clip_state,
         in_3d_context,
+        GlassRenderMode::Fallback,
         true,
     );
 }
@@ -2939,6 +3020,7 @@ fn draw_node_transformed_internal(
     parent_perspective: Option<PerspectiveContext>,
     clip_state: &ClipState,
     in_3d_context: bool,
+    glass_mode: GlassRenderMode,
     allow_surface_promotion: bool,
 ) {
     let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
@@ -2964,6 +3046,8 @@ fn draw_node_transformed_internal(
             return;
         }
     }
+
+    draw_glass_surface_transformed(node, buffer, width, height, matrix, clip_state, glass_mode);
 
     backdrop::draw_backdrop_blur_transformed(
         buffer,
@@ -3071,6 +3155,7 @@ fn draw_node_transformed_internal(
             child_perspective,
             &child_clip_state,
             child_context,
+            glass_mode,
             allow_surface_promotion,
         );
     }
@@ -3133,32 +3218,11 @@ fn draw_background_and_border(
         }
     }
 
-    let fill_layout = if node.style.border.widths.is_zero() {
-        node.layout
-    } else {
-        inset_layout(node.layout, node.style.border.widths)
-    };
-    let fill_radius = if node.style.border.widths.is_zero() {
-        node.style.corner_radius
-    } else {
-        inset_corner_radius(
-            node.layout,
-            node.style.corner_radius,
-            node.style.border.widths,
-        )
-    };
+    let (fill_layout, fill_radius) = node_fill_layout_and_radius(node);
 
-    if let Some(background) = node.style.background {
-        if !draw_axis_aligned_opaque_rect(
-            buffer,
-            width,
-            height,
-            fill_layout,
-            fill_radius,
-            background,
-            clip,
-        ) {
-            draw_rounded_rect(
+    if node.style.native_material != NativeMaterial::Glass {
+        if let Some(background) = node.style.background {
+            if !draw_axis_aligned_opaque_rect(
                 buffer,
                 width,
                 height,
@@ -3166,12 +3230,22 @@ fn draw_background_and_border(
                 fill_radius,
                 background,
                 clip,
-            );
+            ) {
+                draw_rounded_rect(
+                    buffer,
+                    width,
+                    height,
+                    fill_layout,
+                    fill_radius,
+                    background,
+                    clip,
+                );
+            }
         }
-    }
 
-    for layer in node.style.background_layers.iter().rev() {
-        draw_background_layer(buffer, width, height, fill_layout, fill_radius, layer, clip);
+        for layer in node.style.background_layers.iter().rev() {
+            draw_background_layer(buffer, width, height, fill_layout, fill_radius, layer, clip);
+        }
     }
 }
 
@@ -3220,45 +3294,208 @@ fn draw_background_and_border_transformed(
         }
     }
 
-    let fill_layout = if node.style.border.widths.is_zero() {
-        node.layout
-    } else {
-        inset_layout(node.layout, node.style.border.widths)
-    };
-    let fill_radius = if node.style.border.widths.is_zero() {
-        node.style.corner_radius
-    } else {
-        inset_corner_radius(
-            node.layout,
-            node.style.corner_radius,
-            node.style.border.widths,
-        )
-    };
+    let (fill_layout, fill_radius) = node_fill_layout_and_radius(node);
 
-    if let Some(background) = node.style.background {
-        draw_transformed_rounded_rect(
-            buffer,
-            width,
-            height,
-            fill_layout,
-            fill_radius,
-            background,
-            matrix,
-            clip_state,
-        );
+    if node.style.native_material != NativeMaterial::Glass {
+        if let Some(background) = node.style.background {
+            draw_transformed_rounded_rect(
+                buffer,
+                width,
+                height,
+                fill_layout,
+                fill_radius,
+                background,
+                matrix,
+                clip_state,
+            );
+        }
+
+        for layer in node.style.background_layers.iter().rev() {
+            gradient::draw_background_layer_transformed(
+                buffer,
+                width,
+                height,
+                fill_layout,
+                fill_radius,
+                layer,
+                matrix,
+                clip_state,
+            );
+        }
+    }
+}
+
+fn node_fill_layout_and_radius(node: &RenderNode) -> (LayoutBox, cssimpler_core::CornerRadius) {
+    if node.style.border.widths.is_zero() {
+        (node.layout, node.style.corner_radius)
+    } else {
+        (
+            inset_layout(node.layout, node.style.border.widths),
+            inset_corner_radius(
+                node.layout,
+                node.style.corner_radius,
+                node.style.border.widths,
+            ),
+        )
+    }
+}
+
+const DEFAULT_GLASS_FALLBACK_TINT: Color = Color::rgba(245, 250, 255, 96);
+
+fn glass_tint_or_default(node: &RenderNode) -> Color {
+    node.style.glass_tint.unwrap_or(DEFAULT_GLASS_FALLBACK_TINT)
+}
+
+fn draw_glass_surface(
+    node: &RenderNode,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clip: ClipRect,
+    glass_mode: GlassRenderMode,
+) {
+    if node.style.native_material != NativeMaterial::Glass {
+        return;
     }
 
-    for layer in node.style.background_layers.iter().rev() {
-        gradient::draw_background_layer_transformed(
+    let (fill_layout, fill_radius) = node_fill_layout_and_radius(node);
+    match glass_mode {
+        GlassRenderMode::Native => {
+            clear_rounded_rect_to_transparent(
+                buffer,
+                width,
+                height,
+                fill_layout,
+                fill_radius,
+                clip,
+            );
+        }
+        GlassRenderMode::Fallback => {
+            draw_rounded_rect(
+                buffer,
+                width,
+                height,
+                fill_layout,
+                fill_radius,
+                glass_tint_or_default(node),
+                clip,
+            );
+        }
+    }
+}
+
+fn draw_glass_surface_transformed(
+    node: &RenderNode,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+    glass_mode: GlassRenderMode,
+) {
+    if node.style.native_material != NativeMaterial::Glass {
+        return;
+    }
+
+    let (fill_layout, fill_radius) = node_fill_layout_and_radius(node);
+    match glass_mode {
+        GlassRenderMode::Native => clear_transformed_rounded_rect_to_transparent(
             buffer,
             width,
             height,
             fill_layout,
             fill_radius,
-            layer,
             matrix,
             clip_state,
-        );
+        ),
+        GlassRenderMode::Fallback => draw_transformed_rounded_rect(
+            buffer,
+            width,
+            height,
+            fill_layout,
+            fill_radius,
+            glass_tint_or_default(node),
+            matrix,
+            clip_state,
+        ),
+    }
+}
+
+fn clear_rounded_rect_to_transparent(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: cssimpler_core::CornerRadius,
+    clip: ClipRect,
+) {
+    let Some(bounds) = layout_clip(layout).intersect(clip) else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+
+    let clear = pack_transparent();
+    let rows = current_render_buffer_rows();
+    let row_start = y0.max(rows.start.min(height) as i32);
+    let row_end = y1.min(rows.end.min(height) as i32);
+    if row_start >= row_end {
+        return;
+    }
+
+    if radius == cssimpler_core::CornerRadius::ZERO {
+        for y in row_start..row_end {
+            let local_row_start = (y as usize - rows.start) * width;
+            let start = local_row_start + x0 as usize;
+            let end = local_row_start + x1 as usize;
+            buffer[start..end].fill(clear);
+        }
+        return;
+    }
+
+    for y in row_start..row_end {
+        let local_row_start = (y as usize - rows.start) * width;
+        for x in x0..x1 {
+            if rounded_rect_coverage(layout, radius, clip, x, y) >= 128 {
+                buffer[local_row_start + x as usize] = clear;
+            }
+        }
+    }
+}
+
+fn clear_transformed_rounded_rect_to_transparent(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: cssimpler_core::CornerRadius,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+    let Some(bounds) = transform_layout_bounds(layout, matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+
+    let clear = pack_transparent();
+    let rows = current_render_buffer_rows();
+    let row_start = y0.max(rows.start.min(height) as i32);
+    let row_end = y1.min(rows.end.min(height) as i32);
+    for y in row_start..row_end {
+        let local_row_start = (y as usize - rows.start) * width;
+        for x in x0..x1 {
+            if transformed_rounded_rect_coverage(layout, radius, inverse, clip_state, x, y) >= 128 {
+                buffer[local_row_start + x as usize] = clear;
+            }
+        }
     }
 }
 
@@ -3903,6 +4140,8 @@ fn cache_subtree_bounds(
                 || children
                     .iter()
                     .any(|child| child.subtree_uses_backdrop_blur),
+            subtree_uses_native_glass: node.style.native_material == NativeMaterial::Glass
+                || children.iter().any(|child| child.subtree_uses_native_glass),
             children,
         };
     };
@@ -3950,6 +4189,8 @@ fn cache_subtree_bounds(
             || children
                 .iter()
                 .any(|child| child.subtree_uses_backdrop_blur),
+        subtree_uses_native_glass: node.style.native_material == NativeMaterial::Glass
+            || children.iter().any(|child| child.subtree_uses_native_glass),
         children,
     }
 }
@@ -4435,21 +4676,21 @@ mod tests {
         AnglePercentageValue, BackgroundLayer, BorderLineStyle, BoxShadow, CircleRadius, Color,
         ConicGradient, CornerRadius, ElementPath, ExtractedScene, GradientDirection,
         GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop, GradientVertical,
-        Insets, LayoutBox, LengthPercentageValue, LinearGradient, Overflow, RadialGradient,
-        RadialShape, RenderNode, ShadowEffect, TextStrokeStyle, Transform2D, TransformMatrix3d,
-        TransformOperation, TransformStyleMode, VisualStyle,
+        Insets, LayoutBox, LengthPercentageValue, LinearGradient, NativeMaterial, Overflow,
+        RadialGradient, RadialShape, RenderNode, ShadowEffect, TextStrokeStyle, Transform2D,
+        TransformMatrix3d, TransformOperation, TransformStyleMode, VisualStyle,
     };
 
     use crate::{
-        ClipRect, DirtyRenderJob, FramePaintMode, FramePaintReason, MouseEventKind, ViewportSize,
-        WindowConfig, blend_pixel, build_incremental_render_jobs, coalesce_dirty_regions,
-        dirty_job_group_rows, dirty_regions_between_scenes, dispatch_click,
+        ClipRect, DirtyRenderJob, FramePaintMode, FramePaintReason, GlassRenderMode,
+        MouseEventKind, ViewportSize, WindowConfig, blend_pixel, build_incremental_render_jobs,
+        coalesce_dirty_regions, dirty_job_group_rows, dirty_regions_between_scenes, dispatch_click,
         dispatch_hover_transition_events, dispatch_mouse_event, distribute_dirty_render_jobs,
         drawable_viewport_size, hit_test_element_path,
-        incremental_scene_passes_for_full_redraw_heuristic, pack_rgb, render_scene_update,
-        render_scene_update_internal_from_roots, render_to_buffer, resize_buffer,
-        scenes_match_visuals, should_full_redraw, should_present_frame, should_present_scene,
-        should_suspend_updates, unpack_rgb,
+        incremental_scene_passes_for_full_redraw_heuristic, is_transparent, pack_rgb,
+        render_scene_update, render_scene_update_internal_from_roots, render_to_buffer,
+        resize_buffer, scenes_match_visuals, should_full_redraw, should_present_frame,
+        should_present_scene, should_suspend_updates, unpack_rgb,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -4466,6 +4707,16 @@ mod tests {
     const FLAG_MOUSE_UP: usize = 1 << 8;
     const FLAG_CONTEXT_MENU: usize = 1 << 9;
     const FLAG_DBLCLICK: usize = 1 << 10;
+
+    #[test]
+    fn window_config_opts_into_glass_capable_transparency() {
+        let config = WindowConfig::new("glass", 320, 180)
+            .with_glass_capable(true)
+            .with_decorations(false);
+
+        assert!(config.glass_capable);
+        assert!(!config.decorations);
+    }
 
     fn promoted_surface_scene(transform: Transform2D, child_color: Color) -> Vec<RenderNode> {
         vec![
@@ -4662,6 +4913,7 @@ mod tests {
             128,
             96,
             Color::BLACK,
+            GlassRenderMode::Fallback,
         );
         super::render_to_buffer_parallel(
             &scene,
@@ -4671,6 +4923,7 @@ mod tests {
             96,
             Color::BLACK,
             4,
+            GlassRenderMode::Fallback,
         );
 
         assert_eq!(single, threaded);
@@ -4775,6 +5028,86 @@ mod tests {
 
         assert_eq!(buffer[2 * 16 + 2], pack_rgb(Color::WHITE));
         assert_eq!(buffer[6 * 16 + 6], pack_rgb(Color::rgb(40, 120, 220)));
+    }
+
+    #[test]
+    fn glass_region_uses_tinted_fallback_without_native_backdrop() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 16.0, 16.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(20, 28, 40)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(2.0, 2.0, 8.0, 10.0)).with_style(VisualStyle {
+                native_material: NativeMaterial::Glass,
+                glass_tint: Some(Color::rgba(255, 255, 255, 96)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 16 * 16];
+
+        render_to_buffer(&scene, &mut buffer, 16, 16, Color::BLACK);
+
+        assert!(!is_transparent(buffer[6 * 16 + 6]));
+        assert_ne!(buffer[6 * 16 + 6], pack_rgb(Color::rgb(20, 28, 40)));
+        assert_eq!(buffer[1], pack_rgb(Color::rgb(20, 28, 40)));
+    }
+
+    #[test]
+    fn native_glass_region_clears_to_transparent() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 16.0, 16.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(20, 28, 40)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(2.0, 2.0, 8.0, 10.0)).with_style(VisualStyle {
+                native_material: NativeMaterial::Glass,
+                glass_tint: Some(Color::rgba(255, 255, 255, 96)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let extracted = ExtractedScene::from_render_roots(&scene);
+        let mut buffer = vec![0_u32; 16 * 16];
+
+        let _ = super::render_to_buffer_internal(
+            &extracted,
+            &mut buffer,
+            16,
+            16,
+            Color::BLACK,
+            GlassRenderMode::Native,
+        );
+
+        assert!(is_transparent(buffer[6 * 16 + 6]));
+        assert_eq!(buffer[1], pack_rgb(Color::rgb(20, 28, 40)));
+    }
+
+    #[test]
+    fn fallback_glass_regions_keep_distinct_region_tints() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 28.0, 14.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(20, 28, 40)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(2.0, 2.0, 8.0, 8.0)).with_style(VisualStyle {
+                native_material: NativeMaterial::Glass,
+                glass_tint: Some(Color::rgba(255, 255, 255, 96)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(14.0, 2.0, 8.0, 8.0)).with_style(VisualStyle {
+                native_material: NativeMaterial::Glass,
+                glass_tint: Some(Color::rgba(24, 120, 220, 128)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 28 * 14];
+
+        render_to_buffer(&scene, &mut buffer, 28, 14, Color::BLACK);
+
+        let left_tint = buffer[6 * 28 + 6];
+        let right_tint = buffer[6 * 28 + 18];
+        assert_ne!(left_tint, pack_rgb(Color::rgb(20, 28, 40)));
+        assert_ne!(right_tint, pack_rgb(Color::rgb(20, 28, 40)));
+        assert_ne!(left_tint, right_tint);
     }
 
     #[test]

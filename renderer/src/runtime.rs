@@ -2,8 +2,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cssimpler_core::ExtractedScene;
-use softbuffer::{Context, Surface};
+use cssimpler_core::{Color, ExtractedScene};
+use softbuffer::{Context, Rect, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{
@@ -13,7 +13,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHan
 use winit::keyboard::{
     Key as WinitKey, KeyLocation as WinitKeyLocation, ModifiersState, PhysicalKey,
 };
-use winit::window::{Window, WindowId};
+use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::input::{
     ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
@@ -21,14 +21,16 @@ use crate::input::{
 };
 
 use super::{
-    ElementInteractionState, ElementPath, FrameInfo, FrameTimingStats, MouseEventKind,
-    RedrawSchedule, RendererError, Result, SceneProvider, WindowConfig,
+    ElementInteractionState, ElementPath, FrameInfo, FrameTimingStats, GlassRenderMode,
+    MouseEventKind, RedrawSchedule, RendererError, Result, SceneProvider, WindowConfig,
     dispatch_hover_transition_events, dispatch_mouse_event, drawable_viewport_size, duration_to_us,
-    pack_softbuffer_rgb, record_frame_timing_stats, redraw_auto_scroll_indicator_regions,
-    render_scene_update_internal, render_to_buffer_internal, resize_buffer, scrollbar,
-    settle_element_interaction, should_present_frame, should_suspend_updates,
-    to_softbuffer_rgb_blue_noise,
+    is_transparent, native_glass, pack_softbuffer_rgb, record_frame_timing_stats,
+    redraw_auto_scroll_indicator_regions, render_scene_update_internal, render_to_buffer_internal,
+    resize_buffer, scrollbar, settle_element_interaction, should_present_frame,
+    should_suspend_updates, to_softbuffer_rgb_blue_noise,
 };
+
+const DEFAULT_NATIVE_GLASS_TINT: Color = Color::rgba(245, 250, 255, 128);
 
 pub(super) fn run_with_scene_provider<P>(config: WindowConfig, scene_provider: P) -> Result<()>
 where
@@ -77,6 +79,9 @@ struct RuntimeApp<P> {
     previous_presented_scene: Option<ExtractedScene>,
     previous_presented_indicator: Option<scrollbar::AutoScrollIndicator>,
     scrollbar_controller: scrollbar::ScrollbarController,
+    native_glass_active: bool,
+    native_glass_tint: Option<Color>,
+    native_glass_diagnostic: Option<String>,
 }
 
 impl<P> RuntimeApp<P>
@@ -120,10 +125,14 @@ where
             previous_presented_scene: None,
             previous_presented_indicator: None,
             scrollbar_controller: scrollbar::ScrollbarController::default(),
+            native_glass_active: false,
+            native_glass_tint: None,
+            native_glass_diagnostic: None,
         }
     }
 
     fn finish(mut self) -> Result<()> {
+        self.clear_native_glass();
         self.surface = None;
         self.window = None;
         self.fatal_error.map_or(Ok(()), Err)
@@ -208,13 +217,7 @@ where
             return;
         }
 
-        let attributes = Window::default_attributes()
-            .with_title(self.config.title.clone())
-            .with_inner_size(LogicalSize::new(
-                self.config.width as f64,
-                self.config.height as f64,
-            ))
-            .with_resizable(true);
+        let attributes = window_attributes_for_config(&self.config);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -223,6 +226,7 @@ where
             }
         };
         window.set_ime_allowed(true);
+        finish_window_setup(&window, &self.config);
         self.scale_factor = window.scale_factor();
         self.window_id = Some(window.id());
         self.window = Some(window);
@@ -276,6 +280,7 @@ where
 
     fn prepare_suspend(&mut self, event_loop: &ActiveEventLoop) {
         self.suspended = true;
+        self.clear_native_glass();
         let _ = self.scrollbar_controller.cancel_middle_button_auto_scroll();
         self.surface = None;
         self.clear_pointer_state();
@@ -530,6 +535,8 @@ where
         );
 
         let extracted_scene = ExtractedScene::from_render_roots(&scene);
+        self.sync_native_glass(&extracted_scene);
+        let glass_mode = self.glass_render_mode();
 
         if should_present_frame(
             self.previous_presented_scene.as_ref(),
@@ -546,6 +553,7 @@ where
                     self.buffer_width,
                     self.buffer_height,
                     self.config.clear_color,
+                    glass_mode,
                 )
             } else if let Some(previous_scene) = self.previous_presented_scene.as_ref() {
                 render_scene_update_internal(
@@ -555,6 +563,7 @@ where
                     self.buffer_width,
                     self.buffer_height,
                     self.config.clear_color,
+                    glass_mode,
                 )
             } else {
                 render_to_buffer_internal(
@@ -563,6 +572,7 @@ where
                     self.buffer_width,
                     self.buffer_height,
                     self.config.clear_color,
+                    glass_mode,
                 )
             };
             frame_stats.paint_us = duration_to_us(paint_start.elapsed());
@@ -584,6 +594,7 @@ where
                 self.buffer_width,
                 self.buffer_height,
                 self.config.clear_color,
+                glass_mode,
             );
             if let Some(surface) = self.surface.as_mut() {
                 match surface.buffer_mut() {
@@ -598,8 +609,21 @@ where
                             self.buffer_width,
                             self.buffer_height,
                             pack_softbuffer_rgb(self.config.clear_color),
+                            self.native_glass_active,
                         );
-                        if let Err(error) = target.present() {
+                        let present_result = if self.native_glass_active {
+                            let damage = non_transparent_damage_rects(
+                                &self.buffer,
+                                self.buffer_width,
+                                self.buffer_height,
+                                target_width,
+                                target_height,
+                            );
+                            target.present_with_damage(&damage)
+                        } else {
+                            target.present()
+                        };
+                        if let Err(error) = present_result {
                             self.fail(event_loop, error);
                             return;
                         }
@@ -627,6 +651,130 @@ where
             .wants_continuous_redraw()
             .then_some(now + self.config.frame_time);
     }
+
+    fn sync_native_glass(&mut self, scene: &ExtractedScene) {
+        if !scene.requires_native_glass() {
+            self.clear_native_glass();
+            self.clear_native_glass_diagnostic();
+            return;
+        }
+
+        if !self.config.glass_capable {
+            self.native_glass_active = false;
+            self.native_glass_tint = None;
+            self.note_native_glass_diagnostic(
+                "native glass requested, but WindowConfig is not glass-capable; call WindowConfig::with_glass_capable(true). Using renderer fallback.",
+            );
+            return;
+        }
+
+        let tint = scene
+            .preferred_glass_tint()
+            .unwrap_or(DEFAULT_NATIVE_GLASS_TINT);
+        if self.native_glass_active && self.native_glass_tint == Some(tint) {
+            return;
+        }
+
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+
+        match native_glass::apply(window, tint) {
+            Ok(true) => {
+                self.native_glass_active = true;
+                self.native_glass_tint = Some(tint);
+                self.clear_native_glass_diagnostic();
+            }
+            Ok(false) => {
+                self.native_glass_active = false;
+                self.native_glass_tint = None;
+                self.note_native_glass_diagnostic(
+                    "native glass is unavailable on this platform. Using renderer fallback.",
+                );
+            }
+            Err(error) => {
+                self.native_glass_active = false;
+                self.native_glass_tint = None;
+                self.note_native_glass_diagnostic(format!(
+                    "native glass failed: {error}. Using renderer fallback."
+                ));
+            }
+        }
+    }
+
+    fn clear_native_glass(&mut self) {
+        if !self.native_glass_active && self.native_glass_tint.is_none() {
+            return;
+        }
+
+        if let Some(window) = self.window.as_ref() {
+            let _ = native_glass::clear(window);
+            window.set_transparent(self.config.glass_capable);
+        }
+        self.native_glass_active = false;
+        self.native_glass_tint = None;
+    }
+
+    fn glass_render_mode(&self) -> GlassRenderMode {
+        if self.native_glass_active {
+            GlassRenderMode::Native
+        } else {
+            GlassRenderMode::Fallback
+        }
+    }
+
+    fn note_native_glass_diagnostic(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if self.native_glass_diagnostic.as_deref() == Some(message.as_str()) {
+            return;
+        }
+
+        eprintln!("cssimpler: {message}");
+        self.native_glass_diagnostic = Some(message);
+    }
+
+    fn clear_native_glass_diagnostic(&mut self) {
+        self.native_glass_diagnostic = None;
+    }
+}
+
+fn window_attributes_for_config(config: &WindowConfig) -> WindowAttributes {
+    #[allow(unused_mut)]
+    let mut attributes = Window::default_attributes()
+        .with_title(config.title.clone())
+        .with_inner_size(LogicalSize::new(config.width as f64, config.height as f64))
+        .with_resizable(true)
+        .with_transparent(config.glass_capable)
+        .with_decorations(config.decorations);
+
+    #[cfg(target_os = "windows")]
+    if config.glass_capable && !config.decorations {
+        use winit::dpi::PhysicalSize;
+        use winit::platform::windows::WindowAttributesExtWindows;
+
+        attributes = attributes
+            .with_undecorated_shadow(false)
+            .with_inner_size(PhysicalSize::new(0, 0));
+    }
+
+    attributes
+}
+
+fn finish_window_setup(window: &Window, config: &WindowConfig) {
+    #[cfg(target_os = "windows")]
+    if config.glass_capable && !config.decorations {
+        use winit::dpi::PhysicalSize;
+        use winit::platform::windows::WindowExtWindows;
+
+        window.set_undecorated_shadow(true);
+        let _ = window.request_inner_size(PhysicalSize::new(
+            config.width.max(1) as u32,
+            config.height.max(1) as u32,
+        ));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = (window, config);
 }
 
 impl<P> ApplicationHandler for RuntimeApp<P>
@@ -808,6 +956,7 @@ fn copy_render_buffer_into_surface(
     source_width: usize,
     source_height: usize,
     clear: u32,
+    preserve_transparency: bool,
 ) {
     debug_assert_eq!(target.len(), target_width.saturating_mul(target_height));
     debug_assert_eq!(source.len(), source_width.saturating_mul(source_height));
@@ -817,7 +966,8 @@ fn copy_render_buffer_into_surface(
             let row_start = row * source_width;
             for column in 0..source_width {
                 let index = row_start + column;
-                target[index] = to_softbuffer_rgb_blue_noise(source[index], column, row);
+                target[index] =
+                    surface_pixel(source[index], column, row, clear, preserve_transparency);
             }
         }
         return;
@@ -830,9 +980,95 @@ fn copy_render_buffer_into_surface(
         let src_row = row * source_width;
         let dst_row = row * target_width;
         for column in 0..copy_width {
-            target[dst_row + column] =
-                to_softbuffer_rgb_blue_noise(source[src_row + column], column, row);
+            target[dst_row + column] = surface_pixel(
+                source[src_row + column],
+                column,
+                row,
+                clear,
+                preserve_transparency,
+            );
         }
+    }
+}
+
+fn surface_pixel(
+    pixel: u32,
+    column: usize,
+    row: usize,
+    clear: u32,
+    preserve_transparency: bool,
+) -> u32 {
+    if is_transparent(pixel) && !preserve_transparency {
+        clear
+    } else {
+        to_softbuffer_rgb_blue_noise(pixel, column, row)
+    }
+}
+
+fn non_transparent_damage_rects(
+    source: &[u32],
+    source_width: usize,
+    source_height: usize,
+    target_width: usize,
+    target_height: usize,
+) -> Vec<Rect> {
+    let copy_width = source_width.min(target_width);
+    let copy_height = source_height.min(target_height);
+    if copy_width == 0 || copy_height == 0 {
+        return Vec::new();
+    }
+
+    let mut runs = Vec::<DamageRun>::new();
+    for row in 0..copy_height {
+        let mut column = 0;
+        while column < copy_width {
+            while column < copy_width && is_transparent(source[row * source_width + column]) {
+                column += 1;
+            }
+            if column >= copy_width {
+                break;
+            }
+            let x0 = column;
+            while column < copy_width && !is_transparent(source[row * source_width + column]) {
+                column += 1;
+            }
+            let x1 = column;
+            if let Some(previous) = runs.last_mut()
+                && previous.x0 == x0
+                && previous.x1 == x1
+                && previous.y1 == row
+            {
+                previous.y1 += 1;
+                continue;
+            }
+            runs.push(DamageRun {
+                x0,
+                x1,
+                y0: row,
+                y1: row + 1,
+            });
+        }
+    }
+
+    runs.into_iter().filter_map(|run| run.into_rect()).collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DamageRun {
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+}
+
+impl DamageRun {
+    fn into_rect(self) -> Option<Rect> {
+        Some(Rect {
+            x: u32::try_from(self.x0).ok()?,
+            y: u32::try_from(self.y0).ok()?,
+            width: NonZeroU32::new(u32::try_from(self.x1.checked_sub(self.x0)?).ok()?)?,
+            height: NonZeroU32::new(u32::try_from(self.y1.checked_sub(self.y0)?).ok()?)?,
+        })
     }
 }
 
@@ -910,11 +1146,11 @@ mod tests {
     use crate::input::{
         ButtonState, KeyIdentity, KeyLocation, KeyboardModifiers, PointerButton, ScrollDelta,
     };
-    use crate::{pack_rgb, to_softbuffer_rgb_blue_noise};
+    use crate::{pack_rgb, pack_transparent, to_softbuffer_rgb_blue_noise};
 
     use super::{
-        copy_render_buffer_into_surface, normalize_button_state, normalize_key_location,
-        normalize_logical_key, normalize_modifiers, normalize_physical_key,
+        copy_render_buffer_into_surface, non_transparent_damage_rects, normalize_button_state,
+        normalize_key_location, normalize_logical_key, normalize_modifiers, normalize_physical_key,
         normalize_pointer_button, normalize_scroll_delta,
     };
 
@@ -1001,7 +1237,7 @@ mod tests {
             pack_rgb(Color::rgb(16, 17, 18)),
         ];
         let mut target = vec![9; 10];
-        copy_render_buffer_into_surface(&mut target, 5, 2, &source, 3, 2, 0);
+        copy_render_buffer_into_surface(&mut target, 5, 2, &source, 3, 2, 0, false);
         assert_eq!(
             target,
             vec![
@@ -1032,7 +1268,7 @@ mod tests {
             pack_rgb(Color::rgb(22, 23, 24)),
         ];
         let mut target = vec![9; 6];
-        copy_render_buffer_into_surface(&mut target, 3, 2, &source, 4, 2, 0);
+        copy_render_buffer_into_surface(&mut target, 3, 2, &source, 4, 2, 0, false);
         assert_eq!(
             target,
             vec![
@@ -1044,5 +1280,51 @@ mod tests {
                 to_softbuffer_rgb_blue_noise(source[6], 2, 1),
             ]
         );
+    }
+
+    #[test]
+    fn blit_to_surface_can_preserve_transparent_glass_pixels() {
+        let clear = 0x00ff00;
+        let source = vec![
+            pack_rgb(Color::rgb(1, 2, 3)),
+            pack_transparent(),
+            pack_rgb(Color::rgb(7, 8, 9)),
+        ];
+        let mut target = vec![clear; 3];
+
+        copy_render_buffer_into_surface(&mut target, 3, 1, &source, 3, 1, clear, true);
+
+        assert_eq!(
+            target,
+            vec![
+                to_softbuffer_rgb_blue_noise(source[0], 0, 0),
+                0,
+                to_softbuffer_rgb_blue_noise(source[2], 2, 0)
+            ]
+        );
+
+        copy_render_buffer_into_surface(&mut target, 3, 1, &source, 3, 1, clear, false);
+
+        assert_eq!(target[1], clear);
+    }
+
+    #[test]
+    fn transparent_glass_damage_skips_reveal_holes() {
+        let source = vec![
+            pack_rgb(Color::rgb(1, 2, 3)),
+            pack_rgb(Color::rgb(4, 5, 6)),
+            pack_transparent(),
+            pack_rgb(Color::rgb(7, 8, 9)),
+            pack_rgb(Color::rgb(10, 11, 12)),
+            pack_transparent(),
+        ];
+
+        let damage = non_transparent_damage_rects(&source, 3, 2, 3, 2);
+        let simplified = damage
+            .iter()
+            .map(|rect| (rect.x, rect.y, rect.width.get(), rect.height.get()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(simplified, vec![(0, 0, 2, 2)]);
     }
 }

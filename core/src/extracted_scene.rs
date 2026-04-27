@@ -1,10 +1,11 @@
 use crate::{
-    ElementPath, EventHandlers, Insets, LayoutBox, PreparedTextLayout, RenderKind, RenderNode,
-    ScrollbarData, SvgScene, Transform2D, TransitionStyle, VisualStyle,
+    Color, ElementPath, EventHandlers, Insets, LayoutBox, NativeMaterial, PreparedTextLayout,
+    RenderKind, RenderNode, ScrollbarData, SvgScene, Transform2D, TransitionStyle, VisualStyle,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtractedPaintKind {
+    GlassReveal,
     BackdropBlur,
     BoxShadow,
     FilterDropShadow,
@@ -54,16 +55,44 @@ impl ExtractedScene {
             items,
         }
     }
+
+    pub fn requires_native_glass(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.kind == ExtractedPaintKind::GlassReveal)
+    }
+
+    pub fn glass_regions(&self) -> impl Iterator<Item = &ExtractedPaintItem> {
+        self.items
+            .iter()
+            .filter(|item| item.kind == ExtractedPaintKind::GlassReveal)
+    }
+
+    pub fn preferred_glass_tint(&self) -> Option<Color> {
+        self.glass_regions().find_map(|item| item.style.glass_tint)
+    }
 }
 
 fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<ExtractedPaintItem>) {
     let clip = node.style.overflow.clips_any_axis().then_some(node.layout);
 
-    if node.style.backdrop_blur_radius > f32::EPSILON {
+    if node.style.native_material == NativeMaterial::Glass {
         push_item(
             node,
             &path,
             0,
+            ExtractedPaintKind::GlassReveal,
+            clip,
+            None,
+            items,
+        );
+    }
+
+    if node.style.backdrop_blur_radius > f32::EPSILON {
+        push_item(
+            node,
+            &path,
+            8,
             ExtractedPaintKind::BackdropBlur,
             clip,
             None,
@@ -239,6 +268,7 @@ mod tests {
                     border: crate::BorderStyle {
                         widths: Insets::all(1.0),
                         color: Color::rgb(226, 232, 240),
+                        ..crate::BorderStyle::default()
                     },
                     shadows: vec![BoxShadow {
                         color: Color::rgba(15, 23, 42, 140),
@@ -297,6 +327,83 @@ mod tests {
         assert!(kinds.contains(&ExtractedPaintKind::Border));
         assert!(kinds.contains(&ExtractedPaintKind::TextRun));
         assert!(kinds.contains(&ExtractedPaintKind::Scrollbar));
+    }
+
+    #[test]
+    fn extracted_scene_reports_native_glass_regions_and_tint() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 220.0, 160.0)).with_child(
+                RenderNode::container(LayoutBox::new(0.0, 0.0, 72.0, 160.0)).with_style(
+                    VisualStyle {
+                        native_material: crate::NativeMaterial::Glass,
+                        glass_tint: Some(Color::rgba(255, 255, 255, 96)),
+                        ..VisualStyle::default()
+                    },
+                ),
+            ),
+        ];
+
+        let extracted = ExtractedScene::from_render_roots(&scene);
+
+        assert!(extracted.requires_native_glass());
+        assert_eq!(
+            extracted.preferred_glass_tint(),
+            Some(Color::rgba(255, 255, 255, 96))
+        );
+        let regions = extracted.glass_regions().collect::<Vec<_>>();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].layout, LayoutBox::new(0.0, 0.0, 72.0, 160.0));
+    }
+
+    #[test]
+    fn extracted_scene_ignores_glass_tint_without_native_glass() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 80.0, 40.0)).with_style(VisualStyle {
+                glass_tint: Some(Color::rgba(255, 255, 255, 96)),
+                ..VisualStyle::default()
+            }),
+        ];
+
+        let extracted = ExtractedScene::from_render_roots(&scene);
+
+        assert!(!extracted.requires_native_glass());
+        assert_eq!(extracted.glass_regions().count(), 0);
+        assert_eq!(extracted.preferred_glass_tint(), None);
+    }
+
+    #[test]
+    fn extracted_scene_prefers_first_glass_tint_deterministically() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 180.0, 80.0))
+                .with_child(
+                    RenderNode::container(LayoutBox::new(8.0, 8.0, 40.0, 40.0)).with_style(
+                        VisualStyle {
+                            native_material: crate::NativeMaterial::Glass,
+                            glass_tint: Some(Color::rgba(255, 255, 255, 72)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(64.0, 8.0, 40.0, 40.0)).with_style(
+                        VisualStyle {
+                            native_material: crate::NativeMaterial::Glass,
+                            glass_tint: Some(Color::rgba(24, 36, 54, 128)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+
+        let left = ExtractedScene::from_render_roots(&scene);
+        let right = ExtractedScene::from_render_roots(&scene);
+
+        assert_eq!(left.glass_regions().count(), 2);
+        assert_eq!(
+            left.preferred_glass_tint(),
+            Some(Color::rgba(255, 255, 255, 72))
+        );
+        assert_eq!(left.preferred_glass_tint(), right.preferred_glass_tint());
     }
 
     #[test]

@@ -29,6 +29,14 @@ pub(crate) fn pack_linear_rgb(color: LinearRgba) -> u32 {
     )
 }
 
+pub(crate) fn pack_transparent() -> u32 {
+    pack_internal_rgb_u10(0, 0, 0, 0)
+}
+
+pub(crate) fn is_transparent(pixel: u32) -> bool {
+    extract_alpha(pixel) == 0
+}
+
 pub(crate) fn unpack_rgb(pixel: u32) -> Color {
     Color::rgb(
         u10_to_u8_channel(extract_red(pixel)),
@@ -118,7 +126,7 @@ fn linear_to_srgb_unit(value: f32) -> f32 {
 mod tests {
     use cssimpler_core::Color;
 
-    use super::{pack_rgb, u8_to_u10_channel, unpack_rgb};
+    use super::{is_transparent, pack_rgb, pack_transparent, u8_to_u10_channel, unpack_rgb};
 
     #[test]
     fn pack_and_unpack_rgb_round_trips_8bit_inputs() {
@@ -144,5 +152,11 @@ mod tests {
             assert!(current >= previous);
             previous = current;
         }
+    }
+
+    #[test]
+    fn transparent_pixel_preserves_alpha_state() {
+        assert!(is_transparent(pack_transparent()));
+        assert!(!is_transparent(pack_rgb(Color::BLACK)));
     }
 }

@@ -1,6 +1,8 @@
 use std::sync::OnceLock;
 
-use super::color::{pack_softbuffer_channels, u8_to_u10_channel, u10_to_u8_channel, unpack_rgb10};
+use super::color::{
+    is_transparent, pack_softbuffer_channels, u8_to_u10_channel, u10_to_u8_channel, unpack_rgb10,
+};
 
 const TILE_WIDTH: usize = 8;
 const TILE_HEIGHT: usize = 8;
@@ -8,6 +10,10 @@ const TILE_SIZE: usize = TILE_WIDTH * TILE_HEIGHT;
 const BEST_CANDIDATE_SAMPLES: usize = 32;
 
 pub(crate) fn to_softbuffer_rgb_blue_noise(pixel: u32, x: usize, y: usize) -> u32 {
+    if is_transparent(pixel) {
+        return 0;
+    }
+
     let (red10, green10, blue10) = unpack_rgb10(pixel);
     let red = quantize_channel_with_blue_noise(red10, threshold_at(x, y));
     let green =

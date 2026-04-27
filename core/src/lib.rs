@@ -674,6 +674,13 @@ impl TransformOperation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NativeMaterial {
+    #[default]
+    None,
+    Glass,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisualStyle {
     pub background: Option<Color>,
@@ -685,6 +692,8 @@ pub struct VisualStyle {
     pub text_shadows: Vec<ShadowEffect>,
     pub filter_drop_shadows: Vec<ShadowEffect>,
     pub backdrop_blur_radius: f32,
+    pub native_material: NativeMaterial,
+    pub glass_tint: Option<Color>,
     pub corner_radius: CornerRadius,
     pub border: BorderStyle,
     pub shadows: Vec<BoxShadow>,
@@ -707,6 +716,8 @@ impl Default for VisualStyle {
             text_shadows: Vec::new(),
             filter_drop_shadows: Vec::new(),
             backdrop_blur_radius: 0.0,
+            native_material: NativeMaterial::None,
+            glass_tint: None,
             corner_radius: CornerRadius::ZERO,
             border: BorderStyle::default(),
             shadows: Vec::new(),

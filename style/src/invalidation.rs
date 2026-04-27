@@ -83,6 +83,8 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         Declaration::Background(_)
         | Declaration::BackgroundLayers(_)
         | Declaration::Foreground(_)
+        | Declaration::NativeMaterial(_)
+        | Declaration::GlassTint(_)
         | Declaration::SvgFill(_)
         | Declaration::SvgStroke(_)
         | Declaration::SvgStrokeWidth(_)
@@ -197,6 +199,8 @@ fn variable_property_invalidation(property_name: &str) -> StyleInvalidation {
         | "text-shadow"
         | "filter"
         | "backdrop-filter"
+        | "native-material"
+        | "glass-tint"
         | "-webkit-backdrop-filter"
         | "-webkit-text-stroke"
         | "-webkit-text-stroke-width"

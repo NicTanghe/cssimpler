@@ -1,6 +1,7 @@
 mod backdrop;
 mod border;
 mod color;
+mod glass;
 mod gradient;
 mod scrollbar;
 mod shadow;
@@ -21,6 +22,10 @@ use crate::{Declaration, StyleError};
 pub(crate) fn extract_property(
     property: &Property<'_>,
 ) -> Option<Result<Vec<Declaration>, StyleError>> {
+    if let Some(declarations) = glass::custom_property_declarations(property) {
+        return Some(declarations);
+    }
+
     if let Some(declarations) = scrollbar::custom_property_declarations(property) {
         return Some(declarations);
     }
@@ -113,6 +118,14 @@ pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) ->
         }
         Declaration::Foreground(color) => {
             color::apply_foreground(style, *color);
+            true
+        }
+        Declaration::NativeMaterial(material) => {
+            glass::apply_native_material(style, *material);
+            true
+        }
+        Declaration::GlassTint(color) => {
+            glass::apply_glass_tint(style, *color);
             true
         }
         Declaration::SvgFill(paint) => {

@@ -4,8 +4,8 @@ use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
     BorderLineStyle, Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath,
-    LayoutStyle, LengthPercentageCalc, OverflowMode, ScrollbarWidth, Style, SvgPaint,
-    TransformOperation, TransformOrigin, TransformStyleMode, TransitionPropertyName,
+    LayoutStyle, LengthPercentageCalc, NativeMaterial, OverflowMode, ScrollbarWidth, Style,
+    SvgPaint, TransformOperation, TransformOrigin, TransformStyleMode, TransitionPropertyName,
     TransitionTimingFunction,
     fonts::{TextStyle, TextTransform},
 };
@@ -380,6 +380,8 @@ pub enum Declaration {
     Background(Color),
     BackgroundLayers(Vec<BackgroundLayerDeclaration>),
     Foreground(Color),
+    NativeMaterial(NativeMaterial),
+    GlassTint(Option<Color>),
     SvgFill(SvgPaint),
     SvgStroke(SvgPaint),
     SvgStrokeWidth(f32),
@@ -1768,9 +1770,9 @@ mod tests {
         AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient,
         ElementInteractionState, ElementNode, GradientDirection, GradientHorizontal,
         GradientInterpolation, GradientPoint, GradientStop, LengthPercentageValue, LinearGradient,
-        Node, RadialShape, ScrollbarWidth, ShapeExtent, TransformMatrix3d, TransformOperation,
-        TransformOrigin, TransformStyleMode, TransitionPropertyName, TransitionTimingFunction,
-        fonts::TextTransform,
+        NativeMaterial, Node, RadialShape, ScrollbarWidth, ShapeExtent, TransformMatrix3d,
+        TransformOperation, TransformOrigin, TransformStyleMode, TransitionPropertyName,
+        TransitionTimingFunction, fonts::TextTransform,
     };
     use taffy::prelude::{
         AlignItems as TaffyAlignItems, Dimension, Display as TaffyDisplay,
@@ -1856,6 +1858,71 @@ mod tests {
                 .contains(&Declaration::InsetLeft(TaffyLengthPercentageAuto::Length(
                     160.0
                 ),))
+        );
+    }
+
+    #[test]
+    fn parser_supports_native_glass_properties() {
+        let stylesheet = parse_stylesheet(
+            ".drawer {
+                native-material: glass;
+                glass-tint: rgba(245, 250, 255, 0.36);
+            }",
+        )
+        .expect("native glass stylesheet should parse");
+        let element = Node::element("aside").with_class("drawer");
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.visual.native_material, NativeMaterial::Glass);
+        assert_eq!(
+            resolved.visual.glass_tint,
+            Some(Color::rgba(245, 250, 255, 92))
+        );
+    }
+
+    #[test]
+    fn unsupported_native_material_values_fail_clearly() {
+        let error = parse_stylesheet(".drawer { native-material: acrylic; }")
+            .expect_err("unsupported native material should fail");
+
+        assert!(matches!(
+            error,
+            StyleError::UnsupportedValue(message) if message.contains("acrylic")
+        ));
+    }
+
+    #[test]
+    fn glass_tint_does_not_enable_native_glass_by_itself() {
+        let stylesheet = parse_stylesheet(".drawer { glass-tint: rgba(245, 250, 255, 0.36); }")
+            .expect("glass tint alone should parse");
+        let element = Node::element("aside").with_class("drawer");
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.visual.native_material, NativeMaterial::None);
+        assert_eq!(
+            resolved.visual.glass_tint,
+            Some(Color::rgba(245, 250, 255, 92))
+        );
+    }
+
+    #[test]
+    fn variable_backed_native_glass_properties_resolve_before_paint() {
+        let stylesheet = parse_stylesheet(
+            ".drawer {
+                --material: glass;
+                --tint: rgba(14, 18, 24, 0.61);
+                native-material: var(--material);
+                glass-tint: var(--tint);
+            }",
+        )
+        .expect("variable-backed native glass stylesheet should parse");
+        let element = Node::element("aside").with_class("drawer");
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.visual.native_material, NativeMaterial::Glass);
+        assert_eq!(
+            resolved.visual.glass_tint,
+            Some(Color::rgba(14, 18, 24, 156))
         );
     }
 

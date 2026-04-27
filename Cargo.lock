@@ -404,6 +404,7 @@ dependencies = [
  "font8x8",
  "softbuffer",
  "winapi",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

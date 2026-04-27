@@ -4,13 +4,14 @@ use anyhow::Result;
 use cssimpler::app::{App, Invalidation};
 use cssimpler::core::Node;
 use cssimpler::renderer::{FrameInfo, WindowConfig};
-use cssimpler::style::{Stylesheet, parse_stylesheet};
+use cssimpler::style::{parse_stylesheet, Stylesheet};
 use cssimpler::ui;
 
 const BUTTON_TEXT: &str = "uiverse";
 
 fn main() -> Result<()> {
-    let config = WindowConfig::new("cssimpler / uiverse hover button", 1280, 720);
+    let config =
+        WindowConfig::new("cssimpler / uiverse hover button", 1280, 720).with_decorations(false);
 
     App::new((), stylesheet(), update, build_ui)
         .run(config)
@@ -138,12 +139,12 @@ fn stylesheet() -> &'static Stylesheet {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUTTON_TEXT, build_card, build_ui, stylesheet};
+    use super::{build_card, build_ui, stylesheet, BUTTON_TEXT};
     use cssimpler::app::{App, Invalidation};
     use cssimpler::core::fonts::layout_text_block;
     use cssimpler::core::{ElementInteractionState, ElementPath, Node, RenderKind, RenderNode};
     use cssimpler::renderer::{
-        FrameInfo, SceneProvider, ViewportSize, render_scene_update, render_to_buffer,
+        render_scene_update, render_to_buffer, FrameInfo, SceneProvider, ViewportSize,
     };
     use cssimpler::style::{build_render_tree_in_viewport_with_interaction, parse_stylesheet};
     use cssimpler::ui;
