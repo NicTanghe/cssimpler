@@ -1,0 +1,207 @@
+#app {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  native-material: glass;
+  glass-tint: rgba(14, 18, 24, 0.62);
+  color: rgb(232, 242, 250);
+}
+
+#app.mode-mica {
+  glass-tint: rgba(30, 35, 42, 0.48);
+}
+
+#app.mode-acrylic.tint-red {
+  glass-tint: rgba(58, 20, 28, 0.62);
+}
+
+#app.mode-acrylic.tint-yellow {
+  glass-tint: rgba(54, 44, 18, 0.60);
+}
+
+#app.mode-acrylic.tint-green {
+  glass-tint: rgba(18, 50, 36, 0.60);
+}
+
+#app.mode-acrylic.tint-cyan {
+  glass-tint: rgba(12, 44, 54, 0.62);
+}
+
+#app.mode-acrylic.tint-blue {
+  glass-tint: rgba(18, 28, 62, 0.62);
+}
+
+#app.mode-acrylic.tint-magenta {
+  glass-tint: rgba(52, 22, 58, 0.62);
+}
+
+.control-panel {
+  position: absolute;
+  left: 18px;
+  top: 18px;
+  display: flex;
+  width: 282px;
+  height: 250px;
+  padding: 6px;
+  flex-direction: column;
+  gap: 12px;
+  background: rgba(13, 17, 24, 0.70);
+  border: 1px solid rgb(214, 232, 242);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.30);
+}
+
+.mode-switch {
+  display: flex;
+  width: 270px;
+  height: 36px;
+  gap: 6px;
+}
+
+.mode-segment {
+  display: flex;
+  width: 132px;
+  height: 36px;
+  justify-content: center;
+  align-items: center;
+  color: rgb(206, 218, 228);
+  background: rgba(34, 42, 54, 0.56);
+  border: 1px solid rgb(93, 106, 120);
+  font-family: "Courier New";
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.mode-segment.selected {
+  color: rgb(255, 255, 255);
+  background: rgba(88, 132, 168, 0.78);
+  border: 1px solid rgb(245, 251, 255);
+}
+
+.picker-row {
+  display: flex;
+  width: 270px;
+  height: 190px;
+  gap: 12px;
+}
+
+.sv-picker {
+  position: relative;
+  width: 190px;
+  height: 190px;
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.0) 0%, rgba(0, 0, 0, 1.0) 100%),
+    linear-gradient(90deg, rgb(255, 255, 255) 0%, rgb(65, 190, 255) 100%);
+  border: 1px solid rgb(176, 194, 208);
+}
+
+#app.tint-red .sv-picker {
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.0) 0%, rgba(0, 0, 0, 1.0) 100%),
+    linear-gradient(90deg, rgb(255, 255, 255) 0%, rgb(255, 70, 88) 100%);
+}
+
+#app.tint-yellow .sv-picker {
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.0) 0%, rgba(0, 0, 0, 1.0) 100%),
+    linear-gradient(90deg, rgb(255, 255, 255) 0%, rgb(255, 214, 60) 100%);
+}
+
+#app.tint-green .sv-picker {
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.0) 0%, rgba(0, 0, 0, 1.0) 100%),
+    linear-gradient(90deg, rgb(255, 255, 255) 0%, rgb(56, 220, 136) 100%);
+}
+
+#app.tint-cyan .sv-picker {
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.0) 0%, rgba(0, 0, 0, 1.0) 100%),
+    linear-gradient(90deg, rgb(255, 255, 255) 0%, rgb(65, 190, 255) 100%);
+}
+
+#app.tint-blue .sv-picker {
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.0) 0%, rgba(0, 0, 0, 1.0) 100%),
+    linear-gradient(90deg, rgb(255, 255, 255) 0%, rgb(82, 116, 255) 100%);
+}
+
+#app.tint-magenta .sv-picker {
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.0) 0%, rgba(0, 0, 0, 1.0) 100%),
+    linear-gradient(90deg, rgb(255, 255, 255) 0%, rgb(255, 72, 220) 100%);
+}
+
+.sv-knob {
+  position: absolute;
+  width: 13px;
+  height: 13px;
+  border: 1px solid rgb(24, 30, 38);
+  background: rgba(255, 255, 255, 0.0);
+}
+
+.sv-knob.value-bright {
+  left: 133px;
+  top: 14px;
+}
+
+.sv-knob.value-mid {
+  left: 92px;
+  top: 72px;
+}
+
+.sv-knob.value-deep {
+  left: 48px;
+  top: 128px;
+}
+
+.hue-strip {
+  position: relative;
+  width: 68px;
+  height: 190px;
+  background:
+    linear-gradient(
+      180deg,
+      rgb(255, 0, 0) 0%,
+      rgb(255, 255, 0) 17%,
+      rgb(0, 255, 0) 33%,
+      rgb(0, 255, 255) 50%,
+      rgb(0, 0, 255) 67%,
+      rgb(255, 0, 255) 83%,
+      rgb(255, 0, 0) 100%
+    );
+  border: 1px solid rgb(176, 194, 208);
+}
+
+.hue-knob {
+  position: absolute;
+  left: -4px;
+  width: 76px;
+  height: 7px;
+  background: rgb(255, 255, 255);
+  border: 1px solid rgb(24, 30, 38);
+}
+
+.hue-knob.hue-red {
+  top: 0px;
+}
+
+.hue-knob.hue-yellow {
+  top: 31px;
+}
+
+.hue-knob.hue-green {
+  top: 63px;
+}
+
+.hue-knob.hue-cyan {
+  top: 94px;
+}
+
+.hue-knob.hue-blue {
+  top: 126px;
+}
+
+.hue-knob.hue-magenta {
+  top: 158px;
+}

@@ -8,115 +8,111 @@ use cssimpler::renderer::{FrameInfo, WindowConfig};
 use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
 
-const ACTION_SELECT_MICA: u64 = 1 << 0;
-const ACTION_SELECT_ACRYLIC: u64 = 1 << 1;
-const ACTION_CYCLE_HUE: u64 = 1 << 2;
-const ACTION_CYCLE_VALUE: u64 = 1 << 3;
-const HUE_COUNT: usize = 6;
-const VALUE_COUNT: usize = 3;
+const ACTION_TOGGLE_DRAWER: u64 = 1 << 0;
 
 static ACTIONS: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GlassMode {
-    Mica,
-    Acrylic,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GlassState {
-    mode: GlassMode,
-    hue: usize,
-    value: usize,
-}
-
-impl Default for GlassState {
-    fn default() -> Self {
-        Self {
-            mode: GlassMode::Acrylic,
-            hue: 3,
-            value: 0,
-        }
-    }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DrawerState {
+    collapsed: bool,
 }
 
 fn main() -> Result<()> {
-    let config = WindowConfig::new("cssimpler / native glass picker", 900, 560)
+    let config = WindowConfig::new("cssimpler / glass drawer", 900, 560)
         .with_glass_capable(true)
         .with_decorations(false);
 
-    App::new(GlassState::default(), stylesheet(), update, build_ui)
+    App::new(DrawerState::default(), stylesheet(), update, build_ui)
         .run(WindowConfig {
-            clear_color: Color::rgb(14, 18, 24),
+            clear_color: Color::rgb(12, 15, 20),
             ..config
         })
         .map_err(Into::into)
 }
 
-fn update(state: &mut GlassState, _frame: FrameInfo) -> Invalidation {
+fn update(state: &mut DrawerState, _frame: FrameInfo) -> Invalidation {
     let actions = ACTIONS.swap(0, Ordering::Relaxed);
-    if actions == 0 {
+    if actions & ACTION_TOGGLE_DRAWER == 0 {
         return Invalidation::Clean;
     }
 
-    if actions & ACTION_SELECT_MICA != 0 {
-        state.mode = GlassMode::Mica;
-    }
-    if actions & ACTION_SELECT_ACRYLIC != 0 {
-        state.mode = GlassMode::Acrylic;
-    }
-    if actions & ACTION_CYCLE_HUE != 0 {
-        state.mode = GlassMode::Acrylic;
-        state.hue = (state.hue + 1) % HUE_COUNT;
-    }
-    if actions & ACTION_CYCLE_VALUE != 0 {
-        state.mode = GlassMode::Acrylic;
-        state.value = (state.value + 1) % VALUE_COUNT;
-    }
-
+    state.collapsed = !state.collapsed;
     Invalidation::Layout
 }
 
-fn build_ui(state: &GlassState) -> Node {
-    add_classes(
-        ui! {
-            <div id="app">
-                <section class="control-panel">
-                    <div class="mode-switch">
-                        {mode_button("MICA", select_mica, state.mode == GlassMode::Mica)}
-                        {mode_button("ACRYLIC", select_acrylic, state.mode == GlassMode::Acrylic)}
-                    </div>
+fn build_ui(state: &DrawerState) -> Node {
+    let root = ui! {
+        <div id="app">
+            <aside class="drawer">
+                <button class="drawer-toggle" type="button" onclick={toggle_drawer}>
+                    <span class="hamburger-line"></span>
+                    <span class="hamburger-line"></span>
+                    <span class="hamburger-line"></span>
+                </button>
 
-                    <div class="picker-row">
-                        <button class="sv-picker" type="button" onclick={cycle_value}>
-                            {add_class(ui! { <span class="sv-knob"></span> }, value_class(state.value))}
-                        </button>
-                        <button class="hue-strip" type="button" onclick={cycle_hue}>
-                            {add_class(ui! { <span class="hue-knob"></span> }, hue_class(state.hue))}
-                        </button>
+                <div class="drawer-brand">
+                    <span class="brand-mark"></span>
+                    <div class="brand-copy">
+                        <p class="brand-title">Librarian</p>
+                        <p class="brand-subtitle">Archive desk</p>
+                    </div>
+                </div>
+
+                <nav class="drawer-content">
+                    <p class="section-label">Stacks</p>
+                    <div class="nav-item selected">
+                        <span class="nav-dot"></span>
+                        <span class="nav-label">Dashboard</span>
+                    </div>
+                    <div class="nav-item">
+                        <span class="nav-dot"></span>
+                        <span class="nav-label">Returns</span>
+                    </div>
+                    <div class="nav-item">
+                        <span class="nav-dot"></span>
+                        <span class="nav-label">New holds</span>
+                    </div>
+                    <div class="nav-item">
+                        <span class="nav-dot"></span>
+                        <span class="nav-label">Community</span>
+                    </div>
+                </nav>
+
+                <div class="drawer-footer">
+                    <p class="footer-number">146</p>
+                    <p class="footer-label">new holds</p>
+                </div>
+            </aside>
+
+            <main class="workspace">
+                <section class="summary-strip">
+                    <div class="summary-block">
+                        <p class="summary-label">Checked out</p>
+                        <p class="summary-value">1,284</p>
+                    </div>
+                    <div class="summary-block">
+                        <p class="summary-label">Available</p>
+                        <p class="summary-value">8,631</p>
+                    </div>
+                    <div class="summary-block">
+                        <p class="summary-label">Requests</p>
+                        <p class="summary-value">73</p>
                     </div>
                 </section>
-            </div>
-        },
-        [
-            mode_class(state.mode),
-            tint_class(state.hue),
-            value_class(state.value),
-        ],
-    )
-}
 
-fn mode_button(label: &'static str, handler: fn(), selected: bool) -> Node {
-    let button = ui! {
-        <button class="mode-segment" type="button" onclick={handler}>
-            {label}
-        </button>
+                <section class="work-panel">
+                    <p class="panel-label">Today</p>
+                    <h1 class="panel-title">Quietly busy morning</h1>
+                    <p class="panel-copy">Returns are moving steadily and the community desk is opening another hold shelf.</p>
+                </section>
+            </main>
+        </div>
     };
 
-    if selected {
-        add_class(button, "selected")
+    if state.collapsed {
+        add_class(root, "drawer-collapsed")
     } else {
-        button
+        add_class(root, "drawer-open")
     }
 }
 
@@ -127,61 +123,8 @@ fn add_class(node: Node, class_name: &'static str) -> Node {
     }
 }
 
-fn add_classes<const N: usize>(node: Node, class_names: [&'static str; N]) -> Node {
-    class_names.into_iter().fold(node, add_class)
-}
-
-fn mode_class(mode: GlassMode) -> &'static str {
-    match mode {
-        GlassMode::Mica => "mode-mica",
-        GlassMode::Acrylic => "mode-acrylic",
-    }
-}
-
-fn tint_class(hue: usize) -> &'static str {
-    match hue % HUE_COUNT {
-        0 => "tint-red",
-        1 => "tint-yellow",
-        2 => "tint-green",
-        3 => "tint-cyan",
-        4 => "tint-blue",
-        _ => "tint-magenta",
-    }
-}
-
-fn value_class(value: usize) -> &'static str {
-    match value % VALUE_COUNT {
-        0 => "value-bright",
-        1 => "value-mid",
-        _ => "value-deep",
-    }
-}
-
-fn hue_class(hue: usize) -> &'static str {
-    match hue % HUE_COUNT {
-        0 => "hue-red",
-        1 => "hue-yellow",
-        2 => "hue-green",
-        3 => "hue-cyan",
-        4 => "hue-blue",
-        _ => "hue-magenta",
-    }
-}
-
-fn select_mica() {
-    ACTIONS.fetch_or(ACTION_SELECT_MICA, Ordering::Relaxed);
-}
-
-fn select_acrylic() {
-    ACTIONS.fetch_or(ACTION_SELECT_ACRYLIC, Ordering::Relaxed);
-}
-
-fn cycle_hue() {
-    ACTIONS.fetch_or(ACTION_CYCLE_HUE, Ordering::Relaxed);
-}
-
-fn cycle_value() {
-    ACTIONS.fetch_or(ACTION_CYCLE_VALUE, Ordering::Relaxed);
+fn toggle_drawer() {
+    ACTIONS.fetch_or(ACTION_TOGGLE_DRAWER, Ordering::Relaxed);
 }
 
 fn stylesheet() -> &'static Stylesheet {
@@ -189,37 +132,34 @@ fn stylesheet() -> &'static Stylesheet {
 
     STYLESHEET.get_or_init(|| {
         parse_stylesheet(include_str!("glass_drawer.css"))
-            .expect("native glass picker example stylesheet should stay valid")
+            .expect("glass drawer example stylesheet should stay valid")
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-
-    use super::{
-        ACTION_CYCLE_HUE, ACTION_SELECT_MICA, GlassMode, GlassState, build_ui, stylesheet, update,
-    };
+    use super::{ACTION_TOGGLE_DRAWER, ACTIONS, DrawerState, build_ui, stylesheet, update};
     use cssimpler::app::Invalidation;
     use cssimpler::renderer::FrameInfo;
+    use std::sync::atomic::Ordering;
 
     #[test]
-    fn native_glass_picker_example_stylesheet_parses_and_builds_ui() {
+    fn glass_drawer_example_stylesheet_parses_and_builds_ui() {
         let _ = stylesheet();
-        let tree = build_ui(&GlassState::default());
+        let tree = build_ui(&DrawerState::default());
 
         let cssimpler::core::Node::Element(root) = tree else {
             panic!("root should be an element");
         };
 
-        assert_eq!(root.children.len(), 1);
-        assert!(root.classes.contains(&"mode-acrylic".to_string()));
+        assert!(root.classes.contains(&"drawer-open".to_string()));
+        assert_eq!(root.children.len(), 2);
     }
 
     #[test]
-    fn native_glass_picker_actions_update_state() {
-        let mut state = GlassState::default();
-        super::ACTIONS.store(ACTION_SELECT_MICA | ACTION_CYCLE_HUE, Ordering::Relaxed);
+    fn glass_drawer_toggle_collapses_the_drawer() {
+        let mut state = DrawerState::default();
+        ACTIONS.store(ACTION_TOGGLE_DRAWER, Ordering::Relaxed);
 
         let invalidation = update(
             &mut state,
@@ -230,7 +170,6 @@ mod tests {
         );
 
         assert_eq!(invalidation, Invalidation::Layout);
-        assert_eq!(state.mode, GlassMode::Acrylic);
-        assert_eq!(state.hue, 4);
+        assert!(state.collapsed);
     }
 }

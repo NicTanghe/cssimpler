@@ -395,6 +395,7 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
     scene_transition: Option<SceneTransition>,
+    last_stats: RuntimeStats,
     signal: PhantomData<Signal>,
 }
 
@@ -415,6 +416,7 @@ where
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
             scene_transition: None,
+            last_stats: RuntimeStats::default(),
             signal: PhantomData,
         }
     }
@@ -440,6 +442,10 @@ where
 
     pub fn runtime_world(&self) -> &RuntimeWorld {
         &self.runtime_world
+    }
+
+    pub fn latest_stats(&self) -> &RuntimeStats {
+        &self.last_stats
     }
 
     pub fn set_viewport(&mut self, viewport: ViewportSize) {
@@ -476,6 +482,7 @@ where
 
         self.advance_scene_transition(frame.delta, &mut stats);
         stats.transition_active = self.scene_transition.is_some();
+        self.last_stats = stats.clone();
         record_runtime_stats(stats);
     }
 
@@ -803,6 +810,7 @@ pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
     scene_transition: Option<SceneTransition>,
+    last_stats: RuntimeStats,
     signal: PhantomData<Signal>,
 }
 
@@ -827,6 +835,7 @@ where
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
             scene_transition: None,
+            last_stats: RuntimeStats::default(),
             signal: PhantomData,
         }
     }
@@ -852,6 +861,10 @@ where
 
     pub fn runtime_world(&self) -> &RuntimeWorld {
         &self.runtime_world
+    }
+
+    pub fn latest_stats(&self) -> &RuntimeStats {
+        &self.last_stats
     }
 
     pub fn set_viewport(&mut self, viewport: ViewportSize) {
@@ -888,6 +901,7 @@ where
 
         self.advance_scene_transition(frame.delta, &mut stats);
         stats.transition_active = self.scene_transition.is_some();
+        self.last_stats = stats.clone();
         record_runtime_stats(stats);
     }
 
@@ -1348,7 +1362,6 @@ mod tests {
 
     use super::{
         App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode, RuntimePhase,
-        latest_runtime_stats,
     };
     use crate::renderer::{
         FrameInfo, SceneProvider, ViewportSize, render_scene_update, render_to_buffer,
@@ -1398,7 +1411,7 @@ mod tests {
         );
 
         app.frame(frame(0));
-        let stats = latest_runtime_stats();
+        let stats = app.latest_stats();
 
         assert_eq!(
             stats.phase_order,
@@ -1441,7 +1454,7 @@ mod tests {
 
         app.frame(frame(0));
         app.frame(frame(1));
-        let stats = latest_runtime_stats();
+        let stats = app.latest_stats();
 
         assert!(!stats.phase_order.contains(&RuntimePhase::LayoutSync));
         assert!(stats.phase_order.contains(&RuntimePhase::RenderExtraction));
