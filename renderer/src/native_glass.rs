@@ -148,7 +148,7 @@ mod platform {
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject, Bool};
     use objc2::{MainThreadMarker, msg_send};
-    use objc2_core_foundation::{CFRetained, CGPoint, CGRect};
+    use objc2_core_foundation::{CFRetained, CGFloat, CGPoint, CGRect};
     use objc2_core_graphics::{
         CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage,
         CGImageAlphaInfo, CGImageByteOrderInfo, CGImageComponentInfo, CGImagePixelFormatInfo,
@@ -158,12 +158,12 @@ mod platform {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::Window;
 
-    use crate::{is_transparent, to_softbuffer_rgb_blue_noise};
+    use crate::{is_transparent, to_softbuffer_rgb_blue_noise, unpack_alpha8};
 
     const NS_VIEW_WIDTH_SIZABLE: NSUInteger = 2;
     const NS_VIEW_HEIGHT_SIZABLE: NSUInteger = 16;
     const NS_VISUAL_EFFECT_BLENDING_BEHIND_WINDOW: NSInteger = 0;
-    const NS_VISUAL_EFFECT_MATERIAL_UNDER_WINDOW_BACKGROUND: NSInteger = 21;
+    const NS_VISUAL_EFFECT_MATERIAL_HUD_WINDOW: NSInteger = 13;
     const NS_VISUAL_EFFECT_STATE_ACTIVE: NSInteger = 1;
 
     thread_local! {
@@ -172,8 +172,13 @@ mod platform {
 
     struct MacGlassState {
         view: Retained<AnyObject>,
+        view_alpha: CGFloat,
         effect_view: Retained<AnyObject>,
+        root_layer: Retained<CALayer>,
+        root_layer_was_opaque: bool,
+        tint_layer: Retained<CALayer>,
         overlay_layer: Retained<CALayer>,
+        hidden_sublayers: Vec<Retained<CALayer>>,
     }
 
     pub(super) fn apply(window: &Window, tint: Color) -> Result<bool, String> {
@@ -202,6 +207,10 @@ mod platform {
         let key = object_key(&ns_window);
         STATES.with(|states| {
             if let Some(state) = states.borrow_mut().remove(&key) {
+                restore_hidden_sublayers(&state.hidden_sublayers);
+                state.root_layer.setOpaque(state.root_layer_was_opaque);
+                let _: () = unsafe { msg_send![&*state.view, setAlphaValue: state.view_alpha] };
+                state.tint_layer.removeFromSuperlayer();
                 state.overlay_layer.removeFromSuperlayer();
                 let _: () = unsafe { msg_send![&*state.view, removeFromSuperview] };
                 let _: () = unsafe { msg_send![&*ns_window, setContentView: Some(&*state.view)] };
@@ -211,7 +220,7 @@ mod platform {
     }
 
     pub(super) fn requires_initial_transparency() -> bool {
-        false
+        true
     }
 
     pub(super) fn uses_custom_presenter() -> bool {
@@ -273,6 +282,7 @@ mod platform {
             .ok_or_else(|| "AppKit view handle was null".to_string())?;
         let view = unsafe { Retained::retain(view as *const _ as *mut AnyObject) }
             .ok_or_else(|| "failed to retain AppKit view".to_string())?;
+        let view_alpha: CGFloat = unsafe { msg_send![&*view, alphaValue] };
 
         let frame: CGRect = unsafe { msg_send![&*view, frame] };
         let effect_view = new_visual_effect_view(frame, tint)?;
@@ -296,21 +306,83 @@ mod platform {
         let root_layer: Option<Retained<CALayer>> = unsafe { msg_send![&*view, layer] };
         let root_layer =
             root_layer.ok_or_else(|| "failed to create AppKit view backing layer".to_string())?;
-        let overlay_layer = CALayer::new();
-        overlay_layer.setName(Some(ns_string!("cssimpler.native_glass.overlay")));
-        overlay_layer.setAnchorPoint(CGPoint::new(0.0, 0.0));
-        overlay_layer.setGeometryFlipped(true);
-        overlay_layer.setContentsGravity(unsafe { kCAGravityResize });
-        overlay_layer.setFrame(bounds);
-        overlay_layer.setZPosition(1_000_000.0);
-        overlay_layer.setContentsScale(window.scale_factor());
-        root_layer.addSublayer(&overlay_layer);
+        let root_layer_was_opaque = root_layer.isOpaque();
+        root_layer.setOpaque(false);
+        let hidden_sublayers = hide_existing_sublayers(&root_layer);
+
+        let effect_layer: Option<Retained<CALayer>> = unsafe { msg_send![&*effect_view, layer] };
+        let effect_layer = effect_layer
+            .ok_or_else(|| "failed to create native glass effect backing layer".to_string())?;
+        effect_layer.setOpaque(false);
+
+        let tint_layer = new_presenter_layer(
+            ns_string!("cssimpler.native_glass.tint"),
+            bounds,
+            999_999.0,
+            window.scale_factor(),
+        );
+        let overlay_layer = new_presenter_layer(
+            ns_string!("cssimpler.native_glass.overlay"),
+            bounds,
+            1_000_000.0,
+            window.scale_factor(),
+        );
+        effect_layer.addSublayer(&tint_layer);
+        effect_layer.addSublayer(&overlay_layer);
+
+        let _: () = unsafe { msg_send![&*view, setAlphaValue: 0.0 as CGFloat] };
 
         Ok(MacGlassState {
             view,
+            view_alpha,
             effect_view,
+            root_layer,
+            root_layer_was_opaque,
+            tint_layer,
             overlay_layer,
+            hidden_sublayers,
         })
+    }
+
+    fn new_presenter_layer(
+        name: &objc2_foundation::NSString,
+        bounds: CGRect,
+        z_position: f64,
+        scale_factor: f64,
+    ) -> Retained<CALayer> {
+        let layer = CALayer::new();
+        layer.setName(Some(name));
+        layer.setOpaque(false);
+        layer.setAnchorPoint(CGPoint::new(0.0, 0.0));
+        layer.setGeometryFlipped(true);
+        layer.setContentsGravity(unsafe { kCAGravityResize });
+        layer.setFrame(bounds);
+        layer.setZPosition(z_position);
+        layer.setContentsScale(scale_factor);
+        layer
+    }
+
+    fn hide_existing_sublayers(root_layer: &CALayer) -> Vec<Retained<CALayer>> {
+        let Some(sublayers) = (unsafe { root_layer.sublayers() }) else {
+            return Vec::new();
+        };
+
+        let mut hidden_sublayers = Vec::new();
+        for index in 0..sublayers.len() {
+            let layer = sublayers.objectAtIndex(index);
+            if layer.isHidden() {
+                continue;
+            }
+            layer.setHidden(true);
+            hidden_sublayers.push(layer);
+        }
+        hidden_sublayers
+    }
+
+    fn restore_hidden_sublayers(sublayers: &[Retained<CALayer>]) {
+        for layer in sublayers {
+            layer.setHidden(false);
+        }
     }
 
     fn new_visual_effect_view(frame: CGRect, tint: Color) -> Result<Retained<AnyObject>, String> {
@@ -318,6 +390,7 @@ mod platform {
             .ok_or_else(|| "NSVisualEffectView is unavailable".to_string())?;
         let effect_view: Retained<AnyObject> = unsafe { msg_send![class, new] };
         let _: () = unsafe { msg_send![&*effect_view, setFrame: frame] };
+        let _: () = unsafe { msg_send![&*effect_view, setWantsLayer: Bool::YES] };
         let _: () = unsafe {
             msg_send![
                 &*effect_view,
@@ -332,7 +405,7 @@ mod platform {
         let _: () = unsafe {
             msg_send![
                 effect_view,
-                setMaterial: NS_VISUAL_EFFECT_MATERIAL_UNDER_WINDOW_BACKGROUND
+                setMaterial: NS_VISUAL_EFFECT_MATERIAL_HUD_WINDOW
             ]
         };
         let _: () = unsafe {
@@ -342,6 +415,7 @@ mod platform {
             ]
         };
         let _: () = unsafe { msg_send![effect_view, setState: NS_VISUAL_EFFECT_STATE_ACTIVE] };
+        let _: () = unsafe { msg_send![effect_view, setEmphasized: Bool::YES] };
     }
 
     fn ns_color(selector: &str) -> Result<Retained<AnyObject>, String> {
@@ -368,24 +442,36 @@ mod platform {
                 return Err("native glass presenter received a mismatched buffer".to_string());
             }
 
-            let bounds: CGRect = unsafe { msg_send![&*self.view, bounds] };
-            let image = create_alpha_image(buffer, width, height)?;
+            let bounds: CGRect = unsafe { msg_send![&*self.effect_view, bounds] };
+            let content_image =
+                create_alpha_image(buffer, width, height, AlphaImageLayer::Content)?;
+            let tint_image = create_alpha_image(buffer, width, height, AlphaImageLayer::Tint)?;
 
             CATransaction::begin();
             CATransaction::setDisableActions(true);
+            self.tint_layer.setFrame(bounds);
+            self.tint_layer.setContentsScale(scale_factor);
             self.overlay_layer.setFrame(bounds);
             self.overlay_layer.setContentsScale(scale_factor);
-            unsafe { self.overlay_layer.setContents(Some(image.as_ref())) };
+            unsafe { self.tint_layer.setContents(Some(tint_image.as_ref())) };
+            unsafe { self.overlay_layer.setContents(Some(content_image.as_ref())) };
             CATransaction::commit();
 
             Ok(())
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum AlphaImageLayer {
+        Content,
+        Tint,
+    }
+
     fn create_alpha_image(
         buffer: &[u32],
         width: usize,
         height: usize,
+        layer: AlphaImageLayer,
     ) -> Result<CFRetained<CGImage>, String> {
         unsafe extern "C-unwind" fn release(
             _info: *mut c_void,
@@ -404,7 +490,20 @@ mod platform {
                 if is_transparent(pixel) {
                     pixels.push(0);
                 } else {
-                    pixels.push(0xff00_0000 | to_softbuffer_rgb_blue_noise(pixel, column, row));
+                    let alpha = u32::from(unpack_alpha8(pixel));
+                    if alpha < 255 && matches!(layer, AlphaImageLayer::Content) {
+                        pixels.push(0);
+                        continue;
+                    }
+                    if alpha == 255 && matches!(layer, AlphaImageLayer::Tint) {
+                        pixels.push(0);
+                        continue;
+                    }
+                    let rgb = to_softbuffer_rgb_blue_noise(pixel, column, row);
+                    let red = ((rgb >> 16) & 0xff) * alpha / 255;
+                    let green = ((rgb >> 8) & 0xff) * alpha / 255;
+                    let blue = (rgb & 0xff) * alpha / 255;
+                    pixels.push((alpha << 24) | (red << 16) | (green << 8) | blue);
                 }
             }
         }

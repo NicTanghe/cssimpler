@@ -29,6 +29,15 @@ pub(crate) fn pack_linear_rgb(color: LinearRgba) -> u32 {
     )
 }
 
+pub(crate) fn pack_rgba(color: Color) -> u32 {
+    pack_internal_rgb_u10(
+        u8_to_u10_channel(color.r),
+        u8_to_u10_channel(color.g),
+        u8_to_u10_channel(color.b),
+        u8_to_u2_alpha(color.a),
+    )
+}
+
 pub(crate) fn pack_transparent() -> u32 {
     pack_internal_rgb_u10(0, 0, 0, 0)
 }
@@ -62,6 +71,10 @@ pub(crate) fn unpack_rgb10(pixel: u32) -> (u16, u16, u16) {
     )
 }
 
+pub(crate) fn unpack_alpha8(pixel: u32) -> u8 {
+    ((u32::from(extract_alpha(pixel)) * 255 + (TWO_BIT_MAX / 2)) / TWO_BIT_MAX) as u8
+}
+
 pub(crate) fn pack_softbuffer_rgb(color: Color) -> u32 {
     pack_softbuffer_channels(color.r, color.g, color.b)
 }
@@ -76,6 +89,10 @@ pub(crate) fn u8_to_u10_channel(channel: u8) -> u16 {
 
 pub(crate) fn u10_to_u8_channel(channel: u16) -> u8 {
     ((u32::from(channel).min(TEN_BIT_MAX) * 255 + (TEN_BIT_MAX / 2)) / TEN_BIT_MAX) as u8
+}
+
+fn u8_to_u2_alpha(alpha: u8) -> u16 {
+    ((u32::from(alpha) * TWO_BIT_MAX + 127) / 255) as u16
 }
 
 fn pack_internal_rgb_u10(red: u16, green: u16, blue: u16, alpha: u16) -> u32 {
@@ -126,7 +143,10 @@ fn linear_to_srgb_unit(value: f32) -> f32 {
 mod tests {
     use cssimpler_core::Color;
 
-    use super::{is_transparent, pack_rgb, pack_transparent, u8_to_u10_channel, unpack_rgb};
+    use super::{
+        is_transparent, pack_rgb, pack_rgba, pack_transparent, u8_to_u10_channel, unpack_alpha8,
+        unpack_rgb,
+    };
 
     #[test]
     fn pack_and_unpack_rgb_round_trips_8bit_inputs() {
@@ -158,5 +178,17 @@ mod tests {
     fn transparent_pixel_preserves_alpha_state() {
         assert!(is_transparent(pack_transparent()));
         assert!(!is_transparent(pack_rgb(Color::BLACK)));
+    }
+
+    #[test]
+    fn pack_rgba_preserves_quantized_alpha_state() {
+        let transparent = pack_rgba(Color::rgba(10, 20, 30, 0));
+        let translucent = pack_rgba(Color::rgba(10, 20, 30, 128));
+        let opaque = pack_rgba(Color::rgba(10, 20, 30, 255));
+
+        assert!(is_transparent(transparent));
+        assert!(!is_transparent(translucent));
+        assert_eq!(unpack_alpha8(opaque), 255);
+        assert!(unpack_alpha8(translucent) < 255);
     }
 }

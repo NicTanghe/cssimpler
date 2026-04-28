@@ -51,8 +51,8 @@ use softbuffer::SoftBufferError;
 use winit::error::{EventLoopError, OsError};
 
 pub(crate) use self::color::{
-    is_transparent, pack_linear_rgb, pack_rgb, pack_softbuffer_rgb, pack_transparent,
-    unpack_linear_rgb, unpack_rgb,
+    is_transparent, pack_linear_rgb, pack_rgb, pack_rgba, pack_softbuffer_rgb, pack_transparent,
+    unpack_alpha8, unpack_linear_rgb, unpack_rgb,
 };
 pub use self::input::{
     ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
@@ -135,6 +135,7 @@ struct PaintStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GlassRenderMode {
     Native,
+    NativeWithTint,
     Fallback,
 }
 
@@ -3370,6 +3371,17 @@ fn draw_glass_surface(
                 clip,
             );
         }
+        GlassRenderMode::NativeWithTint => {
+            fill_rounded_rect_with_native_glass_tint(
+                buffer,
+                width,
+                height,
+                fill_layout,
+                fill_radius,
+                glass_tint_or_default(node),
+                clip,
+            );
+        }
         GlassRenderMode::Fallback => {
             draw_rounded_rect(
                 buffer,
@@ -3408,6 +3420,16 @@ fn draw_glass_surface_transformed(
             matrix,
             clip_state,
         ),
+        GlassRenderMode::NativeWithTint => fill_transformed_rounded_rect_with_native_glass_tint(
+            buffer,
+            width,
+            height,
+            fill_layout,
+            fill_radius,
+            glass_tint_or_default(node),
+            matrix,
+            clip_state,
+        ),
         GlassRenderMode::Fallback => draw_transformed_rounded_rect(
             buffer,
             width,
@@ -3418,6 +3440,86 @@ fn draw_glass_surface_transformed(
             matrix,
             clip_state,
         ),
+    }
+}
+
+fn fill_rounded_rect_with_native_glass_tint(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: cssimpler_core::CornerRadius,
+    tint: Color,
+    clip: ClipRect,
+) {
+    let Some(bounds) = layout_clip(layout).intersect(clip) else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+
+    let tint = pack_rgba(tint);
+    let rows = current_render_buffer_rows();
+    let row_start = y0.max(rows.start.min(height) as i32);
+    let row_end = y1.min(rows.end.min(height) as i32);
+    if row_start >= row_end {
+        return;
+    }
+
+    if radius == cssimpler_core::CornerRadius::ZERO {
+        for y in row_start..row_end {
+            let local_row_start = (y as usize - rows.start) * width;
+            let start = local_row_start + x0 as usize;
+            let end = local_row_start + x1 as usize;
+            buffer[start..end].fill(tint);
+        }
+        return;
+    }
+
+    for y in row_start..row_end {
+        let local_row_start = (y as usize - rows.start) * width;
+        for x in x0..x1 {
+            if rounded_rect_coverage(layout, radius, clip, x, y) >= 128 {
+                buffer[local_row_start + x as usize] = tint;
+            }
+        }
+    }
+}
+
+fn fill_transformed_rounded_rect_with_native_glass_tint(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: cssimpler_core::CornerRadius,
+    tint: Color,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+    let Some(bounds) = transform_layout_bounds(layout, matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+
+    let tint = pack_rgba(tint);
+    let rows = current_render_buffer_rows();
+    let row_start = y0.max(rows.start.min(height) as i32);
+    let row_end = y1.min(rows.end.min(height) as i32);
+    for y in row_start..row_end {
+        let local_row_start = (y as usize - rows.start) * width;
+        for x in x0..x1 {
+            if transformed_rounded_rect_coverage(layout, radius, inverse, clip_state, x, y) >= 128 {
+                buffer[local_row_start + x as usize] = tint;
+            }
+        }
     }
 }
 
@@ -4687,10 +4789,10 @@ mod tests {
         coalesce_dirty_regions, dirty_job_group_rows, dirty_regions_between_scenes, dispatch_click,
         dispatch_hover_transition_events, dispatch_mouse_event, distribute_dirty_render_jobs,
         drawable_viewport_size, hit_test_element_path,
-        incremental_scene_passes_for_full_redraw_heuristic, is_transparent, pack_rgb,
+        incremental_scene_passes_for_full_redraw_heuristic, is_transparent, pack_rgb, pack_rgba,
         render_scene_update, render_scene_update_internal_from_roots, render_to_buffer,
         resize_buffer, scenes_match_visuals, should_full_redraw, should_present_frame,
-        should_present_scene, should_suspend_updates, unpack_rgb,
+        should_present_scene, should_suspend_updates, unpack_alpha8, unpack_rgb,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -5078,6 +5180,39 @@ mod tests {
         );
 
         assert!(is_transparent(buffer[6 * 16 + 6]));
+        assert_eq!(buffer[1], pack_rgb(Color::rgb(20, 28, 40)));
+    }
+
+    #[test]
+    fn alpha_presenter_native_glass_region_keeps_tint_alpha() {
+        let tint = Color::rgba(255, 255, 255, 128);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 16.0, 16.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(20, 28, 40)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(2.0, 2.0, 8.0, 10.0)).with_style(VisualStyle {
+                native_material: NativeMaterial::Glass,
+                glass_tint: Some(tint),
+                ..VisualStyle::default()
+            }),
+        ];
+        let extracted = ExtractedScene::from_render_roots(&scene);
+        let mut buffer = vec![0_u32; 16 * 16];
+
+        let _ = super::render_to_buffer_internal(
+            &extracted,
+            &mut buffer,
+            16,
+            16,
+            Color::BLACK,
+            GlassRenderMode::NativeWithTint,
+        );
+
+        let glass_pixel = buffer[6 * 16 + 6];
+        assert_eq!(glass_pixel, pack_rgba(tint));
+        assert!(!is_transparent(glass_pixel));
+        assert!(unpack_alpha8(glass_pixel) < 255);
         assert_eq!(buffer[1], pack_rgb(Color::rgb(20, 28, 40)));
     }
 
