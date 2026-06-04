@@ -71,6 +71,7 @@ pub(crate) fn unpack_rgb10(pixel: u32) -> (u16, u16, u16) {
     )
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn unpack_alpha8(pixel: u32) -> u8 {
     ((u32::from(extract_alpha(pixel)) * 255 + (TWO_BIT_MAX / 2)) / TWO_BIT_MAX) as u8
 }

@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cssimpler_core::{Color, ExtractedScene};
-use softbuffer::{Context, Rect, Surface};
+use softbuffer::{Context, Surface};
+#[cfg(test)]
+use softbuffer::Rect;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{
@@ -629,18 +631,10 @@ where
                             pack_softbuffer_rgb(self.config.clear_color),
                             self.native_glass_active,
                         );
-                        let present_result = if self.native_glass_active {
-                            let damage = non_transparent_damage_rects(
-                                &self.buffer,
-                                self.buffer_width,
-                                self.buffer_height,
-                                target_width,
-                                target_height,
-                            );
-                            target.present_with_damage(&damage)
-                        } else {
-                            target.present()
-                        };
+                        // Transparent pixels reveal native glass on Windows. Present the full
+                        // surface so cleared transparent regions also replace stale pixels
+                        // during resize and layout changes.
+                        let present_result = target.present();
                         if let Err(error) = present_result {
                             self.fail(event_loop, error);
                             return;
@@ -1034,6 +1028,7 @@ fn surface_pixel(
     }
 }
 
+#[cfg(test)]
 fn non_transparent_damage_rects(
     source: &[u32],
     source_width: usize,
@@ -1083,6 +1078,7 @@ fn non_transparent_damage_rects(
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg(test)]
 struct DamageRun {
     x0: usize,
     x1: usize,
@@ -1090,6 +1086,7 @@ struct DamageRun {
     y1: usize,
 }
 
+#[cfg(test)]
 impl DamageRun {
     fn into_rect(self) -> Option<Rect> {
         Some(Rect {

@@ -52,8 +52,10 @@ use winit::error::{EventLoopError, OsError};
 
 pub(crate) use self::color::{
     is_transparent, pack_linear_rgb, pack_rgb, pack_rgba, pack_softbuffer_rgb, pack_transparent,
-    unpack_alpha8, unpack_linear_rgb, unpack_rgb,
+    unpack_linear_rgb, unpack_rgb,
 };
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) use self::color::unpack_alpha8;
 pub use self::input::{
     ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
     PointerButton, PointerPosition, ScrollDelta, TextInputEvent, ViewportEvent,
