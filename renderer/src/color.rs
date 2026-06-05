@@ -71,7 +71,6 @@ pub(crate) fn unpack_rgb10(pixel: u32) -> (u16, u16, u16) {
     )
 }
 
-#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn unpack_alpha8(pixel: u32) -> u8 {
     ((u32::from(extract_alpha(pixel)) * 255 + (TWO_BIT_MAX / 2)) / TWO_BIT_MAX) as u8
 }
@@ -81,7 +80,7 @@ pub(crate) fn pack_softbuffer_rgb(color: Color) -> u32 {
 }
 
 pub(crate) fn pack_softbuffer_channels(red: u8, green: u8, blue: u8) -> u32 {
-    (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)
+    0xff00_0000 | (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)
 }
 
 pub(crate) fn u8_to_u10_channel(channel: u8) -> u16 {
@@ -145,8 +144,8 @@ mod tests {
     use cssimpler_core::Color;
 
     use super::{
-        is_transparent, pack_rgb, pack_rgba, pack_transparent, u8_to_u10_channel, unpack_alpha8,
-        unpack_rgb,
+        is_transparent, pack_rgb, pack_rgba, pack_softbuffer_rgb, pack_transparent,
+        u8_to_u10_channel, unpack_alpha8, unpack_rgb,
     };
 
     #[test]
@@ -191,5 +190,10 @@ mod tests {
         assert!(!is_transparent(translucent));
         assert_eq!(unpack_alpha8(opaque), 255);
         assert!(unpack_alpha8(translucent) < 255);
+    }
+
+    #[test]
+    fn softbuffer_pixels_are_opaque_for_transparent_windows() {
+        assert_eq!(pack_softbuffer_rgb(Color::rgb(10, 20, 30)), 0xff0a141e);
     }
 }

@@ -1,7 +1,8 @@
 use std::sync::OnceLock;
 
 use super::color::{
-    is_transparent, pack_softbuffer_channels, u8_to_u10_channel, u10_to_u8_channel, unpack_rgb10,
+    is_transparent, pack_softbuffer_channels, u8_to_u10_channel, u10_to_u8_channel, unpack_alpha8,
+    unpack_rgb10,
 };
 
 const TILE_WIDTH: usize = 8;
@@ -14,12 +15,52 @@ pub(crate) fn to_softbuffer_rgb_blue_noise(pixel: u32, x: usize, y: usize) -> u3
         return 0;
     }
 
+    let alpha = unpack_alpha8(pixel);
+    to_softbuffer_rgb_blue_noise_with_alpha(pixel, alpha, x, y)
+}
+
+pub(crate) fn to_softbuffer_rgb_blue_noise_with_alpha(
+    pixel: u32,
+    alpha: u8,
+    x: usize,
+    y: usize,
+) -> u32 {
+    if alpha == 0 {
+        return 0;
+    }
+
+    let (red, green, blue) = quantized_rgb(pixel, x, y);
+    if alpha == u8::MAX {
+        return pack_softbuffer_channels(red, green, blue);
+    }
+
+    let red = premultiply_channel(red, alpha);
+    let green = premultiply_channel(green, alpha);
+    let blue = premultiply_channel(blue, alpha);
+    (u32::from(alpha) << 24) | (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn to_softbuffer_unpremultiplied_rgb_blue_noise(pixel: u32, x: usize, y: usize) -> u32 {
+    if is_transparent(pixel) {
+        return 0;
+    }
+
+    let (red, green, blue) = quantized_rgb(pixel, x, y);
+    pack_softbuffer_channels(red, green, blue)
+}
+
+fn quantized_rgb(pixel: u32, x: usize, y: usize) -> (u8, u8, u8) {
     let (red10, green10, blue10) = unpack_rgb10(pixel);
     let red = quantize_channel_with_blue_noise(red10, threshold_at(x, y));
     let green =
         quantize_channel_with_blue_noise(green10, threshold_at(x + (TILE_WIDTH / 2), y + 1));
     let blue = quantize_channel_with_blue_noise(blue10, threshold_at(x + 1, y + (TILE_HEIGHT / 2)));
-    pack_softbuffer_channels(red, green, blue)
+    (red, green, blue)
+}
+
+fn premultiply_channel(channel: u8, alpha: u8) -> u8 {
+    ((u16::from(channel) * u16::from(alpha) + 127) / 255) as u8
 }
 
 fn threshold_at(x: usize, y: usize) -> u8 {

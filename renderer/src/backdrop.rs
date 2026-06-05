@@ -4,7 +4,7 @@ use super::shapes::{
     clip_pixel_bounds, layout_clip, rounded_rect_coverage, transformed_rounded_rect_coverage,
 };
 use super::transform::{AffineTransform, ClipState, transform_layout_bounds};
-use super::{ClipRect, buffer_pixel_index, pack_linear_rgb, unpack_rgb};
+use super::{ClipRect, buffer_pixel_index, pack_linear_rgb, set_current_alpha_at, unpack_rgb};
 
 pub(crate) fn draw_backdrop_blur(
     buffer: &mut [u32],
@@ -247,6 +247,7 @@ fn blend_backdrop_pixel(
     }
     if coverage == u8::MAX {
         buffer[index] = pack_linear_rgb(color);
+        set_current_alpha_at(index, u8::MAX);
         return;
     }
 
@@ -259,4 +260,5 @@ fn blend_backdrop_pixel(
         b: color.b * alpha + destination.b * inverse_alpha,
         a: 1.0,
     });
+    set_current_alpha_at(index, u8::MAX);
 }

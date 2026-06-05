@@ -261,6 +261,7 @@ fn draw_mask(
         let buffer_row_end = buffer_row_start + (local_x1 - local_x0);
         blend_mask_row(
             &mut buffer[buffer_row_start..buffer_row_end],
+            buffer_row_start,
             &mask.alpha[mask_row_start..mask_row_end],
             prepared_color,
             color.a,
@@ -321,8 +322,10 @@ fn draw_mask_transformed(
             }
 
             let row_start = (y as usize - rows.start) * width;
+            let buffer_start = row_start + x as usize;
             blend_mask_row(
-                &mut buffer[row_start + x as usize..row_start + x as usize + 1],
+                &mut buffer[buffer_start..buffer_start + 1],
+                buffer_start,
                 &[alpha],
                 prepared_color,
                 color.a,

@@ -50,17 +50,19 @@ use cssimpler_core::{
 use softbuffer::SoftBufferError;
 use winit::error::{EventLoopError, OsError};
 
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) use self::color::unpack_alpha8;
 pub(crate) use self::color::{
     is_transparent, pack_linear_rgb, pack_rgb, pack_rgba, pack_softbuffer_rgb, pack_transparent,
     unpack_linear_rgb, unpack_rgb,
 };
-#[cfg(any(test, target_os = "macos"))]
-pub(crate) use self::color::unpack_alpha8;
 pub use self::input::{
     ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
     PointerButton, PointerPosition, ScrollDelta, TextInputEvent, ViewportEvent,
 };
-pub(crate) use self::softbuffer_dither::to_softbuffer_rgb_blue_noise;
+pub(crate) use self::softbuffer_dither::{
+    to_softbuffer_rgb_blue_noise, to_softbuffer_rgb_blue_noise_with_alpha,
+};
 #[cfg(test)]
 use self::{
     shadow::cached_shadow_mask,
@@ -209,6 +211,13 @@ impl BufferRows {
 
 thread_local! {
     static RENDER_BUFFER_ROWS: Cell<BufferRows> = const { Cell::new(BufferRows::full()) };
+    static RENDER_ALPHA_TARGET: Cell<Option<AlphaTarget>> = const { Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+struct AlphaTarget {
+    ptr: *mut u8,
+    len: usize,
 }
 
 pub fn latest_frame_timing_stats() -> FrameTimingStats {
@@ -739,6 +748,63 @@ fn with_render_buffer_rows<T>(rows: BufferRows, render: impl FnOnce() -> T) -> T
 
 fn current_render_buffer_rows() -> BufferRows {
     RENDER_BUFFER_ROWS.with(|cell| cell.get())
+}
+
+fn with_render_alpha_target<T>(alpha: Option<&mut [u8]>, render: impl FnOnce() -> T) -> T {
+    struct RenderAlphaTargetReset<'a> {
+        cell: &'a Cell<Option<AlphaTarget>>,
+        previous: Option<AlphaTarget>,
+    }
+
+    impl Drop for RenderAlphaTargetReset<'_> {
+        fn drop(&mut self) {
+            self.cell.set(self.previous);
+        }
+    }
+
+    RENDER_ALPHA_TARGET.with(|cell| {
+        let previous = cell.replace(alpha.map(|alpha| AlphaTarget {
+            ptr: alpha.as_mut_ptr(),
+            len: alpha.len(),
+        }));
+        let _reset = RenderAlphaTargetReset { cell, previous };
+        render()
+    })
+}
+
+fn current_alpha_at(index: usize) -> Option<u8> {
+    RENDER_ALPHA_TARGET.with(|target| {
+        let target = target.get()?;
+        (index < target.len).then(|| unsafe { *target.ptr.add(index) })
+    })
+}
+
+fn set_current_alpha_at(index: usize, alpha: u8) {
+    RENDER_ALPHA_TARGET.with(|target| {
+        let Some(target) = target.get() else {
+            return;
+        };
+        if index < target.len {
+            unsafe {
+                *target.ptr.add(index) = alpha;
+            }
+        }
+    });
+}
+
+pub(crate) fn fill_current_alpha_span(start: usize, len: usize, alpha: u8) {
+    RENDER_ALPHA_TARGET.with(|target| {
+        let Some(target) = target.get() else {
+            return;
+        };
+        if start >= target.len {
+            return;
+        }
+        let end = start.saturating_add(len).min(target.len);
+        unsafe {
+            std::slice::from_raw_parts_mut(target.ptr.add(start), end - start).fill(alpha);
+        }
+    });
 }
 
 fn dirty_job_group_rows(jobs: &[DirtyRenderJob]) -> Option<BufferRows> {
@@ -1375,6 +1441,26 @@ fn render_to_buffer_internal(
     clear_color: Color,
     glass_mode: GlassRenderMode,
 ) -> PaintStats {
+    render_to_buffer_internal_with_alpha(
+        scene,
+        buffer,
+        width,
+        height,
+        clear_color,
+        glass_mode,
+        None,
+    )
+}
+
+fn render_to_buffer_internal_with_alpha(
+    scene: &ExtractedScene,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+    glass_mode: GlassRenderMode,
+    alpha_buffer: Option<&mut [u8]>,
+) -> PaintStats {
     render_to_buffer_internal_with_cached_bounds(
         scene,
         None,
@@ -1383,6 +1469,7 @@ fn render_to_buffer_internal(
         height,
         clear_color,
         glass_mode,
+        alpha_buffer,
     )
 }
 
@@ -1394,7 +1481,13 @@ fn render_to_buffer_internal_with_cached_bounds(
     height: usize,
     clear_color: Color,
     glass_mode: GlassRenderMode,
+    mut alpha_buffer: Option<&mut [u8]>,
 ) -> PaintStats {
+    debug_assert!(
+        alpha_buffer
+            .as_ref()
+            .is_none_or(|alpha| alpha.len() == buffer.len())
+    );
     let owned_bounds;
     let cached_bounds = if let Some(cached_bounds) = cached_bounds {
         cached_bounds
@@ -1402,10 +1495,11 @@ fn render_to_buffer_internal_with_cached_bounds(
         owned_bounds = cache_scene_subtree_bounds(&scene.roots);
         &owned_bounds
     };
-    let worker_count = if cached_bounds
-        .roots
-        .iter()
-        .any(|root| root.subtree_uses_backdrop_blur)
+    let worker_count = if alpha_buffer.is_some()
+        || cached_bounds
+            .roots
+            .iter()
+            .any(|root| root.subtree_uses_backdrop_blur)
     {
         1
     } else {
@@ -1420,6 +1514,7 @@ fn render_to_buffer_internal_with_cached_bounds(
             height,
             clear_color,
             glass_mode,
+            alpha_buffer.as_deref_mut(),
         );
     } else {
         render_to_buffer_parallel(
@@ -1454,13 +1549,25 @@ fn render_to_buffer_serial(
     height: usize,
     clear_color: Color,
     glass_mode: GlassRenderMode,
+    alpha_buffer: Option<&mut [u8]>,
 ) {
-    buffer.fill(pack_rgb(clear_color));
-    let clip = ClipRect::full(width as f32, height as f32);
+    with_render_alpha_target(alpha_buffer, || {
+        buffer.fill(pack_rgb(clear_color));
+        fill_current_alpha_span(0, buffer.len(), u8::MAX);
+        let clip = ClipRect::full(width as f32, height as f32);
 
-    for (node, cached_bounds) in scene.iter().zip(cached_bounds) {
-        draw_node_with_cached_bounds(node, cached_bounds, buffer, width, height, clip, glass_mode);
-    }
+        for (node, cached_bounds) in scene.iter().zip(cached_bounds) {
+            draw_node_with_cached_bounds(
+                node,
+                cached_bounds,
+                buffer,
+                width,
+                height,
+                clip,
+                glass_mode,
+            );
+        }
+    });
 }
 
 fn render_to_buffer_parallel(
@@ -1655,6 +1762,7 @@ fn render_scene_update_internal(
             height,
             clear_color,
             glass_mode,
+            None,
         );
         stats.dirty_regions = dirty_region_count;
         stats.dirty_jobs = incremental_dirty_jobs;
@@ -2012,44 +2120,47 @@ fn redraw_auto_scroll_indicator_regions(
     height: usize,
     clear_color: Color,
     glass_mode: GlassRenderMode,
+    alpha_buffer: Option<&mut [u8]>,
 ) {
-    let cached_bounds = cache_scene_subtree_bounds(scene);
-    let mut bounds = Vec::new();
-    if let Some(previous_indicator) = previous_indicator {
-        bounds.push(scrollbar::auto_scroll_indicator_bounds(previous_indicator));
-    }
-    if let Some(indicator) = indicator {
-        let indicator_bounds = scrollbar::auto_scroll_indicator_bounds(indicator);
-        if !bounds.iter().any(|existing| *existing == indicator_bounds) {
-            bounds.push(indicator_bounds);
+    with_render_alpha_target(alpha_buffer, || {
+        let cached_bounds = cache_scene_subtree_bounds(scene);
+        let mut bounds = Vec::new();
+        if let Some(previous_indicator) = previous_indicator {
+            bounds.push(scrollbar::auto_scroll_indicator_bounds(previous_indicator));
         }
-    }
+        if let Some(indicator) = indicator {
+            let indicator_bounds = scrollbar::auto_scroll_indicator_bounds(indicator);
+            if !bounds.iter().any(|existing| *existing == indicator_bounds) {
+                bounds.push(indicator_bounds);
+            }
+        }
 
-    let full_clip = ClipRect::full(width as f32, height as f32);
-    for bounds in bounds {
-        let Some(clip) = full_clip
-            .intersect(layout_clip(bounds))
-            .and_then(|clip| snap_clip_to_pixel_grid(clip, width, height))
-        else {
-            continue;
-        };
-        clear_clip(buffer, width, height, clip, clear_color);
-        let root_indices = root_indices_intersecting_clip(&cached_bounds.roots, clip);
-        draw_cached_root_indices(
-            scene,
-            &cached_bounds.roots,
-            &root_indices,
-            buffer,
-            width,
-            height,
-            clip,
-            glass_mode,
-        );
-    }
+        let full_clip = ClipRect::full(width as f32, height as f32);
+        for bounds in bounds {
+            let Some(clip) = full_clip
+                .intersect(layout_clip(bounds))
+                .and_then(|clip| snap_clip_to_pixel_grid(clip, width, height))
+            else {
+                continue;
+            };
+            clear_clip(buffer, width, height, clip, clear_color);
+            let root_indices = root_indices_intersecting_clip(&cached_bounds.roots, clip);
+            draw_cached_root_indices(
+                scene,
+                &cached_bounds.roots,
+                &root_indices,
+                buffer,
+                width,
+                height,
+                clip,
+                glass_mode,
+            );
+        }
 
-    if let Some(indicator) = indicator {
-        scrollbar::draw_auto_scroll_indicator(indicator, buffer, width, height);
-    }
+        if let Some(indicator) = indicator {
+            scrollbar::draw_auto_scroll_indicator(indicator, buffer, width, height);
+        }
+    });
 }
 
 fn scenes_match_visuals(left: &[RenderNode], right: &[RenderNode]) -> bool {
@@ -3461,6 +3572,7 @@ fn fill_rounded_rect_with_native_glass_tint(
         return;
     };
 
+    let tint_alpha = tint.a;
     let tint = pack_rgba(tint);
     let rows = current_render_buffer_rows();
     let row_start = y0.max(rows.start.min(height) as i32);
@@ -3475,6 +3587,7 @@ fn fill_rounded_rect_with_native_glass_tint(
             let start = local_row_start + x0 as usize;
             let end = local_row_start + x1 as usize;
             buffer[start..end].fill(tint);
+            fill_current_alpha_span(start, end - start, tint_alpha);
         }
         return;
     }
@@ -3483,7 +3596,9 @@ fn fill_rounded_rect_with_native_glass_tint(
         let local_row_start = (y as usize - rows.start) * width;
         for x in x0..x1 {
             if rounded_rect_coverage(layout, radius, clip, x, y) >= 128 {
-                buffer[local_row_start + x as usize] = tint;
+                let index = local_row_start + x as usize;
+                buffer[index] = tint;
+                set_current_alpha_at(index, tint_alpha);
             }
         }
     }
@@ -3511,6 +3626,7 @@ fn fill_transformed_rounded_rect_with_native_glass_tint(
         return;
     };
 
+    let tint_alpha = tint.a;
     let tint = pack_rgba(tint);
     let rows = current_render_buffer_rows();
     let row_start = y0.max(rows.start.min(height) as i32);
@@ -3519,7 +3635,9 @@ fn fill_transformed_rounded_rect_with_native_glass_tint(
         let local_row_start = (y as usize - rows.start) * width;
         for x in x0..x1 {
             if transformed_rounded_rect_coverage(layout, radius, inverse, clip_state, x, y) >= 128 {
-                buffer[local_row_start + x as usize] = tint;
+                let index = local_row_start + x as usize;
+                buffer[index] = tint;
+                set_current_alpha_at(index, tint_alpha);
             }
         }
     }
@@ -3554,6 +3672,7 @@ fn clear_rounded_rect_to_transparent(
             let start = local_row_start + x0 as usize;
             let end = local_row_start + x1 as usize;
             buffer[start..end].fill(clear);
+            fill_current_alpha_span(start, end - start, 0);
         }
         return;
     }
@@ -3562,7 +3681,9 @@ fn clear_rounded_rect_to_transparent(
         let local_row_start = (y as usize - rows.start) * width;
         for x in x0..x1 {
             if rounded_rect_coverage(layout, radius, clip, x, y) >= 128 {
-                buffer[local_row_start + x as usize] = clear;
+                let index = local_row_start + x as usize;
+                buffer[index] = clear;
+                set_current_alpha_at(index, 0);
             }
         }
     }
@@ -3597,7 +3718,9 @@ fn clear_transformed_rounded_rect_to_transparent(
         let local_row_start = (y as usize - rows.start) * width;
         for x in x0..x1 {
             if transformed_rounded_rect_coverage(layout, radius, inverse, clip_state, x, y) >= 128 {
-                buffer[local_row_start + x as usize] = clear;
+                let index = local_row_start + x as usize;
+                buffer[index] = clear;
+                set_current_alpha_at(index, 0);
             }
         }
     }
@@ -4393,6 +4516,7 @@ fn clear_clip_packed(buffer: &mut [u32], width: usize, height: usize, clip: Clip
         let start = local_row_start + x0 as usize;
         let end = local_row_start + x1 as usize;
         buffer[start..end].fill(clear);
+        fill_current_alpha_span(start, end - start, u8::MAX);
     }
 }
 
@@ -4461,6 +4585,7 @@ fn blend_pixel(buffer: &mut [u32], width: usize, height: usize, x: i32, y: i32, 
     };
     if color.a == 255 {
         buffer[index] = pack_rgb(color);
+        set_current_alpha_at(index, u8::MAX);
         return;
     }
 
@@ -4484,6 +4609,7 @@ fn blend_prepared_pixel(
     };
     if color.linear.a >= 1.0 {
         buffer[index] = color.packed;
+        set_current_alpha_at(index, u8::MAX);
         return;
     }
 
@@ -4509,6 +4635,7 @@ fn blend_prepared_pixel_with_coverage(
     };
     blend_mask_row(
         &mut buffer[index..index + 1],
+        index,
         &[coverage],
         color,
         base_alpha,
@@ -4517,6 +4644,7 @@ fn blend_prepared_pixel_with_coverage(
 
 fn blend_mask_row(
     buffer_row: &mut [u32],
+    buffer_start: usize,
     coverages: &[u8],
     color: PreparedBlendColor,
     base_alpha: u8,
@@ -4534,7 +4662,7 @@ fn blend_mask_row(
         if std::is_x86_feature_detected!("sse2") {
             // SAFETY: The call is gated behind a runtime SSE2 feature check.
             unsafe {
-                blend_mask_row_sse2(buffer_row, coverages, color, base_alpha);
+                blend_mask_row_sse2(buffer_row, buffer_start, coverages, color, base_alpha);
             }
             return;
         }
@@ -4544,7 +4672,7 @@ fn blend_mask_row(
     {
         // SAFETY: NEON is part of the AArch64 baseline ISA.
         unsafe {
-            blend_mask_row_neon(buffer_row, coverages, color, base_alpha);
+            blend_mask_row_neon(buffer_row, buffer_start, coverages, color, base_alpha);
         }
         return;
     }
@@ -4554,46 +4682,71 @@ fn blend_mask_row(
         if std::arch::is_arm_feature_detected!("neon") {
             // SAFETY: The call is gated behind a runtime NEON feature check.
             unsafe {
-                blend_mask_row_neon(buffer_row, coverages, color, base_alpha);
+                blend_mask_row_neon(buffer_row, buffer_start, coverages, color, base_alpha);
             }
             return;
         }
     }
 
-    blend_mask_row_scalar(buffer_row, coverages, color, base_alpha);
+    blend_mask_row_scalar(buffer_row, buffer_start, coverages, color, base_alpha);
 }
 
 fn blend_mask_row_scalar(
     buffer_row: &mut [u32],
+    buffer_start: usize,
     coverages: &[u8],
     color: PreparedBlendColor,
     base_alpha: u8,
 ) {
-    for (pixel, &coverage) in buffer_row.iter_mut().zip(coverages) {
+    for (offset, (pixel, &coverage)) in buffer_row.iter_mut().zip(coverages).enumerate() {
         let alpha = scale_alpha(coverage, base_alpha);
         if alpha == 0 {
             continue;
         }
         if alpha == u8::MAX {
             *pixel = color.packed;
+            set_current_alpha_at(buffer_start + offset, u8::MAX);
             continue;
         }
 
         let alpha = alpha as f32 / 255.0;
         let inverse_alpha = 1.0 - alpha;
         let destination = unpack_linear_rgb(*pixel);
+        let Some(destination_alpha) =
+            current_alpha_at(buffer_start + offset).map(|alpha| f32::from(alpha) / 255.0)
+        else {
+            *pixel = pack_linear_rgb(LinearRgba {
+                r: color.linear.r * alpha + destination.r * inverse_alpha,
+                g: color.linear.g * alpha + destination.g * inverse_alpha,
+                b: color.linear.b * alpha + destination.b * inverse_alpha,
+                a: 1.0,
+            });
+            continue;
+        };
+        let output_alpha = alpha + destination_alpha * inverse_alpha;
+        if output_alpha <= f32::EPSILON {
+            *pixel = pack_transparent();
+            set_current_alpha_at(buffer_start + offset, 0);
+            continue;
+        }
+
         *pixel = pack_linear_rgb(LinearRgba {
-            r: color.linear.r * alpha + destination.r * inverse_alpha,
-            g: color.linear.g * alpha + destination.g * inverse_alpha,
-            b: color.linear.b * alpha + destination.b * inverse_alpha,
+            r: (color.linear.r * alpha + destination.r * destination_alpha * inverse_alpha)
+                / output_alpha,
+            g: (color.linear.g * alpha + destination.g * destination_alpha * inverse_alpha)
+                / output_alpha,
+            b: (color.linear.b * alpha + destination.b * destination_alpha * inverse_alpha)
+                / output_alpha,
             a: 1.0,
         });
+        set_current_alpha_at(buffer_start + offset, alpha_to_u8(output_alpha));
     }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn blend_mask_row_sse2(
     buffer_row: &mut [u32],
+    buffer_start: usize,
     coverages: &[u8],
     color: PreparedBlendColor,
     base_alpha: u8,
@@ -4618,6 +4771,7 @@ unsafe fn blend_mask_row_sse2(
         let chunk_end = index + 16;
         blend_mask_row_scalar(
             &mut buffer_row[index..chunk_end],
+            buffer_start + index,
             &coverages[index..chunk_end],
             color,
             base_alpha,
@@ -4628,6 +4782,7 @@ unsafe fn blend_mask_row_sse2(
     if index < coverages.len() {
         blend_mask_row_scalar(
             &mut buffer_row[index..],
+            buffer_start + index,
             &coverages[index..],
             color,
             base_alpha,
@@ -4638,6 +4793,7 @@ unsafe fn blend_mask_row_sse2(
 #[cfg(target_arch = "aarch64")]
 unsafe fn blend_mask_row_neon(
     buffer_row: &mut [u32],
+    buffer_start: usize,
     coverages: &[u8],
     color: PreparedBlendColor,
     base_alpha: u8,
@@ -4661,6 +4817,7 @@ unsafe fn blend_mask_row_neon(
         let chunk_end = index + 16;
         blend_mask_row_scalar(
             &mut buffer_row[index..chunk_end],
+            buffer_start + index,
             &coverages[index..chunk_end],
             color,
             base_alpha,
@@ -4671,6 +4828,7 @@ unsafe fn blend_mask_row_neon(
     if index < coverages.len() {
         blend_mask_row_scalar(
             &mut buffer_row[index..],
+            buffer_start + index,
             &coverages[index..],
             color,
             base_alpha,
@@ -4682,6 +4840,7 @@ unsafe fn blend_mask_row_neon(
 #[target_feature(enable = "neon")]
 unsafe fn blend_mask_row_neon(
     buffer_row: &mut [u32],
+    buffer_start: usize,
     coverages: &[u8],
     color: PreparedBlendColor,
     base_alpha: u8,
@@ -4703,6 +4862,7 @@ unsafe fn blend_mask_row_neon(
         let chunk_end = index + 16;
         blend_mask_row_scalar(
             &mut buffer_row[index..chunk_end],
+            buffer_start + index,
             &coverages[index..chunk_end],
             color,
             base_alpha,
@@ -4713,6 +4873,7 @@ unsafe fn blend_mask_row_neon(
     if index < coverages.len() {
         blend_mask_row_scalar(
             &mut buffer_row[index..],
+            buffer_start + index,
             &coverages[index..],
             color,
             base_alpha,
@@ -4738,27 +4899,63 @@ fn blend_linear_over(buffer: &mut [u32], index: usize, source: LinearRgba) {
     let destination = unpack_linear_rgb(buffer[index]);
     let alpha = source.a;
     let inverse_alpha = 1.0 - alpha;
-    let blended = LinearRgba {
-        r: source.r * alpha + destination.r * inverse_alpha,
-        g: source.g * alpha + destination.g * inverse_alpha,
-        b: source.b * alpha + destination.b * inverse_alpha,
-        a: 1.0,
+    let Some(destination_alpha) = current_alpha_at(index).map(|alpha| f32::from(alpha) / 255.0)
+    else {
+        buffer[index] = pack_linear_rgb(LinearRgba {
+            r: source.r * alpha + destination.r * inverse_alpha,
+            g: source.g * alpha + destination.g * inverse_alpha,
+            b: source.b * alpha + destination.b * inverse_alpha,
+            a: 1.0,
+        });
+        return;
     };
+    let output_alpha = alpha + destination_alpha * inverse_alpha;
+    if output_alpha <= f32::EPSILON {
+        buffer[index] = pack_transparent();
+        set_current_alpha_at(index, 0);
+        return;
+    }
 
-    buffer[index] = pack_linear_rgb(blended);
+    buffer[index] = pack_linear_rgb(LinearRgba {
+        r: (source.r * alpha + destination.r * destination_alpha * inverse_alpha) / output_alpha,
+        g: (source.g * alpha + destination.g * destination_alpha * inverse_alpha) / output_alpha,
+        b: (source.b * alpha + destination.b * destination_alpha * inverse_alpha) / output_alpha,
+        a: output_alpha,
+    });
+    set_current_alpha_at(index, alpha_to_u8(output_alpha));
 }
 
 fn blend_premultiplied_linear_over(buffer: &mut [u32], index: usize, source: LinearRgba) {
     let destination = unpack_linear_rgb(buffer[index]);
     let inverse_alpha = 1.0 - source.a;
-    let blended = LinearRgba {
-        r: source.r + destination.r * inverse_alpha,
-        g: source.g + destination.g * inverse_alpha,
-        b: source.b + destination.b * inverse_alpha,
-        a: 1.0,
+    let Some(destination_alpha) = current_alpha_at(index).map(|alpha| f32::from(alpha) / 255.0)
+    else {
+        buffer[index] = pack_linear_rgb(LinearRgba {
+            r: source.r + destination.r * inverse_alpha,
+            g: source.g + destination.g * inverse_alpha,
+            b: source.b + destination.b * inverse_alpha,
+            a: 1.0,
+        });
+        return;
     };
+    let output_alpha = source.a + destination_alpha * inverse_alpha;
+    if output_alpha <= f32::EPSILON {
+        buffer[index] = pack_transparent();
+        set_current_alpha_at(index, 0);
+        return;
+    }
 
-    buffer[index] = pack_linear_rgb(blended);
+    buffer[index] = pack_linear_rgb(LinearRgba {
+        r: (source.r + destination.r * destination_alpha * inverse_alpha) / output_alpha,
+        g: (source.g + destination.g * destination_alpha * inverse_alpha) / output_alpha,
+        b: (source.b + destination.b * destination_alpha * inverse_alpha) / output_alpha,
+        a: output_alpha,
+    });
+    set_current_alpha_at(index, alpha_to_u8(output_alpha));
+}
+
+fn alpha_to_u8(alpha: f32) -> u8 {
+    (alpha.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn scale_alpha(coverage: u8, alpha: u8) -> u8 {
@@ -5018,6 +5215,7 @@ mod tests {
             96,
             Color::BLACK,
             GlassRenderMode::Fallback,
+            None,
         );
         super::render_to_buffer_parallel(
             &scene,
@@ -5111,8 +5309,8 @@ mod tests {
         ];
         let color = super::PreparedBlendColor::new(Color::rgba(56, 189, 248, 212));
 
-        super::blend_mask_row_scalar(&mut expected, &coverages, color, 180);
-        super::blend_mask_row(&mut accelerated, &coverages, color, 180);
+        super::blend_mask_row_scalar(&mut expected, 0, &coverages, color, 180);
+        super::blend_mask_row(&mut accelerated, 0, &coverages, color, 180);
 
         assert_eq!(accelerated, expected);
     }
@@ -5216,6 +5414,41 @@ mod tests {
         assert!(!is_transparent(glass_pixel));
         assert!(unpack_alpha8(glass_pixel) < 255);
         assert_eq!(buffer[1], pack_rgb(Color::rgb(20, 28, 40)));
+    }
+
+    #[test]
+    fn alpha_buffer_keeps_native_glass_tint_alpha_at_eight_bits() {
+        let tint = Color::rgba(255, 255, 255, 17);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 16.0, 16.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(20, 28, 40)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(2.0, 2.0, 8.0, 10.0)).with_style(VisualStyle {
+                native_material: NativeMaterial::Glass,
+                glass_tint: Some(tint),
+                ..VisualStyle::default()
+            }),
+        ];
+        let extracted = ExtractedScene::from_render_roots(&scene);
+        let mut buffer = vec![0_u32; 16 * 16];
+        let mut alpha = vec![u8::MAX; 16 * 16];
+
+        let _ = super::render_to_buffer_internal_with_alpha(
+            &extracted,
+            &mut buffer,
+            16,
+            16,
+            Color::BLACK,
+            GlassRenderMode::NativeWithTint,
+            Some(&mut alpha),
+        );
+
+        let glass_index = 6 * 16 + 6;
+        assert_eq!(alpha[glass_index], tint.a);
+        assert_eq!(unpack_rgb(buffer[glass_index]), Color::rgb(255, 255, 255));
+        assert_eq!(unpack_alpha8(buffer[glass_index]), 0);
+        assert_eq!(alpha[1], u8::MAX);
     }
 
     #[test]

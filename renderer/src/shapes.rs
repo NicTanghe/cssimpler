@@ -2,7 +2,7 @@ use cssimpler_core::{Color, CornerRadius, Insets, LayoutBox};
 
 use super::{
     ClipRect, PreparedBlendColor, blend_prepared_pixel_with_coverage, current_render_buffer_rows,
-    pack_rgb,
+    fill_current_alpha_span, pack_rgb,
     transform::{AffineTransform, ClipState},
 };
 
@@ -480,7 +480,10 @@ pub(crate) fn fill_opaque_span_rows(
             continue;
         }
         let row_start = (y - rows.start) * width;
-        buffer[row_start + x0 as usize..row_start + x1 as usize].fill(packed);
+        let start = row_start + x0 as usize;
+        let end = row_start + x1 as usize;
+        buffer[start..end].fill(packed);
+        fill_current_alpha_span(start, end - start, u8::MAX);
     }
 }
 

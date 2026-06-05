@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cssimpler_core::{Color, ExtractedScene};
-use softbuffer::{Context, Surface};
 #[cfg(test)]
 use softbuffer::Rect;
+use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{
@@ -28,8 +28,9 @@ use super::{
     dispatch_hover_transition_events, dispatch_mouse_event, drawable_viewport_size, duration_to_us,
     is_transparent, native_glass, pack_softbuffer_rgb, record_frame_timing_stats,
     redraw_auto_scroll_indicator_regions, render_scene_update_internal, render_to_buffer_internal,
-    resize_buffer, scrollbar, settle_element_interaction, should_present_frame,
-    should_suspend_updates, to_softbuffer_rgb_blue_noise,
+    render_to_buffer_internal_with_alpha, resize_buffer, scrollbar, settle_element_interaction,
+    should_present_frame, should_suspend_updates, to_softbuffer_rgb_blue_noise,
+    to_softbuffer_rgb_blue_noise_with_alpha,
 };
 
 const DEFAULT_NATIVE_GLASS_TINT: Color = Color::rgba(245, 250, 255, 128);
@@ -54,6 +55,7 @@ struct RuntimeApp<P> {
     window_id: Option<WindowId>,
     fatal_error: Option<RendererError>,
     buffer: Vec<u32>,
+    alpha_buffer: Vec<u8>,
     buffer_width: usize,
     buffer_height: usize,
     frame_index: u64,
@@ -100,6 +102,7 @@ where
             window_id: None,
             fatal_error: None,
             buffer: Vec::new(),
+            alpha_buffer: Vec::new(),
             buffer_width: 0,
             buffer_height: 0,
             frame_index: 0,
@@ -539,6 +542,13 @@ where
         let extracted_scene = ExtractedScene::from_render_roots(&scene);
         self.sync_native_glass(&extracted_scene);
         let glass_mode = self.glass_render_mode();
+        let use_alpha_buffer = self.native_glass_active;
+        if use_alpha_buffer {
+            self.alpha_buffer.resize(
+                self.buffer_width.saturating_mul(self.buffer_height),
+                u8::MAX,
+            );
+        }
 
         if should_present_frame(
             self.previous_presented_scene.as_ref(),
@@ -548,7 +558,17 @@ where
             resized,
         ) {
             let paint_start = Instant::now();
-            let paint_stats = if resized {
+            let paint_stats = if use_alpha_buffer {
+                render_to_buffer_internal_with_alpha(
+                    &extracted_scene,
+                    &mut self.buffer,
+                    self.buffer_width,
+                    self.buffer_height,
+                    self.config.clear_color,
+                    glass_mode,
+                    Some(&mut self.alpha_buffer),
+                )
+            } else if resized {
                 render_to_buffer_internal(
                     &extracted_scene,
                     &mut self.buffer,
@@ -597,6 +617,11 @@ where
                 self.buffer_height,
                 self.config.clear_color,
                 glass_mode,
+                if use_alpha_buffer {
+                    Some(&mut self.alpha_buffer)
+                } else {
+                    None
+                },
             );
             if self.native_glass_active && native_glass::uses_custom_presenter() {
                 let Some(window) = self.window.as_ref() else {
@@ -605,6 +630,7 @@ where
                 match native_glass::present(
                     window,
                     &self.buffer,
+                    Some(self.alpha_buffer.as_slice()),
                     self.buffer_width,
                     self.buffer_height,
                     self.scale_factor,
@@ -628,6 +654,11 @@ where
                             &self.buffer,
                             self.buffer_width,
                             self.buffer_height,
+                            if self.native_glass_active {
+                                Some(self.alpha_buffer.as_slice())
+                            } else {
+                                None
+                            },
                             pack_softbuffer_rgb(self.config.clear_color),
                             self.native_glass_active,
                         );
@@ -978,19 +1009,27 @@ fn copy_render_buffer_into_surface(
     source: &[u32],
     source_width: usize,
     source_height: usize,
+    source_alpha: Option<&[u8]>,
     clear: u32,
     preserve_transparency: bool,
 ) {
     debug_assert_eq!(target.len(), target_width.saturating_mul(target_height));
     debug_assert_eq!(source.len(), source_width.saturating_mul(source_height));
+    debug_assert!(source_alpha.is_none_or(|alpha| alpha.len() == source.len()));
 
     if target_width == source_width && target_height == source_height {
         for row in 0..source_height {
             let row_start = row * source_width;
             for column in 0..source_width {
                 let index = row_start + column;
-                target[index] =
-                    surface_pixel(source[index], column, row, clear, preserve_transparency);
+                target[index] = surface_pixel(
+                    source[index],
+                    source_alpha.map(|alpha| alpha[index]),
+                    column,
+                    row,
+                    clear,
+                    preserve_transparency,
+                );
             }
         }
         return;
@@ -1003,8 +1042,10 @@ fn copy_render_buffer_into_surface(
         let src_row = row * source_width;
         let dst_row = row * target_width;
         for column in 0..copy_width {
+            let source_index = src_row + column;
             target[dst_row + column] = surface_pixel(
-                source[src_row + column],
+                source[source_index],
+                source_alpha.map(|alpha| alpha[source_index]),
                 column,
                 row,
                 clear,
@@ -1016,11 +1057,19 @@ fn copy_render_buffer_into_surface(
 
 fn surface_pixel(
     pixel: u32,
+    alpha: Option<u8>,
     column: usize,
     row: usize,
     clear: u32,
     preserve_transparency: bool,
 ) -> u32 {
+    if let Some(alpha) = alpha {
+        if alpha == 0 {
+            return if preserve_transparency { 0 } else { clear };
+        }
+        return to_softbuffer_rgb_blue_noise_with_alpha(pixel, alpha, column, row);
+    }
+
     if is_transparent(pixel) && !preserve_transparency {
         clear
     } else {
@@ -1172,7 +1221,10 @@ mod tests {
     use crate::input::{
         ButtonState, KeyIdentity, KeyLocation, KeyboardModifiers, PointerButton, ScrollDelta,
     };
-    use crate::{pack_rgb, pack_transparent, to_softbuffer_rgb_blue_noise};
+    use crate::{
+        pack_rgb, pack_transparent, to_softbuffer_rgb_blue_noise,
+        to_softbuffer_rgb_blue_noise_with_alpha,
+    };
 
     use super::{
         copy_render_buffer_into_surface, non_transparent_damage_rects, normalize_button_state,
@@ -1264,7 +1316,7 @@ mod tests {
             pack_rgb(Color::rgb(16, 17, 18)),
         ];
         let mut target = vec![9; 10];
-        copy_render_buffer_into_surface(&mut target, 5, 2, &source, 3, 2, 0, false);
+        copy_render_buffer_into_surface(&mut target, 5, 2, &source, 3, 2, None, 0, false);
         assert_eq!(
             target,
             vec![
@@ -1295,7 +1347,7 @@ mod tests {
             pack_rgb(Color::rgb(22, 23, 24)),
         ];
         let mut target = vec![9; 6];
-        copy_render_buffer_into_surface(&mut target, 3, 2, &source, 4, 2, 0, false);
+        copy_render_buffer_into_surface(&mut target, 3, 2, &source, 4, 2, None, 0, false);
         assert_eq!(
             target,
             vec![
@@ -1319,7 +1371,7 @@ mod tests {
         ];
         let mut target = vec![clear; 3];
 
-        copy_render_buffer_into_surface(&mut target, 3, 1, &source, 3, 1, clear, true);
+        copy_render_buffer_into_surface(&mut target, 3, 1, &source, 3, 1, None, clear, true);
 
         assert_eq!(
             target,
@@ -1330,9 +1382,42 @@ mod tests {
             ]
         );
 
-        copy_render_buffer_into_surface(&mut target, 3, 1, &source, 3, 1, clear, false);
+        copy_render_buffer_into_surface(&mut target, 3, 1, &source, 3, 1, None, clear, false);
 
         assert_eq!(target[1], clear);
+    }
+
+    #[test]
+    fn blit_to_surface_uses_external_eight_bit_alpha() {
+        let source = vec![
+            pack_rgb(Color::rgb(100, 200, 50)),
+            pack_rgb(Color::rgb(20, 40, 80)),
+            pack_rgb(Color::rgb(1, 2, 3)),
+        ];
+        let alpha = [128, 0, 255];
+        let clear = 0x00ff00;
+        let mut target = vec![clear; 3];
+
+        copy_render_buffer_into_surface(
+            &mut target,
+            3,
+            1,
+            &source,
+            3,
+            1,
+            Some(&alpha),
+            clear,
+            true,
+        );
+
+        assert_eq!(
+            target,
+            vec![
+                to_softbuffer_rgb_blue_noise_with_alpha(source[0], alpha[0], 0, 0),
+                0,
+                to_softbuffer_rgb_blue_noise_with_alpha(source[2], alpha[2], 2, 0),
+            ]
+        );
     }
 
     #[test]

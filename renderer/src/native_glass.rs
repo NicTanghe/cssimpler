@@ -20,11 +20,12 @@ pub(crate) fn uses_custom_presenter() -> bool {
 pub(crate) fn present(
     window: &Window,
     buffer: &[u32],
+    alpha: Option<&[u8]>,
     width: usize,
     height: usize,
     scale_factor: f64,
 ) -> Result<bool, String> {
-    platform::present(window, buffer, width, height, scale_factor)
+    platform::present(window, buffer, alpha, width, height, scale_factor)
 }
 
 #[cfg(target_os = "windows")]
@@ -52,6 +53,7 @@ mod platform {
     pub(super) fn present(
         _window: &Window,
         _buffer: &[u32],
+        _alpha: Option<&[u8]>,
         _width: usize,
         _height: usize,
         _scale_factor: f64,
@@ -158,7 +160,10 @@ mod platform {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::Window;
 
-    use crate::{is_transparent, to_softbuffer_rgb_blue_noise, unpack_alpha8};
+    use crate::{
+        is_transparent, softbuffer_dither::to_softbuffer_unpremultiplied_rgb_blue_noise,
+        unpack_alpha8,
+    };
 
     const NS_VIEW_WIDTH_SIZABLE: NSUInteger = 2;
     const NS_VIEW_HEIGHT_SIZABLE: NSUInteger = 16;
@@ -230,6 +235,7 @@ mod platform {
     pub(super) fn present(
         window: &Window,
         buffer: &[u32],
+        alpha: Option<&[u8]>,
         width: usize,
         height: usize,
         scale_factor: f64,
@@ -242,7 +248,7 @@ mod platform {
             let state = states
                 .get_mut(&key)
                 .ok_or_else(|| "macOS native glass presenter was not installed".to_string())?;
-            state.present(buffer, width, height, scale_factor)
+            state.present(buffer, alpha, width, height, scale_factor)
         })?;
         Ok(true)
     }
@@ -431,6 +437,7 @@ mod platform {
         fn present(
             &mut self,
             buffer: &[u32],
+            alpha: Option<&[u8]>,
             width: usize,
             height: usize,
             scale_factor: f64,
@@ -441,11 +448,15 @@ mod platform {
             if buffer.len() != width.saturating_mul(height) {
                 return Err("native glass presenter received a mismatched buffer".to_string());
             }
+            if alpha.is_some_and(|alpha| alpha.len() != buffer.len()) {
+                return Err("native glass presenter received a mismatched alpha buffer".to_string());
+            }
 
             let bounds: CGRect = unsafe { msg_send![&*self.effect_view, bounds] };
             let content_image =
-                create_alpha_image(buffer, width, height, AlphaImageLayer::Content)?;
-            let tint_image = create_alpha_image(buffer, width, height, AlphaImageLayer::Tint)?;
+                create_alpha_image(buffer, alpha, width, height, AlphaImageLayer::Content)?;
+            let tint_image =
+                create_alpha_image(buffer, alpha, width, height, AlphaImageLayer::Tint)?;
 
             CATransaction::begin();
             CATransaction::setDisableActions(true);
@@ -469,6 +480,7 @@ mod platform {
 
     fn create_alpha_image(
         buffer: &[u32],
+        alpha: Option<&[u8]>,
         width: usize,
         height: usize,
         layer: AlphaImageLayer,
@@ -486,11 +498,20 @@ mod platform {
         let mut pixels = Vec::with_capacity(buffer.len());
         for row in 0..height {
             for column in 0..width {
-                let pixel = buffer[row * width + column];
-                if is_transparent(pixel) {
+                let index = row * width + column;
+                let pixel = buffer[index];
+                let alpha_value = alpha
+                    .map(|alpha| alpha[index])
+                    .unwrap_or_else(|| unpack_alpha8(pixel));
+                let transparent = if alpha.is_some() {
+                    alpha_value == 0
+                } else {
+                    alpha_value == 0 || is_transparent(pixel)
+                };
+                if transparent {
                     pixels.push(0);
                 } else {
-                    let alpha = u32::from(unpack_alpha8(pixel));
+                    let alpha = u32::from(alpha_value);
                     if alpha < 255 && matches!(layer, AlphaImageLayer::Content) {
                         pixels.push(0);
                         continue;
@@ -499,7 +520,7 @@ mod platform {
                         pixels.push(0);
                         continue;
                     }
-                    let rgb = to_softbuffer_rgb_blue_noise(pixel, column, row);
+                    let rgb = to_softbuffer_unpremultiplied_rgb_blue_noise(pixel, column, row);
                     let red = ((rgb >> 16) & 0xff) * alpha / 255;
                     let green = ((rgb >> 8) & 0xff) * alpha / 255;
                     let blue = (rgb & 0xff) * alpha / 255;
@@ -570,6 +591,7 @@ mod platform {
     pub(super) fn present(
         _window: &Window,
         _buffer: &[u32],
+        _alpha: Option<&[u8]>,
         _width: usize,
         _height: usize,
         _scale_factor: f64,
