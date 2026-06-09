@@ -12,6 +12,7 @@ use cssimpler_core::{
 use super::shapes::{pixel_bounds, rounded_rect_coverage, transformed_rounded_rect_coverage};
 use super::{
     ClipRect, blend_linear_over, clip_pixel_bounds, current_render_buffer_rows, pack_linear_rgb,
+    set_current_alpha_at,
     transform::{AffineTransform, ClipState, transform_layout_bounds},
 };
 
@@ -893,7 +894,9 @@ fn draw_cached_gradient_layer(
                     if source == 0 {
                         continue;
                     }
-                    buffer[dest_row_start + x as usize] = source;
+                    let buffer_index = dest_row_start + x as usize;
+                    buffer[buffer_index] = source;
+                    set_current_alpha_at(buffer_index, u8::MAX);
                 }
             }
         }
@@ -913,6 +916,7 @@ fn draw_cached_gradient_layer(
                     let buffer_index = dest_row_start + x as usize;
                     if alpha >= 1.0 - f32::EPSILON {
                         buffer[buffer_index] = pack_linear_rgb(LinearRgba { a: 1.0, ..source });
+                        set_current_alpha_at(buffer_index, u8::MAX);
                     } else {
                         blend_linear_over(buffer, buffer_index, LinearRgba { a: alpha, ..source });
                     }
@@ -1357,6 +1361,7 @@ fn blend_gradient_sample(
     let index = (y - rows.start) * width + x as usize;
     if alpha >= 1.0 - f32::EPSILON {
         buffer[index] = pack_linear_rgb(LinearRgba { a: 1.0, ..color });
+        set_current_alpha_at(index, u8::MAX);
     } else {
         blend_linear_over(buffer, index, LinearRgba { a: alpha, ..color });
     }
