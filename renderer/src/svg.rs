@@ -1,4 +1,6 @@
-use cssimpler_core::{LinearRgba, SvgBounds, SvgPathGeometry, SvgPoint, SvgScene, SvgViewBox};
+use cssimpler_core::{
+    LinearRgba, SvgBounds, SvgPathGeometry, SvgPathPaintSource, SvgPoint, SvgScene, SvgViewBox,
+};
 
 use super::{
     ClipRect, blend_linear_over, clip_pixel_bounds, current_render_buffer_rows,
@@ -74,9 +76,27 @@ fn draw_svg_scene_with_matrix(
             continue;
         };
 
-        let fill = path.paint.fill.map(|color| color.to_linear_rgba());
+        let fill = path
+            .paint
+            .fill
+            .as_ref()
+            .map(svg_paint_source_to_linear_rgba)
+            .transpose();
+        let fill = match fill {
+            Ok(fill) => fill,
+            Err(message) => panic!("{message}"),
+        };
         let stroke = if path.paint.stroke_width > f32::EPSILON {
-            path.paint.stroke.map(|color| color.to_linear_rgba())
+            let stroke = path
+                .paint
+                .stroke
+                .as_ref()
+                .map(svg_paint_source_to_linear_rgba)
+                .transpose();
+            match stroke {
+                Ok(stroke) => stroke,
+                Err(message) => panic!("{message}"),
+            }
         } else {
             None
         };
@@ -140,6 +160,16 @@ fn draw_svg_scene_with_matrix(
                 }
             }
         }
+    }
+}
+
+fn svg_paint_source_to_linear_rgba(paint: &SvgPathPaintSource) -> Result<LinearRgba, String> {
+    match paint {
+        SvgPathPaintSource::Color(color) => Ok(color.to_linear_rgba()),
+        SvgPathPaintSource::PaintServer(reference) => Err(format!(
+            "SVG paint-server rendering is not implemented for url(#{})",
+            reference.id
+        )),
     }
 }
 
@@ -298,7 +328,7 @@ fn point_segment_distance_sq(point: SvgPoint, start: SvgPoint, end: SvgPoint) ->
 mod tests {
     use cssimpler_core::{
         Color, LayoutBox, RenderNode, SvgContour, SvgPathGeometry, SvgPathInstance, SvgPathPaint,
-        SvgPoint, SvgScene, SvgViewBox,
+        SvgPathPaintSource, SvgPoint, SvgScene, SvgViewBox,
     };
 
     use super::super::{pack_rgb, render_to_buffer};
@@ -320,7 +350,7 @@ mod tests {
                         closed: true,
                     }]),
                     paint: SvgPathPaint {
-                        fill: Some(Color::rgb(37, 99, 235)),
+                        fill: Some(SvgPathPaintSource::Color(Color::rgb(37, 99, 235))),
                         stroke: None,
                         stroke_width: 0.0,
                     },
@@ -348,7 +378,7 @@ mod tests {
                     }]),
                     paint: SvgPathPaint {
                         fill: None,
-                        stroke: Some(Color::rgb(22, 163, 74)),
+                        stroke: Some(SvgPathPaintSource::Color(Color::rgb(22, 163, 74))),
                         stroke_width: 2.0,
                     },
                 }],

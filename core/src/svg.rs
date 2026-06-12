@@ -1,13 +1,14 @@
 use crate::Color;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SvgPaint {
     Color(Color),
     CurrentColor,
+    PaintServer(String),
     None,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SvgStyle {
     pub fill: Option<SvgPaint>,
     pub stroke: Option<SvgPaint>,
@@ -103,17 +104,40 @@ impl SvgPathGeometry {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum SvgPathPaintSource {
+    Color(Color),
+    PaintServer(SvgPaintServerReference),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SvgPaintServerReference {
+    pub id: String,
+    pub kind: SvgPaintServerKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SvgPaintServerKind {
+    LinearGradient,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SvgPaintServer {
+    pub id: String,
+    pub kind: SvgPaintServerKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct SvgPathPaint {
-    pub fill: Option<Color>,
-    pub stroke: Option<Color>,
+    pub fill: Option<SvgPathPaintSource>,
+    pub stroke: Option<SvgPathPaintSource>,
     pub stroke_width: f32,
 }
 
 impl Default for SvgPathPaint {
     fn default() -> Self {
         Self {
-            fill: Some(Color::BLACK),
+            fill: Some(SvgPathPaintSource::Color(Color::BLACK)),
             stroke: None,
             stroke_width: 1.0,
         }
@@ -143,18 +167,28 @@ impl SvgPathInstance {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SvgScene {
     pub view_box: SvgViewBox,
+    pub paint_servers: Vec<SvgPaintServer>,
     pub paths: Vec<SvgPathInstance>,
     pub bounds: Option<SvgBounds>,
 }
 
 impl SvgScene {
     pub fn new(view_box: SvgViewBox, paths: Vec<SvgPathInstance>) -> Self {
+        Self::with_paint_servers(view_box, Vec::new(), paths)
+    }
+
+    pub fn with_paint_servers(
+        view_box: SvgViewBox,
+        paint_servers: Vec<SvgPaintServer>,
+        paths: Vec<SvgPathInstance>,
+    ) -> Self {
         let bounds = paths
             .iter()
             .filter_map(SvgPathInstance::bounds)
             .reduce(SvgBounds::union);
         Self {
             view_box,
+            paint_servers,
             paths,
             bounds,
         }

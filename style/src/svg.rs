@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use cssimpler_core::{
     Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, Node, Style,
-    SvgContour, SvgPaint, SvgPathGeometry, SvgPathInstance, SvgPathPaint, SvgPoint, SvgScene,
+    SvgContour, SvgPaint, SvgPaintServer, SvgPaintServerKind, SvgPaintServerReference,
+    SvgPathGeometry, SvgPathInstance, SvgPathPaint, SvgPathPaintSource, SvgPoint, SvgScene,
     SvgStyle, SvgViewBox, fonts::TextStyle,
 };
 use lightningcss::properties::{Property, PropertyId};
@@ -15,7 +18,7 @@ pub(crate) struct ResolvedSvgRoot {
     pub(crate) scene: SvgScene,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SvgCascadeState {
     fill: SvgPaint,
     stroke: SvgPaint,
@@ -36,8 +39,41 @@ impl Default for SvgCascadeState {
     }
 }
 
+#[derive(Default)]
+struct SvgPaintServerRegistry {
+    servers: HashMap<String, SvgPaintServerKind>,
+}
+
+impl SvgPaintServerRegistry {
+    fn insert(&mut self, id: String, kind: SvgPaintServerKind) {
+        if self.servers.insert(id.clone(), kind).is_some() {
+            panic!("duplicate SVG paint-server id `{id}`");
+        }
+    }
+
+    fn resolve(&self, id: &str) -> SvgPaintServerReference {
+        let Some(kind) = self.servers.get(id).copied() else {
+            panic!("missing SVG paint-server id `{id}`");
+        };
+        SvgPaintServerReference {
+            id: id.to_string(),
+            kind,
+        }
+    }
+
+    fn into_paint_servers(self) -> Vec<SvgPaintServer> {
+        let mut paint_servers = self
+            .servers
+            .into_iter()
+            .map(|(id, kind)| SvgPaintServer { id, kind })
+            .collect::<Vec<_>>();
+        paint_servers.sort_by(|left, right| left.id.cmp(&right.id));
+        paint_servers
+    }
+}
+
 pub(crate) fn is_supported_svg_tag(tag: &str) -> bool {
-    matches!(tag, "svg" | "g" | "path" | "circle")
+    matches!(tag, "svg" | "defs" | "g" | "path" | "circle")
 }
 
 pub(crate) fn seed_element_style(element: &ElementNode) -> Style {
@@ -105,6 +141,8 @@ pub(crate) fn resolve_svg_root(
     child_ancestors.extend_from_slice(ancestors);
 
     let inherited_svg = svg_cascade_from_style(SvgCascadeState::default(), &style.visual.svg);
+    let mut paint_server_registry = SvgPaintServerRegistry::default();
+    collect_svg_paint_servers(element, &mut paint_server_registry);
     let mut paths = Vec::new();
     let mut child_index = 0;
     for child in &element.children {
@@ -123,16 +161,18 @@ pub(crate) fn resolve_svg_root(
                     &child_ancestors,
                     interaction,
                     &child_path,
-                    inherited_svg,
+                    inherited_svg.clone(),
+                    &paint_server_registry,
                     &mut paths,
                 );
             }
         }
     }
+    let paint_servers = paint_server_registry.into_paint_servers();
 
     ResolvedSvgRoot {
         style,
-        scene: SvgScene::new(metadata.view_box, paths),
+        scene: SvgScene::with_paint_servers(metadata.view_box, paint_servers, paths),
     }
 }
 
@@ -232,6 +272,58 @@ fn apply_svg_root_intrinsic_size(style: &mut Style, view_box: SvgViewBox) {
     }
 }
 
+fn collect_svg_paint_servers(element: &ElementNode, registry: &mut SvgPaintServerRegistry) {
+    for child in &element.children {
+        match child {
+            Node::Text(text) if text.trim().is_empty() => {}
+            Node::Text(_) => {}
+            Node::Element(child) => match child.tag.as_str() {
+                "defs" => collect_svg_defs(child, registry),
+                "g" => collect_svg_paint_servers(child, registry),
+                "linearGradient" => {
+                    panic!("SVG paint-server <linearGradient> must be declared inside <defs>")
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
+fn collect_svg_defs(element: &ElementNode, registry: &mut SvgPaintServerRegistry) {
+    for (name, _) in element.attributes() {
+        if name == "id" || name == "class" {
+            continue;
+        }
+        panic!("unsupported SVG attribute `{}` on <defs>", name);
+    }
+
+    for child in &element.children {
+        match child {
+            Node::Text(text) if text.trim().is_empty() => {}
+            Node::Text(_) => panic!("text nodes are not supported inside <defs>"),
+            Node::Element(child) => collect_svg_paint_server_definition(child, registry),
+        }
+    }
+}
+
+fn collect_svg_paint_server_definition(
+    element: &ElementNode,
+    registry: &mut SvgPaintServerRegistry,
+) {
+    match element.tag.as_str() {
+        "linearGradient" => {
+            let id = element
+                .attribute("id")
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| {
+                    panic!("SVG paint-server <linearGradient> requires a non-empty `id`")
+                });
+            registry.insert(id.to_string(), SvgPaintServerKind::LinearGradient);
+        }
+        tag => panic!("unsupported SVG paint-server tag <{tag}> inside <defs>"),
+    }
+}
+
 fn collect_svg_paths(
     element: &ElementNode,
     stylesheet: &Stylesheet,
@@ -242,9 +334,11 @@ fn collect_svg_paths(
     interaction: &ElementInteractionState,
     element_path: &ElementPath,
     inherited_svg: SvgCascadeState,
+    paint_servers: &SvgPaintServerRegistry,
     paths: &mut Vec<SvgPathInstance>,
 ) {
     match element.tag.as_str() {
+        "defs" => return,
         "g" | "path" | "circle" => {}
         "svg" => panic!("nested <svg> elements are not supported inside SVG subtrees"),
         _ => panic!("unsupported SVG tag <{}>", element.tag),
@@ -290,7 +384,8 @@ fn collect_svg_paths(
                             &child_ancestors,
                             interaction,
                             &child_path,
-                            svg_state,
+                            svg_state.clone(),
+                            paint_servers,
                             paths,
                         );
                     }
@@ -316,7 +411,7 @@ fn collect_svg_paths(
                     svg_state.translate_x,
                     svg_state.translate_y,
                 ),
-                paint: svg_path_paint(svg_state, style.visual.foreground),
+                paint: svg_path_paint(&svg_state, style.visual.foreground, paint_servers),
             });
         }
         "circle" => {
@@ -339,7 +434,7 @@ fn collect_svg_paths(
                     svg_state.translate_x,
                     svg_state.translate_y,
                 ),
-                paint: svg_path_paint(svg_state, style.visual.foreground),
+                paint: svg_path_paint(&svg_state, style.visual.foreground, paint_servers),
             });
         }
         _ => unreachable!("unsupported SVG tags are rejected before matching"),
@@ -348,8 +443,8 @@ fn collect_svg_paths(
 
 fn svg_cascade_from_style(parent: SvgCascadeState, style: &SvgStyle) -> SvgCascadeState {
     SvgCascadeState {
-        fill: style.fill.unwrap_or(parent.fill),
-        stroke: style.stroke.unwrap_or(parent.stroke),
+        fill: style.fill.clone().unwrap_or(parent.fill),
+        stroke: style.stroke.clone().unwrap_or(parent.stroke),
         stroke_width: style.stroke_width.unwrap_or(parent.stroke_width).max(0.0),
         translate_x: parent.translate_x,
         translate_y: parent.translate_y,
@@ -491,24 +586,35 @@ fn translate_svg_geometry(
     geometry
 }
 
-fn svg_path_paint(style: SvgCascadeState, current_color: Color) -> SvgPathPaint {
+fn svg_path_paint(
+    style: &SvgCascadeState,
+    current_color: Color,
+    paint_servers: &SvgPaintServerRegistry,
+) -> SvgPathPaint {
     let stroke = if style.stroke_width <= f32::EPSILON {
         None
     } else {
-        resolve_svg_paint(style.stroke, current_color)
+        resolve_svg_paint(&style.stroke, current_color, paint_servers)
     };
 
     SvgPathPaint {
-        fill: resolve_svg_paint(style.fill, current_color),
+        fill: resolve_svg_paint(&style.fill, current_color, paint_servers),
         stroke,
         stroke_width: style.stroke_width.max(0.0),
     }
 }
 
-fn resolve_svg_paint(paint: SvgPaint, current_color: Color) -> Option<Color> {
+fn resolve_svg_paint(
+    paint: &SvgPaint,
+    current_color: Color,
+    paint_servers: &SvgPaintServerRegistry,
+) -> Option<SvgPathPaintSource> {
     match paint {
-        SvgPaint::Color(color) => Some(color),
-        SvgPaint::CurrentColor => Some(current_color),
+        SvgPaint::Color(color) => Some(SvgPathPaintSource::Color(*color)),
+        SvgPaint::CurrentColor => Some(SvgPathPaintSource::Color(current_color)),
+        SvgPaint::PaintServer(id) => {
+            Some(SvgPathPaintSource::PaintServer(paint_servers.resolve(id)))
+        }
         SvgPaint::None => None,
     }
 }
@@ -1120,7 +1226,9 @@ struct SvgRootMetadata {
 
 #[cfg(test)]
 mod tests {
-    use cssimpler_core::{Color, Node, RenderKind};
+    use cssimpler_core::{
+        Color, Node, RenderKind, SvgPaintServerKind, SvgPaintServerReference, SvgPathPaintSource,
+    };
 
     use crate::{Stylesheet, build_render_tree, parse_stylesheet};
 
@@ -1146,7 +1254,10 @@ mod tests {
             panic!("expected an SVG render node");
         };
         assert_eq!(svg.paths.len(), 1);
-        assert_eq!(svg.paths[0].paint.fill, Some(Color::rgb(37, 99, 235)));
+        assert_eq!(
+            svg.paths[0].paint.fill,
+            Some(SvgPathPaintSource::Color(Color::rgb(37, 99, 235)))
+        );
         assert_eq!(svg.paths[0].paint.stroke, None);
     }
 
@@ -1171,8 +1282,152 @@ mod tests {
         };
         assert_eq!(svg.paths.len(), 1);
         assert_eq!(svg.paths[0].paint.fill, None);
-        assert_eq!(svg.paths[0].paint.stroke, Some(Color::rgb(249, 115, 22)));
+        assert_eq!(
+            svg.paths[0].paint.stroke,
+            Some(SvgPathPaintSource::Color(Color::rgb(249, 115, 22)))
+        );
         assert_eq!(svg.paths[0].paint.stroke_width, 2.0);
+    }
+
+    #[test]
+    fn svg_resolves_local_paint_server_refs_for_fill_and_stroke() {
+        let tree = Node::element("svg")
+            .with_attribute("viewBox", "0 0 24 24")
+            .with_child(
+                Node::element("defs")
+                    .with_child(Node::element("linearGradient").with_id("fillGradient").into())
+                    .with_child(Node::element("linearGradient").with_id("strokeGradient").into())
+                    .into(),
+            )
+            .with_child(
+                Node::element("path")
+                    .with_attribute("d", "M4 4 L20 4 L20 20 L4 20 Z")
+                    .with_attribute("fill", "url(#fillGradient)")
+                    .with_attribute("stroke", "url(#strokeGradient)")
+                    .with_attribute("stroke-width", "2")
+                    .into(),
+            )
+            .into();
+
+        let scene = build_render_tree(&tree, &Stylesheet::default());
+        let RenderKind::Svg(svg) = scene.kind else {
+            panic!("expected an SVG render node");
+        };
+
+        assert_eq!(svg.paint_servers.len(), 2);
+        assert_eq!(svg.paint_servers[0].id, "fillGradient");
+        assert_eq!(svg.paint_servers[0].kind, SvgPaintServerKind::LinearGradient);
+        assert_eq!(svg.paint_servers[1].id, "strokeGradient");
+        assert_eq!(svg.paint_servers[1].kind, SvgPaintServerKind::LinearGradient);
+        assert_eq!(
+            svg.paths[0].paint.fill,
+            Some(SvgPathPaintSource::PaintServer(SvgPaintServerReference {
+                id: "fillGradient".to_string(),
+                kind: SvgPaintServerKind::LinearGradient,
+            }))
+        );
+        assert_eq!(
+            svg.paths[0].paint.stroke,
+            Some(SvgPathPaintSource::PaintServer(SvgPaintServerReference {
+                id: "strokeGradient".to_string(),
+                kind: SvgPaintServerKind::LinearGradient,
+            }))
+        );
+        assert_eq!(svg.paths[0].paint.stroke_width, 2.0);
+    }
+
+    #[test]
+    fn svg_missing_paint_server_refs_fail_clearly() {
+        let tree = Node::element("svg")
+            .with_attribute("viewBox", "0 0 24 24")
+            .with_child(
+                Node::element("path")
+                    .with_attribute("d", "M4 4 L20 4 L20 20 L4 20 Z")
+                    .with_attribute("fill", "url(#missing)")
+                    .into(),
+            )
+            .into();
+
+        let error = std::panic::catch_unwind(|| build_render_tree(&tree, &Stylesheet::default()))
+            .expect_err("missing paint-server references should panic");
+
+        assert!(panic_message(error).contains("missing SVG paint-server id `missing`"));
+    }
+
+    #[test]
+    fn svg_duplicate_paint_server_ids_fail_clearly() {
+        let tree = Node::element("svg")
+            .with_attribute("viewBox", "0 0 24 24")
+            .with_child(
+                Node::element("defs")
+                    .with_child(Node::element("linearGradient").with_id("paint").into())
+                    .with_child(Node::element("linearGradient").with_id("paint").into())
+                    .into(),
+            )
+            .with_child(
+                Node::element("path")
+                    .with_attribute("d", "M4 4 L20 4 L20 20 L4 20 Z")
+                    .into(),
+            )
+            .into();
+
+        let error = std::panic::catch_unwind(|| build_render_tree(&tree, &Stylesheet::default()))
+            .expect_err("duplicate paint-server ids should panic");
+
+        assert!(panic_message(error).contains("duplicate SVG paint-server id `paint`"));
+    }
+
+    #[test]
+    fn svg_unsupported_defs_children_fail_clearly() {
+        let tree = Node::element("svg")
+            .with_attribute("viewBox", "0 0 24 24")
+            .with_child(
+                Node::element("defs")
+                    .with_child(Node::element("filter").with_id("shadow").into())
+                    .into(),
+            )
+            .with_child(
+                Node::element("path")
+                    .with_attribute("d", "M4 4 L20 4 L20 20 L4 20 Z")
+                    .into(),
+            )
+            .into();
+
+        let error = std::panic::catch_unwind(|| build_render_tree(&tree, &Stylesheet::default()))
+            .expect_err("unsupported defs children should panic");
+
+        assert!(panic_message(error).contains("unsupported SVG paint-server tag <filter>"));
+    }
+
+    #[test]
+    fn svg_paint_server_urls_reject_external_refs_and_fallbacks() {
+        let external = Node::element("svg")
+            .with_attribute("viewBox", "0 0 24 24")
+            .with_child(
+                Node::element("path")
+                    .with_attribute("d", "M4 4 L20 4 L20 20 L4 20 Z")
+                    .with_attribute("fill", "url(icon.svg#paint)")
+                    .into(),
+            )
+            .into();
+        let external_error =
+            std::panic::catch_unwind(|| build_render_tree(&external, &Stylesheet::default()))
+                .expect_err("external paint-server urls should panic");
+        assert!(panic_message(external_error).contains("only local url(#id) references"));
+
+        let fallback = Node::element("svg")
+            .with_attribute("viewBox", "0 0 24 24")
+            .with_child(
+                Node::element("path")
+                    .with_attribute("d", "M4 4 L20 4 L20 20 L4 20 Z")
+                    .with_attribute("fill", "url(#paint) red")
+                    .into(),
+            )
+            .into();
+        let fallback_error =
+            std::panic::catch_unwind(|| build_render_tree(&fallback, &Stylesheet::default()))
+                .expect_err("paint-server fallback values should panic");
+        assert!(panic_message(fallback_error).contains("unsupported SVG paint fallback"));
     }
 
     #[test]
@@ -1249,15 +1504,7 @@ mod tests {
 
         let error = std::panic::catch_unwind(|| build_render_tree(&tree, &Stylesheet::default()))
             .expect_err("unsupported SVG attributes should panic");
-        let message = if let Some(message) = error.downcast_ref::<String>() {
-            message.clone()
-        } else if let Some(message) = error.downcast_ref::<&str>() {
-            (*message).to_string()
-        } else {
-            String::new()
-        };
-
-        assert!(message.contains("unsupported SVG transform attribute"));
+        assert!(panic_message(error).contains("unsupported SVG transform attribute"));
     }
 
     #[test]
@@ -1282,5 +1529,15 @@ mod tests {
             .bounds
             .expect("arc geometry should have bounds");
         assert!(bounds.max_x >= 20.0);
+    }
+
+    fn panic_message(error: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(message) = error.downcast_ref::<String>() {
+            message.clone()
+        } else if let Some(message) = error.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else {
+            String::new()
+        }
     }
 }

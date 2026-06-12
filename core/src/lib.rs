@@ -29,8 +29,9 @@ pub use scrollbar::{
     ScrollbarStyle, ScrollbarWidth,
 };
 pub use svg::{
-    SvgBounds, SvgContour, SvgPaint, SvgPathGeometry, SvgPathInstance, SvgPathPaint, SvgPoint,
-    SvgScene, SvgStyle, SvgViewBox,
+    SvgBounds, SvgContour, SvgPaint, SvgPaintServer, SvgPaintServerKind, SvgPaintServerReference,
+    SvgPathGeometry, SvgPathInstance, SvgPathPaint, SvgPathPaintSource, SvgPoint, SvgScene,
+    SvgStyle, SvgViewBox,
 };
 pub use transitions::{
     TransitionEntry, TransitionPropertyName, TransitionStyle, TransitionTimingFunction,

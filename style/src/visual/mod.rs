@@ -133,11 +133,11 @@ pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) ->
             true
         }
         Declaration::SvgFill(paint) => {
-            svg::apply_svg_fill(style, *paint);
+            svg::apply_svg_fill(style, paint.clone());
             true
         }
         Declaration::SvgStroke(paint) => {
-            svg::apply_svg_stroke(style, *paint);
+            svg::apply_svg_stroke(style, paint.clone());
             true
         }
         Declaration::SvgStrokeWidth(width) => {

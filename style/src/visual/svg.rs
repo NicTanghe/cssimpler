@@ -40,7 +40,21 @@ fn svg_paint_from_css(paint: &CssSvgPaint<'_>) -> Result<SvgPaint, StyleError> {
         CssSvgPaint::Color(CssColor::CurrentColor) => Ok(SvgPaint::CurrentColor),
         CssSvgPaint::Color(color) => Ok(SvgPaint::Color(color::color_from_css(color)?)),
         CssSvgPaint::None => Ok(SvgPaint::None),
-        CssSvgPaint::Url { .. } | CssSvgPaint::ContextFill | CssSvgPaint::ContextStroke => {
+        CssSvgPaint::Url { url, fallback } => {
+            if fallback.is_some() {
+                return Err(StyleError::UnsupportedValue(format!(
+                    "unsupported SVG paint fallback: {paint:?}"
+                )));
+            }
+            let raw_url = url.url.as_ref();
+            let Some(id) = raw_url.strip_prefix('#').filter(|id| !id.is_empty()) else {
+                return Err(StyleError::UnsupportedValue(format!(
+                    "unsupported SVG paint URL `{raw_url}` (only local url(#id) references are supported)"
+                )));
+            };
+            Ok(SvgPaint::PaintServer(id.to_string()))
+        }
+        CssSvgPaint::ContextFill | CssSvgPaint::ContextStroke => {
             Err(StyleError::UnsupportedValue(format!("{paint:?}")))
         }
     }
