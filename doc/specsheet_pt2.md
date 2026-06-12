@@ -314,6 +314,56 @@ Acceptance:
 
 ---
 
+## S3. SVG local paint-server references
+Depends: S1, S2  
+Status: planned  
+
+Purpose:
+- Extend SVG paint from solid colors, `currentColor`, and `none` to local paint-server references shared by both fill and stroke
+
+Should have been an extension:
+- This extends S2 because it broadens the supported SVG paint value model while keeping references local and deterministic
+
+Support:
+- Inline `<defs>` containers inside supported `<svg>` roots
+- Paint-server collection by local `id` before supported shape paint is resolved
+- `fill: url(#paint-id)` on supported SVG shapes
+- `stroke: url(#paint-id)` on supported SVG shapes
+- Shared URL-paint resolution for fill and stroke; stroke URL paint is required, not optional
+- Clear rejection for external URLs, missing paint-server ids, duplicate paint-server ids, unsupported paint-server tags, and unsupported fallback paint syntax
+
+Acceptance:
+- A supported SVG path can resolve separate local paint-server references for fill and stroke
+- `stroke: url(#paint-id)` behaves as first-class SVG paint rather than a fill-only special case
+- Unsupported SVG paint-server references fail clearly instead of silently rendering black or dropping paint
+
+---
+
+## S4. SVG linearGradient paint servers
+Depends: S3, G3  
+Status: planned  
+
+Purpose:
+- Render the common inline SVG pattern where supported vector shapes reference local `<linearGradient>` definitions through `fill: url(#id)` or `stroke: url(#id)`
+
+Should have been an extension:
+- This extends S3 by adding the first concrete paint-server type and reusing the renderer-owned gradient sampling model
+
+Support:
+- `<linearGradient>` paint definitions with local `id` lookup
+- `<stop>` children with supported stop colors and offsets
+- Supported `x1`, `y1`, `x2`, and `y2` gradient endpoints
+- Gradient fills and gradient strokes on supported SVG shapes
+- Clear rejection for unsupported gradient units, spread methods, inherited/template gradients, and stop styling outside the supported subset
+
+Acceptance:
+- A supported SVG path can render a local `<linearGradient>` fill referenced through `url(#id)`
+- A supported SVG path can render a local `<linearGradient>` stroke referenced through `url(#id)`
+- Gradient coordinates map deterministically through the same viewBox/layout transform used for solid SVG path paint
+- Unsupported SVG gradient references fail clearly instead of silently rendering black or dropping paint
+
+---
+
 # Epic T - Backdrop and glass effects
 
 ## T1. Filter-capable backdrop surfaces
