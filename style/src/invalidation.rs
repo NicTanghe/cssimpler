@@ -102,6 +102,7 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::TextShadows(_)
         | Declaration::FilterDropShadows(_)
         | Declaration::BackdropBlur(_)
+        | Declaration::BackdropOcclusion(_)
         | Declaration::TextStrokeWidth(_)
         | Declaration::TextStrokeColor(_)
         | Declaration::TransformOperations(_)
@@ -199,6 +200,7 @@ fn variable_property_invalidation(property_name: &str) -> StyleInvalidation {
         | "text-shadow"
         | "filter"
         | "backdrop-filter"
+        | "backdrop-occlude"
         | "native-material"
         | "glass-tint"
         | "-webkit-backdrop-filter"

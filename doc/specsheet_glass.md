@@ -243,6 +243,48 @@ Acceptance:
 
 ---
 
+## AC7. Native glass alpha paint performance
+
+Depends: AC3, AC4, O8  
+Status: planned
+
+Purpose:
+- Keep native glass visually equivalent or very close while making the alpha-backed software paint path fast enough for interactive apps.
+- Treat renderer performance as part of the glass feature contract, not as an app-level CSS workaround.
+
+Observed baseline:
+- A release PrintLTools profile with native glass active showed slow interaction frames coming from `Full, FullRedraw` paint.
+- Slow frames repainted the full 900x760 window, about 684000 pixels.
+- Slow frames used `workers=1` because the alpha-buffer path does not use the existing band-parallel full renderer.
+- Average slow paint time was about 195 ms, with present/DWM handoff around 6-8 ms and app/runtime update work usually 0-3 ms.
+- This points to cssimpler's software alpha paint path, not DWM present time or application update logic.
+
+Primary optimization:
+- Add parallel full-window rendering when an alpha target is active.
+- Give each worker a color buffer band and matching alpha band.
+- Render each row band through the same paint logic using `with_render_buffer_rows(...)` and `with_render_alpha_target(Some(...))`.
+- Copy both the color and alpha bands back into the main frame buffers.
+- Preserve transparent/native-glass reveal pixels, per-region tints, rounded clipping, children, borders, shadows, and fallback behavior.
+
+Follow-up optimization:
+- Investigate scroll-specific reuse for native glass scenes after the parallel alpha path is proven.
+- When content scrolls but the platform glass backdrop is visually stable, consider copying reusable color and alpha framebuffer regions and repainting only newly exposed strips plus invalidated overlays such as scrollbars.
+- Keep this separate from the first pass unless it falls out naturally from the existing damage model.
+
+Measurement rules:
+- Use release builds only for performance conclusions.
+- Measure before and after with the runtime frame profiler.
+- Debug builds may be useful for correctness but are not an acceptance signal for interaction performance.
+
+Acceptance:
+- Native-glass full repaint frames report more than one render worker when the window is large enough to justify parallel work.
+- `frame_paint_us` for PrintLTools hover and scrollbar-drag interaction frames drops materially from the serial alpha baseline.
+- `frame_present_us` remains secondary and is not treated as the main bottleneck unless measurements change.
+- Glass reveal behavior remains visually equivalent or very close to the existing output.
+- Renderer tests cover alpha-buffer rendering parity where practical.
+
+---
+
 # Suggested Implementation Order
 
 1. Add `NativeMaterial` and `glass_tint` to core visual style.
@@ -256,6 +298,8 @@ Acceptance:
 9. Draw per-region tint overlays.
 10. Add fallback rendering for unsupported platforms and native failures.
 11. Add an example app and regression tests.
+12. Parallelize native-glass alpha full-window repaint.
+13. Investigate scroll-region reuse for native-glass scenes if full repaint remains too expensive.
 
 ---
 
@@ -267,6 +311,7 @@ Acceptance:
 - Should a custom `<glass>` tag exist as syntax sugar, or should CSS remain the only v1 API?
 - Should transformed glass regions fall back initially, or block the feature until transform-safe masking exists?
 - Should generated or baked UI assets preserve `native-material` as a first-class style descriptor?
+- Can native-glass scroll damage safely reuse color and alpha framebuffer regions when the platform backdrop is stable, or should the first scroll optimization stay limited to newly exposed strips and explicit overlay invalidation?
 
 ---
 

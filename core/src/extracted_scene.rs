@@ -1,11 +1,13 @@
 use crate::{
-    Color, ElementPath, EventHandlers, Insets, LayoutBox, NativeMaterial, PreparedTextLayout,
-    RenderKind, RenderNode, ScrollbarData, SvgScene, Transform2D, TransitionStyle, VisualStyle,
+    BackdropOcclusion, Color, ElementPath, EventHandlers, Insets, LayoutBox, NativeMaterial,
+    PreparedTextLayout, RenderKind, RenderNode, ScrollbarData, SvgScene, Transform2D,
+    TransitionStyle, VisualStyle,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtractedPaintKind {
     GlassReveal,
+    BackdropOcclude,
     BackdropBlur,
     BoxShadow,
     FilterDropShadow,
@@ -88,6 +90,18 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
         );
     }
 
+    if node.style.backdrop_occlusion == BackdropOcclusion::Scene {
+        push_item(
+            node,
+            &path,
+            4,
+            ExtractedPaintKind::BackdropOcclude,
+            clip,
+            None,
+            items,
+        );
+    }
+
     if node.style.backdrop_blur_radius > f32::EPSILON {
         push_item(
             node,
@@ -144,6 +158,18 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
             &path,
             80,
             ExtractedPaintKind::Border,
+            clip,
+            None,
+            items,
+        );
+    }
+
+    for (index, _) in node.style.inset_shadows.iter().enumerate() {
+        push_item(
+            node,
+            &path,
+            88 + index as u8,
+            ExtractedPaintKind::BoxShadow,
             clip,
             None,
             items,
@@ -248,9 +274,9 @@ fn stable_sort_key(path: &[usize], phase: u8) -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        BoxShadow, Color, CornerRadius, Insets, LayoutBox, Overflow, PreparedTextLayout,
-        RenderNode, ScrollbarData, ScrollbarMetrics, ScrollbarStyle, ScrollbarWidth, TextStyle,
-        VisualStyle, fonts::TextLayout,
+        BackdropOcclusion, BoxShadow, Color, CornerRadius, Insets, LayoutBox, Overflow,
+        PreparedTextLayout, RenderNode, ScrollbarData, ScrollbarMetrics, ScrollbarStyle,
+        ScrollbarWidth, TextStyle, VisualStyle, fonts::TextLayout,
     };
 
     use super::{ExtractedPaintKind, ExtractedScene};
@@ -265,6 +291,7 @@ mod tests {
                         y: crate::OverflowMode::Scroll,
                     },
                     background: Some(Color::rgb(15, 23, 42)),
+                    backdrop_occlusion: BackdropOcclusion::Scene,
                     border: crate::BorderStyle {
                         widths: Insets::all(1.0),
                         color: Color::rgb(226, 232, 240),
@@ -323,10 +350,21 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(kinds.contains(&ExtractedPaintKind::BoxShadow));
+        assert!(kinds.contains(&ExtractedPaintKind::BackdropOcclude));
         assert!(kinds.contains(&ExtractedPaintKind::Background));
         assert!(kinds.contains(&ExtractedPaintKind::Border));
         assert!(kinds.contains(&ExtractedPaintKind::TextRun));
         assert!(kinds.contains(&ExtractedPaintKind::Scrollbar));
+
+        let occlude_index = kinds
+            .iter()
+            .position(|kind| *kind == ExtractedPaintKind::BackdropOcclude)
+            .expect("occlusion item should be extracted");
+        let background_index = kinds
+            .iter()
+            .position(|kind| *kind == ExtractedPaintKind::Background)
+            .expect("background item should be extracted");
+        assert!(occlude_index < background_index);
     }
 
     #[test]

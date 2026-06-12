@@ -681,6 +681,13 @@ pub enum NativeMaterial {
     Glass,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackdropOcclusion {
+    #[default]
+    None,
+    Scene,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisualStyle {
     pub background: Option<Color>,
@@ -692,11 +699,13 @@ pub struct VisualStyle {
     pub text_shadows: Vec<ShadowEffect>,
     pub filter_drop_shadows: Vec<ShadowEffect>,
     pub backdrop_blur_radius: f32,
+    pub backdrop_occlusion: BackdropOcclusion,
     pub native_material: NativeMaterial,
     pub glass_tint: Option<Color>,
     pub corner_radius: CornerRadius,
     pub border: BorderStyle,
     pub shadows: Vec<BoxShadow>,
+    pub inset_shadows: Vec<BoxShadow>,
     pub overflow: Overflow,
     pub transform: Transform2D,
     pub perspective: Option<f32>,
@@ -716,11 +725,13 @@ impl Default for VisualStyle {
             text_shadows: Vec::new(),
             filter_drop_shadows: Vec::new(),
             backdrop_blur_radius: 0.0,
+            backdrop_occlusion: BackdropOcclusion::None,
             native_material: NativeMaterial::None,
             glass_tint: None,
             corner_radius: CornerRadius::ZERO,
             border: BorderStyle::default(),
             shadows: Vec::new(),
+            inset_shadows: Vec::new(),
             overflow: Overflow::VISIBLE,
             transform: Transform2D::default(),
             perspective: None,

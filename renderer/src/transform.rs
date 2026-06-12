@@ -1,6 +1,6 @@
-use cssimpler_core::{LayoutBox, Transform2D, TransformMatrix3d, TransformOperation};
+use cssimpler_core::{CornerRadius, LayoutBox, Transform2D, TransformMatrix3d, TransformOperation};
 
-use super::ClipRect;
+use super::{ClipRect, shapes::point_in_rounded_rect};
 
 const TRANSFORM_EPSILON: f32 = 1e-5;
 
@@ -101,6 +101,7 @@ impl AffineTransform {
 #[derive(Clone, Debug)]
 struct ClipRegion {
     layout: LayoutBox,
+    radius: CornerRadius,
     inverse: AffineTransform,
 }
 
@@ -124,13 +125,14 @@ impl ClipState {
                 let (local_x, local_y) = region.inverse.transform_point(x, y);
                 local_x.is_finite()
                     && local_y.is_finite()
-                    && layout_contains(region.layout, local_x, local_y)
+                    && point_in_rounded_rect(local_x, local_y, region.layout, region.radius)
             })
     }
 
     pub(crate) fn push_layout_clip(
         &self,
         layout: LayoutBox,
+        radius: CornerRadius,
         matrix: AffineTransform,
     ) -> Option<Self> {
         let inverse = matrix.invert()?;
@@ -138,7 +140,11 @@ impl ClipState {
             .coarse
             .intersect(transform_layout_bounds(layout, matrix)?)?;
         let mut regions = self.regions.clone();
-        regions.push(ClipRegion { layout, inverse });
+        regions.push(ClipRegion {
+            layout,
+            radius,
+            inverse,
+        });
         Some(Self { coarse, regions })
     }
 }
@@ -435,10 +441,6 @@ fn solve_linear_system(matrix: &mut [[f32; 8]; 8], vector: &mut [f32; 8]) -> Opt
     }
 
     Some(*vector)
-}
-
-fn layout_contains(layout: LayoutBox, x: f32, y: f32) -> bool {
-    x >= layout.x && y >= layout.y && x < layout.x + layout.width && y < layout.y + layout.height
 }
 
 #[cfg(test)]

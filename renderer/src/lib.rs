@@ -26,15 +26,16 @@ mod transform;
 use self::{
     gradient::draw_background_layer,
     shadow::{
-        draw_shadow, draw_shadow_effect, shadow_bounds, shadow_effect_bounds, text_stroke_bounds,
+        draw_inset_shadow, draw_inset_shadow_transformed, draw_shadow, draw_shadow_effect,
+        shadow_bounds, shadow_effect_bounds, text_stroke_bounds,
     },
     shapes::{
-        clip_pixel_bounds, draw_axis_aligned_opaque_rect, draw_axis_aligned_opaque_ring,
-        draw_dashed_rounded_ring, draw_rounded_rect, draw_rounded_ring, inset_corner_radius,
-        inset_layout, layout_clip, non_empty_layout_clip, offset_layout, rounded_rect_coverage,
-        snap_clip_to_pixel_grid, transformed_dashed_rounded_ring_coverage,
-        transformed_rounded_rect_coverage, transformed_rounded_ring_coverage,
-        union_optional_bounds,
+        clip_pixel_bounds, corner_radius_is_zero, draw_axis_aligned_opaque_rect,
+        draw_axis_aligned_opaque_ring, draw_dashed_rounded_ring, draw_rounded_rect,
+        draw_rounded_ring, inset_corner_radius, inset_layout, layout_clip, non_empty_layout_clip,
+        offset_layout, rounded_rect_coverage, snap_clip_to_pixel_grid,
+        transformed_dashed_rounded_ring_coverage, transformed_rounded_rect_coverage,
+        transformed_rounded_ring_coverage, union_optional_bounds,
     },
     transform::{
         AffineTransform, ClipState, PerspectiveContext, node_local_transform_matrix,
@@ -43,9 +44,9 @@ use self::{
     },
 };
 use cssimpler_core::{
-    BorderLineStyle, Color, ElementInteractionState, ElementPath, EventHandler, ExtractedScene,
-    LayoutBox, LinearRgba, NativeMaterial, RenderKind, RenderNode, Transform2D, TransformMatrix3d,
-    TransformStyleMode, VisualStyle,
+    BackdropOcclusion, BorderLineStyle, Color, ElementInteractionState, ElementPath, EventHandler,
+    ExtractedScene, LayoutBox, LinearRgba, NativeMaterial, RenderKind, RenderNode, Transform2D,
+    TransformMatrix3d, TransformStyleMode, VisualStyle,
 };
 use softbuffer::SoftBufferError;
 use winit::error::{EventLoopError, OsError};
@@ -87,6 +88,7 @@ const SCENE_TRAVERSAL_COST_PER_NODE: usize = 96;
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 const MAX_SUBTREE_SURFACE_CACHE_ENTRIES: usize = 64;
 const MAX_WORKER_BUFFER_POOL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_WORKER_ALPHA_BUFFER_POOL_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FramePaintMode {
@@ -151,6 +153,7 @@ struct DirtyRenderJob {
 
 static FRAME_TIMING_STATS: OnceLock<Mutex<FrameTimingStats>> = OnceLock::new();
 static WORKER_BUFFER_POOL: OnceLock<Mutex<Vec<Vec<u32>>>> = OnceLock::new();
+static WORKER_ALPHA_BUFFER_POOL: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
 static SUBTREE_SURFACE_CACHE: OnceLock<Mutex<SubtreeSurfaceCache>> = OnceLock::new();
 #[cfg(test)]
 static SUBTREE_SURFACE_CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -240,13 +243,27 @@ fn worker_buffer_pool() -> &'static Mutex<Vec<Vec<u32>>> {
     WORKER_BUFFER_POOL.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn worker_alpha_buffer_pool() -> &'static Mutex<Vec<Vec<u8>>> {
+    WORKER_ALPHA_BUFFER_POOL.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn buffer_storage_bytes(capacity: usize) -> usize {
     capacity.saturating_mul(size_of::<u32>())
+}
+
+fn alpha_buffer_storage_bytes(capacity: usize) -> usize {
+    capacity.saturating_mul(size_of::<u8>())
 }
 
 fn worker_buffer_pool_reserved_bytes(pool: &[Vec<u32>]) -> usize {
     pool.iter()
         .map(|buffer| buffer_storage_bytes(buffer.capacity()))
+        .sum()
+}
+
+fn worker_alpha_buffer_pool_reserved_bytes(pool: &[Vec<u8>]) -> usize {
+    pool.iter()
+        .map(|buffer| alpha_buffer_storage_bytes(buffer.capacity()))
         .sum()
 }
 
@@ -266,10 +283,42 @@ fn trim_worker_buffer_pool_to_budget(pool: &mut Vec<Vec<u32>>, budget_bytes: usi
     }
 }
 
+fn trim_worker_alpha_buffer_pool_to_budget(pool: &mut Vec<Vec<u8>>, budget_bytes: usize) {
+    let mut reserved_bytes = worker_alpha_buffer_pool_reserved_bytes(pool);
+    if reserved_bytes <= budget_bytes {
+        return;
+    }
+
+    pool.sort_by_key(|buffer| buffer.capacity());
+    while reserved_bytes > budget_bytes {
+        let Some(buffer) = pool.pop() else {
+            break;
+        };
+        reserved_bytes =
+            reserved_bytes.saturating_sub(alpha_buffer_storage_bytes(buffer.capacity()));
+    }
+}
+
 fn acquire_worker_buffers(lengths: &[usize]) -> Vec<Vec<u32>> {
     let mut pool = worker_buffer_pool()
         .lock()
         .expect("worker buffer pool mutex should not be poisoned");
+    let mut buffers = Vec::with_capacity(lengths.len());
+    for &len in lengths {
+        let mut buffer = pool.pop().unwrap_or_default();
+        buffer.resize(len, 0);
+        if buffer.capacity() > len.saturating_mul(2).max(1) {
+            buffer.shrink_to(len);
+        }
+        buffers.push(buffer);
+    }
+    buffers
+}
+
+fn acquire_worker_alpha_buffers(lengths: &[usize]) -> Vec<Vec<u8>> {
+    let mut pool = worker_alpha_buffer_pool()
+        .lock()
+        .expect("worker alpha buffer pool mutex should not be poisoned");
     let mut buffers = Vec::with_capacity(lengths.len());
     for &len in lengths {
         let mut buffer = pool.pop().unwrap_or_default();
@@ -288,6 +337,14 @@ fn release_worker_buffers(buffers: Vec<Vec<u32>>) {
         .expect("worker buffer pool mutex should not be poisoned");
     pool.extend(buffers);
     trim_worker_buffer_pool_to_budget(&mut pool, MAX_WORKER_BUFFER_POOL_BYTES);
+}
+
+fn release_worker_alpha_buffers(buffers: Vec<Vec<u8>>) {
+    let mut pool = worker_alpha_buffer_pool()
+        .lock()
+        .expect("worker alpha buffer pool mutex should not be poisoned");
+    pool.extend(buffers);
+    trim_worker_alpha_buffer_pool_to_budget(&mut pool, MAX_WORKER_ALPHA_BUFFER_POOL_BYTES);
 }
 
 fn subtree_surface_cache() -> &'static Mutex<SubtreeSurfaceCache> {
@@ -578,6 +635,7 @@ fn cached_promoted_surface(
             surface_width,
             surface_height,
             local_clip,
+            Color::BLACK,
             GlassRenderMode::Fallback,
             false,
         );
@@ -588,6 +646,7 @@ fn cached_promoted_surface(
             surface_width,
             surface_height,
             local_clip,
+            Color::WHITE,
             GlassRenderMode::Fallback,
             false,
         );
@@ -668,6 +727,7 @@ fn node_can_use_promoted_surface(node: &RenderNode, cached_bounds: &CachedSubtre
         && node.style.perspective.is_none()
         && node.style.transform_style == TransformStyleMode::Flat
         && !cached_bounds.subtree_uses_backdrop_blur
+        && !cached_bounds.subtree_uses_backdrop_occlusion
         && !cached_bounds.subtree_uses_native_glass
         && !cached_bounds.subtree_uses_depth
         && node.scrollbars.is_none()
@@ -777,6 +837,10 @@ fn current_alpha_at(index: usize) -> Option<u8> {
         let target = target.get()?;
         (index < target.len).then(|| unsafe { *target.ptr.add(index) })
     })
+}
+
+fn render_alpha_target_active() -> bool {
+    RENDER_ALPHA_TARGET.with(|target| target.get().is_some())
 }
 
 fn set_current_alpha_at(index: usize, alpha: u8) {
@@ -1495,11 +1559,10 @@ fn render_to_buffer_internal_with_cached_bounds(
         owned_bounds = cache_scene_subtree_bounds(&scene.roots);
         &owned_bounds
     };
-    let worker_count = if alpha_buffer.is_some()
-        || cached_bounds
-            .roots
-            .iter()
-            .any(|root| root.subtree_uses_backdrop_blur)
+    let worker_count = if cached_bounds
+        .roots
+        .iter()
+        .any(|root| root.subtree_uses_backdrop_blur)
     {
         1
     } else {
@@ -1526,6 +1589,7 @@ fn render_to_buffer_internal_with_cached_bounds(
             clear_color,
             worker_count,
             glass_mode,
+            alpha_buffer.as_deref_mut(),
         );
     }
 
@@ -1564,6 +1628,7 @@ fn render_to_buffer_serial(
                 width,
                 height,
                 clip,
+                clear_color,
                 glass_mode,
             );
         }
@@ -1579,6 +1644,7 @@ fn render_to_buffer_parallel(
     clear_color: Color,
     worker_count: usize,
     glass_mode: GlassRenderMode,
+    mut alpha_buffer: Option<&mut [u8]>,
 ) {
     let clear = pack_rgb(clear_color);
     let band_count = worker_count.max(1).min(height.max(1));
@@ -1606,46 +1672,105 @@ fn render_to_buffer_parallel(
         .map(|rows| rows.pixel_len(width))
         .collect::<Vec<_>>();
     let mut worker_buffers = acquire_worker_buffers(&worker_buffer_lengths);
+    let mut worker_alpha_buffers = alpha_buffer
+        .as_ref()
+        .map(|_| acquire_worker_alpha_buffers(&worker_buffer_lengths));
 
-    thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for ((worker_buffer, rows), root_indices) in worker_buffers
-            .iter_mut()
-            .zip(bands.iter().copied())
-            .zip(band_root_indices.iter())
-        {
-            let band_clip = ClipRect {
-                x0: 0.0,
-                y0: rows.start as f32,
-                x1: width as f32,
-                y1: rows.end as f32,
-            };
-            handles.push(scope.spawn(move || {
-                with_render_buffer_rows(rows, || {
-                    worker_buffer.fill(clear);
-                    draw_cached_root_indices(
-                        scene,
-                        &cached_bounds.roots,
-                        root_indices,
-                        worker_buffer,
-                        width,
-                        height,
-                        band_clip,
-                        glass_mode,
-                    );
-                });
-            }));
-        }
+    if let Some(worker_alpha_buffers) = worker_alpha_buffers.as_mut() {
+        thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (((worker_buffer, worker_alpha_buffer), rows), root_indices) in worker_buffers
+                .iter_mut()
+                .zip(worker_alpha_buffers.iter_mut())
+                .zip(bands.iter().copied())
+                .zip(band_root_indices.iter())
+            {
+                let band_clip = ClipRect {
+                    x0: 0.0,
+                    y0: rows.start as f32,
+                    x1: width as f32,
+                    y1: rows.end as f32,
+                };
+                handles.push(scope.spawn(move || {
+                    with_render_alpha_target(Some(worker_alpha_buffer.as_mut_slice()), || {
+                        with_render_buffer_rows(rows, || {
+                            worker_buffer.fill(clear);
+                            fill_current_alpha_span(0, worker_buffer.len(), u8::MAX);
+                            draw_cached_root_indices(
+                                scene,
+                                &cached_bounds.roots,
+                                root_indices,
+                                worker_buffer,
+                                width,
+                                height,
+                                band_clip,
+                                clear_color,
+                                glass_mode,
+                            );
+                        });
+                    });
+                }));
+            }
 
-        for handle in handles {
-            handle.join().expect("render worker should not panic");
-        }
-    });
+            for handle in handles {
+                handle.join().expect("render worker should not panic");
+            }
+        });
+    } else {
+        thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for ((worker_buffer, rows), root_indices) in worker_buffers
+                .iter_mut()
+                .zip(bands.iter().copied())
+                .zip(band_root_indices.iter())
+            {
+                let band_clip = ClipRect {
+                    x0: 0.0,
+                    y0: rows.start as f32,
+                    x1: width as f32,
+                    y1: rows.end as f32,
+                };
+                handles.push(scope.spawn(move || {
+                    with_render_buffer_rows(rows, || {
+                        worker_buffer.fill(clear);
+                        draw_cached_root_indices(
+                            scene,
+                            &cached_bounds.roots,
+                            root_indices,
+                            worker_buffer,
+                            width,
+                            height,
+                            band_clip,
+                            clear_color,
+                            glass_mode,
+                        );
+                    });
+                }));
+            }
+
+            for handle in handles {
+                handle.join().expect("render worker should not panic");
+            }
+        });
+    }
 
     for (worker_buffer, rows) in worker_buffers.iter().zip(bands.iter().copied()) {
         let start = rows.start * width;
         let end = rows.end * width;
         buffer[start..end].copy_from_slice(worker_buffer);
+    }
+
+    if let Some(worker_alpha_buffers) = worker_alpha_buffers {
+        if let Some(alpha_buffer) = alpha_buffer.as_deref_mut() {
+            for (worker_alpha_buffer, rows) in
+                worker_alpha_buffers.iter().zip(bands.iter().copied())
+            {
+                let start = rows.start * width;
+                let end = rows.end * width;
+                alpha_buffer[start..end].copy_from_slice(worker_alpha_buffer);
+            }
+        }
+        release_worker_alpha_buffers(worker_alpha_buffers);
     }
 
     release_worker_buffers(worker_buffers);
@@ -1807,6 +1932,7 @@ fn render_scene_update_internal(
             width,
             height,
             dirty_region,
+            clear_color,
             glass_mode,
         );
     }
@@ -1878,6 +2004,7 @@ fn render_scene_update_parallel(
                             width,
                             height,
                             job.clip,
+                            clear_color,
                             glass_mode,
                         );
                     }
@@ -2048,6 +2175,7 @@ fn draw_cached_root_indices(
     width: usize,
     height: usize,
     clip: ClipRect,
+    clear_color: Color,
     glass_mode: GlassRenderMode,
 ) {
     for &root_index in root_indices {
@@ -2057,7 +2185,16 @@ fn draw_cached_root_indices(
         let Some(bounds) = cached_bounds.get(root_index) else {
             continue;
         };
-        draw_node_with_cached_bounds(node, bounds, buffer, width, height, clip, glass_mode);
+        draw_node_with_cached_bounds(
+            node,
+            bounds,
+            buffer,
+            width,
+            height,
+            clip,
+            clear_color,
+            glass_mode,
+        );
     }
 }
 
@@ -2153,6 +2290,7 @@ fn redraw_auto_scroll_indicator_regions(
                 width,
                 height,
                 clip,
+                clear_color,
                 glass_mode,
             );
         }
@@ -2225,6 +2363,7 @@ struct CachedSubtreeBounds {
     bounds: Option<ClipRect>,
     subtree_uses_depth: bool,
     subtree_uses_backdrop_blur: bool,
+    subtree_uses_backdrop_occlusion: bool,
     subtree_uses_native_glass: bool,
     children: Vec<CachedSubtreeBounds>,
 }
@@ -2411,6 +2550,11 @@ fn child_3d_context(node: &RenderNode, in_3d_context: bool) -> bool {
         || node.style.transform_style == TransformStyleMode::Preserve3d
 }
 
+fn node_has_rounded_overflow_clip(node: &RenderNode) -> bool {
+    node.style.overflow.clips_any_axis()
+        && !corner_radius_is_zero(node.layout, node.style.corner_radius)
+}
+
 fn draw_node_with_cached_bounds(
     node: &RenderNode,
     cached_bounds: &CachedSubtreeBounds,
@@ -2418,6 +2562,7 @@ fn draw_node_with_cached_bounds(
     width: usize,
     height: usize,
     clip: ClipRect,
+    clear_color: Color,
     glass_mode: GlassRenderMode,
 ) {
     draw_node_with_cached_bounds_internal(
@@ -2427,6 +2572,7 @@ fn draw_node_with_cached_bounds(
         width,
         height,
         clip,
+        clear_color,
         glass_mode,
         true,
     );
@@ -2439,6 +2585,7 @@ fn draw_node_with_cached_bounds_internal(
     width: usize,
     height: usize,
     clip: ClipRect,
+    clear_color: Color,
     glass_mode: GlassRenderMode,
     allow_surface_promotion: bool,
 ) {
@@ -2460,6 +2607,7 @@ fn draw_node_with_cached_bounds_internal(
         clip,
         None,
         false,
+        clear_color,
         glass_mode,
         allow_surface_promotion,
     );
@@ -2475,6 +2623,7 @@ fn draw_node_contents(
     clip: ClipRect,
     parent_perspective: Option<PerspectiveContext>,
     in_3d_context: bool,
+    clear_color: Color,
 ) {
     draw_node_contents_internal(
         node,
@@ -2485,6 +2634,7 @@ fn draw_node_contents(
         clip,
         parent_perspective,
         in_3d_context,
+        clear_color,
         GlassRenderMode::Fallback,
         true,
     );
@@ -2499,6 +2649,7 @@ fn draw_node_contents_internal(
     clip: ClipRect,
     parent_perspective: Option<PerspectiveContext>,
     in_3d_context: bool,
+    clear_color: Color,
     glass_mode: GlassRenderMode,
     allow_surface_promotion: bool,
 ) {
@@ -2513,11 +2664,14 @@ fn draw_node_contents_internal(
             parent_perspective,
             &ClipState::new(clip),
             in_3d_context,
+            clear_color,
             glass_mode,
             allow_surface_promotion,
         );
         return;
     }
+
+    draw_backdrop_occlusion(node, buffer, width, height, clip, clear_color);
 
     draw_glass_surface(node, buffer, width, height, clip, glass_mode);
 
@@ -2560,6 +2714,18 @@ fn draw_node_contents_internal(
 
     draw_background_and_border(node, buffer, width, height, clip);
 
+    for shadow in &node.style.inset_shadows {
+        draw_inset_shadow(
+            buffer,
+            width,
+            height,
+            node.layout,
+            node.style.corner_radius,
+            *shadow,
+            clip,
+        );
+    }
+
     if let RenderKind::Text(content) = &node.kind {
         let text_layout = scrollbar::text_layout(node);
         let text_clip = scrollbar::text_clip(node, clip);
@@ -2575,6 +2741,37 @@ fn draw_node_contents_internal(
         );
     } else if let RenderKind::Svg(scene) = &node.kind {
         svg::draw_svg_scene(buffer, width, height, node.layout, scene, clip);
+    }
+
+    if node_has_rounded_overflow_clip(node) {
+        let Some(child_clip_state) = ClipState::new(clip).push_layout_clip(
+            node.layout,
+            node.style.corner_radius,
+            AffineTransform::IDENTITY,
+        ) else {
+            return;
+        };
+        let child_context = child_3d_context(node, in_3d_context);
+        let child_perspective = active_child_perspective(node, parent_perspective, child_context);
+        for (child, child_bounds) in node.children.iter().zip(&cached_bounds.children) {
+            draw_node_transformed_internal(
+                child,
+                child_bounds,
+                buffer,
+                width,
+                height,
+                TransformMatrix3d::IDENTITY,
+                child_perspective,
+                &child_clip_state,
+                child_context,
+                clear_color,
+                glass_mode,
+                allow_surface_promotion,
+            );
+        }
+
+        scrollbar::draw_scrollbars(node, buffer, width, height, clip);
+        return;
     }
 
     let child_clip = if node.style.overflow.clips_any_axis() {
@@ -2600,6 +2797,7 @@ fn draw_node_contents_internal(
                 child_clip,
                 child_perspective,
                 child_context,
+                clear_color,
                 glass_mode,
                 allow_surface_promotion,
             );
@@ -2614,6 +2812,7 @@ fn draw_node_contents_internal(
                 child_perspective,
                 &ClipState::new(child_clip),
                 child_context,
+                clear_color,
                 glass_mode,
                 allow_surface_promotion,
             );
@@ -2944,7 +3143,7 @@ fn hit_test_node_for_event_transformed(
     }
 
     let child_clip_state = if node.style.overflow.clips_any_axis() {
-        clip_state.push_layout_clip(node.layout, matrix)?
+        clip_state.push_layout_clip(node.layout, node.style.corner_radius, matrix)?
     } else {
         clip_state.clone()
     };
@@ -3002,7 +3201,7 @@ fn hit_test_element_path_node_transformed(
     }
 
     let child_clip_state = if node.style.overflow.clips_any_axis() {
-        clip_state.push_layout_clip(node.layout, matrix)?
+        clip_state.push_layout_clip(node.layout, node.style.corner_radius, matrix)?
     } else {
         clip_state.clone()
     };
@@ -3108,6 +3307,7 @@ fn draw_node_transformed(
     parent_perspective: Option<PerspectiveContext>,
     clip_state: &ClipState,
     in_3d_context: bool,
+    clear_color: Color,
 ) {
     draw_node_transformed_internal(
         node,
@@ -3119,6 +3319,7 @@ fn draw_node_transformed(
         parent_perspective,
         clip_state,
         in_3d_context,
+        clear_color,
         GlassRenderMode::Fallback,
         true,
     );
@@ -3134,6 +3335,7 @@ fn draw_node_transformed_internal(
     parent_perspective: Option<PerspectiveContext>,
     clip_state: &ClipState,
     in_3d_context: bool,
+    clear_color: Color,
     glass_mode: GlassRenderMode,
     allow_surface_promotion: bool,
 ) {
@@ -3160,6 +3362,16 @@ fn draw_node_transformed_internal(
             return;
         }
     }
+
+    draw_backdrop_occlusion_transformed(
+        node,
+        buffer,
+        width,
+        height,
+        matrix,
+        clip_state,
+        clear_color,
+    );
 
     draw_glass_surface_transformed(node, buffer, width, height, matrix, clip_state, glass_mode);
 
@@ -3205,11 +3417,26 @@ fn draw_node_transformed_internal(
 
     draw_background_and_border_transformed(node, buffer, width, height, matrix, clip_state);
 
+    for shadow in &node.style.inset_shadows {
+        draw_inset_shadow_transformed(
+            buffer,
+            width,
+            height,
+            node.layout,
+            node.style.corner_radius,
+            *shadow,
+            matrix,
+            clip_state,
+        );
+    }
+
     if let RenderKind::Text(content) = &node.kind {
         let text_layout = scrollbar::text_layout(node);
         let text_clip_state = if node.style.overflow.clips_any_axis() || node.scrollbars.is_some() {
             let viewport = scrollbar::text_viewport(node);
-            let Some(state) = clip_state.push_layout_clip(viewport, matrix) else {
+            let Some(state) =
+                clip_state.push_layout_clip(viewport, cssimpler_core::CornerRadius::ZERO, matrix)
+            else {
                 return;
             };
             state
@@ -3240,7 +3467,9 @@ fn draw_node_transformed_internal(
     }
 
     let child_clip_state = if node.style.overflow.clips_any_axis() {
-        let Some(state) = clip_state.push_layout_clip(node.layout, matrix) else {
+        let Some(state) =
+            clip_state.push_layout_clip(node.layout, node.style.corner_radius, matrix)
+        else {
             return;
         };
         state
@@ -3269,6 +3498,7 @@ fn draw_node_transformed_internal(
             child_perspective,
             &child_clip_state,
             child_context,
+            clear_color,
             glass_mode,
             allow_surface_promotion,
         );
@@ -3452,6 +3682,54 @@ fn node_fill_layout_and_radius(node: &RenderNode) -> (LayoutBox, cssimpler_core:
             ),
         )
     }
+}
+
+fn draw_backdrop_occlusion(
+    node: &RenderNode,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clip: ClipRect,
+    clear_color: Color,
+) {
+    if node.style.backdrop_occlusion != BackdropOcclusion::Scene {
+        return;
+    }
+
+    clear_rounded_rect_to_scene(
+        buffer,
+        width,
+        height,
+        node.layout,
+        node.style.corner_radius,
+        clip,
+        clear_color,
+    );
+}
+
+fn draw_backdrop_occlusion_transformed(
+    node: &RenderNode,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+    clear_color: Color,
+) {
+    if node.style.backdrop_occlusion != BackdropOcclusion::Scene {
+        return;
+    }
+
+    clear_transformed_rounded_rect_to_scene(
+        buffer,
+        width,
+        height,
+        node.layout,
+        node.style.corner_radius,
+        matrix,
+        clip_state,
+        clear_color,
+    );
 }
 
 const DEFAULT_GLASS_FALLBACK_TINT: Color = Color::rgba(245, 250, 255, 96);
@@ -3689,6 +3967,73 @@ fn clear_rounded_rect_to_transparent(
     }
 }
 
+fn clear_rounded_rect_to_scene(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: cssimpler_core::CornerRadius,
+    clip: ClipRect,
+    clear_color: Color,
+) {
+    let Some(bounds) = layout_clip(layout).intersect(clip) else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+
+    let clear = pack_rgb(clear_color);
+    let clear = if render_alpha_target_active() {
+        pack_transparent()
+    } else {
+        clear
+    };
+    let rows = current_render_buffer_rows();
+    let row_start = y0.max(rows.start.min(height) as i32);
+    let row_end = y1.min(rows.end.min(height) as i32);
+    if row_start >= row_end {
+        return;
+    }
+
+    if radius == cssimpler_core::CornerRadius::ZERO {
+        for y in row_start..row_end {
+            let local_row_start = (y as usize - rows.start) * width;
+            let start = local_row_start + x0 as usize;
+            let end = local_row_start + x1 as usize;
+            buffer[start..end].fill(clear);
+            fill_current_alpha_span(
+                start,
+                end - start,
+                if render_alpha_target_active() {
+                    0
+                } else {
+                    u8::MAX
+                },
+            );
+        }
+        return;
+    }
+
+    for y in row_start..row_end {
+        let local_row_start = (y as usize - rows.start) * width;
+        for x in x0..x1 {
+            if rounded_rect_coverage(layout, radius, clip, x, y) >= 128 {
+                let index = local_row_start + x as usize;
+                buffer[index] = clear;
+                set_current_alpha_at(
+                    index,
+                    if render_alpha_target_active() {
+                        0
+                    } else {
+                        u8::MAX
+                    },
+                );
+            }
+        }
+    }
+}
+
 fn clear_transformed_rounded_rect_to_transparent(
     buffer: &mut [u32],
     width: usize,
@@ -3721,6 +4066,56 @@ fn clear_transformed_rounded_rect_to_transparent(
                 let index = local_row_start + x as usize;
                 buffer[index] = clear;
                 set_current_alpha_at(index, 0);
+            }
+        }
+    }
+}
+
+fn clear_transformed_rounded_rect_to_scene(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: cssimpler_core::CornerRadius,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+    clear_color: Color,
+) {
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+    let Some(bounds) = transform_layout_bounds(layout, matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+
+    let clear = pack_rgb(clear_color);
+    let clear = if render_alpha_target_active() {
+        pack_transparent()
+    } else {
+        clear
+    };
+    let rows = current_render_buffer_rows();
+    let row_start = y0.max(rows.start.min(height) as i32);
+    let row_end = y1.min(rows.end.min(height) as i32);
+    for y in row_start..row_end {
+        let local_row_start = (y as usize - rows.start) * width;
+        for x in x0..x1 {
+            if transformed_rounded_rect_coverage(layout, radius, inverse, clip_state, x, y) >= 128 {
+                let index = local_row_start + x as usize;
+                buffer[index] = clear;
+                set_current_alpha_at(
+                    index,
+                    if render_alpha_target_active() {
+                        0
+                    } else {
+                        u8::MAX
+                    },
+                );
             }
         }
     }
@@ -4367,6 +4762,11 @@ fn cache_subtree_bounds(
                 || children
                     .iter()
                     .any(|child| child.subtree_uses_backdrop_blur),
+            subtree_uses_backdrop_occlusion: node.style.backdrop_occlusion
+                == BackdropOcclusion::Scene
+                || children
+                    .iter()
+                    .any(|child| child.subtree_uses_backdrop_occlusion),
             subtree_uses_native_glass: node.style.native_material == NativeMaterial::Glass
                 || children.iter().any(|child| child.subtree_uses_native_glass),
             children,
@@ -4416,6 +4816,10 @@ fn cache_subtree_bounds(
             || children
                 .iter()
                 .any(|child| child.subtree_uses_backdrop_blur),
+        subtree_uses_backdrop_occlusion: node.style.backdrop_occlusion == BackdropOcclusion::Scene
+            || children
+                .iter()
+                .any(|child| child.subtree_uses_backdrop_occlusion),
         subtree_uses_native_glass: node.style.native_material == NativeMaterial::Glass
             || children.iter().any(|child| child.subtree_uses_native_glass),
         children,
@@ -4974,12 +5378,12 @@ mod tests {
 
     use cssimpler_core::fonts::{FontFamily, TextStyle, TextTransform, register_font_file};
     use cssimpler_core::{
-        AnglePercentageValue, BackgroundLayer, BorderLineStyle, BoxShadow, CircleRadius, Color,
-        ConicGradient, CornerRadius, ElementPath, ExtractedScene, GradientDirection,
-        GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop, GradientVertical,
-        Insets, LayoutBox, LengthPercentageValue, LinearGradient, NativeMaterial, Overflow,
-        RadialGradient, RadialShape, RenderNode, ShadowEffect, TextStrokeStyle, Transform2D,
-        TransformMatrix3d, TransformOperation, TransformStyleMode, VisualStyle,
+        AnglePercentageValue, BackdropOcclusion, BackgroundLayer, BorderLineStyle, BoxShadow,
+        CircleRadius, Color, ConicGradient, CornerRadius, ElementPath, ExtractedScene,
+        GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
+        GradientVertical, Insets, LayoutBox, LengthPercentageValue, LinearGradient, NativeMaterial,
+        Overflow, RadialGradient, RadialShape, RenderNode, ShadowEffect, TextStrokeStyle,
+        Transform2D, TransformMatrix3d, TransformOperation, TransformStyleMode, VisualStyle,
     };
 
     use crate::{
@@ -5226,9 +5630,71 @@ mod tests {
             Color::BLACK,
             4,
             GlassRenderMode::Fallback,
+            None,
         );
 
         assert_eq!(single, threaded);
+    }
+
+    #[test]
+    fn multithreaded_alpha_full_redraw_matches_the_single_threaded_result() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 96.0, 72.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(20, 28, 40)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(8.0, 8.0, 64.0, 42.0))
+                .with_style(VisualStyle {
+                    native_material: NativeMaterial::Glass,
+                    glass_tint: Some(Color::rgba(255, 255, 255, 96)),
+                    corner_radius: CornerRadius::all(10.0),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(18.0, 16.0, 30.0, 18.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgba(40, 120, 220, 192)),
+                            corner_radius: CornerRadius::all(6.0),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+            RenderNode::container(LayoutBox::new(42.0, 30.0, 28.0, 18.0)).with_style(VisualStyle {
+                backdrop_occlusion: BackdropOcclusion::Scene,
+                corner_radius: CornerRadius::all(5.0),
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut single = vec![0_u32; 96 * 72];
+        let mut threaded = vec![0_u32; 96 * 72];
+        let mut single_alpha = vec![0_u8; 96 * 72];
+        let mut threaded_alpha = vec![0_u8; 96 * 72];
+        let cached_bounds = super::cache_scene_subtree_bounds(&scene);
+
+        super::render_to_buffer_serial(
+            &scene,
+            &cached_bounds.roots,
+            &mut single,
+            96,
+            72,
+            Color::BLACK,
+            GlassRenderMode::NativeWithTint,
+            Some(&mut single_alpha),
+        );
+        super::render_to_buffer_parallel(
+            &scene,
+            &cached_bounds,
+            &mut threaded,
+            96,
+            72,
+            Color::BLACK,
+            4,
+            GlassRenderMode::NativeWithTint,
+            Some(&mut threaded_alpha),
+        );
+
+        assert_eq!(single, threaded);
+        assert_eq!(single_alpha, threaded_alpha);
     }
 
     #[test]
@@ -6018,6 +6484,57 @@ mod tests {
         render_to_buffer(&scene, &mut buffer, 20, 20, Color::WHITE);
 
         assert_ne!(buffer[13 * 20 + 13], pack_rgb(Color::WHITE));
+    }
+
+    #[test]
+    fn rounded_overflow_clip_hides_child_pixels_outside_parent_radius() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(2.0, 2.0, 12.0, 12.0))
+                .with_style(VisualStyle {
+                    corner_radius: CornerRadius::all(6.0),
+                    overflow: Overflow::CLIP,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(2.0, 2.0, 12.0, 12.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(220, 38, 38)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 20 * 20];
+
+        render_to_buffer(&scene, &mut buffer, 20, 20, Color::WHITE);
+
+        assert_eq!(buffer[8 * 20 + 8], pack_rgb(Color::rgb(220, 38, 38)));
+        assert_eq!(buffer[2 * 20 + 2], pack_rgb(Color::WHITE));
+    }
+
+    #[test]
+    fn inset_box_shadow_renders_inside_rounded_element() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(2.0, 2.0, 16.0, 16.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(30, 64, 175)),
+                corner_radius: CornerRadius::all(5.0),
+                inset_shadows: vec![BoxShadow {
+                    color: Color::rgb(220, 38, 38),
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    blur_radius: 0.0,
+                    spread: 2.0,
+                }],
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 20 * 20];
+
+        render_to_buffer(&scene, &mut buffer, 20, 20, Color::WHITE);
+
+        assert_eq!(buffer[10 * 20 + 3], pack_rgb(Color::rgb(220, 38, 38)));
+        assert_eq!(buffer[10 * 20 + 10], pack_rgb(Color::rgb(30, 64, 175)));
+        assert_eq!(buffer[2 * 20 + 2], pack_rgb(Color::WHITE));
     }
 
     #[test]
@@ -8683,6 +9200,116 @@ mod tests {
                 ..VisualStyle::default()
             }),
         ]
+    }
+
+    #[test]
+    fn scene_backdrop_occlusion_clears_previous_scene_to_clear_color() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(239, 68, 68)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(4.0, 4.0, 12.0, 12.0)).with_style(VisualStyle {
+                backdrop_occlusion: BackdropOcclusion::Scene,
+                corner_radius: CornerRadius::all(6.0),
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 20 * 20];
+
+        render_to_buffer(&scene, &mut buffer, 20, 20, Color::WHITE);
+
+        assert_eq!(buffer[10 * 20 + 10], pack_rgb(Color::WHITE));
+        assert_eq!(buffer[4 * 20 + 4], pack_rgb(Color::rgb(239, 68, 68)));
+    }
+
+    #[test]
+    fn scene_backdrop_occlusion_does_not_clear_own_paint() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(239, 68, 68)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(4.0, 4.0, 12.0, 12.0))
+                .with_style(VisualStyle {
+                    backdrop_occlusion: BackdropOcclusion::Scene,
+                    background: Some(Color::rgb(37, 99, 235)),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(8.0, 8.0, 4.0, 4.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(34, 197, 94)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 20 * 20];
+
+        render_to_buffer(&scene, &mut buffer, 20, 20, Color::WHITE);
+
+        assert_eq!(buffer[6 * 20 + 6], pack_rgb(Color::rgb(37, 99, 235)));
+        assert_eq!(buffer[9 * 20 + 9], pack_rgb(Color::rgb(34, 197, 94)));
+    }
+
+    #[test]
+    fn scene_backdrop_occlusion_reveals_native_glass_alpha() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(239, 68, 68)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(4.0, 4.0, 12.0, 12.0)).with_style(VisualStyle {
+                backdrop_occlusion: BackdropOcclusion::Scene,
+                ..VisualStyle::default()
+            }),
+        ];
+        let extracted = ExtractedScene::from_render_roots(&scene);
+        let mut buffer = vec![0_u32; 20 * 20];
+        let mut alpha = vec![u8::MAX; 20 * 20];
+
+        let _ = super::render_to_buffer_internal_with_alpha(
+            &extracted,
+            &mut buffer,
+            20,
+            20,
+            Color::WHITE,
+            GlassRenderMode::Native,
+            Some(&mut alpha),
+        );
+
+        assert_eq!(alpha[10 * 20 + 10], 0);
+        assert!(is_transparent(buffer[10 * 20 + 10]));
+        assert_eq!(alpha[2 * 20 + 2], u8::MAX);
+        assert_eq!(buffer[2 * 20 + 2], pack_rgb(Color::rgb(239, 68, 68)));
+    }
+
+    #[test]
+    fn transformed_scene_backdrop_occlusion_uses_transformed_bounds() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(239, 68, 68)),
+                ..VisualStyle::default()
+            }),
+            RenderNode::container(LayoutBox::new(4.0, 4.0, 8.0, 8.0)).with_style(VisualStyle {
+                backdrop_occlusion: BackdropOcclusion::Scene,
+                transform: Transform2D {
+                    operations: vec![TransformOperation::Translate {
+                        x: LengthPercentageValue::from_px(4.0),
+                        y: LengthPercentageValue::ZERO,
+                    }],
+                    ..Transform2D::default()
+                },
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 20 * 20];
+
+        render_to_buffer(&scene, &mut buffer, 20, 20, Color::WHITE);
+
+        assert_eq!(buffer[8 * 20 + 12], pack_rgb(Color::WHITE));
+        assert_eq!(buffer[8 * 20 + 6], pack_rgb(Color::rgb(239, 68, 68)));
     }
 
     #[test]

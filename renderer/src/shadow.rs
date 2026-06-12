@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use cssimpler_core::{Color, CornerRadius, LayoutBox, TextStrokeStyle};
 
 use super::shapes::{
-    clip_pixel_bounds, draw_rounded_rect, expand_corner_radius, expand_layout,
-    non_empty_layout_clip, offset_layout, point_in_rounded_rect,
+    clip_pixel_bounds, draw_rounded_rect, expand_corner_radius, expand_layout, layout_clip,
+    non_empty_layout_clip, offset_layout, point_in_rounded_rect, rounded_rect_coverage,
+    transformed_rounded_rect_coverage,
 };
 use super::{
     ClipRect, PreparedBlendColor, blend_mask_row, current_render_buffer_rows,
@@ -283,6 +284,117 @@ pub(crate) fn draw_shadow_transformed(
     );
 }
 
+pub(crate) fn draw_inset_shadow(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    shadow: cssimpler_core::BoxShadow,
+    clip: ClipRect,
+) {
+    if shadow.color.a == 0 {
+        return;
+    }
+    let Some(bounds) = layout_clip(layout).intersect(clip) else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+
+    let rows = current_render_buffer_rows();
+    let row_start = y0.max(rows.start.min(height) as i32);
+    let row_end = y1.min(rows.end.min(height) as i32);
+    if row_start >= row_end || x0 >= x1 {
+        return;
+    }
+
+    let prepared_color = PreparedBlendColor::new(shadow.color);
+    let mut alpha_row = vec![0_u8; (x1 - x0) as usize];
+    for y in row_start..row_end {
+        alpha_row.fill(0);
+        for x in x0..x1 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            if coverage == 0 {
+                continue;
+            }
+
+            let alpha = inset_shadow_alpha(x as f32 + 0.5, y as f32 + 0.5, layout, radius, shadow);
+            alpha_row[(x - x0) as usize] = multiply_alpha(alpha, coverage);
+        }
+
+        let buffer_start = (y as usize - rows.start) * width + x0 as usize;
+        let buffer_end = buffer_start + alpha_row.len();
+        blend_mask_row(
+            &mut buffer[buffer_start..buffer_end],
+            buffer_start,
+            &alpha_row,
+            prepared_color,
+            shadow.color.a,
+        );
+    }
+}
+
+pub(crate) fn draw_inset_shadow_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    shadow: cssimpler_core::BoxShadow,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    if shadow.color.a == 0 {
+        return;
+    }
+    let Some(inverse) = matrix.invert() else {
+        return;
+    };
+    let Some(bounds) = transform_clip_rect(layout_clip(layout), matrix)
+        .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+
+    let prepared_color = PreparedBlendColor::new(shadow.color);
+    let rows = current_render_buffer_rows();
+    let row_start = y0.max(rows.start.min(height) as i32);
+    let row_end = y1.min(rows.end.min(height) as i32);
+    for y in row_start..row_end {
+        for x in x0..x1 {
+            let coverage =
+                transformed_rounded_rect_coverage(layout, radius, inverse, clip_state, x, y);
+            if coverage == 0 {
+                continue;
+            }
+            let (source_x, source_y) = inverse.transform_point(x as f32 + 0.5, y as f32 + 0.5);
+            if !source_x.is_finite() || !source_y.is_finite() {
+                continue;
+            }
+
+            let alpha = inset_shadow_alpha(source_x, source_y, layout, radius, shadow);
+            let alpha = multiply_alpha(alpha, coverage);
+            if alpha == 0 {
+                continue;
+            }
+
+            let buffer_start = (y as usize - rows.start) * width + x as usize;
+            blend_mask_row(
+                &mut buffer[buffer_start..buffer_start + 1],
+                buffer_start,
+                &[alpha],
+                prepared_color,
+                shadow.color.a,
+            );
+        }
+    }
+}
+
 pub(crate) fn draw_shadow_effect(
     buffer: &mut [u32],
     width: usize,
@@ -343,6 +455,10 @@ pub(crate) fn shadow_bounds(
     layout: LayoutBox,
     shadow: cssimpler_core::BoxShadow,
 ) -> Option<ClipRect> {
+    if shadow.color.a == 0 {
+        return None;
+    }
+
     let shadow_layout = offset_layout(
         expand_layout(layout, shadow.spread),
         shadow.offset_x,
@@ -554,6 +670,39 @@ fn shadow_alpha(
 
     let falloff = 1.0 - (distance / blur_radius);
     ((max_alpha as f32) * falloff * falloff).round() as u8
+}
+
+fn inset_shadow_alpha(
+    x: f32,
+    y: f32,
+    layout: LayoutBox,
+    radius: CornerRadius,
+    shadow: cssimpler_core::BoxShadow,
+) -> u8 {
+    if !point_in_rounded_rect(x, y, layout, radius) {
+        return 0;
+    }
+
+    let blur_radius = shadow.blur_radius.max(0.0);
+    let contraction = (shadow.spread + blur_radius).max(0.0);
+    let caster_layout = offset_layout(
+        expand_layout(layout, -contraction),
+        shadow.offset_x,
+        shadow.offset_y,
+    );
+    let caster_radius = expand_corner_radius(layout, radius, -contraction);
+    u8::MAX.saturating_sub(shadow_alpha(
+        x,
+        y,
+        caster_layout,
+        caster_radius,
+        blur_radius,
+        u8::MAX,
+    ))
+}
+
+fn multiply_alpha(alpha: u8, coverage: u8) -> u8 {
+    (((alpha as u16) * (coverage as u16) + 127) / 255) as u8
 }
 
 fn distance_to_rounded_rect(x: f32, y: f32, layout: LayoutBox, radius: CornerRadius) -> f32 {

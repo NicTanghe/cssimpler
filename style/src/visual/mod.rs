@@ -30,6 +30,10 @@ pub(crate) fn extract_property(
         return Some(declarations);
     }
 
+    if let Some(declarations) = backdrop::custom_property_declarations(property) {
+        return Some(declarations);
+    }
+
     if let Some(declarations) = shadow::extract_unparsed_property(property) {
         return Some(declarations);
     }
@@ -194,6 +198,10 @@ pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) ->
         }
         Declaration::BackdropBlur(radius) => {
             backdrop::apply_backdrop_blur(style, *radius);
+            true
+        }
+        Declaration::BackdropOcclusion(occlusion) => {
+            backdrop::apply_backdrop_occlusion(style, *occlusion);
             true
         }
         Declaration::TextStrokeWidth(width) => {

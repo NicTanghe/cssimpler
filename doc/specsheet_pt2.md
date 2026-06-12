@@ -361,6 +361,109 @@ Acceptance:
 
 ---
 
+## T3. CSS `backdrop-occlude` paint barrier
+Depends: T1, T2, E3, Q1  
+Status: implemented  
+
+Purpose:
+- Add a controlled scene paint barrier that lets an element hide all previously painted CSS/UI renderer content behind its own visual box, without cutting, masking, or modifying the app-level acrylic/window backdrop
+
+Should have been an extension:
+- This would ideally have extended E3, Q1, and T1 because it is a renderer compositing behavior over already-painted scene content rather than a layout feature or a normal CSS filter
+
+Support:
+- `backdrop-occlude: scene`
+- `backdrop-occlude: false`
+- Default value: `false`
+- Occlusion shape derived from the element's used border box and used border radius
+- The occlusion operation happens before painting the element's own shadow, background, border, and children
+- The `scene` operation clears all previously painted CSS/UI scene content in the current renderer layer
+- The operation does not clear or modify the platform/app-level acrylic backdrop behind the renderer
+- Deterministic behavior for nested occluding elements based on normal painter order
+
+Paint order:
+```text
+platform/app acrylic background
+↓
+previous CSS/UI scene content
+↓
+backdrop-occlude: scene clear inside this element's rounded border shape
+↓
+element shadow
+↓
+element background
+↓
+element border
+↓
+element children
+```
+
+Non-goals:
+- Do not behave like `backdrop-filter`
+- Do not blur, sample, brighten, darken, or otherwise filter pixels
+- Do not cut holes in the app/window acrylic layer
+- Do not affect layout, hit testing, event routing, or scroll bounds
+- Do not clear content outside the element's used border shape
+- Do not clear the element's own shadow, background, border, or descendants
+- Do not target one specific element, selector, layer, or z-level; that is T4
+
+Acceptance:
+- A card with `backdrop-occlude: scene` can hide page-level gradients, glows, and decorative CSS effects that were painted earlier behind the card
+- The app-level acrylic backdrop remains visible through transparent or translucent parts of the card background
+- Rounded corners do not show stale gradient or glow pixels behind the card
+- Nested occluding elements produce deterministic output using normal painter order
+- CPU renderer behavior is treated as the reference result
+- GPU renderer either matches the CPU behavior or reports the feature as unsupported through the backend capability/fallback policy
+
+Implementation notes:
+- Treat `backdrop-occlude` as a compositing operation, not as a filter.
+- In the CPU renderer, this can be implemented by clearing the current CSS/UI scene buffer inside the element's rounded border mask before drawing that element's own visual primitives.
+- In a GPU renderer, this can be implemented with destination-out alpha, a stencil mask, a scene-layer clear pass, or an equivalent compositing strategy.
+- The extracted scene should preserve an explicit `BackdropOcclude` or `PaintBarrier` primitive so render backends do not need to infer the operation from style during painting.
+
+---
+
+## T4. Element-targeted `backdrop-occlude`
+Depends: T3, E3, Q1  
+Status: planned  
+
+Purpose:
+- Extend `backdrop-occlude` so an element can hide the previously painted output of one named element or subtree behind its own visual box, while leaving other earlier CSS/UI scene content and the app-level acrylic/window backdrop intact
+
+Should have been an extension:
+- This builds on T3, but is kept separate because targeting a specific element requires extracted paint identity, target lookup, and renderer-side compositing that the scene-wide clear does not need
+
+Support:
+- `backdrop-occlude: element(#element-id)`
+- Target lookup is limited to one element id in the same extracted scene
+- The target includes the named element's own paint and descendant paint that was produced before the occluding element in normal painter order
+- Occlusion shape is still derived from the occluding element's used border box and used border radius
+- The operation happens before painting the occluding element's own shadow, background, border, and children
+- If the target element is missing or has not painted before the occluder, the operation is a deterministic no-op
+- Extracted paint items preserve enough element path/id metadata for render backends to determine the targeted contribution without selector matching during paint
+
+Non-goals:
+- Do not support arbitrary CSS selectors, class selectors, combinators, pseudo-classes, or multiple targets in the first targeted version
+- Do not support z-level, layer, or painter-phase targeting in this milestone
+- Do not clear future paint from the target element if the target paints after the occluding element
+- Do not clear or modify the platform/app-level acrylic backdrop
+- Do not affect layout, hit testing, event routing, or scroll bounds for either element
+
+Acceptance:
+- A card with `backdrop-occlude: element(#accent-glow)` can hide that earlier accent/glow element behind the card while leaving unrelated earlier scene content visible
+- Targeted occlusion respects the occluding element's rounded border shape
+- Missing or later-painted targets produce stable output and do not crash
+- Nested targeted occluders remain deterministic under normal painter order
+- CPU renderer behavior is treated as the reference result
+- GPU renderer either matches the CPU behavior or reports the feature as unsupported through the backend capability/fallback policy
+
+Implementation notes:
+- Prefer explicit extracted-scene paint identity over repaint-time selector evaluation.
+- A straightforward CPU implementation can collect or replay the targeted element's earlier paint contribution into a mask/source buffer, then clear only those pixels inside the occluder's rounded shape.
+- If the first implementation cannot isolate the target cheaply, it should report unsupported rather than silently falling back to `scene`.
+
+---
+
 # Epic U - Motion for transforms and surfaces
 
 ## U1. Transform and surface transitions
@@ -467,10 +570,11 @@ Acceptance:
 4. R1  
 5. R2  
 6. R3  
-7. T1 + T2  
-8. U1 + U2  
-9. V1  
-10. W1  
+7. T1 + T2 + T3  
+8. T4  
+9. U1 + U2  
+10. V1  
+11. W1  
 
 ---
 

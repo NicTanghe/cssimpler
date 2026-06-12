@@ -3,10 +3,10 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
-    BorderLineStyle, Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath,
-    LayoutStyle, LengthPercentageCalc, NativeMaterial, OverflowMode, ScrollbarWidth, Style,
-    SvgPaint, TransformOperation, TransformOrigin, TransformStyleMode, TransitionPropertyName,
-    TransitionTimingFunction,
+    BackdropOcclusion, BorderLineStyle, Color, CustomProperties, ElementInteractionState,
+    ElementNode, ElementPath, LayoutStyle, LengthPercentageCalc, NativeMaterial, OverflowMode,
+    ScrollbarWidth, Style, SvgPaint, TransformOperation, TransformOrigin, TransformStyleMode,
+    TransitionPropertyName, TransitionTimingFunction,
     fonts::{TextStyle, TextTransform},
 };
 use lightningcss::declaration::DeclarationBlock;
@@ -406,6 +406,7 @@ pub enum Declaration {
     TextShadows(Vec<ShadowDeclaration>),
     FilterDropShadows(Vec<ShadowDeclaration>),
     BackdropBlur(f32),
+    BackdropOcclusion(BackdropOcclusion),
     TextStrokeWidth(f32),
     TextStrokeColor(Option<Color>),
     TransformOperations(Vec<TransformOperation>),
@@ -1767,8 +1768,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use cssimpler_core::{
-        AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient,
-        ElementInteractionState, ElementNode, GradientDirection, GradientHorizontal,
+        AnglePercentageValue, BackdropOcclusion, BackgroundLayer, CircleRadius, Color,
+        ConicGradient, ElementInteractionState, ElementNode, GradientDirection, GradientHorizontal,
         GradientInterpolation, GradientPoint, GradientStop, LengthPercentageValue, LinearGradient,
         NativeMaterial, Node, RadialShape, ScrollbarWidth, ShapeExtent, TransformMatrix3d,
         TransformOperation, TransformOrigin, TransformStyleMode, TransitionPropertyName,
@@ -1878,6 +1879,29 @@ mod tests {
             resolved.visual.glass_tint,
             Some(Color::rgba(245, 250, 255, 92))
         );
+    }
+
+    #[test]
+    fn parser_preserves_inset_box_shadows() {
+        let stylesheet = parse_stylesheet(
+            ".button {
+                box-shadow:
+                    inset 0px 0px 16px rgba(255, 255, 255, 0.68),
+                    0px 12px 28px rgba(37, 54, 70, 0.20);
+            }",
+        )
+        .expect("inset box-shadow stylesheet should parse");
+        let element = Node::element("button").with_class("button");
+        let resolved = resolve_style(&element, &stylesheet);
+
+        assert_eq!(resolved.visual.inset_shadows.len(), 1);
+        assert_eq!(resolved.visual.inset_shadows[0].blur_radius, 16.0);
+        assert_eq!(
+            resolved.visual.inset_shadows[0].color,
+            Color::rgba(255, 255, 255, 173)
+        );
+        assert_eq!(resolved.visual.shadows.len(), 1);
+        assert_eq!(resolved.visual.shadows[0].offset_y, 12.0);
     }
 
     #[test]
@@ -2528,6 +2552,7 @@ mod tests {
                     offset_y: 2.0,
                     blur_radius: 3.0,
                     spread: 0.0,
+                    inset: false,
                 }]))
         );
         assert!(
@@ -2539,6 +2564,7 @@ mod tests {
                     offset_y: 5.0,
                     blur_radius: 6.0,
                     spread: 0.0,
+                    inset: false,
                 }]))
         );
     }
@@ -2567,6 +2593,52 @@ mod tests {
         let scene = build_render_tree(&tree, &stylesheet);
 
         assert_eq!(scene.style.backdrop_blur_radius, 8.0);
+    }
+
+    #[test]
+    fn parser_supports_scene_backdrop_occlusion() {
+        let stylesheet = parse_stylesheet(".glass { backdrop-occlude: scene; }")
+            .expect("backdrop occlusion stylesheet should parse");
+
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::BackdropOcclusion(BackdropOcclusion::Scene))
+        );
+
+        let tree = Node::element("div").with_class("glass").into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        assert_eq!(scene.style.backdrop_occlusion, BackdropOcclusion::Scene);
+    }
+
+    #[test]
+    fn backdrop_occlusion_false_resets_to_default() {
+        let stylesheet = parse_stylesheet(
+            ".glass {
+                backdrop-occlude: scene;
+                backdrop-occlude: false;
+            }",
+        )
+        .expect("backdrop occlusion reset should parse");
+        let tree = Node::element("div").with_class("glass").into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        assert_eq!(scene.style.backdrop_occlusion, BackdropOcclusion::None);
+    }
+
+    #[test]
+    fn unsupported_backdrop_occlusion_values_fail_clearly() {
+        let error = parse_stylesheet(".glass { backdrop-occlude: true; }")
+            .expect_err("unsupported backdrop occlusion should fail clearly");
+
+        assert!(matches!(
+            error,
+            StyleError::UnsupportedValue(message)
+                if message.contains("backdrop-occlude")
+                    && message.contains("true")
+                    && message.contains("only false and scene are supported")
+        ));
     }
 
     #[test]

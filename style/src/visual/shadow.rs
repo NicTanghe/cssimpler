@@ -21,6 +21,7 @@ pub struct ShadowDeclaration {
     pub(crate) offset_y: f32,
     pub(crate) blur_radius: f32,
     pub(crate) spread: f32,
+    pub(crate) inset: bool,
 }
 
 pub(super) fn extract_unparsed_property(
@@ -49,7 +50,6 @@ pub(super) fn box_shadow_declarations(
     Ok(vec![Declaration::BoxShadows(
         shadows
             .iter()
-            .filter(|shadow| !shadow.inset)
             .map(box_shadow_declaration)
             .collect::<Result<Vec<_>, _>>()?,
     )])
@@ -84,16 +84,24 @@ pub(super) fn filter_drop_shadow_declarations(
 }
 
 pub(super) fn apply_box_shadows(style: &mut Style, shadows: &[ShadowDeclaration]) {
-    style.visual.shadows = shadows
-        .iter()
-        .map(|shadow| CoreBoxShadow {
+    style.visual.shadows.clear();
+    style.visual.inset_shadows.clear();
+
+    for shadow in shadows {
+        let resolved = CoreBoxShadow {
             color: shadow.color.unwrap_or(style.visual.foreground),
             offset_x: shadow.offset_x,
             offset_y: shadow.offset_y,
             blur_radius: shadow.blur_radius,
             spread: shadow.spread,
-        })
-        .collect();
+        };
+
+        if shadow.inset {
+            style.visual.inset_shadows.push(resolved);
+        } else {
+            style.visual.shadows.push(resolved);
+        }
+    }
 }
 
 pub(super) fn apply_text_shadows(style: &mut Style, shadows: &[ShadowDeclaration]) {
@@ -132,6 +140,7 @@ fn box_shadow_declaration(shadow: &BoxShadow) -> Result<ShadowDeclaration, Style
         offset_y: length_to_px(&shadow.y_offset)?,
         blur_radius: length_to_px(&shadow.blur)?,
         spread: length_to_px(&shadow.spread)?,
+        inset: shadow.inset,
     })
 }
 
@@ -142,6 +151,7 @@ fn text_shadow_declaration(shadow: &TextShadow) -> Result<ShadowDeclaration, Sty
         offset_y: length_to_px(&shadow.y_offset)?,
         blur_radius: length_to_px(&shadow.blur)?,
         spread: length_to_px(&shadow.spread)?,
+        inset: false,
     })
 }
 
@@ -152,6 +162,7 @@ fn drop_shadow_declaration(shadow: &DropShadow) -> Result<ShadowDeclaration, Sty
         offset_y: length_to_px(&shadow.y_offset)?,
         blur_radius: length_to_px(&shadow.blur)?,
         spread: 0.0,
+        inset: false,
     })
 }
 
