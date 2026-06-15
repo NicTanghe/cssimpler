@@ -642,39 +642,40 @@ where
                         return;
                     }
                 }
-            } else if let Some(surface) = self.surface.as_mut() {
-                match surface.buffer_mut() {
-                    Ok(mut target) => {
-                        let target_width = target.width().get() as usize;
-                        let target_height = target.height().get() as usize;
-                        copy_render_buffer_into_surface(
-                            &mut target,
-                            target_width,
-                            target_height,
-                            &self.buffer,
-                            self.buffer_width,
-                            self.buffer_height,
-                            if self.native_glass_active {
-                                Some(self.alpha_buffer.as_slice())
-                            } else {
-                                None
-                            },
-                            pack_softbuffer_rgb(self.config.clear_color),
-                            self.native_glass_active,
-                        );
-                        // Transparent pixels reveal native glass on Windows. Present the full
-                        // surface so cleared transparent regions also replace stale pixels
-                        // during resize and layout changes.
-                        let present_result = target.present();
-                        if let Err(error) = present_result {
-                            self.fail(event_loop, error);
-                            return;
+            } else {
+                let surface_result = if let Some(surface) = self.surface.as_mut() {
+                    match surface.buffer_mut() {
+                        Ok(mut target) => {
+                            let target_width = target.width().get() as usize;
+                            let target_height = target.height().get() as usize;
+                            copy_render_buffer_into_surface(
+                                &mut target,
+                                target_width,
+                                target_height,
+                                &self.buffer,
+                                self.buffer_width,
+                                self.buffer_height,
+                                if self.native_glass_active {
+                                    Some(self.alpha_buffer.as_slice())
+                                } else {
+                                    None
+                                },
+                                pack_softbuffer_rgb(self.config.clear_color),
+                                self.native_glass_active,
+                            );
+                            // Transparent pixels reveal native glass on Windows. Present the full
+                            // surface so cleared transparent regions also replace stale pixels
+                            // during resize and layout changes.
+                            target.present().map_err(RendererError::from)
                         }
+                        Err(error) => Err(RendererError::from(error)),
                     }
-                    Err(error) => {
-                        self.fail(event_loop, error);
-                        return;
-                    }
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = surface_result {
+                    self.fail(event_loop, error);
+                    return;
                 }
             }
             frame_stats.present_us = duration_to_us(present_start.elapsed());

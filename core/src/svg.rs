@@ -1,4 +1,4 @@
-use crate::Color;
+use crate::{Color, LengthPercentageValue};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SvgPaint {
@@ -125,6 +125,27 @@ pub enum SvgPaintServerKind {
 pub struct SvgPaintServer {
     pub id: String,
     pub kind: SvgPaintServerKind,
+    pub data: SvgPaintServerData,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SvgPaintServerData {
+    LinearGradient(SvgLinearGradient),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SvgLinearGradient {
+    pub x1: LengthPercentageValue,
+    pub y1: LengthPercentageValue,
+    pub x2: LengthPercentageValue,
+    pub y2: LengthPercentageValue,
+    pub stops: Vec<SvgGradientStop>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SvgGradientStop {
+    pub color: Color,
+    pub offset: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]

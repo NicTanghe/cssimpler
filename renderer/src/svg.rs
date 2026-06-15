@@ -1,5 +1,6 @@
 use cssimpler_core::{
-    LinearRgba, SvgBounds, SvgPathGeometry, SvgPathPaintSource, SvgPoint, SvgScene, SvgViewBox,
+    GradientInterpolation, LinearRgba, SvgBounds, SvgLinearGradient, SvgPaintServerData,
+    SvgPathGeometry, SvgPathPaintSource, SvgPoint, SvgScene, SvgViewBox,
 };
 
 use super::{
@@ -7,10 +8,47 @@ use super::{
     transform::{AffineTransform, ClipState, transform_clip_rect},
 };
 
+use super::gradient::{
+    PreparedResolvedGradient, ResolvedGradientStop, prepare_resolved_gradient,
+    sample_prepared_gradient,
+};
+
 use cssimpler_core::LayoutBox;
 
 const SVG_COVERAGE_SAMPLES: [(f32, f32); 4] =
     [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+
+struct PreparedSvgLinearGradient {
+    start_x: f32,
+    start_y: f32,
+    dx: f32,
+    dy: f32,
+    inverse_length_sq: f32,
+    stops: PreparedResolvedGradient,
+}
+
+enum SvgResolvedPaint {
+    Color(LinearRgba),
+    LinearGradient(PreparedSvgLinearGradient),
+}
+
+impl SvgResolvedPaint {
+    fn sample(&self, x: f32, y: f32) -> LinearRgba {
+        match self {
+            Self::Color(color) => *color,
+            Self::LinearGradient(gradient) => {
+                if gradient.inverse_length_sq <= f32::EPSILON {
+                    return sample_prepared_gradient(&gradient.stops, 0.0, false);
+                }
+
+                let projection = (((x - gradient.start_x) * gradient.dx)
+                    + ((y - gradient.start_y) * gradient.dy))
+                    * gradient.inverse_length_sq;
+                sample_prepared_gradient(&gradient.stops, projection, false)
+            }
+        }
+    }
+}
 
 pub(crate) fn draw_svg_scene(
     buffer: &mut [u32],
@@ -80,7 +118,7 @@ fn draw_svg_scene_with_matrix(
             .paint
             .fill
             .as_ref()
-            .map(svg_paint_source_to_linear_rgba)
+            .map(|paint| resolve_svg_paint_source(paint, scene))
             .transpose();
         let fill = match fill {
             Ok(fill) => fill,
@@ -91,7 +129,7 @@ fn draw_svg_scene_with_matrix(
                 .paint
                 .stroke
                 .as_ref()
-                .map(svg_paint_source_to_linear_rgba)
+                .map(|paint| resolve_svg_paint_source(paint, scene))
                 .transpose();
             match stroke {
                 Ok(stroke) => stroke,
@@ -137,23 +175,33 @@ fn draw_svg_scene_with_matrix(
                 }
 
                 let index = local_row_start + x as usize;
-                if let Some(fill) = fill
+                let center_source = if fill_hits > 0 || stroke_hits > 0 {
+                    let (source_x, source_y) =
+                        inverse.transform_point(x as f32 + 0.5, y as f32 + 0.5);
+                    (source_x.is_finite() && source_y.is_finite()).then_some((source_x, source_y))
+                } else {
+                    None
+                };
+                if let (Some(fill), Some((source_x, source_y))) = (&fill, center_source)
                     && fill_hits > 0
                 {
                     blend_linear_over(
                         buffer,
                         index,
-                        with_coverage(fill, fill_hits as f32 / SVG_COVERAGE_SAMPLES.len() as f32),
+                        with_coverage(
+                            fill.sample(source_x, source_y),
+                            fill_hits as f32 / SVG_COVERAGE_SAMPLES.len() as f32,
+                        ),
                     );
                 }
-                if let Some(stroke) = stroke
+                if let (Some(stroke), Some((source_x, source_y))) = (&stroke, center_source)
                     && stroke_hits > 0
                 {
                     blend_linear_over(
                         buffer,
                         index,
                         with_coverage(
-                            stroke,
+                            stroke.sample(source_x, source_y),
                             stroke_hits as f32 / SVG_COVERAGE_SAMPLES.len() as f32,
                         ),
                     );
@@ -163,13 +211,72 @@ fn draw_svg_scene_with_matrix(
     }
 }
 
-fn svg_paint_source_to_linear_rgba(paint: &SvgPathPaintSource) -> Result<LinearRgba, String> {
+fn resolve_svg_paint_source(
+    paint: &SvgPathPaintSource,
+    scene: &SvgScene,
+) -> Result<SvgResolvedPaint, String> {
     match paint {
-        SvgPathPaintSource::Color(color) => Ok(color.to_linear_rgba()),
-        SvgPathPaintSource::PaintServer(reference) => Err(format!(
-            "SVG paint-server rendering is not implemented for url(#{})",
-            reference.id
-        )),
+        SvgPathPaintSource::Color(color) => Ok(SvgResolvedPaint::Color(color.to_linear_rgba())),
+        SvgPathPaintSource::PaintServer(reference) => {
+            let Some(server) = scene
+                .paint_servers
+                .iter()
+                .find(|server| server.id == reference.id)
+            else {
+                return Err(format!(
+                    "missing SVG paint-server data for url(#{})",
+                    reference.id
+                ));
+            };
+            if server.kind != reference.kind {
+                return Err(format!(
+                    "SVG paint-server url(#{}) changed kind during rendering",
+                    reference.id
+                ));
+            }
+
+            match &server.data {
+                SvgPaintServerData::LinearGradient(gradient) => {
+                    Ok(SvgResolvedPaint::LinearGradient(
+                        prepare_svg_linear_gradient(gradient, scene.view_box),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn prepare_svg_linear_gradient(
+    gradient: &SvgLinearGradient,
+    view_box: SvgViewBox,
+) -> PreparedSvgLinearGradient {
+    let start_x = view_box.min_x + gradient.x1.resolve(view_box.width);
+    let start_y = view_box.min_y + gradient.y1.resolve(view_box.height);
+    let end_x = view_box.min_x + gradient.x2.resolve(view_box.width);
+    let end_y = view_box.min_y + gradient.y2.resolve(view_box.height);
+    let dx = end_x - start_x;
+    let dy = end_y - start_y;
+    let length_sq = dx * dx + dy * dy;
+    let stops = gradient
+        .stops
+        .iter()
+        .map(|stop| ResolvedGradientStop {
+            color: stop.color.to_linear_rgba(),
+            position: stop.offset,
+        })
+        .collect::<Vec<_>>();
+
+    PreparedSvgLinearGradient {
+        start_x,
+        start_y,
+        dx,
+        dy,
+        inverse_length_sq: if length_sq <= f32::EPSILON {
+            0.0
+        } else {
+            1.0 / length_sq
+        },
+        stops: prepare_resolved_gradient(&stops, GradientInterpolation::LinearSrgb),
     }
 }
 
@@ -327,11 +434,13 @@ fn point_segment_distance_sq(point: SvgPoint, start: SvgPoint, end: SvgPoint) ->
 #[cfg(test)]
 mod tests {
     use cssimpler_core::{
-        Color, LayoutBox, RenderNode, SvgContour, SvgPathGeometry, SvgPathInstance, SvgPathPaint,
+        Color, LayoutBox, LengthPercentageValue, RenderNode, SvgContour, SvgGradientStop,
+        SvgLinearGradient, SvgPaintServer, SvgPaintServerData, SvgPaintServerKind,
+        SvgPaintServerReference, SvgPathGeometry, SvgPathInstance, SvgPathPaint,
         SvgPathPaintSource, SvgPoint, SvgScene, SvgViewBox,
     };
 
-    use super::super::{pack_rgb, render_to_buffer};
+    use super::super::{pack_rgb, render_to_buffer, unpack_rgb};
 
     #[test]
     fn svg_fill_renders_inside_the_mapped_view_box() {
@@ -390,5 +499,121 @@ mod tests {
 
         assert_eq!(buffer[12 * 24 + 12], pack_rgb(Color::rgb(22, 163, 74)));
         assert_eq!(buffer[8 * 24 + 12], pack_rgb(Color::WHITE));
+    }
+
+    #[test]
+    fn svg_linear_gradient_fill_samples_local_paint_server() {
+        let scene = vec![RenderNode::svg(
+            LayoutBox::new(0.0, 0.0, 10.0, 10.0),
+            SvgScene::with_paint_servers(
+                SvgViewBox::new(0.0, 0.0, 10.0, 10.0),
+                vec![horizontal_gradient_server(
+                    "paint",
+                    Color::rgb(239, 68, 68),
+                    Color::rgb(59, 130, 246),
+                )],
+                vec![SvgPathInstance {
+                    geometry: SvgPathGeometry::new(vec![SvgContour {
+                        points: vec![
+                            SvgPoint::new(0.0, 0.0),
+                            SvgPoint::new(10.0, 0.0),
+                            SvgPoint::new(10.0, 10.0),
+                            SvgPoint::new(0.0, 10.0),
+                        ],
+                        closed: true,
+                    }]),
+                    paint: SvgPathPaint {
+                        fill: Some(paint_server_ref("paint")),
+                        stroke: None,
+                        stroke_width: 0.0,
+                    },
+                }],
+            ),
+        )];
+        let mut buffer = vec![0_u32; 10 * 10];
+
+        render_to_buffer(&scene, &mut buffer, 10, 10, Color::WHITE);
+
+        let left = unpack_rgb(buffer[5 * 10 + 1]);
+        let right = unpack_rgb(buffer[5 * 10 + 8]);
+        assert!(
+            left.r > left.b,
+            "left fill sample should be red-dominant: {left:?}"
+        );
+        assert!(
+            right.b > right.r,
+            "right fill sample should be blue-dominant: {right:?}"
+        );
+    }
+
+    #[test]
+    fn svg_linear_gradient_stroke_samples_local_paint_server() {
+        let scene = vec![RenderNode::svg(
+            LayoutBox::new(0.0, 0.0, 10.0, 10.0),
+            SvgScene::with_paint_servers(
+                SvgViewBox::new(0.0, 0.0, 10.0, 10.0),
+                vec![horizontal_gradient_server(
+                    "strokePaint",
+                    Color::rgb(239, 68, 68),
+                    Color::rgb(34, 197, 94),
+                )],
+                vec![SvgPathInstance {
+                    geometry: SvgPathGeometry::new(vec![SvgContour {
+                        points: vec![SvgPoint::new(1.0, 5.0), SvgPoint::new(9.0, 5.0)],
+                        closed: false,
+                    }]),
+                    paint: SvgPathPaint {
+                        fill: None,
+                        stroke: Some(paint_server_ref("strokePaint")),
+                        stroke_width: 2.0,
+                    },
+                }],
+            ),
+        )];
+        let mut buffer = vec![0_u32; 10 * 10];
+
+        render_to_buffer(&scene, &mut buffer, 10, 10, Color::WHITE);
+
+        let left = unpack_rgb(buffer[5 * 10 + 2]);
+        let right = unpack_rgb(buffer[5 * 10 + 8]);
+        assert!(
+            left.r > left.g,
+            "left stroke sample should be red-dominant: {left:?}"
+        );
+        assert!(
+            right.g > right.r,
+            "right stroke sample should be green-dominant: {right:?}"
+        );
+        assert_eq!(buffer[2 * 10 + 5], pack_rgb(Color::WHITE));
+    }
+
+    fn horizontal_gradient_server(id: &str, start: Color, end: Color) -> SvgPaintServer {
+        SvgPaintServer {
+            id: id.to_string(),
+            kind: SvgPaintServerKind::LinearGradient,
+            data: SvgPaintServerData::LinearGradient(SvgLinearGradient {
+                x1: LengthPercentageValue::ZERO,
+                y1: LengthPercentageValue::ZERO,
+                x2: LengthPercentageValue::from_px(10.0),
+                y2: LengthPercentageValue::ZERO,
+                stops: vec![
+                    SvgGradientStop {
+                        color: start,
+                        offset: 0.0,
+                    },
+                    SvgGradientStop {
+                        color: end,
+                        offset: 1.0,
+                    },
+                ],
+            }),
+        }
+    }
+
+    fn paint_server_ref(id: &str) -> SvgPathPaintSource {
+        SvgPathPaintSource::PaintServer(SvgPaintServerReference {
+            id: id.to_string(),
+            kind: SvgPaintServerKind::LinearGradient,
+        })
     }
 }

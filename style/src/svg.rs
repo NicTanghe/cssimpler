@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 
 use cssimpler_core::{
-    Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath, Node, Style,
-    SvgContour, SvgPaint, SvgPaintServer, SvgPaintServerKind, SvgPaintServerReference,
+    Color, CustomProperties, ElementInteractionState, ElementNode, ElementPath,
+    LengthPercentageValue, Node, Style, SvgContour, SvgGradientStop, SvgLinearGradient, SvgPaint,
+    SvgPaintServer, SvgPaintServerData, SvgPaintServerKind, SvgPaintServerReference,
     SvgPathGeometry, SvgPathInstance, SvgPathPaint, SvgPathPaintSource, SvgPoint, SvgScene,
     SvgStyle, SvgViewBox, fonts::TextStyle,
 };
 use lightningcss::properties::{Property, PropertyId};
 use lightningcss::stylesheet::ParserOptions;
+use lightningcss::values::color::CssColor;
 use taffy::prelude::Dimension;
 
 use crate::{ElementRef, Stylesheet};
@@ -41,23 +43,23 @@ impl Default for SvgCascadeState {
 
 #[derive(Default)]
 struct SvgPaintServerRegistry {
-    servers: HashMap<String, SvgPaintServerKind>,
+    servers: HashMap<String, SvgPaintServerData>,
 }
 
 impl SvgPaintServerRegistry {
-    fn insert(&mut self, id: String, kind: SvgPaintServerKind) {
-        if self.servers.insert(id.clone(), kind).is_some() {
+    fn insert(&mut self, id: String, data: SvgPaintServerData) {
+        if self.servers.insert(id.clone(), data).is_some() {
             panic!("duplicate SVG paint-server id `{id}`");
         }
     }
 
     fn resolve(&self, id: &str) -> SvgPaintServerReference {
-        let Some(kind) = self.servers.get(id).copied() else {
+        let Some(data) = self.servers.get(id) else {
             panic!("missing SVG paint-server id `{id}`");
         };
         SvgPaintServerReference {
             id: id.to_string(),
-            kind,
+            kind: svg_paint_server_data_kind(data),
         }
     }
 
@@ -65,15 +67,28 @@ impl SvgPaintServerRegistry {
         let mut paint_servers = self
             .servers
             .into_iter()
-            .map(|(id, kind)| SvgPaintServer { id, kind })
+            .map(|(id, data)| SvgPaintServer {
+                id,
+                kind: svg_paint_server_data_kind(&data),
+                data,
+            })
             .collect::<Vec<_>>();
         paint_servers.sort_by(|left, right| left.id.cmp(&right.id));
         paint_servers
     }
 }
 
+fn svg_paint_server_data_kind(data: &SvgPaintServerData) -> SvgPaintServerKind {
+    match data {
+        SvgPaintServerData::LinearGradient(_) => SvgPaintServerKind::LinearGradient,
+    }
+}
+
 pub(crate) fn is_supported_svg_tag(tag: &str) -> bool {
-    matches!(tag, "svg" | "defs" | "g" | "path" | "circle")
+    matches!(
+        tag,
+        "svg" | "defs" | "g" | "path" | "circle" | "linearGradient" | "stop"
+    )
 }
 
 pub(crate) fn seed_element_style(element: &ElementNode) -> Style {
@@ -318,9 +333,235 @@ fn collect_svg_paint_server_definition(
                 .unwrap_or_else(|| {
                     panic!("SVG paint-server <linearGradient> requires a non-empty `id`")
                 });
-            registry.insert(id.to_string(), SvgPaintServerKind::LinearGradient);
+            let gradient = parse_svg_linear_gradient(element)
+                .unwrap_or_else(|error| panic!("unsupported SVG <linearGradient> `{id}`: {error}"));
+            registry.insert(id.to_string(), SvgPaintServerData::LinearGradient(gradient));
         }
         tag => panic!("unsupported SVG paint-server tag <{tag}> inside <defs>"),
+    }
+}
+
+fn parse_svg_linear_gradient(element: &ElementNode) -> Result<SvgLinearGradient, String> {
+    for (name, value) in element.attributes() {
+        match name.as_str() {
+            "id" | "class" | "x1" | "y1" | "x2" | "y2" => {}
+            "gradientUnits" => {
+                if value.trim() != "userSpaceOnUse" {
+                    return Err(format!(
+                        "unsupported gradientUnits `{value}` (only `userSpaceOnUse` is supported)"
+                    ));
+                }
+            }
+            "spreadMethod" => {
+                if value.trim() != "pad" {
+                    return Err(format!(
+                        "unsupported spreadMethod `{value}` (only `pad` is supported)"
+                    ));
+                }
+            }
+            "gradientTransform" => {
+                return Err("gradientTransform is not supported".to_string());
+            }
+            "href" | "xlink:href" => {
+                return Err("inherited/template gradients are not supported".to_string());
+            }
+            _ => return Err(format!("unsupported attribute `{name}`")),
+        }
+    }
+
+    let mut stops = Vec::new();
+    for child in &element.children {
+        match child {
+            Node::Text(text) if text.trim().is_empty() => {}
+            Node::Text(_) => {
+                return Err("text nodes are not supported inside <linearGradient>".to_string());
+            }
+            Node::Element(child) if child.tag == "stop" => {
+                stops.push(parse_svg_gradient_stop(child)?);
+            }
+            Node::Element(child) => {
+                return Err(format!(
+                    "unsupported child <{}> inside <linearGradient>",
+                    child.tag
+                ));
+            }
+        }
+    }
+
+    if stops.is_empty() {
+        return Err("linearGradient requires at least one <stop>".to_string());
+    }
+    clamp_svg_gradient_stop_offsets(&mut stops);
+
+    Ok(SvgLinearGradient {
+        x1: element
+            .attribute("x1")
+            .map(|value| parse_svg_gradient_coordinate(value, "x1"))
+            .transpose()?
+            .unwrap_or(LengthPercentageValue::ZERO),
+        y1: element
+            .attribute("y1")
+            .map(|value| parse_svg_gradient_coordinate(value, "y1"))
+            .transpose()?
+            .unwrap_or(LengthPercentageValue::ZERO),
+        x2: element
+            .attribute("x2")
+            .map(|value| parse_svg_gradient_coordinate(value, "x2"))
+            .transpose()?
+            .unwrap_or_else(|| LengthPercentageValue::from_fraction(1.0)),
+        y2: element
+            .attribute("y2")
+            .map(|value| parse_svg_gradient_coordinate(value, "y2"))
+            .transpose()?
+            .unwrap_or(LengthPercentageValue::ZERO),
+        stops,
+    })
+}
+
+fn parse_svg_gradient_stop(element: &ElementNode) -> Result<SvgGradientStop, String> {
+    for (name, _) in element.attributes() {
+        match name.as_str() {
+            "id" | "class" | "offset" | "stop-color" | "stop-opacity" => {}
+            "style" => {
+                return Err(
+                    "stop style attributes are not supported; use offset, stop-color, and stop-opacity attributes"
+                        .to_string(),
+                );
+            }
+            _ => return Err(format!("unsupported attribute `{name}` on <stop>")),
+        }
+    }
+
+    for child in &element.children {
+        match child {
+            Node::Text(text) if text.trim().is_empty() => {}
+            _ => return Err("<stop> does not support child nodes".to_string()),
+        }
+    }
+
+    let offset = element
+        .attribute("offset")
+        .ok_or_else(|| "<stop> requires an `offset` attribute".to_string())
+        .and_then(parse_svg_stop_offset)?;
+    let mut color = element
+        .attribute("stop-color")
+        .ok_or_else(|| "<stop> requires a `stop-color` attribute".to_string())
+        .and_then(parse_svg_stop_color)?;
+    let opacity = element
+        .attribute("stop-opacity")
+        .map(parse_svg_stop_opacity)
+        .transpose()?
+        .unwrap_or(1.0);
+    color.a = ((color.a as f32 * opacity).round()).clamp(0.0, 255.0) as u8;
+
+    Ok(SvgGradientStop { color, offset })
+}
+
+fn parse_svg_gradient_coordinate(
+    value: &str,
+    attribute_name: &str,
+) -> Result<LengthPercentageValue, String> {
+    let value = value.trim();
+    if let Some(percent) = value.strip_suffix('%') {
+        let percent = percent.trim().parse::<f32>().map_err(|_| {
+            format!("`{attribute_name}` expects a number, px length, or percentage, got `{value}`")
+        })?;
+        if !percent.is_finite() {
+            return Err(format!("`{attribute_name}` must be finite, got `{value}`"));
+        }
+        return Ok(LengthPercentageValue::from_fraction(percent / 100.0));
+    }
+    if let Some(px) = value.strip_suffix("px") {
+        let px = px.trim().parse::<f32>().map_err(|_| {
+            format!("`{attribute_name}` expects a number, px length, or percentage, got `{value}`")
+        })?;
+        if !px.is_finite() {
+            return Err(format!("`{attribute_name}` must be finite, got `{value}`"));
+        }
+        return Ok(LengthPercentageValue::from_px(px));
+    }
+
+    let px = value.parse::<f32>().map_err(|_| {
+        format!("`{attribute_name}` expects a number, px length, or percentage, got `{value}`")
+    })?;
+    if !px.is_finite() {
+        return Err(format!("`{attribute_name}` must be finite, got `{value}`"));
+    }
+    Ok(LengthPercentageValue::from_px(px))
+}
+
+fn parse_svg_stop_offset(value: &str) -> Result<f32, String> {
+    let value = value.trim();
+    let offset = if let Some(percent) = value.strip_suffix('%') {
+        percent
+            .trim()
+            .parse::<f32>()
+            .map(|value| value / 100.0)
+            .map_err(|_| format!("stop offset expects a number or percentage, got `{value}`"))?
+    } else {
+        value
+            .parse::<f32>()
+            .map_err(|_| format!("stop offset expects a number or percentage, got `{value}`"))?
+    };
+    if !offset.is_finite() {
+        return Err(format!("stop offset must be finite, got `{value}`"));
+    }
+    Ok(offset.clamp(0.0, 1.0))
+}
+
+fn parse_svg_stop_color(value: &str) -> Result<Color, String> {
+    let property = Property::parse_string(
+        PropertyId::from("color"),
+        value.trim(),
+        ParserOptions::default(),
+    )
+    .map_err(|error| format!("unsupported stop-color `{value}`: {error}"))?;
+
+    match property {
+        Property::Color(CssColor::CurrentColor) => {
+            Err("currentColor stop colors are not supported".to_string())
+        }
+        Property::Color(color) => color_from_css(&color)
+            .map_err(|error| format!("unsupported stop-color `{value}`: {error}")),
+        _ => Err(format!("unsupported stop-color `{value}`")),
+    }
+}
+
+fn color_from_css(color: &CssColor) -> Result<Color, String> {
+    let rgb = color.to_rgb().map_err(|_| format!("{color:?}"))?;
+    match rgb {
+        CssColor::RGBA(rgba) => Ok(Color::rgba(rgba.red, rgba.green, rgba.blue, rgba.alpha)),
+        _ => Err(format!("{color:?}")),
+    }
+}
+
+fn parse_svg_stop_opacity(value: &str) -> Result<f32, String> {
+    let value = value.trim();
+    let opacity = if let Some(percent) = value.strip_suffix('%') {
+        percent
+            .trim()
+            .parse::<f32>()
+            .map(|value| value / 100.0)
+            .map_err(|_| format!("stop-opacity expects a number or percentage, got `{value}`"))?
+    } else {
+        value
+            .parse::<f32>()
+            .map_err(|_| format!("stop-opacity expects a number or percentage, got `{value}`"))?
+    };
+    if !opacity.is_finite() {
+        return Err(format!("stop-opacity must be finite, got `{value}`"));
+    }
+    Ok(opacity.clamp(0.0, 1.0))
+}
+
+fn clamp_svg_gradient_stop_offsets(stops: &mut [SvgGradientStop]) {
+    let mut previous = 0.0;
+    for stop in stops {
+        if stop.offset < previous {
+            stop.offset = previous;
+        } else {
+            previous = stop.offset;
+        }
     }
 }
 
@@ -1227,7 +1468,8 @@ struct SvgRootMetadata {
 #[cfg(test)]
 mod tests {
     use cssimpler_core::{
-        Color, Node, RenderKind, SvgPaintServerKind, SvgPaintServerReference, SvgPathPaintSource,
+        Color, LengthPercentageValue, Node, RenderKind, SvgPaintServerData, SvgPaintServerKind,
+        SvgPaintServerReference, SvgPathPaintSource,
     };
 
     use crate::{Stylesheet, build_render_tree, parse_stylesheet};
@@ -1295,8 +1537,47 @@ mod tests {
             .with_attribute("viewBox", "0 0 24 24")
             .with_child(
                 Node::element("defs")
-                    .with_child(Node::element("linearGradient").with_id("fillGradient").into())
-                    .with_child(Node::element("linearGradient").with_id("strokeGradient").into())
+                    .with_child(
+                        Node::element("linearGradient")
+                            .with_id("fillGradient")
+                            .with_attribute("x1", "0")
+                            .with_attribute("y1", "0")
+                            .with_attribute("x2", "24")
+                            .with_attribute("y2", "0")
+                            .with_child(
+                                Node::element("stop")
+                                    .with_attribute("offset", "0%")
+                                    .with_attribute("stop-color", "#ef4444")
+                                    .into(),
+                            )
+                            .with_child(
+                                Node::element("stop")
+                                    .with_attribute("offset", "100%")
+                                    .with_attribute("stop-color", "#3b82f6")
+                                    .into(),
+                            )
+                            .into(),
+                    )
+                    .with_child(
+                        Node::element("linearGradient")
+                            .with_id("strokeGradient")
+                            .with_attribute("x1", "10%")
+                            .with_attribute("x2", "90%")
+                            .with_child(
+                                Node::element("stop")
+                                    .with_attribute("offset", "0")
+                                    .with_attribute("stop-color", "rgb(34, 197, 94)")
+                                    .into(),
+                            )
+                            .with_child(
+                                Node::element("stop")
+                                    .with_attribute("offset", "1")
+                                    .with_attribute("stop-color", "rgba(59, 130, 246, 0.5)")
+                                    .with_attribute("stop-opacity", "50%")
+                                    .into(),
+                            )
+                            .into(),
+                    )
                     .into(),
             )
             .with_child(
@@ -1316,9 +1597,38 @@ mod tests {
 
         assert_eq!(svg.paint_servers.len(), 2);
         assert_eq!(svg.paint_servers[0].id, "fillGradient");
-        assert_eq!(svg.paint_servers[0].kind, SvgPaintServerKind::LinearGradient);
+        assert_eq!(
+            svg.paint_servers[0].kind,
+            SvgPaintServerKind::LinearGradient
+        );
+        let SvgPaintServerData::LinearGradient(fill_gradient) = &svg.paint_servers[0].data;
+        assert_eq!(fill_gradient.x1, LengthPercentageValue::from_px(0.0));
+        assert_eq!(fill_gradient.y1, LengthPercentageValue::from_px(0.0));
+        assert_eq!(fill_gradient.x2, LengthPercentageValue::from_px(24.0));
+        assert_eq!(fill_gradient.y2, LengthPercentageValue::from_px(0.0));
+        assert_eq!(fill_gradient.stops.len(), 2);
+        assert_eq!(fill_gradient.stops[0].color, Color::rgb(239, 68, 68));
+        assert_eq!(fill_gradient.stops[0].offset, 0.0);
+        assert_eq!(fill_gradient.stops[1].color, Color::rgb(59, 130, 246));
+        assert_eq!(fill_gradient.stops[1].offset, 1.0);
         assert_eq!(svg.paint_servers[1].id, "strokeGradient");
-        assert_eq!(svg.paint_servers[1].kind, SvgPaintServerKind::LinearGradient);
+        assert_eq!(
+            svg.paint_servers[1].kind,
+            SvgPaintServerKind::LinearGradient
+        );
+        let SvgPaintServerData::LinearGradient(stroke_gradient) = &svg.paint_servers[1].data;
+        assert_eq!(
+            stroke_gradient.x1,
+            LengthPercentageValue::from_fraction(0.1)
+        );
+        assert_eq!(
+            stroke_gradient.x2,
+            LengthPercentageValue::from_fraction(0.9)
+        );
+        assert_eq!(
+            stroke_gradient.stops[1].color,
+            Color::rgba(59, 130, 246, 64)
+        );
         assert_eq!(
             svg.paths[0].paint.fill,
             Some(SvgPathPaintSource::PaintServer(SvgPaintServerReference {
@@ -1360,8 +1670,28 @@ mod tests {
             .with_attribute("viewBox", "0 0 24 24")
             .with_child(
                 Node::element("defs")
-                    .with_child(Node::element("linearGradient").with_id("paint").into())
-                    .with_child(Node::element("linearGradient").with_id("paint").into())
+                    .with_child(
+                        Node::element("linearGradient")
+                            .with_id("paint")
+                            .with_child(
+                                Node::element("stop")
+                                    .with_attribute("offset", "0")
+                                    .with_attribute("stop-color", "#000")
+                                    .into(),
+                            )
+                            .into(),
+                    )
+                    .with_child(
+                        Node::element("linearGradient")
+                            .with_id("paint")
+                            .with_child(
+                                Node::element("stop")
+                                    .with_attribute("offset", "0")
+                                    .with_attribute("stop-color", "#fff")
+                                    .into(),
+                            )
+                            .into(),
+                    )
                     .into(),
             )
             .with_child(
@@ -1397,6 +1727,41 @@ mod tests {
             .expect_err("unsupported defs children should panic");
 
         assert!(panic_message(error).contains("unsupported SVG paint-server tag <filter>"));
+    }
+
+    #[test]
+    fn svg_unsupported_linear_gradient_features_fail_clearly() {
+        let unsupported_units = svg_with_gradient(
+            Node::element("linearGradient")
+                .with_id("paint")
+                .with_attribute("gradientUnits", "objectBoundingBox")
+                .with_child(
+                    Node::element("stop")
+                        .with_attribute("offset", "0")
+                        .with_attribute("stop-color", "#000")
+                        .into(),
+                ),
+        );
+        let unsupported_units_error = std::panic::catch_unwind(|| {
+            build_render_tree(&unsupported_units, &Stylesheet::default())
+        })
+        .expect_err("unsupported gradient units should panic");
+        assert!(panic_message(unsupported_units_error).contains("unsupported gradientUnits"));
+
+        let stop_style = svg_with_gradient(
+            Node::element("linearGradient").with_id("paint").with_child(
+                Node::element("stop")
+                    .with_attribute("offset", "0")
+                    .with_attribute("style", "stop-color: #000")
+                    .into(),
+            ),
+        );
+        let stop_style_error =
+            std::panic::catch_unwind(|| build_render_tree(&stop_style, &Stylesheet::default()))
+                .expect_err("unsupported stop style should panic");
+        assert!(
+            panic_message(stop_style_error).contains("stop style attributes are not supported")
+        );
     }
 
     #[test]
@@ -1529,6 +1894,19 @@ mod tests {
             .bounds
             .expect("arc geometry should have bounds");
         assert!(bounds.max_x >= 20.0);
+    }
+
+    fn svg_with_gradient(gradient: cssimpler_core::ElementNode) -> Node {
+        Node::element("svg")
+            .with_attribute("viewBox", "0 0 24 24")
+            .with_child(Node::element("defs").with_child(gradient.into()).into())
+            .with_child(
+                Node::element("path")
+                    .with_attribute("d", "M4 4 L20 4 L20 20 L4 20 Z")
+                    .with_attribute("fill", "url(#paint)")
+                    .into(),
+            )
+            .into()
     }
 
     fn panic_message(error: Box<dyn std::any::Any + Send>) -> String {

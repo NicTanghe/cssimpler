@@ -341,7 +341,7 @@ Acceptance:
 
 ## S4. SVG linearGradient paint servers
 Depends: S3, G3  
-Status: planned  
+Status: implemented
 
 Purpose:
 - Render the common inline SVG pattern where supported vector shapes reference local `<linearGradient>` definitions through `fill: url(#id)` or `stroke: url(#id)`
