@@ -549,7 +549,7 @@ where
         );
         sync_runtime_interaction(&mut self.runtime_world, stats);
         let dirty_flags = self.runtime_world.root_dirty_flags(0);
-        let scene = vec![
+        let mut scene = vec![
             render_root_with_schedule(
                 &self.runtime_world,
                 0,
@@ -563,6 +563,8 @@ where
             )
             .expect("runtime world should contain the app root before rendering"),
         ];
+        self.text_inputs
+            .decorate_scene(&mut scene, self.stylesheet, &self.runtime_world);
 
         let scene_swap_start = Instant::now();
         self.replace_scene(scene);
@@ -666,6 +668,8 @@ where
             };
             *target = node;
         }
+        self.text_inputs
+            .decorate_scene(&mut scene, self.stylesheet, &self.runtime_world);
 
         let scene_swap_start = Instant::now();
         self.replace_scene(scene);
@@ -1003,6 +1007,8 @@ where
                 .expect("runtime world should contain the fragment root before rendering"),
             );
         }
+        self.text_inputs
+            .decorate_scene(&mut scene, self.stylesheet, &self.runtime_world);
         self.replace_scene(scene);
         self.runtime_world.clear_dirty_flags();
     }
@@ -1057,6 +1063,8 @@ where
         for (index, node) in replacements {
             scene[index] = node;
         }
+        self.text_inputs
+            .decorate_scene(&mut scene, self.stylesheet, &self.runtime_world);
 
         self.replace_scene(scene);
         self.runtime_world.clear_dirty_flags();
@@ -1395,7 +1403,10 @@ mod tests {
     use std::cell::Cell;
     use std::time::Duration;
 
-    use crate::core::{Color, ElementInteractionState, ElementPath, Node, RenderKind, RenderNode};
+    use crate::core::{
+        Color, ElementInteractionState, ElementPath, Node, RenderKind, RenderNode,
+        TextEditDecoration,
+    };
     use crate::ui;
 
     use super::{
@@ -1460,7 +1471,7 @@ mod tests {
         assert!(!SceneProvider::handle_engine_event(
             &mut app,
             &EngineEvent::PointerMoved {
-                position: PointerPosition { x: 4.0, y: 4.0 },
+                position: PointerPosition { x: 112.0, y: 4.0 },
                 modifiers: Default::default(),
             },
         ));
@@ -1473,14 +1484,16 @@ mod tests {
             },
         ));
         let focused = app.frame(frame(1));
-        assert_eq!(text_nodes(&focused), vec!["hi|".to_string()]);
+        assert_eq!(text_nodes(&focused), vec!["hi".to_string()]);
+        assert_eq!(input_text_edit(&focused, "field").caret, Some(2));
 
         assert!(SceneProvider::handle_engine_event(
             &mut app,
             &EngineEvent::TextInput(TextInputEvent::Commit("!".to_string())),
         ));
         let typed = app.frame(frame(2));
-        assert_eq!(text_nodes(&typed), vec!["hi!|".to_string()]);
+        assert_eq!(text_nodes(&typed), vec!["hi!".to_string()]);
+        assert_eq!(input_text_edit(&typed, "field").caret, Some(3));
 
         assert!(SceneProvider::handle_engine_event(
             &mut app,
@@ -1494,7 +1507,8 @@ mod tests {
             }),
         ));
         let edited = app.frame(frame(3));
-        assert_eq!(text_nodes(&edited), vec!["hi|".to_string()]);
+        assert_eq!(text_nodes(&edited), vec!["hi".to_string()]);
+        assert_eq!(input_text_edit(&edited, "field").caret, Some(2));
     }
 
     #[test]
@@ -2708,6 +2722,31 @@ mod tests {
         }
 
         text
+    }
+
+    fn input_text_edit<'a>(scene: &'a [RenderNode], id: &str) -> &'a TextEditDecoration {
+        find_render_node_by_id(scene, id)
+            .and_then(|node| node.text_edit.as_ref())
+            .unwrap_or_else(|| panic!("input {id} should have text edit decoration"))
+    }
+
+    fn find_render_node_by_id<'a>(scene: &'a [RenderNode], id: &str) -> Option<&'a RenderNode> {
+        scene
+            .iter()
+            .find_map(|node| find_render_node_by_id_in_node(node, id))
+    }
+
+    fn find_render_node_by_id_in_node<'a>(
+        node: &'a RenderNode,
+        id: &str,
+    ) -> Option<&'a RenderNode> {
+        if node.element_id.as_deref() == Some(id) {
+            return Some(node);
+        }
+
+        node.children
+            .iter()
+            .find_map(|child| find_render_node_by_id_in_node(child, id))
     }
 
     fn collect_text(node: &RenderNode, text: &mut Vec<String>) {

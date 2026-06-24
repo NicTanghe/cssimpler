@@ -1,15 +1,28 @@
 use std::collections::HashMap;
 
-use crate::core::{ElementNode, ElementPath, Node, RenderNode, RuntimeWorld};
+use crate::core::{
+    ElementNode, ElementPath, Node, RenderNode, RuntimeWorld, TextEditDecoration,
+    TextSelectionRange,
+};
+use crate::fonts::layout_text_block;
 use crate::renderer::{
     self, ButtonState, EngineEvent, KeyIdentity, KeyboardEvent, PointerButton, PointerPosition,
     TextInputEvent,
 };
+use crate::style::{Stylesheet, resolve_selection_style_at_path};
 
 #[derive(Clone, Debug, Default)]
 struct NativeTextInputState {
     value: String,
     cursor: usize,
+    selection_anchor: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveInputDrag {
+    key: String,
+    path: ElementPath,
+    anchor: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -17,6 +30,7 @@ pub(super) struct NativeTextInputs {
     states: HashMap<String, NativeTextInputState>,
     focused: Option<String>,
     pointer_position: Option<PointerPosition>,
+    active_drag: Option<ActiveInputDrag>,
 }
 
 impl NativeTextInputs {
@@ -33,10 +47,11 @@ impl NativeTextInputs {
         match event {
             EngineEvent::PointerMoved { position, .. } => {
                 self.pointer_position = Some(*position);
-                false
+                self.update_drag_selection(scene)
             }
             EngineEvent::PointerLeft => {
                 self.pointer_position = None;
+                self.active_drag = None;
                 false
             }
             EngineEvent::PointerButton {
@@ -44,6 +59,11 @@ impl NativeTextInputs {
                 state: ButtonState::Pressed,
                 ..
             } => self.focus_input_at_pointer(scene, runtime_world),
+            EngineEvent::PointerButton {
+                button: PointerButton::Primary,
+                state: ButtonState::Released,
+                ..
+            } => self.finish_drag_selection(),
             EngineEvent::TextInput(TextInputEvent::Commit(text)) => self.insert_focused_text(text),
             EngineEvent::TextInput(TextInputEvent::Preedit { .. }) => false,
             EngineEvent::Key(event) => self.handle_key_event(event),
@@ -66,18 +86,14 @@ impl NativeTextInputs {
                             .or_insert_with(|| NativeTextInputState {
                                 cursor: initial_value.len(),
                                 value: initial_value,
+                                selection_anchor: None,
                             });
-                    state.cursor = clamp_to_char_boundary(&state.value, state.cursor);
+                    state.normalize_selection();
 
-                    let display_value = text_input_display_value(
-                        &state.value,
-                        state.cursor,
-                        self.focused.as_deref() == Some(key.as_str()),
-                    );
                     element.set_attribute("value", state.value.clone());
                     element.children.clear();
-                    if !display_value.is_empty() {
-                        element.children.push(Node::Text(display_value));
+                    if !state.value.is_empty() {
+                        element.children.push(Node::Text(state.value.clone()));
                     }
                     return Node::Element(element);
                 }
@@ -101,6 +117,54 @@ impl NativeTextInputs {
                     .collect();
                 Node::Element(element)
             }
+        }
+    }
+
+    pub(super) fn decorate_scene(
+        &self,
+        scene: &mut [RenderNode],
+        stylesheet: &Stylesheet,
+        runtime_world: &RuntimeWorld,
+    ) {
+        if self.focused.is_none() {
+            return;
+        }
+
+        for node in scene {
+            self.decorate_node(node, stylesheet, runtime_world);
+        }
+    }
+
+    fn decorate_node(
+        &self,
+        node: &mut RenderNode,
+        stylesheet: &Stylesheet,
+        runtime_world: &RuntimeWorld,
+    ) {
+        if let Some(path) = node.element_path.clone()
+            && let Some(root) = runtime_world.root_as_node(path.root)
+            && let Some(element) = element_at_path(&root, &path)
+            && is_native_text_input(element)
+        {
+            let key = text_input_key(element, &path);
+            if self.focused.as_deref() == Some(key.as_str())
+                && let Some(state) = self.states.get(&key)
+            {
+                node.text_edit = Some(text_edit_decoration(
+                    state,
+                    resolve_selection_style_at_path(
+                        &root,
+                        stylesheet,
+                        runtime_world.interaction(),
+                        &path,
+                    )
+                    .unwrap_or_default(),
+                ));
+            }
+        }
+
+        for child in &mut node.children {
+            self.decorate_node(child, stylesheet, runtime_world);
         }
     }
 
@@ -130,27 +194,78 @@ impl NativeTextInputs {
 
         let key = text_input_key(element, &path);
         let initial_value = element.attribute("value").unwrap_or_default().to_string();
+        let fallback_cursor = initial_value.len();
         let state = self
             .states
             .entry(key.clone())
             .or_insert_with(|| NativeTextInputState {
-                cursor: initial_value.len(),
+                cursor: fallback_cursor,
                 value: initial_value,
+                selection_anchor: None,
             });
-        if self.focused.as_deref() != Some(key.as_str()) {
-            state.cursor = state.value.len();
-        }
+        let cursor =
+            caret_index_from_pointer_or_value(Some(scene), &path, &state.value, position.x)
+                .unwrap_or_else(|| clamp_to_char_boundary(&state.value, fallback_cursor));
+        let changed = self.focused.as_deref() != Some(key.as_str())
+            || state.cursor != cursor
+            || state.selection_anchor.is_some();
 
-        if self.focused.as_deref() == Some(key.as_str()) {
-            false
-        } else {
-            self.focused = Some(key);
-            true
+        state.set_cursor(cursor);
+        self.focused = Some(key.clone());
+        self.active_drag = Some(ActiveInputDrag {
+            key,
+            path,
+            anchor: cursor,
+        });
+
+        changed
+    }
+
+    fn update_drag_selection(&mut self, scene: Option<&[RenderNode]>) -> bool {
+        let Some(drag) = self.active_drag.clone() else {
+            return false;
+        };
+        let Some(position) = self.pointer_position else {
+            return false;
+        };
+        let Some(state) = self.states.get_mut(&drag.key) else {
+            return false;
+        };
+        let Some(cursor) =
+            caret_index_from_pointer_or_value(scene, &drag.path, &state.value, position.x)
+        else {
+            return false;
+        };
+
+        let previous_cursor = state.cursor;
+        let previous_anchor = state.selection_anchor;
+        state.set_selection(drag.anchor, cursor);
+
+        previous_cursor != state.cursor || previous_anchor != state.selection_anchor
+    }
+
+    fn finish_drag_selection(&mut self) -> bool {
+        let Some(drag) = self.active_drag.take() else {
+            return false;
+        };
+        let Some(state) = self.states.get_mut(&drag.key) else {
+            return false;
+        };
+        if state.selection_range().is_none() && state.selection_anchor.take().is_some() {
+            return true;
         }
+        false
     }
 
     fn clear_focus(&mut self) -> bool {
-        self.focused.take().is_some()
+        self.active_drag = None;
+        let Some(key) = self.focused.take() else {
+            return false;
+        };
+        if let Some(state) = self.states.get_mut(&key) {
+            state.selection_anchor = None;
+        }
+        true
     }
 
     fn insert_focused_text(&mut self, text: &str) -> bool {
@@ -168,9 +283,15 @@ impl NativeTextInputs {
             return false;
         }
 
-        state.cursor = clamp_to_char_boundary(&state.value, state.cursor);
-        state.value.insert_str(state.cursor, &text);
-        state.cursor += text.len();
+        if let Some((start, end)) = state.selection_range() {
+            state.value.replace_range(start..end, &text);
+            state.cursor = start + text.len();
+            state.selection_anchor = None;
+        } else {
+            state.cursor = clamp_to_char_boundary(&state.value, state.cursor);
+            state.value.insert_str(state.cursor, &text);
+            state.cursor += text.len();
+        }
         true
     }
 
@@ -210,6 +331,12 @@ impl NativeTextInputs {
 
     fn backspace_focused(&mut self) -> bool {
         self.with_focused_state_mut(|state| {
+            if let Some((start, end)) = state.selection_range() {
+                state.value.drain(start..end);
+                state.cursor = start;
+                state.selection_anchor = None;
+                return true;
+            }
             let Some(previous) = previous_char_boundary(&state.value, state.cursor) else {
                 return false;
             };
@@ -221,6 +348,12 @@ impl NativeTextInputs {
 
     fn delete_focused(&mut self) -> bool {
         self.with_focused_state_mut(|state| {
+            if let Some((start, end)) = state.selection_range() {
+                state.value.drain(start..end);
+                state.cursor = start;
+                state.selection_anchor = None;
+                return true;
+            }
             let Some(next) = next_char_boundary(&state.value, state.cursor) else {
                 return false;
             };
@@ -231,6 +364,11 @@ impl NativeTextInputs {
 
     fn move_focused_cursor_left(&mut self) -> bool {
         self.with_focused_state_mut(|state| {
+            if let Some((start, _)) = state.selection_range() {
+                state.cursor = start;
+                state.selection_anchor = None;
+                return true;
+            }
             let Some(previous) = previous_char_boundary(&state.value, state.cursor) else {
                 return false;
             };
@@ -241,6 +379,11 @@ impl NativeTextInputs {
 
     fn move_focused_cursor_right(&mut self) -> bool {
         self.with_focused_state_mut(|state| {
+            if let Some((_, end)) = state.selection_range() {
+                state.cursor = end;
+                state.selection_anchor = None;
+                return true;
+            }
             let Some(next) = next_char_boundary(&state.value, state.cursor) else {
                 return false;
             };
@@ -251,22 +394,57 @@ impl NativeTextInputs {
 
     fn move_focused_cursor_home(&mut self) -> bool {
         self.with_focused_state_mut(|state| {
-            if state.cursor == 0 {
+            if state.cursor == 0 && state.selection_anchor.is_none() {
                 return false;
             }
             state.cursor = 0;
+            state.selection_anchor = None;
             true
         })
     }
 
     fn move_focused_cursor_end(&mut self) -> bool {
         self.with_focused_state_mut(|state| {
-            if state.cursor == state.value.len() {
+            if state.cursor == state.value.len() && state.selection_anchor.is_none() {
                 return false;
             }
             state.cursor = state.value.len();
+            state.selection_anchor = None;
             true
         })
+    }
+}
+
+impl NativeTextInputState {
+    fn normalize_selection(&mut self) {
+        self.cursor = clamp_to_char_boundary(&self.value, self.cursor);
+        self.selection_anchor = self
+            .selection_anchor
+            .map(|anchor| clamp_to_char_boundary(&self.value, anchor))
+            .filter(|anchor| *anchor != self.cursor);
+    }
+
+    fn set_cursor(&mut self, cursor: usize) {
+        self.cursor = clamp_to_char_boundary(&self.value, cursor);
+        self.selection_anchor = None;
+    }
+
+    fn set_selection(&mut self, anchor: usize, cursor: usize) {
+        let anchor = clamp_to_char_boundary(&self.value, anchor);
+        let cursor = clamp_to_char_boundary(&self.value, cursor);
+        self.cursor = cursor;
+        self.selection_anchor = (anchor != cursor).then_some(anchor);
+    }
+
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        if anchor == self.cursor {
+            None
+        } else if anchor < self.cursor {
+            Some((anchor, self.cursor))
+        } else {
+            Some((self.cursor, anchor))
+        }
     }
 }
 
@@ -296,17 +474,93 @@ fn element_path_key(path: &ElementPath) -> String {
     key
 }
 
-fn text_input_display_value(value: &str, cursor: usize, focused: bool) -> String {
-    if !focused {
-        return value.to_string();
+fn text_edit_decoration(
+    state: &NativeTextInputState,
+    selection_style: crate::core::TextSelectionStyle,
+) -> TextEditDecoration {
+    let selection = state
+        .selection_range()
+        .map(|(start, end)| TextSelectionRange {
+            start,
+            end,
+            style: selection_style,
+        });
+
+    TextEditDecoration {
+        caret: selection.is_none().then_some(state.cursor),
+        selection,
+    }
+}
+
+fn caret_index_from_pointer_or_value(
+    scene: Option<&[RenderNode]>,
+    path: &ElementPath,
+    value: &str,
+    x: f32,
+) -> Option<usize> {
+    scene
+        .and_then(|scene| find_render_node_at_path(scene, path))
+        .map(|node| caret_index_from_pointer(node, value, x))
+}
+
+fn caret_index_from_pointer(node: &RenderNode, value: &str, x: f32) -> usize {
+    if value.is_empty() {
+        return 0;
     }
 
-    let cursor = clamp_to_char_boundary(value, cursor);
-    let mut display = String::with_capacity(value.len() + 1);
-    display.push_str(&value[..cursor]);
-    display.push('|');
-    display.push_str(&value[cursor..]);
-    display
+    let content_x = x - node.layout.x - node.content_inset.left;
+    if content_x <= 0.0 {
+        return 0;
+    }
+
+    let full_width = layout_text_block(value, &node.style.text, None).width;
+    if content_x >= full_width {
+        return value.len();
+    }
+
+    let mut best_index = 0;
+    let mut best_distance = content_x.abs();
+    for boundary in char_boundaries(value).into_iter().skip(1) {
+        let width = layout_text_block(&value[..boundary], &node.style.text, None).width;
+        let distance = (width - content_x).abs();
+        if distance < best_distance {
+            best_index = boundary;
+            best_distance = distance;
+        }
+    }
+
+    best_index
+}
+
+fn char_boundaries(value: &str) -> Vec<usize> {
+    let mut boundaries = Vec::with_capacity(value.chars().count() + 1);
+    boundaries.push(0);
+    for (index, character) in value.char_indices() {
+        boundaries.push(index + character.len_utf8());
+    }
+    boundaries
+}
+
+fn find_render_node_at_path<'a>(
+    scene: &'a [RenderNode],
+    path: &ElementPath,
+) -> Option<&'a RenderNode> {
+    scene
+        .iter()
+        .find_map(|node| find_render_node_at_path_node(node, path))
+}
+
+fn find_render_node_at_path_node<'a>(
+    node: &'a RenderNode,
+    path: &ElementPath,
+) -> Option<&'a RenderNode> {
+    if node.element_path.as_ref() == Some(path) {
+        return Some(node);
+    }
+
+    node.children
+        .iter()
+        .find_map(|child| find_render_node_at_path_node(child, path))
 }
 
 fn element_at_path<'a>(root: &'a Node, path: &ElementPath) -> Option<&'a ElementNode> {

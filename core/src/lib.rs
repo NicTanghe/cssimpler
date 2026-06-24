@@ -370,6 +370,36 @@ pub struct TextStrokeStyle {
     pub color: Option<Color>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextSelectionStyle {
+    pub background: Color,
+    pub foreground: Color,
+    pub text_shadows: Vec<ShadowEffect>,
+}
+
+impl Default for TextSelectionStyle {
+    fn default() -> Self {
+        Self {
+            background: Color::rgb(179, 215, 255),
+            foreground: Color::BLACK,
+            text_shadows: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextSelectionRange {
+    pub start: usize,
+    pub end: usize,
+    pub style: TextSelectionStyle,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextEditDecoration {
+    pub caret: Option<usize>,
+    pub selection: Option<TextSelectionRange>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Overflow {
     pub x: OverflowMode,
@@ -784,6 +814,7 @@ pub struct RenderNode {
     pub style: VisualStyle,
     pub transitions: TransitionStyle,
     pub text_layout: Option<PreparedTextLayout>,
+    pub text_edit: Option<TextEditDecoration>,
     pub element_id: Option<String>,
     pub element_path: Option<ElementPath>,
     pub content_inset: Insets,
@@ -800,6 +831,7 @@ impl RenderNode {
             style: VisualStyle::default(),
             transitions: TransitionStyle::default(),
             text_layout: None,
+            text_edit: None,
             element_id: None,
             element_path: None,
             content_inset: Insets::ZERO,
@@ -816,6 +848,7 @@ impl RenderNode {
             style: VisualStyle::default(),
             transitions: TransitionStyle::default(),
             text_layout: None,
+            text_edit: None,
             element_id: None,
             element_path: None,
             content_inset: Insets::ZERO,
@@ -832,6 +865,7 @@ impl RenderNode {
             style: VisualStyle::default(),
             transitions: TransitionStyle::default(),
             text_layout: None,
+            text_edit: None,
             element_id: None,
             element_path: None,
             content_inset: Insets::ZERO,
@@ -853,6 +887,11 @@ impl RenderNode {
 
     pub fn with_text_layout(mut self, text_layout: impl Into<Option<PreparedTextLayout>>) -> Self {
         self.text_layout = text_layout.into();
+        self
+    }
+
+    pub fn with_text_edit(mut self, text_edit: impl Into<Option<TextEditDecoration>>) -> Self {
+        self.text_edit = text_edit.into();
         self
     }
 

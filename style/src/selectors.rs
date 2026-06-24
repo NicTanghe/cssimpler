@@ -26,6 +26,7 @@ pub(crate) enum SelectorAnchor {
 pub enum PseudoElementKind {
     Before,
     After,
+    Selection,
 }
 
 impl InteractionDependencies {
@@ -47,6 +48,7 @@ impl InteractionDependencies {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SimpleSelector {
+    Universal,
     Class(String),
     Id(String),
     Tag(String),
@@ -94,6 +96,7 @@ impl SimpleSelector {
                 .classes
                 .iter()
                 .any(|class_name| class_name == expected),
+            Self::Universal => true,
             Self::Id(expected) => element.id.is_some_and(|actual| actual == expected),
             Self::Tag(expected) => element.tag == expected,
             Self::AttributeExists(name) => element.attribute(name).is_some(),
@@ -448,6 +451,12 @@ fn extract_compound_selector(
         .flatten()
         .collect::<Vec<_>>();
 
+    let simple_selectors = if simple_selectors.is_empty() && pseudo_element.is_some() {
+        vec![SimpleSelector::Universal]
+    } else {
+        simple_selectors
+    };
+
     if simple_selectors.is_empty() {
         return Err(unsupported_selector(selector));
     }
@@ -498,6 +507,9 @@ fn extract_simple_selector(
         }
         Component::PseudoElement(LightningPseudoElement::After) => {
             Ok((None, Some(PseudoElementKind::After)))
+        }
+        Component::PseudoElement(LightningPseudoElement::Selection(_)) => {
+            Ok((None, Some(PseudoElementKind::Selection)))
         }
         Component::Combinator(LightningCombinator::PseudoElement) => Ok((None, None)),
         Component::ExplicitUniversalType => Ok((None, None)),

@@ -4,9 +4,9 @@ use std::fmt::{Display, Formatter};
 
 use cssimpler_core::{
     BackdropOcclusion, BorderLineStyle, Color, CustomProperties, ElementInteractionState,
-    ElementNode, ElementPath, LayoutStyle, LengthPercentageCalc, NativeMaterial, OverflowMode,
-    ScrollbarWidth, Style, SvgPaint, TransformOperation, TransformOrigin, TransformStyleMode,
-    TransitionPropertyName, TransitionTimingFunction,
+    ElementNode, ElementPath, LayoutStyle, LengthPercentageCalc, NativeMaterial, Node,
+    OverflowMode, ScrollbarWidth, Style, SvgPaint, TextSelectionStyle, TransformOperation,
+    TransformOrigin, TransformStyleMode, TransitionPropertyName, TransitionTimingFunction,
     fonts::{OverflowWrap, TextAlign, TextStyle, TextTransform, WhiteSpace, WordBreak},
 };
 use lightningcss::declaration::DeclarationBlock;
@@ -629,6 +629,49 @@ pub fn resolve_style_with_interaction(
     )
 }
 
+pub fn resolve_selection_style_at_path(
+    root: &Node,
+    stylesheet: &Stylesheet,
+    interaction: &ElementInteractionState,
+    element_path: &ElementPath,
+) -> Option<TextSelectionStyle> {
+    let (element, ancestors) = element_and_ancestors_at_path(root, element_path)?;
+    let base = resolve_style_target(
+        element,
+        stylesheet,
+        svg::seed_element_style(element),
+        None,
+        None,
+        None,
+        &ancestors,
+        interaction,
+        element_path,
+        None,
+    );
+    let selected = resolve_style_target(
+        element,
+        stylesheet,
+        Style::default(),
+        Some(&base.visual.text),
+        Some(base.visual.foreground),
+        Some(&base.custom_properties),
+        &ancestors,
+        interaction,
+        element_path,
+        Some(PseudoElementKind::Selection),
+    );
+
+    let mut style = TextSelectionStyle {
+        foreground: selected.visual.foreground,
+        text_shadows: selected.visual.text_shadows,
+        ..TextSelectionStyle::default()
+    };
+    if let Some(background) = selected.visual.background {
+        style.background = background;
+    }
+    Some(style)
+}
+
 fn resolve_style_target(
     element: &ElementNode,
     stylesheet: &Stylesheet,
@@ -674,6 +717,37 @@ fn resolve_style_target(
     }
 
     resolved
+}
+
+fn element_and_ancestors_at_path<'a>(
+    root: &'a Node,
+    path: &ElementPath,
+) -> Option<(&'a ElementNode, Vec<ElementRef<'a>>)> {
+    let mut element = match root {
+        Node::Element(element) => element,
+        Node::Text(_) => return None,
+    };
+    let mut ancestors = Vec::with_capacity(path.children.len());
+
+    for &target_child_index in &path.children {
+        let mut child_element_index = 0;
+        let mut matched = None;
+        for child in &element.children {
+            let Node::Element(child_element) = child else {
+                continue;
+            };
+            if child_element_index == target_child_index {
+                matched = Some(child_element);
+                break;
+            }
+            child_element_index += 1;
+        }
+        ancestors.push(ElementRef::from(element));
+        element = matched?;
+    }
+
+    ancestors.reverse();
+    Some((element, ancestors))
 }
 
 pub fn to_taffy(style: &LayoutStyle) -> TaffyStyle {
@@ -1774,11 +1848,11 @@ mod tests {
 
     use cssimpler_core::{
         AnglePercentageValue, BackdropOcclusion, BackgroundLayer, CircleRadius, Color,
-        ConicGradient, ElementInteractionState, ElementNode, GradientDirection, GradientHorizontal,
-        GradientInterpolation, GradientPoint, GradientStop, LengthPercentageValue, LinearGradient,
-        NativeMaterial, Node, RadialShape, ScrollbarWidth, ShapeExtent, TransformMatrix3d,
-        TransformOperation, TransformOrigin, TransformStyleMode, TransitionPropertyName,
-        TransitionTimingFunction,
+        ConicGradient, ElementInteractionState, ElementNode, ElementPath, GradientDirection,
+        GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
+        LengthPercentageValue, LinearGradient, NativeMaterial, Node, RadialShape, ScrollbarWidth,
+        ShapeExtent, TransformMatrix3d, TransformOperation, TransformOrigin, TransformStyleMode,
+        TransitionPropertyName, TransitionTimingFunction,
         fonts::{
             FontFamily, LineHeight, OverflowWrap, TextAlign, TextStyle, TextTransform, WhiteSpace,
             WordBreak, layout_text_block, register_font_file,
@@ -1796,7 +1870,8 @@ mod tests {
         StyleRule, Stylesheet, build_render_tree, build_render_tree_in_viewport,
         extract_render_tree, layout_resolved_render_tree_in_viewport, parse_stylesheet,
         rebuild_render_tree_with_cached_layout, resolve_element_tree,
-        resolve_render_tree_with_interaction_at_root, resolve_style, to_taffy,
+        resolve_render_tree_with_interaction_at_root, resolve_selection_style_at_path,
+        resolve_style, to_taffy,
     };
 
     fn bundled_font_family() -> String {
@@ -1879,6 +1954,34 @@ mod tests {
                     160.0
                 ),))
         );
+    }
+
+    #[test]
+    fn selection_pseudo_element_resolves_highlight_style() {
+        let stylesheet = parse_stylesheet(
+            "::selection { background: #b3d7ff; color: white; }
+             input[type=text]::selection { background: #ff0099; color: black; text-shadow: none; }",
+        )
+        .expect("selection stylesheet should parse");
+        let root: Node = Node::element("div")
+            .with_child(
+                Node::element("input")
+                    .with_attribute("type", "text")
+                    .with_id("field")
+                    .into(),
+            )
+            .into();
+        let selection = resolve_selection_style_at_path(
+            &root,
+            &stylesheet,
+            &ElementInteractionState::default(),
+            &ElementPath::root(0).with_child(0),
+        )
+        .expect("input selection style should resolve");
+
+        assert_eq!(selection.background, Color::rgb(255, 0, 153));
+        assert_eq!(selection.foreground, Color::BLACK);
+        assert!(selection.text_shadows.is_empty());
     }
 
     #[test]

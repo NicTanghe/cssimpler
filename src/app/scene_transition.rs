@@ -195,6 +195,8 @@ fn sample_render_node_in_place(
         sampled.style.border.color = to.style.border.color;
     }
 
+    sampled.text_edit = to.text_edit.clone();
+
     for (((sampled_child, from_child), to_child), child_plan) in sampled
         .children
         .iter_mut()

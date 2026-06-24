@@ -44,9 +44,11 @@ use self::{
     },
 };
 use cssimpler_core::{
-    BackdropOcclusion, BorderLineStyle, Color, ElementInteractionState, ElementPath, EventHandler,
-    ExtractedScene, LayoutBox, LinearRgba, NativeMaterial, RenderKind, RenderNode, Transform2D,
-    TransformMatrix3d, TransformStyleMode, VisualStyle,
+    BackdropOcclusion, BorderLineStyle, Color, CornerRadius, ElementInteractionState, ElementPath,
+    EventHandler, ExtractedScene, LayoutBox, LinearRgba, NativeMaterial, RenderKind, RenderNode,
+    TextEditDecoration, TextSelectionRange, Transform2D, TransformMatrix3d, TransformStyleMode,
+    VisualStyle,
+    fonts::{PreparedTextLayout, TextAlign, TextStyle, layout_text_block},
 };
 use softbuffer::SoftBufferError;
 use winit::error::{EventLoopError, OsError};
@@ -432,6 +434,7 @@ fn hash_surface_subtree(node: &RenderNode) -> u64 {
         format!("{:?}", node.kind).hash(hasher);
         hash_layout(hasher, node.layout);
         format!("{:?}", node.style).hash(hasher);
+        format!("{:?}", node.text_edit).hash(hasher);
         format!("{:?}", node.content_inset).hash(hasher);
         format!("{:?}", node.scrollbars).hash(hasher);
         for child in &node.children {
@@ -2318,6 +2321,7 @@ fn render_nodes_match_own_visuals(left: &RenderNode, right: &RenderNode) -> bool
     left.kind == right.kind
         && left.layout == right.layout
         && left.style == right.style
+        && left.text_edit == right.text_edit
         && left.content_inset == right.content_inset
         && left.scrollbars == right.scrollbars
 }
@@ -2328,6 +2332,7 @@ fn render_nodes_match_own_visuals_ignoring_projection(
 ) -> bool {
     left.kind == right.kind
         && left.layout == right.layout
+        && left.text_edit == right.text_edit
         && left.content_inset == right.content_inset
         && left.scrollbars == right.scrollbars
         && visual_styles_match_ignoring_projection(&left.style, &right.style)
@@ -2739,8 +2744,29 @@ fn draw_node_contents_internal(
             &node.style,
             text_clip,
         );
+        draw_text_edit_decorations(
+            buffer,
+            width,
+            height,
+            text_layout,
+            content,
+            node.text_layout.as_ref(),
+            &node.style,
+            node.text_edit.as_ref(),
+            text_clip,
+        );
     } else if let RenderKind::Svg(scene) = &node.kind {
         svg::draw_svg_scene(buffer, width, height, node.layout, scene, clip);
+    } else {
+        draw_empty_text_edit_decorations(
+            buffer,
+            width,
+            height,
+            scrollbar::text_layout(node),
+            &node.style,
+            node.text_edit.as_ref(),
+            clip,
+        );
     }
 
     if node_has_rounded_overflow_clip(node) {
@@ -3454,6 +3480,18 @@ fn draw_node_transformed_internal(
             matrix,
             &text_clip_state,
         );
+        draw_text_edit_decorations_transformed(
+            buffer,
+            width,
+            height,
+            text_layout,
+            content,
+            node.text_layout.as_ref(),
+            &node.style,
+            node.text_edit.as_ref(),
+            matrix,
+            &text_clip_state,
+        );
     } else if let RenderKind::Svg(scene) = &node.kind {
         svg::draw_svg_scene_transformed(
             buffer,
@@ -3461,6 +3499,17 @@ fn draw_node_transformed_internal(
             height,
             node.layout,
             scene,
+            matrix,
+            clip_state,
+        );
+    } else {
+        draw_empty_text_edit_decorations_transformed(
+            buffer,
+            width,
+            height,
+            scrollbar::text_layout(node),
+            &node.style,
+            node.text_edit.as_ref(),
             matrix,
             clip_state,
         );
@@ -3507,6 +3556,386 @@ fn draw_node_transformed_internal(
     if matrix.is_identity() {
         scrollbar::draw_scrollbars(node, buffer, width, height, clip_state.coarse);
     }
+}
+
+#[derive(Clone, Debug)]
+struct TextRangeSegment {
+    text: String,
+    layout: LayoutBox,
+}
+
+fn draw_text_edit_decorations(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    text: &str,
+    prepared_text_layout: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+    edit: Option<&TextEditDecoration>,
+    clip: ClipRect,
+) {
+    let Some(edit) = edit else {
+        return;
+    };
+
+    if let Some(selection) = &edit.selection {
+        draw_text_selection(
+            buffer,
+            width,
+            height,
+            layout,
+            text,
+            prepared_text_layout,
+            style,
+            selection,
+            clip,
+        );
+        return;
+    }
+
+    if let Some(caret) = edit.caret
+        && let Some(caret) = text_caret_rect(layout, text, prepared_text_layout, &style.text, caret)
+    {
+        draw_rounded_rect(
+            buffer,
+            width,
+            height,
+            caret,
+            CornerRadius::ZERO,
+            style.foreground,
+            clip,
+        );
+    }
+}
+
+fn draw_empty_text_edit_decorations(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    style: &VisualStyle,
+    edit: Option<&TextEditDecoration>,
+    clip: ClipRect,
+) {
+    let Some(edit) = edit else {
+        return;
+    };
+    if edit.selection.is_some() || edit.caret.is_none() {
+        return;
+    }
+
+    draw_rounded_rect(
+        buffer,
+        width,
+        height,
+        empty_text_caret_rect(layout, &style.text),
+        CornerRadius::ZERO,
+        style.foreground,
+        clip,
+    );
+}
+
+fn draw_text_selection(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    text: &str,
+    prepared_text_layout: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+    selection: &TextSelectionRange,
+    clip: ClipRect,
+) {
+    let segments = text_range_segments(
+        layout,
+        text,
+        prepared_text_layout,
+        &style.text,
+        selection.start,
+        selection.end,
+    );
+    if segments.is_empty() {
+        return;
+    }
+
+    for segment in &segments {
+        draw_rounded_rect(
+            buffer,
+            width,
+            height,
+            segment.layout,
+            CornerRadius::ZERO,
+            selection.style.background,
+            clip,
+        );
+    }
+
+    let mut selected_style = style.clone();
+    selected_style.foreground = selection.style.foreground;
+    selected_style.text_shadows = selection.style.text_shadows.clone();
+    selected_style.text.text_align = TextAlign::Left;
+    for segment in segments {
+        fonts::draw_text(
+            buffer,
+            width,
+            height,
+            segment.layout,
+            &segment.text,
+            None,
+            &selected_style,
+            clip,
+        );
+    }
+}
+
+fn draw_text_edit_decorations_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    text: &str,
+    prepared_text_layout: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+    edit: Option<&TextEditDecoration>,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let Some(edit) = edit else {
+        return;
+    };
+
+    if let Some(selection) = &edit.selection {
+        draw_text_selection_transformed(
+            buffer,
+            width,
+            height,
+            layout,
+            text,
+            prepared_text_layout,
+            style,
+            selection,
+            matrix,
+            clip_state,
+        );
+        return;
+    }
+
+    if let Some(caret) = edit.caret
+        && let Some(caret) = text_caret_rect(layout, text, prepared_text_layout, &style.text, caret)
+    {
+        draw_transformed_rounded_rect(
+            buffer,
+            width,
+            height,
+            caret,
+            CornerRadius::ZERO,
+            style.foreground,
+            matrix,
+            clip_state,
+        );
+    }
+}
+
+fn draw_empty_text_edit_decorations_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    style: &VisualStyle,
+    edit: Option<&TextEditDecoration>,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let Some(edit) = edit else {
+        return;
+    };
+    if edit.selection.is_some() || edit.caret.is_none() {
+        return;
+    }
+
+    draw_transformed_rounded_rect(
+        buffer,
+        width,
+        height,
+        empty_text_caret_rect(layout, &style.text),
+        CornerRadius::ZERO,
+        style.foreground,
+        matrix,
+        clip_state,
+    );
+}
+
+fn draw_text_selection_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    text: &str,
+    prepared_text_layout: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+    selection: &TextSelectionRange,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let segments = text_range_segments(
+        layout,
+        text,
+        prepared_text_layout,
+        &style.text,
+        selection.start,
+        selection.end,
+    );
+    if segments.is_empty() {
+        return;
+    }
+
+    for segment in &segments {
+        draw_transformed_rounded_rect(
+            buffer,
+            width,
+            height,
+            segment.layout,
+            CornerRadius::ZERO,
+            selection.style.background,
+            matrix,
+            clip_state,
+        );
+    }
+
+    let mut selected_style = style.clone();
+    selected_style.foreground = selection.style.foreground;
+    selected_style.text_shadows = selection.style.text_shadows.clone();
+    selected_style.text.text_align = TextAlign::Left;
+    for segment in segments {
+        fonts::draw_text_transformed(
+            buffer,
+            width,
+            height,
+            segment.layout,
+            &segment.text,
+            None,
+            &selected_style,
+            matrix,
+            clip_state,
+        );
+    }
+}
+
+fn text_range_segments(
+    layout: LayoutBox,
+    text: &str,
+    prepared_text_layout: Option<&PreparedTextLayout>,
+    style: &TextStyle,
+    start: usize,
+    end: usize,
+) -> Vec<TextRangeSegment> {
+    let start = clamp_to_char_boundary(text, start.min(end));
+    let end = clamp_to_char_boundary(text, end.max(start));
+    if start == end {
+        return Vec::new();
+    }
+
+    let owned_layout;
+    let text_layout = if let Some(prepared) = prepared_text_layout {
+        &prepared.layout
+    } else {
+        owned_layout = layout_text_block(text, style, Some(layout.width.max(1.0)));
+        &owned_layout
+    };
+
+    let mut segments = Vec::new();
+    let mut line_start = 0;
+    for (line_index, line) in text_layout.lines.iter().enumerate() {
+        let line_end = line_start + line.text.len();
+        let segment_start = start.max(line_start).min(line_end);
+        let segment_end = end.max(line_start).min(line_end);
+        if segment_start < segment_end {
+            let local_start = clamp_to_char_boundary(&line.text, segment_start - line_start);
+            let local_end = clamp_to_char_boundary(&line.text, segment_end - line_start);
+            let selected_text = line.text[local_start..local_end].to_string();
+            let prefix = &line.text[..local_start];
+            let selected_width = layout_text_block(&selected_text, style, None).width;
+            if selected_width > f32::EPSILON {
+                let x = aligned_text_line_start_x(layout, line.width, style.text_align)
+                    + layout_text_block(prefix, style, None).width;
+                let y = layout.y + line_index as f32 * text_layout.line_height;
+                segments.push(TextRangeSegment {
+                    text: selected_text,
+                    layout: LayoutBox::new(x, y, selected_width, text_layout.line_height),
+                });
+            }
+        }
+        line_start = line_end;
+        if end <= line_start {
+            break;
+        }
+    }
+
+    segments
+}
+
+fn text_caret_rect(
+    layout: LayoutBox,
+    text: &str,
+    prepared_text_layout: Option<&PreparedTextLayout>,
+    style: &TextStyle,
+    caret: usize,
+) -> Option<LayoutBox> {
+    let caret = clamp_to_char_boundary(text, caret);
+    let owned_layout;
+    let text_layout = if let Some(prepared) = prepared_text_layout {
+        &prepared.layout
+    } else {
+        owned_layout = layout_text_block(text, style, Some(layout.width.max(1.0)));
+        &owned_layout
+    };
+
+    if text_layout.lines.is_empty() {
+        return Some(empty_text_caret_rect(layout, style));
+    }
+
+    let mut line_start = 0;
+    for (line_index, line) in text_layout.lines.iter().enumerate() {
+        let line_end = line_start + line.text.len();
+        if caret <= line_end || line_index + 1 == text_layout.lines.len() {
+            let local_caret = clamp_to_char_boundary(&line.text, caret.saturating_sub(line_start));
+            let x = aligned_text_line_start_x(layout, line.width, style.text_align)
+                + layout_text_block(&line.text[..local_caret], style, None).width;
+            let y = layout.y + line_index as f32 * text_layout.line_height;
+            return Some(LayoutBox::new(x, y, 1.0, text_layout.line_height));
+        }
+        line_start = line_end;
+    }
+
+    None
+}
+
+fn empty_text_caret_rect(layout: LayoutBox, style: &TextStyle) -> LayoutBox {
+    LayoutBox::new(layout.x, layout.y, 1.0, style.resolved_line_height_px())
+}
+
+fn aligned_text_line_start_x(layout: LayoutBox, line_width: f32, text_align: TextAlign) -> f32 {
+    match text_align {
+        TextAlign::Start | TextAlign::Left => layout.x,
+        TextAlign::Center => layout.x + (layout.width - line_width) * 0.5,
+        TextAlign::Right | TextAlign::End => layout.x + layout.width - line_width,
+    }
+}
+
+fn clamp_to_char_boundary(value: &str, cursor: usize) -> usize {
+    if cursor >= value.len() {
+        return value.len();
+    }
+    if value.is_char_boundary(cursor) {
+        return cursor;
+    }
+
+    let mut clamped = cursor;
+    while clamped > 0 && !value.is_char_boundary(clamped) {
+        clamped -= 1;
+    }
+    clamped
 }
 
 fn draw_background_and_border(
@@ -5376,14 +5805,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
-    use cssimpler_core::fonts::{FontFamily, TextStyle, TextTransform, register_font_file};
+    use cssimpler_core::fonts::{
+        FontFamily, TextStyle, TextTransform, layout_text_block, register_font_file,
+    };
     use cssimpler_core::{
         AnglePercentageValue, BackdropOcclusion, BackgroundLayer, BorderLineStyle, BoxShadow,
         CircleRadius, Color, ConicGradient, CornerRadius, ElementPath, ExtractedScene,
         GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
         GradientVertical, Insets, LayoutBox, LengthPercentageValue, LinearGradient, NativeMaterial,
-        Overflow, RadialGradient, RadialShape, RenderNode, ShadowEffect, TextStrokeStyle,
-        Transform2D, TransformMatrix3d, TransformOperation, TransformStyleMode, VisualStyle,
+        Overflow, RadialGradient, RadialShape, RenderNode, ShadowEffect, TextEditDecoration,
+        TextSelectionRange, TextSelectionStyle, TextStrokeStyle, Transform2D, TransformMatrix3d,
+        TransformOperation, TransformStyleMode, VisualStyle,
     };
 
     use crate::{
@@ -6581,6 +7013,45 @@ mod tests {
 
         assert_ne!(baseline_buffer, bundled_buffer);
         assert!(different_pixels > 100);
+    }
+
+    #[test]
+    fn text_selection_draws_colored_background() {
+        let text_style = TextStyle {
+            size_px: 20.0,
+            white_space: cssimpler_core::fonts::WhiteSpace::Pre,
+            ..TextStyle::default()
+        };
+        let prefix_width = layout_text_block("A", &text_style, None).width;
+        let selection_color = Color::rgb(255, 0, 153);
+        let scene = vec![
+            RenderNode::text(LayoutBox::new(20.0, 20.0, 120.0, 32.0), "A B")
+                .with_style(VisualStyle {
+                    background: Some(Color::WHITE),
+                    foreground: Color::BLACK,
+                    text: text_style,
+                    ..VisualStyle::default()
+                })
+                .with_text_edit(TextEditDecoration {
+                    caret: None,
+                    selection: Some(TextSelectionRange {
+                        start: 1,
+                        end: 2,
+                        style: TextSelectionStyle {
+                            background: selection_color,
+                            foreground: Color::BLACK,
+                            text_shadows: Vec::new(),
+                        },
+                    }),
+                }),
+        ];
+        let mut buffer = vec![0_u32; 160 * 72];
+
+        render_to_buffer(&scene, &mut buffer, 160, 72, Color::WHITE);
+
+        let sample_x = (20.0 + prefix_width + 2.0).round() as usize;
+        let sample_y = 26_usize;
+        assert_eq!(buffer[sample_y * 160 + sample_x], pack_rgb(selection_color));
     }
 
     #[test]
