@@ -6,7 +6,7 @@ use cssimpler_core::{
 };
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::{
-    AvailableSpace, Dimension, LengthPercentage as TaffyLengthPercentage,
+    AvailableSpace, Dimension, Display as TaffyDisplay, LengthPercentage as TaffyLengthPercentage,
     LengthPercentageAuto as TaffyLengthPercentageAuto, NodeId, Style as TaffyStyle, TaffyTree,
 };
 
@@ -102,6 +102,7 @@ pub fn layout_resolved_render_tree(
     available_space_override: Option<TaffySize<AvailableSpace>>,
 ) -> LaidOutRenderTree {
     let mut taffy = TaffyTree::<LeafMeasureContext>::new();
+    taffy.disable_rounding();
     let root = build_layout_tree(resolved.root(), &mut taffy);
     let available_space = available_space_override
         .unwrap_or_else(|| available_space_from_root(&root.style.layout.taffy));
@@ -323,8 +324,16 @@ pub(crate) fn resolve_element_tree(
         .iter()
         .any(|child| matches!(child, Node::Element(_)));
     let direct_text = direct_text_content(element);
+    let establishes_child_formatting_context = matches!(
+        style.layout.taffy.display,
+        TaffyDisplay::Flex | TaffyDisplay::Grid
+    );
 
-    if before.is_none() && after.is_none() && !has_element_children {
+    if before.is_none()
+        && after.is_none()
+        && !has_element_children
+        && !establishes_child_formatting_context
+    {
         return ResolvedElement {
             element_id: element.id.clone(),
             style,
@@ -346,7 +355,13 @@ pub(crate) fn resolve_element_tree(
         match child {
             Node::Text(text) => pending_text.push_str(text),
             Node::Element(child) => {
-                flush_text_child(&mut children, &mut pending_text, &style, element_path);
+                flush_text_child(
+                    &mut children,
+                    &mut pending_text,
+                    &style,
+                    element_path,
+                    establishes_child_formatting_context,
+                );
                 let child_path = element_path.with_child(child_index);
                 child_index += 1;
                 children.push(resolve_element_tree(
@@ -362,7 +377,13 @@ pub(crate) fn resolve_element_tree(
             }
         }
     }
-    flush_text_child(&mut children, &mut pending_text, &style, element_path);
+    flush_text_child(
+        &mut children,
+        &mut pending_text,
+        &style,
+        element_path,
+        establishes_child_formatting_context,
+    );
 
     if let Some(after) = after {
         children.push(after);
@@ -414,7 +435,11 @@ fn build_layout_tree(
         .map(|child| build_layout_tree(child, taffy))
         .collect();
     let child_ids: Vec<_> = children.iter().map(|child| child.node_id).collect();
-    let node_id = if child_ids.is_empty() {
+    let establishes_child_formatting_context = matches!(
+        resolved.style.layout.taffy.display,
+        TaffyDisplay::Flex | TaffyDisplay::Grid
+    );
+    let node_id = if child_ids.is_empty() && !establishes_child_formatting_context {
         taffy
             .new_leaf_with_context(
                 crate::to_taffy(&resolved.style.layout),
@@ -711,11 +736,14 @@ fn render_node_from_layout(
     }
 
     if child_nodes.is_empty() && !tree.text.is_empty() {
-        let text_layout = text_layout_from_measure_context(
+        let wrap_width = text_layout_wrap_width(layout_box, content_inset, scrollbars);
+        debug_assert_final_text_measurement_is_consistent(
+            tree,
             taffy,
-            tree.node_id,
-            text_layout_wrap_width(layout_box, content_inset, scrollbars),
+            wrap_width,
+            scrollbars.is_none(),
         );
+        let text_layout = text_layout_from_measure_context(taffy, tree.node_id, wrap_width);
         let mut node = RenderNode::text(layout_box, tree.text.clone())
             .with_style(tree.style.visual.clone())
             .with_transitions(tree.style.transitions.clone())
@@ -801,8 +829,13 @@ fn flush_text_child(
     pending_text: &mut String,
     parent_style: &Style,
     element_path: &ElementPath,
+    ignore_whitespace_only: bool,
 ) {
     if pending_text.is_empty() {
+        return;
+    }
+    if ignore_whitespace_only && pending_text.trim().is_empty() {
+        pending_text.clear();
         return;
     }
 
@@ -815,6 +848,34 @@ fn flush_text_child(
         handlers: EventHandlers::default(),
         children: Vec::new(),
     });
+}
+
+fn debug_assert_final_text_measurement_is_consistent(
+    tree: &LayoutTree,
+    taffy: &TaffyTree<LeafMeasureContext>,
+    wrap_width: Option<f32>,
+    has_unscrolled_content_box: bool,
+) {
+    if !cfg!(debug_assertions)
+        || !has_unscrolled_content_box
+        || !matches!(tree.style.layout.taffy.size.width, Dimension::Auto)
+    {
+        return;
+    }
+
+    let Some(measured) = taffy
+        .get_node_context(tree.node_id)
+        .and_then(|context| context.text_layout.as_ref())
+    else {
+        return;
+    };
+    if measured.wrap_width.is_some() {
+        debug_assert!(
+            measured.matches_wrap_width(wrap_width),
+            "final text content width {wrap_width:?} differs from the Taffy measurement width {:?}",
+            measured.wrap_width
+        );
+    }
 }
 
 fn render_node_with_cached_layout(

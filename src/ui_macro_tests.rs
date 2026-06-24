@@ -114,3 +114,27 @@ fn ui_macro_supports_generic_and_dashed_attributes() {
         Node::Text(_) => panic!("expected button element"),
     }
 }
+
+#[test]
+fn ui_macro_accepts_html_void_input_without_self_closing_slash() {
+    let tree = ui! {
+        <form>
+            <label for="fname">First Name</label>
+            <input type="text" id="fname" name="fname">
+            <label for="lname">Last Name</label>
+        </form>
+    };
+
+    match tree {
+        Node::Element(form) => {
+            assert_eq!(form.children.len(), 3);
+            let Node::Element(input) = &form.children[1] else {
+                panic!("expected input element");
+            };
+            assert_eq!(input.tag, "input");
+            assert_eq!(input.attribute("type"), Some("text"));
+            assert!(input.children.is_empty());
+        }
+        Node::Text(_) => panic!("expected form element"),
+    }
+}

@@ -1,7 +1,8 @@
 use cssimpler_core::Style;
 use cssimpler_core::fonts::{
     FontFamily, FontStyle, GenericFontFamily, LineHeight as CoreLineHeight,
-    TextTransform as CoreTextTransform,
+    OverflowWrap as CoreOverflowWrap, TextAlign as CoreTextAlign,
+    TextTransform as CoreTextTransform, WhiteSpace as CoreWhiteSpace, WordBreak as CoreWordBreak,
 };
 use lightningcss::printer::PrinterOptions;
 use lightningcss::properties::Property;
@@ -12,7 +13,9 @@ use lightningcss::properties::font::{
     RelativeFontSize as CssRelativeFontSize,
 };
 use lightningcss::properties::text::{
-    Spacing, TextTransform as CssTextTransform, TextTransformCase as CssTextTransformCase,
+    OverflowWrap as CssOverflowWrap, Spacing, TextAlign as CssTextAlign,
+    TextTransform as CssTextTransform, TextTransformCase as CssTextTransformCase,
+    WhiteSpace as CssWhiteSpace, WordBreak as CssWordBreak,
 };
 use lightningcss::traits::ToCss;
 use lightningcss::values::length::{Length, LengthPercentage, LengthValue};
@@ -117,6 +120,20 @@ pub(crate) fn extract_property(
         Property::TextTransform(value) => Some(
             text_transform_from_css(value).map(|value| vec![Declaration::TextTransform(value)]),
         ),
+        Property::WhiteSpace(value) => Some(Ok(vec![Declaration::WhiteSpace(
+            white_space_from_css(*value),
+        )])),
+        Property::OverflowWrap(value) | Property::WordWrap(value) => {
+            Some(Ok(vec![Declaration::OverflowWrap(overflow_wrap_from_css(
+                *value,
+            ))]))
+        }
+        Property::WordBreak(value) => Some(Ok(vec![Declaration::WordBreak(word_break_from_css(
+            *value,
+        ))])),
+        Property::TextAlign(value) => {
+            Some(text_align_from_css(*value).map(|value| vec![Declaration::TextAlign(value)]))
+        }
         _ => None,
     }
 }
@@ -157,6 +174,22 @@ pub(crate) fn apply_font_declaration(
         }
         Declaration::TextTransform(value) => {
             style.visual.text.text_transform = *value;
+            true
+        }
+        Declaration::WhiteSpace(value) => {
+            style.visual.text.white_space = *value;
+            true
+        }
+        Declaration::OverflowWrap(value) => {
+            style.visual.text.overflow_wrap = *value;
+            true
+        }
+        Declaration::WordBreak(value) => {
+            style.visual.text.word_break = *value;
+            true
+        }
+        Declaration::TextAlign(value) => {
+            style.visual.text.text_align = *value;
             true
         }
         _ => false,
@@ -311,6 +344,42 @@ fn text_transform_from_css(value: &CssTextTransform) -> Result<CoreTextTransform
         CssTextTransformCase::Lowercase => CoreTextTransform::Lowercase,
         CssTextTransformCase::Capitalize => CoreTextTransform::Capitalize,
     })
+}
+
+fn white_space_from_css(value: CssWhiteSpace) -> CoreWhiteSpace {
+    match value {
+        CssWhiteSpace::Normal | CssWhiteSpace::PreLine => CoreWhiteSpace::Normal,
+        CssWhiteSpace::NoWrap => CoreWhiteSpace::NoWrap,
+        CssWhiteSpace::Pre => CoreWhiteSpace::Pre,
+        CssWhiteSpace::PreWrap | CssWhiteSpace::BreakSpaces => CoreWhiteSpace::PreWrap,
+    }
+}
+
+fn overflow_wrap_from_css(value: CssOverflowWrap) -> CoreOverflowWrap {
+    match value {
+        CssOverflowWrap::Normal => CoreOverflowWrap::Normal,
+        CssOverflowWrap::Anywhere | CssOverflowWrap::BreakWord => CoreOverflowWrap::Anywhere,
+    }
+}
+
+fn word_break_from_css(value: CssWordBreak) -> CoreWordBreak {
+    match value {
+        CssWordBreak::Normal | CssWordBreak::KeepAll => CoreWordBreak::Normal,
+        CssWordBreak::BreakAll | CssWordBreak::BreakWord => CoreWordBreak::BreakAll,
+    }
+}
+
+fn text_align_from_css(value: CssTextAlign) -> Result<CoreTextAlign, StyleError> {
+    match value {
+        CssTextAlign::Start | CssTextAlign::MatchParent => Ok(CoreTextAlign::Start),
+        CssTextAlign::Left => Ok(CoreTextAlign::Left),
+        CssTextAlign::Center => Ok(CoreTextAlign::Center),
+        CssTextAlign::Right => Ok(CoreTextAlign::Right),
+        CssTextAlign::End => Ok(CoreTextAlign::End),
+        CssTextAlign::Justify | CssTextAlign::JustifyAll => {
+            Err(StyleError::UnsupportedValue(format!("{value:?}")))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

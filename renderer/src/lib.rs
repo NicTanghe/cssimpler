@@ -2919,7 +2919,7 @@ fn hit_test_scene_for_event(
     })
 }
 
-fn hit_test_element_path(scene: &[RenderNode], x: f32, y: f32) -> Option<ElementPath> {
+pub fn hit_test_element_path(scene: &[RenderNode], x: f32, y: f32) -> Option<ElementPath> {
     scene
         .iter()
         .enumerate()

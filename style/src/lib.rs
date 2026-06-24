@@ -7,7 +7,7 @@ use cssimpler_core::{
     ElementNode, ElementPath, LayoutStyle, LengthPercentageCalc, NativeMaterial, OverflowMode,
     ScrollbarWidth, Style, SvgPaint, TransformOperation, TransformOrigin, TransformStyleMode,
     TransitionPropertyName, TransitionTimingFunction,
-    fonts::{TextStyle, TextTransform},
+    fonts::{OverflowWrap, TextAlign, TextStyle, TextTransform, WhiteSpace, WordBreak},
 };
 use lightningcss::declaration::DeclarationBlock;
 use lightningcss::printer::PrinterOptions;
@@ -392,6 +392,10 @@ pub enum Declaration {
     LineHeight(LineHeightDeclaration),
     LetterSpacing(LetterSpacingDeclaration),
     TextTransform(TextTransform),
+    WhiteSpace(WhiteSpace),
+    OverflowWrap(OverflowWrap),
+    WordBreak(WordBreak),
+    TextAlign(TextAlign),
     CornerTopLeft(f32),
     CornerTopRight(f32),
     CornerBottomRight(f32),
@@ -1766,6 +1770,7 @@ fn length_percentage_auto_hint_from_calc(value: LengthPercentageCalc) -> TaffyLe
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     use cssimpler_core::{
         AnglePercentageValue, BackdropOcclusion, BackgroundLayer, CircleRadius, Color,
@@ -1773,7 +1778,11 @@ mod tests {
         GradientInterpolation, GradientPoint, GradientStop, LengthPercentageValue, LinearGradient,
         NativeMaterial, Node, RadialShape, ScrollbarWidth, ShapeExtent, TransformMatrix3d,
         TransformOperation, TransformOrigin, TransformStyleMode, TransitionPropertyName,
-        TransitionTimingFunction, fonts::TextTransform,
+        TransitionTimingFunction,
+        fonts::{
+            FontFamily, LineHeight, OverflowWrap, TextAlign, TextStyle, TextTransform, WhiteSpace,
+            WordBreak, layout_text_block, register_font_file,
+        },
     };
     use taffy::prelude::{
         AlignItems as TaffyAlignItems, Dimension, Display as TaffyDisplay,
@@ -1789,6 +1798,16 @@ mod tests {
         rebuild_render_tree_with_cached_layout, resolve_element_tree,
         resolve_render_tree_with_interaction_at_root, resolve_style, to_taffy,
     };
+
+    fn bundled_font_family() -> String {
+        let asset_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/assets/powerline-demo.ttf");
+        register_font_file(&asset_path)
+            .expect("bundled font should register for text layout tests")
+            .into_iter()
+            .next()
+            .expect("bundled font should expose a family name")
+    }
 
     #[test]
     fn matching_rules_are_returned_in_insertion_order() {
@@ -2204,6 +2223,25 @@ mod tests {
                 .declarations
                 .contains(&Declaration::TextTransform(TextTransform::Uppercase))
         );
+    }
+
+    #[test]
+    fn parser_and_resolution_support_text_layout_controls() {
+        let stylesheet = parse_stylesheet(
+            ".label {
+                white-space: nowrap;
+                overflow-wrap: anywhere;
+                word-break: break-all;
+                text-align: center;
+            }",
+        )
+        .expect("text layout stylesheet should parse");
+        let resolved = resolve_style(&Node::element("span").with_class("label"), &stylesheet);
+
+        assert_eq!(resolved.visual.text.white_space, WhiteSpace::NoWrap);
+        assert_eq!(resolved.visual.text.overflow_wrap, OverflowWrap::Anywhere);
+        assert_eq!(resolved.visual.text.word_break, WordBreak::BreakAll);
+        assert_eq!(resolved.visual.text.text_align, TextAlign::Center);
     }
 
     #[test]
@@ -3101,6 +3139,75 @@ mod tests {
     }
 
     #[test]
+    fn direct_text_in_flex_container_becomes_a_centered_anonymous_item() {
+        let family = bundled_font_family();
+        let stylesheet = parse_stylesheet(&format!(
+            "#button {{
+                display: flex;
+                width: 120px;
+                height: 32px;
+                padding: 4px 8px;
+                justify-content: center;
+                align-items: center;
+                font-family: \"{family}\";
+                font-size: 12px;
+                line-height: 1;
+            }}"
+        ))
+        .expect("direct text flex stylesheet should parse");
+        let tree = Node::element("button")
+            .with_id("button")
+            .with_child(Node::text("Recording"))
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        assert!(matches!(scene.kind, cssimpler_core::RenderKind::Container));
+        assert_eq!(scene.children.len(), 1);
+        let text = &scene.children[0];
+        assert!(matches!(text.kind, cssimpler_core::RenderKind::Text(_)));
+        assert_eq!(
+            text.text_layout
+                .as_ref()
+                .expect("anonymous text item should have prepared layout")
+                .layout
+                .lines
+                .len(),
+            1
+        );
+
+        let content_center_x = scene.layout.x
+            + scene.content_inset.left
+            + (scene.layout.width - scene.content_inset.left - scene.content_inset.right) * 0.5;
+        let content_center_y = scene.layout.y
+            + scene.content_inset.top
+            + (scene.layout.height - scene.content_inset.top - scene.content_inset.bottom) * 0.5;
+        let text_center_x = text.layout.x + text.layout.width * 0.5;
+        let text_center_y = text.layout.y + text.layout.height * 0.5;
+
+        assert!((text_center_x - content_center_x).abs() < 0.01);
+        assert!((text_center_y - content_center_y).abs() < 0.01);
+    }
+
+    #[test]
+    fn flex_and_grid_containers_ignore_whitespace_only_anonymous_items() {
+        let stylesheet = parse_stylesheet(
+            "#row { display: flex; width: 100px; height: 30px; }
+             #cell { width: 20px; height: 10px; }",
+        )
+        .expect("whitespace flex stylesheet should parse");
+        let tree = Node::element("div")
+            .with_id("row")
+            .with_child(Node::text("\n    "))
+            .with_child(Node::element("span").with_id("cell").into())
+            .with_child(Node::text("\n"))
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+
+        assert_eq!(scene.children.len(), 1);
+        assert_eq!(scene.children[0].element_id.as_deref(), Some("cell"));
+    }
+
+    #[test]
     fn column_flex_layout_with_shorthand_growth_pushes_footer_to_the_bottom() {
         let stylesheet = parse_stylesheet(
             "#app {
@@ -3273,6 +3380,47 @@ mod tests {
                 prepared.wrap_width,
             )
         );
+    }
+
+    #[test]
+    fn fractional_text_width_survives_final_layout_without_rewrap() {
+        let family = bundled_font_family();
+        let text_style = TextStyle {
+            families: vec![FontFamily::Named(family.clone())],
+            size_px: 12.0,
+            line_height: LineHeight::Scale(1.0),
+            ..TextStyle::default()
+        };
+        let intrinsic = layout_text_block("Recording", &text_style, None);
+        assert!(
+            intrinsic.width.fract().abs() > 0.001,
+            "test font must produce a fractional intrinsic width"
+        );
+
+        let stylesheet = parse_stylesheet(&format!(
+            ".label {{
+                width: {:.6}px;
+                font-family: \"{family}\";
+                font-size: 12px;
+                line-height: 1;
+            }}",
+            intrinsic.width
+        ))
+        .expect("fractional text width stylesheet should parse");
+        let tree = Node::element("span")
+            .with_class("label")
+            .with_child(Node::text("Recording"))
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+        let prepared = scene
+            .text_layout
+            .as_ref()
+            .expect("text leaf should carry prepared layout");
+
+        assert!((scene.layout.width - intrinsic.width).abs() < 0.001);
+        assert_eq!(prepared.layout.lines.len(), 1);
+        assert!((prepared.wrap_width.expect("final width") - scene.layout.width).abs() < 0.001);
+        assert!((prepared.layout.height - scene.layout.height).abs() < 0.001);
     }
 
     #[test]
@@ -3476,6 +3624,44 @@ mod tests {
         assert_eq!(rerendered.style.foreground, Color::rgb(37, 99, 235));
         assert_eq!(rerendered.text_layout, scene.children[0].text_layout);
         assert_eq!(text_nodes(&rerendered), vec!["value".to_string()]);
+    }
+
+    #[test]
+    fn cached_layout_rebuild_matches_anonymous_flex_text_layout() {
+        let stylesheet = parse_stylesheet(
+            "#button {
+                display: flex;
+                width: 120px;
+                height: 32px;
+                padding: 4px 8px;
+                justify-content: center;
+                align-items: center;
+                font-size: 12px;
+                line-height: 1;
+                text-align: center;
+            }",
+        )
+        .expect("cached anonymous text stylesheet should parse");
+        let tree: Node = Node::element("button")
+            .with_id("button")
+            .with_child(Node::text("Recording"))
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+        let rebuilt = rebuild_render_tree_with_cached_layout(
+            &tree,
+            &stylesheet,
+            &ElementInteractionState::default(),
+            &cssimpler_core::ElementPath::root(0),
+            &scene,
+        )
+        .expect("cached anonymous text layout should rebuild");
+
+        assert_eq!(rebuilt.children.len(), 1);
+        assert_eq!(rebuilt.children[0].layout, scene.children[0].layout);
+        assert_eq!(
+            rebuilt.children[0].text_layout,
+            scene.children[0].text_layout
+        );
     }
 
     #[test]

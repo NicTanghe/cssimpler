@@ -109,7 +109,8 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::TransformOrigin(_)
         | Declaration::Perspective(_)
         | Declaration::TransformStyle(_)
-        | Declaration::ScrollbarColors(_, _) => StyleInvalidation::Paint,
+        | Declaration::ScrollbarColors(_, _)
+        | Declaration::TextAlign(_) => StyleInvalidation::Paint,
         Declaration::FontFamilies(_)
         | Declaration::FontSize(_)
         | Declaration::FontWeight(_)
@@ -117,6 +118,9 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::LineHeight(_)
         | Declaration::LetterSpacing(_)
         | Declaration::TextTransform(_)
+        | Declaration::WhiteSpace(_)
+        | Declaration::OverflowWrap(_)
+        | Declaration::WordBreak(_)
         | Declaration::OverflowX(_)
         | Declaration::OverflowY(_)
         | Declaration::ScrollbarWidth(_)

@@ -383,6 +383,7 @@ dependencies = [
  "ab_glyph",
  "fontdb",
  "taffy",
+ "unicode-segmentation",
 ]
 
 [[package]]

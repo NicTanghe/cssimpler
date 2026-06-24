@@ -6,14 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use ab_glyph::{Font, FontArc, FontVec, ScaleFont};
+use unicode_segmentation::UnicodeSegmentation;
 
 const DEFAULT_FONT_SIZE_PX: f32 = 16.0;
 const DEFAULT_FONT_WEIGHT: u16 = 400;
 const DEFAULT_LINE_HEIGHT_SCALE: f32 = 1.2;
 
-const BITMAP_BASE_FONT_SIZE_PX: f32 = 16.0;
-const BITMAP_GLYPH_ADVANCE_PX: f32 = 18.0;
-const BITMAP_LINE_HEIGHT_PX: f32 = 20.0;
+const BITMAP_CELL_SIZE_PX: f32 = 8.0;
+const BITMAP_GLYPH_ADVANCE_PX: f32 = 9.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GenericFontFamily {
@@ -78,6 +78,39 @@ pub enum TextTransform {
     Capitalize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WhiteSpace {
+    #[default]
+    Normal,
+    NoWrap,
+    Pre,
+    PreWrap,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverflowWrap {
+    #[default]
+    Normal,
+    Anywhere,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WordBreak {
+    #[default]
+    Normal,
+    BreakAll,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextAlign {
+    #[default]
+    Start,
+    Left,
+    Center,
+    Right,
+    End,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
     pub families: Vec<FontFamily>,
@@ -87,6 +120,10 @@ pub struct TextStyle {
     pub line_height: LineHeight,
     pub letter_spacing_px: f32,
     pub text_transform: TextTransform,
+    pub white_space: WhiteSpace,
+    pub overflow_wrap: OverflowWrap,
+    pub word_break: WordBreak,
+    pub text_align: TextAlign,
 }
 
 impl Default for TextStyle {
@@ -99,6 +136,10 @@ impl Default for TextStyle {
             line_height: LineHeight::Normal,
             letter_spacing_px: 0.0,
             text_transform: TextTransform::None,
+            white_space: WhiteSpace::Normal,
+            overflow_wrap: OverflowWrap::Normal,
+            word_break: WordBreak::Normal,
+            text_align: TextAlign::Start,
         }
     }
 }
@@ -175,6 +216,22 @@ impl ResolvedFont {
 
     pub fn line_height_px(&self) -> f32 {
         self.line_height_px
+    }
+
+    pub fn ascent_px(&self) -> f32 {
+        self.font.as_scaled(self.size_px).ascent()
+    }
+
+    pub fn descent_px(&self) -> f32 {
+        self.font.as_scaled(self.size_px).descent()
+    }
+
+    pub fn glyph_height_px(&self) -> f32 {
+        self.ascent_px() - self.descent_px()
+    }
+
+    pub fn baseline_offset_px(&self) -> f32 {
+        half_leading_offset(self.line_height_px, self.glyph_height_px()) + self.ascent_px()
     }
 
     pub fn measure_text_width(&self, text: &str) -> f32 {
@@ -303,7 +360,7 @@ impl FontRegistry {
         ResolvedFont {
             font,
             size_px: style.size_px.max(1.0),
-            line_height_px: style.resolved_line_height_px().max(style.size_px.max(1.0)),
+            line_height_px: style.resolved_line_height_px().max(0.0),
         }
     }
 
@@ -449,6 +506,9 @@ pub fn layout_text_block(text: &str, style: &TextStyle, wrap_width: Option<f32>)
         wrap_width,
         &backend,
         style.letter_spacing_px,
+        style.white_space,
+        style.overflow_wrap,
+        style.word_break,
     );
     let width = lines.iter().map(|line| line.width).fold(0.0_f32, f32::max);
     let height = lines.len() as f32 * line_height;
@@ -489,26 +549,50 @@ impl MeasurementBackend {
 }
 
 #[derive(Clone, Copy)]
-struct BitmapFontMetrics {
+pub struct BitmapFontMetrics {
+    raster_scale: i32,
     glyph_advance_px: f32,
+    glyph_height_px: f32,
     line_height_px: f32,
 }
 
 impl BitmapFontMetrics {
-    fn from_style(style: &TextStyle) -> Self {
+    pub fn from_style(style: &TextStyle) -> Self {
         let font_size_px = style.size_px.max(1.0);
-        let scale = font_size_px / BITMAP_BASE_FONT_SIZE_PX;
-        let default_line_height = BITMAP_LINE_HEIGHT_PX * scale;
+        let raster_scale = ((font_size_px / BITMAP_CELL_SIZE_PX).round() as i32).max(1);
+        let raster_scale_px = raster_scale as f32;
 
         Self {
-            glyph_advance_px: BITMAP_GLYPH_ADVANCE_PX * scale,
-            line_height_px: style.resolved_line_height_px().max(default_line_height),
+            raster_scale,
+            glyph_advance_px: BITMAP_GLYPH_ADVANCE_PX * raster_scale_px,
+            glyph_height_px: BITMAP_CELL_SIZE_PX * raster_scale_px,
+            line_height_px: style.resolved_line_height_px().max(0.0),
         }
     }
 
-    fn measure_text_width(self, text: &str) -> f32 {
+    pub fn raster_scale(self) -> i32 {
+        self.raster_scale
+    }
+
+    pub fn glyph_height_px(self) -> f32 {
+        self.glyph_height_px
+    }
+
+    pub fn line_height_px(self) -> f32 {
+        self.line_height_px
+    }
+
+    pub fn glyph_offset_y(self) -> f32 {
+        half_leading_offset(self.line_height_px, self.glyph_height_px)
+    }
+
+    pub fn measure_text_width(self, text: &str) -> f32 {
         text.chars().count() as f32 * self.glyph_advance_px
     }
+}
+
+pub fn half_leading_offset(line_height: f32, glyph_height: f32) -> f32 {
+    (line_height - glyph_height) * 0.5
 }
 
 fn wrap_text_lines(
@@ -516,34 +600,42 @@ fn wrap_text_lines(
     wrap_width: Option<f32>,
     backend: &MeasurementBackend,
     letter_spacing_px: f32,
+    white_space: WhiteSpace,
+    overflow_wrap: OverflowWrap,
+    word_break: WordBreak,
 ) -> Vec<TextLineLayout> {
-    let max_width = wrap_width.filter(|width| *width > 0.0);
-    let Some(max_width) = max_width else {
-        let mut lines = Vec::new();
-        for source_line in text.lines() {
-            lines.push(TextLineLayout {
-                text: source_line.to_string(),
-                width: backend.measure_text_width(source_line, letter_spacing_px),
-            });
-        }
-        if lines.is_empty() {
-            lines.push(TextLineLayout {
-                text: String::new(),
-                width: 0.0,
-            });
-        }
-        return lines;
-    };
-
     let mut wrapped = Vec::new();
     for source_line in text.lines() {
-        wrap_source_line(
-            source_line,
-            max_width,
-            backend,
-            letter_spacing_px,
-            &mut wrapped,
-        );
+        let source_line = match white_space {
+            WhiteSpace::Normal | WhiteSpace::NoWrap => collapse_whitespace(source_line),
+            WhiteSpace::Pre | WhiteSpace::PreWrap => source_line.to_string(),
+        };
+        let max_width = match white_space {
+            WhiteSpace::NoWrap | WhiteSpace::Pre => None,
+            WhiteSpace::Normal | WhiteSpace::PreWrap => wrap_width.filter(|width| *width > 0.0),
+        };
+
+        match (white_space, max_width) {
+            (WhiteSpace::Normal, Some(max_width)) => wrap_source_line(
+                &source_line,
+                max_width,
+                backend,
+                letter_spacing_px,
+                overflow_wrap,
+                word_break,
+                &mut wrapped,
+            ),
+            (WhiteSpace::PreWrap, Some(max_width)) => wrap_preserved_source_line(
+                &source_line,
+                max_width,
+                backend,
+                letter_spacing_px,
+                overflow_wrap,
+                word_break,
+                &mut wrapped,
+            ),
+            _ => push_measured_line(&source_line, backend, letter_spacing_px, &mut wrapped),
+        }
     }
 
     if wrapped.is_empty() {
@@ -561,6 +653,8 @@ fn wrap_source_line(
     max_width: f32,
     backend: &MeasurementBackend,
     letter_spacing_px: f32,
+    overflow_wrap: OverflowWrap,
+    word_break: WordBreak,
     wrapped: &mut Vec<TextLineLayout>,
 ) {
     if line.is_empty() {
@@ -572,10 +666,13 @@ fn wrap_source_line(
     }
 
     let mut current = String::new();
+    let break_long_words =
+        overflow_wrap == OverflowWrap::Anywhere || word_break == WordBreak::BreakAll;
 
     for word in line.split_whitespace() {
         if current.is_empty() {
-            if backend.measure_text_width(word, letter_spacing_px) <= max_width {
+            if !break_long_words || backend.measure_text_width(word, letter_spacing_px) <= max_width
+            {
                 current.push_str(word);
             } else {
                 wrap_long_word(word, max_width, backend, letter_spacing_px, wrapped);
@@ -593,7 +690,8 @@ fn wrap_source_line(
                 width,
             });
 
-            if backend.measure_text_width(word, letter_spacing_px) <= max_width {
+            if !break_long_words || backend.measure_text_width(word, letter_spacing_px) <= max_width
+            {
                 current.push_str(word);
             } else {
                 wrap_long_word(word, max_width, backend, letter_spacing_px, wrapped);
@@ -610,6 +708,48 @@ fn wrap_source_line(
     }
 }
 
+fn wrap_preserved_source_line(
+    line: &str,
+    max_width: f32,
+    backend: &MeasurementBackend,
+    letter_spacing_px: f32,
+    overflow_wrap: OverflowWrap,
+    word_break: WordBreak,
+    wrapped: &mut Vec<TextLineLayout>,
+) {
+    if line.is_empty() {
+        push_measured_line(line, backend, letter_spacing_px, wrapped);
+        return;
+    }
+
+    let break_long_words =
+        overflow_wrap == OverflowWrap::Anywhere || word_break == WordBreak::BreakAll;
+    let mut current = String::new();
+
+    for segment in line.split_inclusive(char::is_whitespace) {
+        let candidate = format!("{current}{segment}");
+        if backend.measure_text_width(&candidate, letter_spacing_px) <= max_width {
+            current.push_str(segment);
+            continue;
+        }
+
+        if !current.is_empty() {
+            push_measured_line(&current, backend, letter_spacing_px, wrapped);
+            current.clear();
+        }
+
+        if break_long_words && backend.measure_text_width(segment, letter_spacing_px) > max_width {
+            wrap_long_word(segment, max_width, backend, letter_spacing_px, wrapped);
+        } else {
+            current.push_str(segment);
+        }
+    }
+
+    if !current.is_empty() {
+        push_measured_line(&current, backend, letter_spacing_px, wrapped);
+    }
+}
+
 fn wrap_long_word(
     word: &str,
     max_width: f32,
@@ -619,12 +759,12 @@ fn wrap_long_word(
 ) {
     let mut segment = String::new();
 
-    for character in word.chars() {
-        let candidate = format!("{segment}{character}");
+    for grapheme in word.graphemes(true) {
+        let candidate = format!("{segment}{grapheme}");
         if segment.is_empty()
             || backend.measure_text_width(&candidate, letter_spacing_px) <= max_width
         {
-            segment.push(character);
+            segment.push_str(grapheme);
             continue;
         }
 
@@ -633,7 +773,7 @@ fn wrap_long_word(
             text: std::mem::take(&mut segment),
             width,
         });
-        segment.push(character);
+        segment.push_str(grapheme);
     }
 
     if !segment.is_empty() {
@@ -643,6 +783,22 @@ fn wrap_long_word(
             width,
         });
     }
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn push_measured_line(
+    text: &str,
+    backend: &MeasurementBackend,
+    letter_spacing_px: f32,
+    lines: &mut Vec<TextLineLayout>,
+) {
+    lines.push(TextLineLayout {
+        text: text.to_string(),
+        width: backend.measure_text_width(text, letter_spacing_px),
+    });
 }
 
 fn letter_spacing_adjustment(text: &str, letter_spacing_px: f32) -> f32 {
@@ -692,8 +848,9 @@ mod tests {
     use std::thread;
 
     use super::{
-        FontFamily, GenericFontFamily, LineHeight, TextStyle, TextTransform, layout_text_block,
-        query_families, register_font_file, resolve_font,
+        BitmapFontMetrics, FontFamily, GenericFontFamily, LineHeight, OverflowWrap, TextStyle,
+        TextTransform, WhiteSpace, WordBreak, layout_text_block, query_families,
+        register_font_file, resolve_font,
     };
 
     fn bundled_font_family() -> String {
@@ -731,12 +888,122 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_fallback_wraps_long_words_when_width_is_small() {
-        let style = TextStyle::default();
+    fn default_wrapping_does_not_split_long_words() {
+        let style = TextStyle {
+            families: vec![FontFamily::Named(
+                "cssimpler-missing-font-for-bitmap-tests".to_string(),
+            )],
+            ..TextStyle::default()
+        };
         let layout = layout_text_block("abcdefgh", &style, Some(40.0));
 
+        assert_eq!(layout.lines.len(), 1);
+        assert_eq!(layout.lines[0].text, "abcdefgh");
+        assert!(layout.width > 40.0);
+    }
+
+    #[test]
+    fn overflow_wrap_anywhere_splits_only_at_grapheme_boundaries() {
+        let style = TextStyle {
+            families: vec![FontFamily::Named(
+                "cssimpler-missing-font-for-bitmap-tests".to_string(),
+            )],
+            overflow_wrap: OverflowWrap::Anywhere,
+            ..TextStyle::default()
+        };
+        let text = "a\u{301}b";
+        let first_grapheme_width = layout_text_block("a\u{301}", &style, None).width;
+        let layout = layout_text_block(text, &style, Some(first_grapheme_width));
+
+        assert_eq!(layout.lines.len(), 2);
+        assert_eq!(layout.lines[0].text, "a\u{301}");
+        assert_eq!(layout.lines[1].text, "b");
+        assert_eq!(
+            layout
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<String>(),
+            text
+        );
+    }
+
+    #[test]
+    fn word_break_break_all_enables_grapheme_safe_word_splitting() {
+        let style = TextStyle {
+            families: vec![FontFamily::Named(
+                "cssimpler-missing-font-for-bitmap-tests".to_string(),
+            )],
+            word_break: WordBreak::BreakAll,
+            ..TextStyle::default()
+        };
+        let layout = layout_text_block("abcdef", &style, Some(40.0));
+
         assert!(layout.lines.len() > 1);
-        assert!(layout.width <= 40.0);
+        assert_eq!(
+            layout
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<String>(),
+            "abcdef"
+        );
+    }
+
+    #[test]
+    fn normal_wrapping_still_wraps_at_collapsed_spaces() {
+        let style = TextStyle {
+            families: vec![FontFamily::Named(
+                "cssimpler-missing-font-for-bitmap-tests".to_string(),
+            )],
+            ..TextStyle::default()
+        };
+        let word_width = layout_text_block("alpha", &style, None).width;
+        let layout = layout_text_block("alpha   beta", &style, Some(word_width + 1.0));
+
+        assert_eq!(
+            layout
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn nowrap_collapses_spaces_without_automatic_wrapping() {
+        let style = TextStyle {
+            families: vec![FontFamily::Named(
+                "cssimpler-missing-font-for-bitmap-tests".to_string(),
+            )],
+            white_space: WhiteSpace::NoWrap,
+            ..TextStyle::default()
+        };
+        let layout = layout_text_block("alpha   beta", &style, Some(20.0));
+
+        assert_eq!(layout.lines.len(), 1);
+        assert_eq!(layout.lines[0].text, "alpha beta");
+        assert!(layout.width > 20.0);
+    }
+
+    #[test]
+    fn bitmap_line_box_offset_uses_half_leading_including_negative_leading() {
+        let roomy = TextStyle {
+            size_px: 16.0,
+            line_height: LineHeight::Px(32.0),
+            ..TextStyle::default()
+        };
+        let tight = TextStyle {
+            line_height: LineHeight::Px(12.0),
+            ..roomy.clone()
+        };
+        let roomy_metrics = BitmapFontMetrics::from_style(&roomy);
+        let tight_metrics = BitmapFontMetrics::from_style(&tight);
+
+        assert_eq!(roomy_metrics.glyph_height_px(), 16.0);
+        assert_eq!(roomy_metrics.glyph_offset_y(), 8.0);
+        assert_eq!(tight_metrics.glyph_offset_y(), -2.0);
     }
 
     #[test]

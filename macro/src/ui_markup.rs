@@ -40,6 +40,7 @@ impl Parse for Element {
         input.parse::<Token![<]>()?;
         let tag = input.call(Ident::parse_any)?;
         let attributes = parse_attributes(input)?;
+        let is_void = is_void_element(&tag.to_string());
 
         if input.peek(Token![/]) {
             input.parse::<Token![/]>()?;
@@ -52,6 +53,13 @@ impl Parse for Element {
         }
 
         input.parse::<Token![>]>()?;
+        if is_void {
+            return Ok(Self {
+                tag,
+                attributes,
+                children: Vec::new(),
+            });
+        }
 
         let mut children = Vec::new();
         while !is_closing_tag(input) {
@@ -184,6 +192,26 @@ fn parse_attributes(input: ParseStream<'_>) -> Result<Vec<Attribute>> {
 
 fn is_closing_tag(input: ParseStream<'_>) -> bool {
     input.peek(Token![<]) && input.peek2(Token![/])
+}
+
+fn is_void_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
 }
 
 fn tokens_to_text(tokens: &[TokenTree]) -> String {
@@ -399,5 +427,21 @@ mod tests {
             .to_string();
 
         assert!(expanded.contains(". with_attribute (\"data-text\" , dynamic_value)"));
+    }
+
+    #[test]
+    fn parser_accepts_html_void_elements_without_self_closing_slash() {
+        let root: UiRoot = parse_str(
+            r#"<form><label>First Name</label><input type="text" id="fname"><label>Last Name</label></form>"#,
+        )
+        .expect("void input should parse without an explicit slash");
+
+        assert_eq!(root.element.children.len(), 3);
+        let Child::Element(input) = &root.element.children[1] else {
+            panic!("expected input element child");
+        };
+
+        assert_eq!(input.tag, "input");
+        assert!(input.children.is_empty());
     }
 }

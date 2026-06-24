@@ -5,8 +5,9 @@ use std::thread;
 
 use ab_glyph::{Font, ScaleFont, point};
 use cssimpler_core::fonts::{
-    FontFamily, FontStyle, GenericFontFamily, LineHeight, PreparedTextLayout, ResolvedFont,
-    TextLayout, TextStyle, TextTransform, layout_text_block, resolve_font,
+    BitmapFontMetrics, FontFamily, FontStyle, GenericFontFamily, LineHeight, OverflowWrap,
+    PreparedTextLayout, ResolvedFont, TextAlign, TextLayout, TextStyle, TextTransform, WhiteSpace,
+    WordBreak, layout_text_block, resolve_font,
 };
 use cssimpler_core::{Color, LayoutBox, ShadowEffect, TextStrokeStyle, VisualStyle};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
@@ -16,7 +17,6 @@ use crate::{
     transform::{AffineTransform, ClipState, transform_clip_rect},
 };
 
-const BITMAP_LINE_HEIGHT_PX: f32 = 20.0;
 const MAX_TEXT_RASTER_CACHE_ENTRIES: usize = 256;
 const MAX_TEXT_EFFECT_CACHE_ENTRIES: usize = 512;
 const MAX_TEXT_EFFECT_WORKERS: usize = 8;
@@ -373,9 +373,9 @@ fn rasterize_resolved_text(
     wrapped: &TextLayout,
     font: &ResolvedFont,
     letter_spacing_px: f32,
+    text_align: TextAlign,
 ) -> Option<AlphaMask> {
-    let scaled_font = font.font().as_scaled(font.size_px());
-    let glyphs = positioned_glyphs(layout, wrapped, font, letter_spacing_px);
+    let glyphs = positioned_glyphs(layout, wrapped, font, letter_spacing_px, text_align);
     let mut bounds: Option<(i32, i32, i32, i32)> = None;
 
     for glyph in &glyphs {
@@ -404,7 +404,6 @@ fn rasterize_resolved_text(
         });
     }
 
-    let _ = scaled_font;
     Some(mask)
 }
 
@@ -437,6 +436,7 @@ fn cached_text_mask(
             &wrapped,
             &font,
             text_style.letter_spacing_px,
+            text_style.text_align,
         )
     } else {
         rasterize_bitmap_text(relative_layout, &wrapped, text_style)
@@ -557,15 +557,16 @@ fn positioned_glyphs(
     wrapped: &TextLayout,
     font: &ResolvedFont,
     letter_spacing_px: f32,
+    text_align: TextAlign,
 ) -> Vec<ab_glyph::Glyph> {
     let scaled_font = font.font().as_scaled(font.size_px());
-    let start_x = layout.x;
     let start_y = layout.y;
     let mut glyphs = Vec::new();
 
     for (line_index, line) in wrapped.lines.iter().enumerate() {
-        let mut caret_x = start_x;
-        let baseline_y = start_y + scaled_font.ascent() + line_index as f32 * font.line_height_px();
+        let mut caret_x = aligned_line_start_x(layout, line.width, text_align);
+        let baseline_y =
+            start_y + font.baseline_offset_px() + line_index as f32 * font.line_height_px();
         let mut previous = None;
         let mut characters = line.text.chars().peekable();
 
@@ -593,17 +594,15 @@ fn rasterize_bitmap_text(
     wrapped: &TextLayout,
     text_style: &TextStyle,
 ) -> Option<AlphaMask> {
-    let scale = ((text_style.size_px.max(1.0) / 8.0).round() as i32).max(1);
-    let start_x = layout.x.round() as i32;
-    let start_y = layout.y.round() as i32;
-    let line_step = wrapped
-        .line_height
-        .max(BITMAP_LINE_HEIGHT_PX * (scale as f32 / 2.0));
+    let metrics = BitmapFontMetrics::from_style(text_style);
+    let scale = metrics.raster_scale();
+    let start_y = layout.y + metrics.glyph_offset_y();
+    let line_step = wrapped.line_height;
     let mut bounds: Option<(i32, i32, i32, i32)> = None;
 
     for (line_index, line) in wrapped.lines.iter().enumerate() {
-        let mut cursor_x = start_x as f32;
-        let cursor_y = start_y + (line_index as f32 * line_step).round() as i32;
+        let mut cursor_x = aligned_line_start_x(layout, line.width, text_style.text_align);
+        let cursor_y = (start_y + line_index as f32 * line_step).round() as i32;
         let mut characters = line.text.chars().peekable();
 
         while let Some(character) = characters.next() {
@@ -635,8 +634,8 @@ fn rasterize_bitmap_text(
     let mut mask = AlphaMask::new(min_x, min_y, max_x - min_x, max_y - min_y);
 
     for (line_index, line) in wrapped.lines.iter().enumerate() {
-        let mut cursor_x = start_x as f32;
-        let cursor_y = start_y + (line_index as f32 * line_step).round() as i32;
+        let mut cursor_x = aligned_line_start_x(layout, line.width, text_style.text_align);
+        let cursor_y = (start_y + line_index as f32 * line_step).round() as i32;
         let mut characters = line.text.chars().peekable();
 
         while let Some(character) = characters.next() {
@@ -669,6 +668,14 @@ fn rasterize_bitmap_text(
     }
 
     Some(mask)
+}
+
+fn aligned_line_start_x(layout: LayoutBox, line_width: f32, text_align: TextAlign) -> f32 {
+    match text_align {
+        TextAlign::Start | TextAlign::Left => layout.x,
+        TextAlign::Center => layout.x + (layout.width - line_width) * 0.5,
+        TextAlign::Right | TextAlign::End => layout.x + layout.width - line_width,
+    }
 }
 
 fn pad_mask(mask: &AlphaMask, radius: f32) -> AlphaMask {
@@ -1081,6 +1088,10 @@ struct TextStyleCacheKey {
     line_height: LineHeightCacheKey,
     letter_spacing_bits: u32,
     text_transform: u8,
+    white_space: u8,
+    overflow_wrap: u8,
+    word_break: u8,
+    text_align: u8,
 }
 
 impl TextStyleCacheKey {
@@ -1097,6 +1108,10 @@ impl TextStyleCacheKey {
             line_height: line_height_cache_key(&style.line_height),
             letter_spacing_bits: style.letter_spacing_px.to_bits(),
             text_transform: text_transform_cache_key(style.text_transform),
+            white_space: white_space_cache_key(style.white_space),
+            overflow_wrap: overflow_wrap_cache_key(style.overflow_wrap),
+            word_break: word_break_cache_key(style.word_break),
+            text_align: text_align_cache_key(style.text_align),
         }
     }
 }
@@ -1191,6 +1206,39 @@ fn text_transform_cache_key(text_transform: TextTransform) -> u8 {
     }
 }
 
+fn white_space_cache_key(white_space: WhiteSpace) -> u8 {
+    match white_space {
+        WhiteSpace::Normal => 0,
+        WhiteSpace::NoWrap => 1,
+        WhiteSpace::Pre => 2,
+        WhiteSpace::PreWrap => 3,
+    }
+}
+
+fn overflow_wrap_cache_key(overflow_wrap: OverflowWrap) -> u8 {
+    match overflow_wrap {
+        OverflowWrap::Normal => 0,
+        OverflowWrap::Anywhere => 1,
+    }
+}
+
+fn word_break_cache_key(word_break: WordBreak) -> u8 {
+    match word_break {
+        WordBreak::Normal => 0,
+        WordBreak::BreakAll => 1,
+    }
+}
+
+fn text_align_cache_key(text_align: TextAlign) -> u8 {
+    match text_align {
+        TextAlign::Start => 0,
+        TextAlign::Left => 1,
+        TextAlign::Center => 2,
+        TextAlign::Right => 3,
+        TextAlign::End => 4,
+    }
+}
+
 fn next_cache_use(next_use: &mut u64) -> u64 {
     let last_used = *next_use;
     *next_use = next_use.saturating_add(1);
@@ -1271,19 +1319,33 @@ pub(crate) fn lock_text_mask_cache_for_tests() -> std::sync::MutexGuard<'static,
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
 
-    use cssimpler_core::fonts::TextStyle;
+    use cssimpler_core::fonts::{
+        BitmapFontMetrics, FontFamily, LineHeight, TextAlign, TextStyle, layout_text_block,
+        register_font_file, resolve_font,
+    };
     use cssimpler_core::{Color, LayoutBox, ShadowEffect};
 
     use super::{
         MAX_TEXT_EFFECT_CACHE_ENTRIES, MAX_TEXT_RASTER_CACHE_ENTRIES, TextEffectCacheKind,
-        blur_mask_with_workers, blur_pass_radii, cached_text_effect_mask, cached_text_mask,
-        clear_text_mask_cache_for_tests, draw_mask, draw_mask_transformed,
-        lock_text_mask_cache_for_tests, sample_mask_bilinear, shadow_mask_from_raster,
-        text_mask_cache,
+        aligned_line_start_x, blur_mask_with_workers, blur_pass_radii, cached_text_effect_mask,
+        cached_text_mask, clear_text_mask_cache_for_tests, draw_mask, draw_mask_transformed,
+        lock_text_mask_cache_for_tests, positioned_glyphs, sample_mask_bilinear,
+        shadow_mask_from_raster, text_mask_cache,
     };
     use crate::{ClipRect, pack_rgb, transform::AffineTransform, transform::ClipState};
+
+    fn bundled_font_family() -> String {
+        let asset_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/assets/powerline-demo.ttf");
+        register_font_file(&asset_path)
+            .expect("bundled font should register for raster tests")
+            .into_iter()
+            .next()
+            .expect("bundled font should expose a family name")
+    }
 
     #[test]
     fn identical_text_masks_are_reused_across_integer_position_changes() {
@@ -1308,6 +1370,64 @@ mod tests {
         assert!(Arc::ptr_eq(&first.mask, &second.mask));
         assert_eq!(first.offset_x, 10);
         assert_eq!(second.offset_x, 90);
+    }
+
+    #[test]
+    fn resolved_font_glyphs_use_symmetric_half_leading() {
+        let style = TextStyle {
+            families: vec![FontFamily::Named(bundled_font_family())],
+            size_px: 16.0,
+            line_height: LineHeight::Px(32.0),
+            ..TextStyle::default()
+        };
+        let font = resolve_font(&style).expect("bundled font should resolve");
+        let wrapped = layout_text_block("A", &style, None);
+        let glyphs = positioned_glyphs(
+            LayoutBox::new(0.0, 0.0, 80.0, 32.0),
+            &wrapped,
+            &font,
+            style.letter_spacing_px,
+            TextAlign::Left,
+        );
+        let baseline = glyphs[0].position.y;
+        let top_leading = baseline - font.ascent_px();
+        let bottom_leading = font.line_height_px() - (baseline - font.descent_px());
+        let bitmap_offset = BitmapFontMetrics::from_style(&style).glyph_offset_y();
+
+        assert!((top_leading - bottom_leading).abs() < 0.001);
+        assert!((top_leading - bitmap_offset).abs() < 0.001);
+        assert!(top_leading > 0.0);
+    }
+
+    #[test]
+    fn centered_text_changes_raster_position_and_cache_identity() {
+        let _cache_guard = lock_text_mask_cache_for_tests();
+        clear_text_mask_cache_for_tests();
+        let left_style = TextStyle {
+            families: vec![FontFamily::Named(
+                "cssimpler-missing-font-for-raster-tests".to_string(),
+            )],
+            text_align: TextAlign::Left,
+            ..TextStyle::default()
+        };
+        let centered_style = TextStyle {
+            text_align: TextAlign::Center,
+            ..left_style.clone()
+        };
+        let layout = LayoutBox::new(0.0, 0.0, 80.0, 32.0);
+        let line = layout_text_block("A", &left_style, Some(layout.width));
+        let expected_start = aligned_line_start_x(layout, line.lines[0].width, TextAlign::Center);
+        let left_free_space = expected_start - layout.x;
+        let right_free_space = layout.x + layout.width - (expected_start + line.lines[0].width);
+        let left = cached_text_mask(layout, "A", &left_style, None)
+            .expect("left aligned bitmap text should rasterize");
+        let centered = cached_text_mask(layout, "A", &centered_style, None)
+            .expect("centered bitmap text should rasterize");
+
+        assert!(!Arc::ptr_eq(&left.mask, &centered.mask));
+        assert!((left_free_space - right_free_space).abs() < 0.001);
+        assert!((centered.mask.origin_x as f32 - expected_start).abs() <= 1.0);
+        assert!(centered.mask.origin_x > left.mask.origin_x);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod input;
 mod scene_transition;
 
 use std::collections::HashMap;
@@ -6,12 +7,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 
+use self::input::NativeTextInputs;
 use self::scene_transition::SceneTransition;
 use crate::core::{
     ElementInteractionState, ElementPath, Node, RenderNode, RuntimeDirtyClass, RuntimeDirtyFlags,
     RuntimeSyncAction, RuntimeSyncPolicy, RuntimeViewport, RuntimeWorld,
 };
-use crate::renderer::{self, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
+use crate::renderer::{self, EngineEvent, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
 use crate::style::{
     Stylesheet, extract_render_tree, layout_resolved_render_tree_in_viewport,
     rebuild_resolved_render_tree_with_cached_layout, resolve_render_tree_with_interaction_at_path,
@@ -391,6 +393,7 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     update: Update,
     view: View,
     runtime_world: RuntimeWorld,
+    text_inputs: NativeTextInputs,
     render_mode: RenderMode,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
@@ -412,6 +415,7 @@ where
             update,
             view,
             runtime_world: RuntimeWorld::default(),
+            text_inputs: NativeTextInputs::default(),
             render_mode: RenderMode::OnInvalidation,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
@@ -524,6 +528,7 @@ where
         let view = &mut self.view;
         let view_start = Instant::now();
         let tree = view(&self.state);
+        let tree = self.text_inputs.materialize_root(0, tree);
         stats.view_us = duration_to_us(view_start.elapsed());
 
         let dirty_class = runtime_dirty_class(
@@ -579,6 +584,7 @@ where
         let view = &mut self.view;
         let view_start = Instant::now();
         let tree = view(&self.state);
+        let tree = self.text_inputs.materialize_root(0, tree);
         stats.view_us = duration_to_us(view_start.elapsed());
 
         let sync = sync_runtime_world(
@@ -787,6 +793,19 @@ where
         App::set_interaction_state(self, interaction)
     }
 
+    fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        if self.text_inputs.handle_engine_event(
+            event,
+            self.cached_scene.as_deref(),
+            &self.runtime_world,
+        ) {
+            self.invalidate(Invalidation::Structure);
+            true
+        } else {
+            false
+        }
+    }
+
     fn redraw_schedule(&self) -> renderer::RedrawSchedule {
         match self.render_mode {
             RenderMode::EveryFrame => renderer::RedrawSchedule::EveryFrame,
@@ -806,6 +825,7 @@ pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     fragments: Vec<Fragment<'a, State>>,
     fragment_indices: HashMap<String, usize>,
     runtime_world: RuntimeWorld,
+    text_inputs: NativeTextInputs,
     render_mode: RenderMode,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
@@ -831,6 +851,7 @@ where
             fragment_indices: build_fragment_indices(&fragments),
             fragments,
             runtime_world: RuntimeWorld::default(),
+            text_inputs: NativeTextInputs::default(),
             render_mode: RenderMode::OnInvalidation,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
@@ -952,7 +973,9 @@ where
         );
         let mut scene = Vec::with_capacity(self.fragments.len());
         for index in 0..self.fragments.len() {
-            let node = self.fragments[index].render(&self.state);
+            let node = self
+                .text_inputs
+                .materialize_root(index, self.fragments[index].render(&self.state));
             sync_runtime_world(
                 &mut self.runtime_world,
                 index,
@@ -997,7 +1020,9 @@ where
             let Some(&index) = self.fragment_indices.get(id) else {
                 return false;
             };
-            let node = self.fragments[index].render(&self.state);
+            let node = self
+                .text_inputs
+                .materialize_root(index, self.fragments[index].render(&self.state));
             let sync = sync_runtime_world(
                 &mut self.runtime_world,
                 index,
@@ -1144,6 +1169,19 @@ where
 
     fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
         FragmentApp::set_interaction_state(self, interaction)
+    }
+
+    fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        if self.text_inputs.handle_engine_event(
+            event,
+            self.cached_scene.as_deref(),
+            &self.runtime_world,
+        ) {
+            self.invalidate(Invalidation::Structure);
+            true
+        } else {
+            false
+        }
     }
 
     fn redraw_schedule(&self) -> renderer::RedrawSchedule {
@@ -1364,7 +1402,9 @@ mod tests {
         App, Fragment, FragmentApp, Invalidation, Refresh, RefreshTarget, RenderMode, RuntimePhase,
     };
     use crate::renderer::{
-        FrameInfo, SceneProvider, ViewportSize, render_scene_update, render_to_buffer,
+        ButtonState, EngineEvent, FrameInfo, KeyIdentity, KeyboardEvent, PointerButton,
+        PointerPosition, SceneProvider, TextInputEvent, ViewportSize, render_scene_update,
+        render_to_buffer,
     };
     use crate::style::{Stylesheet, parse_stylesheet};
 
@@ -1392,6 +1432,69 @@ mod tests {
 
         assert_eq!(render_calls.get(), 1);
         assert_eq!(text_nodes(&scene), vec!["count 3".to_string()]);
+    }
+
+    #[test]
+    fn app_native_text_input_focuses_and_edits_text() {
+        let stylesheet = parse_stylesheet(
+            "#app { width: 240px; height: 80px; }
+             input[type=text] { width: 120px; height: 24px; padding: 0; }",
+        )
+        .expect("text input stylesheet should parse");
+        let mut app = App::new(
+            (),
+            &stylesheet,
+            |_state, _frame| Invalidation::Clean,
+            |_state| {
+                ui! {
+                    <div id="app">
+                        <input type="text" id="field" name="field" value="hi">
+                    </div>
+                }
+            },
+        );
+
+        let initial = app.frame(frame(0));
+        assert_eq!(text_nodes(&initial), vec!["hi".to_string()]);
+
+        assert!(!SceneProvider::handle_engine_event(
+            &mut app,
+            &EngineEvent::PointerMoved {
+                position: PointerPosition { x: 4.0, y: 4.0 },
+                modifiers: Default::default(),
+            },
+        ));
+        assert!(SceneProvider::handle_engine_event(
+            &mut app,
+            &EngineEvent::PointerButton {
+                button: PointerButton::Primary,
+                state: ButtonState::Pressed,
+                modifiers: Default::default(),
+            },
+        ));
+        let focused = app.frame(frame(1));
+        assert_eq!(text_nodes(&focused), vec!["hi|".to_string()]);
+
+        assert!(SceneProvider::handle_engine_event(
+            &mut app,
+            &EngineEvent::TextInput(TextInputEvent::Commit("!".to_string())),
+        ));
+        let typed = app.frame(frame(2));
+        assert_eq!(text_nodes(&typed), vec!["hi!|".to_string()]);
+
+        assert!(SceneProvider::handle_engine_event(
+            &mut app,
+            &EngineEvent::Key(KeyboardEvent {
+                logical_key: KeyIdentity::Named("Backspace".to_string()),
+                physical_key: None,
+                location: Default::default(),
+                state: ButtonState::Pressed,
+                repeat: false,
+                modifiers: Default::default(),
+            }),
+        ));
+        let edited = app.frame(frame(3));
+        assert_eq!(text_nodes(&edited), vec!["hi|".to_string()]);
     }
 
     #[test]
