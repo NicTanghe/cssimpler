@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::Style;
 
 pub type EventHandler = fn();
+pub type InputEventHandler = fn(&str);
 
 //revisit warning it if profiling shows DOM memory/build cost is a real bottleneck.
 #[derive(Clone, Copy, Debug, Default)]
@@ -10,6 +11,7 @@ pub struct EventHandlers {
     pub click: Option<EventHandler>,
     pub contextmenu: Option<EventHandler>,
     pub dblclick: Option<EventHandler>,
+    pub input: Option<InputEventHandler>,
     pub mousedown: Option<EventHandler>,
     pub mouseenter: Option<EventHandler>,
     pub mouseleave: Option<EventHandler>,
@@ -112,6 +114,11 @@ impl ElementNode {
 
     pub fn on_dblclick(mut self, handler: EventHandler) -> Self {
         self.handlers.dblclick = Some(handler);
+        self
+    }
+
+    pub fn on_input(mut self, handler: InputEventHandler) -> Self {
+        self.handlers.input = Some(handler);
         self
     }
 

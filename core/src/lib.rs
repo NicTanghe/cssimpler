@@ -7,6 +7,7 @@ pub mod generated_content;
 pub mod interaction;
 pub mod runtime_ecs;
 pub mod scrollbar;
+pub mod stacking;
 pub mod svg;
 pub mod transitions;
 
@@ -15,7 +16,9 @@ use taffy::Style as TaffyStyle;
 
 pub use color::{Color, GradientInterpolation, LinearRgba};
 pub use custom_properties::CustomProperties;
-pub use dom::{ElementNode, EventHandler, EventHandlers, IntoNode, Node, into_node};
+pub use dom::{
+    ElementNode, EventHandler, EventHandlers, InputEventHandler, IntoNode, Node, into_node,
+};
 pub use extracted_scene::{ExtractedPaintItem, ExtractedPaintKind, ExtractedScene};
 pub use generated_content::GeneratedTextSource;
 pub use interaction::{ElementInteractionState, ElementPath};
@@ -28,6 +31,7 @@ pub use scrollbar::{
     OverflowMode, ScrollbarAxisState, ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics,
     ScrollbarStyle, ScrollbarWidth,
 };
+pub use stacking::{establishes_stacking_context, stacking_context_level};
 pub use svg::{
     SvgBounds, SvgContour, SvgGradientStop, SvgLinearGradient, SvgPaint, SvgPaintServer,
     SvgPaintServerData, SvgPaintServerKind, SvgPaintServerReference, SvgPathGeometry,
@@ -719,6 +723,22 @@ pub enum BackdropOcclusion {
     Scene,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ZIndex {
+    #[default]
+    Auto,
+    Integer(i32),
+}
+
+impl ZIndex {
+    pub const fn integer(self) -> Option<i32> {
+        match self {
+            Self::Auto => None,
+            Self::Integer(value) => Some(value),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisualStyle {
     pub background: Option<Color>,
@@ -737,6 +757,8 @@ pub struct VisualStyle {
     pub border: BorderStyle,
     pub shadows: Vec<BoxShadow>,
     pub inset_shadows: Vec<BoxShadow>,
+    pub positioned: bool,
+    pub z_index: ZIndex,
     pub overflow: Overflow,
     pub transform: Transform2D,
     pub perspective: Option<f32>,
@@ -763,6 +785,8 @@ impl Default for VisualStyle {
             border: BorderStyle::default(),
             shadows: Vec::new(),
             inset_shadows: Vec::new(),
+            positioned: false,
+            z_index: ZIndex::Auto,
             overflow: Overflow::VISIBLE,
             transform: Transform2D::default(),
             perspective: None,
@@ -932,6 +956,11 @@ impl RenderNode {
 
     pub fn on_dblclick(mut self, handler: EventHandler) -> Self {
         self.handlers.dblclick = Some(handler);
+        self
+    }
+
+    pub fn on_input(mut self, handler: InputEventHandler) -> Self {
+        self.handlers.input = Some(handler);
         self
     }
 

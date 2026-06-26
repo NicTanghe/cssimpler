@@ -3,6 +3,7 @@ use cssimpler_core::Node;
 use crate::ui;
 
 fn increment() {}
+fn capture_input(_value: &str) {}
 
 #[test]
 fn ui_macro_builds_nested_nodes_from_html_like_input() {
@@ -39,6 +40,21 @@ fn ui_macro_supports_event_binding() {
             assert_eq!(button.children.len(), 1);
         }
         Node::Text(_) => panic!("expected button element"),
+    }
+}
+
+#[test]
+fn ui_macro_supports_input_event_binding() {
+    let tree = ui! {
+        <input type="text" id="q" value="Bob" oninput={capture_input}>
+    };
+
+    match tree {
+        Node::Element(input) => {
+            assert!(input.handlers.input.is_some());
+            assert_eq!(input.attribute("value"), Some("Bob"));
+        }
+        Node::Text(_) => panic!("expected input element"),
     }
 }
 

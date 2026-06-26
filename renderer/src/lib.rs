@@ -47,8 +47,9 @@ use cssimpler_core::{
     BackdropOcclusion, BorderLineStyle, Color, CornerRadius, ElementInteractionState, ElementPath,
     EventHandler, ExtractedScene, LayoutBox, LinearRgba, NativeMaterial, RenderKind, RenderNode,
     TextEditDecoration, TextSelectionRange, Transform2D, TransformMatrix3d, TransformStyleMode,
-    VisualStyle,
+    VisualStyle, establishes_stacking_context,
     fonts::{PreparedTextLayout, TextAlign, TextStyle, layout_text_block},
+    stacking_context_level,
 };
 use softbuffer::SoftBufferError;
 use winit::error::{EventLoopError, OsError};
@@ -1623,7 +1624,9 @@ fn render_to_buffer_serial(
         fill_current_alpha_span(0, buffer.len(), u8::MAX);
         let clip = ClipRect::full(width as f32, height as f32);
 
-        for (node, cached_bounds) in scene.iter().zip(cached_bounds) {
+        for index in sorted_scene_indices(scene) {
+            let node = &scene[index];
+            let cached_bounds = &cached_bounds[index];
             draw_node_with_cached_bounds(
                 node,
                 cached_bounds,
@@ -1660,6 +1663,7 @@ fn render_to_buffer_parallel(
         .iter()
         .map(|rows| {
             root_indices_intersecting_clip(
+                scene,
                 &cached_bounds.roots,
                 ClipRect {
                     x0: 0.0,
@@ -1925,8 +1929,11 @@ fn render_scene_update_internal(
 
     for dirty_region in snapped_dirty_regions {
         clear_clip(buffer, width, height, dirty_region, clear_color);
-        let root_indices =
-            root_indices_intersecting_clip(&scene_diff.current_bounds.roots, dirty_region);
+        let root_indices = root_indices_intersecting_clip(
+            &scene.roots,
+            &scene_diff.current_bounds.roots,
+            dirty_region,
+        );
         draw_cached_root_indices(
             &scene.roots,
             &scene_diff.current_bounds.roots,
@@ -1977,7 +1984,7 @@ fn render_scene_update_parallel(
         .map(|jobs| {
             let clip = dirty_job_group_clip(jobs)
                 .expect("dirty render groups should only contain at least one clip");
-            root_indices_intersecting_clip(cached_bounds, clip)
+            root_indices_intersecting_clip(scene, cached_bounds, clip)
         })
         .collect::<Vec<_>>();
     let clear = pack_rgb(clear_color);
@@ -2284,7 +2291,7 @@ fn redraw_auto_scroll_indicator_regions(
                 continue;
             };
             clear_clip(buffer, width, height, clip, clear_color);
-            let root_indices = root_indices_intersecting_clip(&cached_bounds.roots, clip);
+            let root_indices = root_indices_intersecting_clip(scene, &cached_bounds.roots, clip);
             draw_cached_root_indices(
                 scene,
                 &cached_bounds.roots,
@@ -2374,10 +2381,11 @@ struct CachedSubtreeBounds {
 }
 
 fn root_indices_intersecting_clip(
+    scene: &[RenderNode],
     cached_bounds: &[CachedSubtreeBounds],
     clip: ClipRect,
 ) -> Vec<usize> {
-    cached_bounds
+    let mut indices = cached_bounds
         .iter()
         .enumerate()
         .filter_map(|(index, bounds)| {
@@ -2386,13 +2394,36 @@ fn root_indices_intersecting_clip(
                 .and_then(|node_bounds| clip.intersect(node_bounds))
                 .map(|_| index)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    sort_indices_by_stacking(scene, &mut indices);
+    indices
+}
+
+fn sorted_scene_indices(scene: &[RenderNode]) -> Vec<usize> {
+    let mut indices = (0..scene.len()).collect::<Vec<_>>();
+    sort_indices_by_stacking(scene, &mut indices);
+    indices
+}
+
+fn sort_indices_by_stacking(nodes: &[RenderNode], indices: &mut [usize]) {
+    indices.sort_by(|left, right| {
+        let left_level = nodes
+            .get(*left)
+            .map(stacking_context_level)
+            .unwrap_or_default();
+        let right_level = nodes
+            .get(*right)
+            .map(stacking_context_level)
+            .unwrap_or_default();
+        left_level.cmp(&right_level).then(left.cmp(right))
+    });
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ProjectedChildEntry {
     index: usize,
     depth: f32,
+    stacking_level: i32,
 }
 
 fn node_requires_projected_path(node: &RenderNode) -> bool {
@@ -2424,16 +2455,20 @@ fn node_sorts_projected_children(node: &RenderNode, in_3d_context: bool) -> bool
 }
 
 fn sort_projected_children(entries: &mut [ProjectedChildEntry], sort_by_depth: bool) {
-    if !sort_by_depth {
-        return;
+    if sort_by_depth {
+        entries.sort_by(|left, right| {
+            left.depth
+                .partial_cmp(&right.depth)
+                .unwrap_or(Ordering::Equal)
+                .then(left.index.cmp(&right.index))
+        });
+    } else {
+        entries.sort_by(|left, right| {
+            left.stacking_level
+                .cmp(&right.stacking_level)
+                .then(left.index.cmp(&right.index))
+        });
     }
-
-    entries.sort_by(|left, right| {
-        left.depth
-            .partial_cmp(&right.depth)
-            .unwrap_or(Ordering::Equal)
-            .then(left.index.cmp(&right.index))
-    });
 }
 
 fn projected_children(
@@ -2464,6 +2499,7 @@ fn projected_children(
                 )
                 .map(|(_, _, z)| z)
                 .unwrap_or(f32::NEG_INFINITY),
+                stacking_level: stacking_context_level(child),
             })
         })
         .collect::<Vec<_>>();
@@ -2560,6 +2596,22 @@ fn node_has_rounded_overflow_clip(node: &RenderNode) -> bool {
         && !corner_radius_is_zero(node.layout, node.style.corner_radius)
 }
 
+#[derive(Clone)]
+enum DeferredRenderClip {
+    Rect(ClipRect),
+    State(ClipState),
+}
+
+struct DeferredRenderStackingContext<'a> {
+    node: &'a RenderNode,
+    cached_bounds: &'a CachedSubtreeBounds,
+    clip: DeferredRenderClip,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    level: i32,
+    order: u64,
+}
+
 fn draw_node_with_cached_bounds(
     node: &RenderNode,
     cached_bounds: &CachedSubtreeBounds,
@@ -2645,6 +2697,146 @@ fn draw_node_contents(
     );
 }
 
+fn collect_deferred_render_stacking_contexts<'a>(
+    node: &'a RenderNode,
+    cached_bounds: &'a CachedSubtreeBounds,
+    child_clip: DeferredRenderClip,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    order: &mut u64,
+    deferred: &mut Vec<DeferredRenderStackingContext<'a>>,
+) {
+    let child_context = child_3d_context(node, in_3d_context);
+    let child_perspective = active_child_perspective(node, parent_perspective, child_context);
+    for (index, child) in node.children.iter().enumerate() {
+        let Some(child_bounds) = cached_bounds.children.get(index) else {
+            continue;
+        };
+        if establishes_stacking_context(child) {
+            deferred.push(DeferredRenderStackingContext {
+                node: child,
+                cached_bounds: child_bounds,
+                clip: child_clip.clone(),
+                parent_perspective: child_perspective,
+                in_3d_context: child_context,
+                level: stacking_context_level(child),
+                order: *order,
+            });
+            *order = order.wrapping_add(1);
+        } else if matches!(child_clip, DeferredRenderClip::Rect(_))
+            && !node_requires_projected_path(child)
+            && let Some(descendant_clip) = descendant_render_clip(&child_clip, child)
+        {
+            collect_deferred_render_stacking_contexts(
+                child,
+                child_bounds,
+                descendant_clip,
+                child_perspective,
+                child_context,
+                order,
+                deferred,
+            );
+        }
+    }
+}
+
+fn descendant_render_clip(
+    parent_child_clip: &DeferredRenderClip,
+    node: &RenderNode,
+) -> Option<DeferredRenderClip> {
+    if !node.style.overflow.clips_any_axis() {
+        return Some(parent_child_clip.clone());
+    }
+
+    match parent_child_clip {
+        DeferredRenderClip::Rect(clip) => {
+            if node_has_rounded_overflow_clip(node) {
+                ClipState::new(*clip)
+                    .push_layout_clip(
+                        node.layout,
+                        node.style.corner_radius,
+                        AffineTransform::IDENTITY,
+                    )
+                    .map(DeferredRenderClip::State)
+            } else {
+                clip.intersect(layout_clip(node.layout))
+                    .map(DeferredRenderClip::Rect)
+            }
+        }
+        DeferredRenderClip::State(clip_state) => clip_state
+            .push_layout_clip(
+                node.layout,
+                node.style.corner_radius,
+                AffineTransform::IDENTITY,
+            )
+            .map(DeferredRenderClip::State),
+    }
+}
+
+fn sort_deferred_render_contexts(entries: &mut [DeferredRenderStackingContext<'_>]) {
+    entries.sort_by(|left, right| {
+        left.level
+            .cmp(&right.level)
+            .then(left.order.cmp(&right.order))
+    });
+}
+
+fn draw_deferred_render_context(
+    entry: &DeferredRenderStackingContext<'_>,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+    glass_mode: GlassRenderMode,
+    allow_surface_promotion: bool,
+) {
+    match &entry.clip {
+        DeferredRenderClip::Rect(clip) if !node_requires_projected_path(entry.node) => {
+            draw_node_contents_internal(
+                entry.node,
+                entry.cached_bounds,
+                buffer,
+                width,
+                height,
+                *clip,
+                entry.parent_perspective,
+                entry.in_3d_context,
+                clear_color,
+                glass_mode,
+                allow_surface_promotion,
+            );
+        }
+        DeferredRenderClip::Rect(clip) => draw_node_transformed_internal(
+            entry.node,
+            entry.cached_bounds,
+            buffer,
+            width,
+            height,
+            TransformMatrix3d::IDENTITY,
+            entry.parent_perspective,
+            &ClipState::new(*clip),
+            entry.in_3d_context,
+            clear_color,
+            glass_mode,
+            allow_surface_promotion,
+        ),
+        DeferredRenderClip::State(clip_state) => draw_node_transformed_internal(
+            entry.node,
+            entry.cached_bounds,
+            buffer,
+            width,
+            height,
+            TransformMatrix3d::IDENTITY,
+            entry.parent_perspective,
+            clip_state,
+            entry.in_3d_context,
+            clear_color,
+            glass_mode,
+            allow_surface_promotion,
+        ),
+    }
+}
+
 fn draw_node_contents_internal(
     node: &RenderNode,
     cached_bounds: &CachedSubtreeBounds,
@@ -2657,6 +2849,65 @@ fn draw_node_contents_internal(
     clear_color: Color,
     glass_mode: GlassRenderMode,
     allow_surface_promotion: bool,
+) {
+    draw_node_contents_internal_impl(
+        node,
+        cached_bounds,
+        buffer,
+        width,
+        height,
+        clip,
+        parent_perspective,
+        in_3d_context,
+        clear_color,
+        glass_mode,
+        allow_surface_promotion,
+        true,
+    );
+}
+
+fn draw_node_contents_in_current_stacking_context(
+    node: &RenderNode,
+    cached_bounds: &CachedSubtreeBounds,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clip: ClipRect,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    clear_color: Color,
+    glass_mode: GlassRenderMode,
+    allow_surface_promotion: bool,
+) {
+    draw_node_contents_internal_impl(
+        node,
+        cached_bounds,
+        buffer,
+        width,
+        height,
+        clip,
+        parent_perspective,
+        in_3d_context,
+        clear_color,
+        glass_mode,
+        allow_surface_promotion,
+        false,
+    );
+}
+
+fn draw_node_contents_internal_impl(
+    node: &RenderNode,
+    cached_bounds: &CachedSubtreeBounds,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clip: ClipRect,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    clear_color: Color,
+    glass_mode: GlassRenderMode,
+    allow_surface_promotion: bool,
+    draw_deferred_stacking_contexts: bool,
 ) {
     if node_requires_projected_path(node) {
         draw_node_transformed_internal(
@@ -2779,7 +3030,38 @@ fn draw_node_contents_internal(
         };
         let child_context = child_3d_context(node, in_3d_context);
         let child_perspective = active_child_perspective(node, parent_perspective, child_context);
-        for (child, child_bounds) in node.children.iter().zip(&cached_bounds.children) {
+        let mut deferred = Vec::new();
+        if draw_deferred_stacking_contexts {
+            let mut order = 0;
+            collect_deferred_render_stacking_contexts(
+                node,
+                cached_bounds,
+                DeferredRenderClip::State(child_clip_state.clone()),
+                parent_perspective,
+                in_3d_context,
+                &mut order,
+                &mut deferred,
+            );
+            sort_deferred_render_contexts(&mut deferred);
+        }
+
+        for entry in deferred.iter().filter(|entry| entry.level < 0) {
+            draw_deferred_render_context(
+                entry,
+                buffer,
+                width,
+                height,
+                clear_color,
+                glass_mode,
+                allow_surface_promotion,
+            );
+        }
+
+        for (index, child) in node.children.iter().enumerate() {
+            if establishes_stacking_context(child) {
+                continue;
+            }
+            let child_bounds = &cached_bounds.children[index];
             draw_node_transformed_internal(
                 child,
                 child_bounds,
@@ -2797,6 +3079,17 @@ fn draw_node_contents_internal(
         }
 
         scrollbar::draw_scrollbars(node, buffer, width, height, clip);
+        for entry in deferred.iter().filter(|entry| entry.level >= 0) {
+            draw_deferred_render_context(
+                entry,
+                buffer,
+                width,
+                height,
+                clear_color,
+                glass_mode,
+                allow_surface_promotion,
+            );
+        }
         return;
     }
 
@@ -2812,9 +3105,40 @@ fn draw_node_contents_internal(
 
     let child_context = child_3d_context(node, in_3d_context);
     let child_perspective = active_child_perspective(node, parent_perspective, child_context);
-    for (child, child_bounds) in node.children.iter().zip(&cached_bounds.children) {
+    let mut deferred = Vec::new();
+    if draw_deferred_stacking_contexts {
+        let mut order = 0;
+        collect_deferred_render_stacking_contexts(
+            node,
+            cached_bounds,
+            DeferredRenderClip::Rect(child_clip),
+            parent_perspective,
+            in_3d_context,
+            &mut order,
+            &mut deferred,
+        );
+        sort_deferred_render_contexts(&mut deferred);
+    }
+
+    for entry in deferred.iter().filter(|entry| entry.level < 0) {
+        draw_deferred_render_context(
+            entry,
+            buffer,
+            width,
+            height,
+            clear_color,
+            glass_mode,
+            allow_surface_promotion,
+        );
+    }
+
+    for (index, child) in node.children.iter().enumerate() {
+        if establishes_stacking_context(child) {
+            continue;
+        }
+        let child_bounds = &cached_bounds.children[index];
         if !node_requires_projected_path(child) {
-            draw_node_contents_internal(
+            draw_node_contents_in_current_stacking_context(
                 child,
                 child_bounds,
                 buffer,
@@ -2846,6 +3170,17 @@ fn draw_node_contents_internal(
     }
 
     scrollbar::draw_scrollbars(node, buffer, width, height, clip);
+    for entry in deferred.iter().filter(|entry| entry.level >= 0) {
+        draw_deferred_render_context(
+            entry,
+            buffer,
+            width,
+            height,
+            clear_color,
+            glass_mode,
+            allow_surface_promotion,
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2927,30 +3262,34 @@ fn hit_test_scene_for_event(
     y: f32,
     event: MouseEventKind,
 ) -> Option<EventHandler> {
-    scene.iter().rev().find_map(|node| {
-        if !node_requires_projected_path(node) {
-            hit_test_node_for_event(node, x, y, ClipRect::unbounded(), None, false, event)
-        } else {
-            hit_test_node_for_event_transformed(
-                node,
-                x,
-                y,
-                &ClipState::new(ClipRect::unbounded()),
-                TransformMatrix3d::IDENTITY,
-                None,
-                false,
-                event,
-            )
-        }
-    })
+    sorted_scene_indices(scene)
+        .into_iter()
+        .rev()
+        .find_map(|index| {
+            let node = &scene[index];
+            if !node_requires_projected_path(node) {
+                hit_test_node_for_event(node, x, y, ClipRect::unbounded(), None, false, event)
+            } else {
+                hit_test_node_for_event_transformed(
+                    node,
+                    x,
+                    y,
+                    &ClipState::new(ClipRect::unbounded()),
+                    TransformMatrix3d::IDENTITY,
+                    None,
+                    false,
+                    event,
+                )
+            }
+        })
 }
 
 pub fn hit_test_element_path(scene: &[RenderNode], x: f32, y: f32) -> Option<ElementPath> {
-    scene
-        .iter()
-        .enumerate()
+    sorted_scene_indices(scene)
+        .into_iter()
         .rev()
-        .find_map(|(root_index, node)| {
+        .find_map(|root_index| {
+            let node = &scene[root_index];
             let root_path = ElementPath::root(root_index);
             if !node_requires_projected_path(node) {
                 hit_test_element_path_node(
@@ -2986,7 +3325,11 @@ fn hit_test_node_for_event(
     in_3d_context: bool,
     event: MouseEventKind,
 ) -> Option<EventHandler> {
-    if !clip.contains(x, y) || !layout_contains(node.layout, x, y) {
+    if !clip.contains(x, y) {
+        return None;
+    }
+    let contains = layout_contains(node.layout, x, y);
+    if !contains && node.style.overflow.clips_any_axis() {
         return None;
     }
 
@@ -2998,7 +3341,32 @@ fn hit_test_node_for_event(
 
     let child_context = child_3d_context(node, in_3d_context);
     let child_perspective = active_child_perspective(node, parent_perspective, child_context);
+    let mut deferred = Vec::new();
+    let mut order = 0;
+    collect_deferred_hit_stacking_contexts(
+        node,
+        &ElementPath {
+            root: usize::MAX,
+            children: Vec::new(),
+        },
+        child_clip,
+        parent_perspective,
+        in_3d_context,
+        &mut order,
+        &mut deferred,
+    );
+    sort_deferred_hit_contexts(&mut deferred);
+
+    for entry in deferred.iter().rev().filter(|entry| entry.level >= 0) {
+        if let Some(handler) = hit_deferred_context_for_event(entry, x, y, event) {
+            return Some(handler);
+        }
+    }
+
     for child in node.children.iter().rev() {
+        if establishes_stacking_context(child) {
+            continue;
+        }
         let hit = if !node_requires_projected_path(child) {
             hit_test_node_for_event(
                 child,
@@ -3026,7 +3394,13 @@ fn hit_test_node_for_event(
         }
     }
 
-    event_handler(node, event)
+    for entry in deferred.iter().rev().filter(|entry| entry.level < 0) {
+        if let Some(handler) = hit_deferred_context_for_event(entry, x, y, event) {
+            return Some(handler);
+        }
+    }
+
+    contains.then(|| event_handler(node, event)).flatten()
 }
 
 fn find_handler_for_path(
@@ -3090,6 +3464,128 @@ fn shared_path_prefix_len(left: &[ElementPath], right: &[ElementPath]) -> usize 
         .count()
 }
 
+struct DeferredHitStackingContext<'a> {
+    node: &'a RenderNode,
+    path: ElementPath,
+    clip: ClipRect,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    level: i32,
+    order: u64,
+}
+
+fn collect_deferred_hit_stacking_contexts<'a>(
+    node: &'a RenderNode,
+    path: &ElementPath,
+    child_clip: ClipRect,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    order: &mut u64,
+    deferred: &mut Vec<DeferredHitStackingContext<'a>>,
+) {
+    let child_context = child_3d_context(node, in_3d_context);
+    let child_perspective = active_child_perspective(node, parent_perspective, child_context);
+    for (index, child) in node.children.iter().enumerate() {
+        let child_path = path.with_child(index);
+        if establishes_stacking_context(child) {
+            deferred.push(DeferredHitStackingContext {
+                node: child,
+                path: child_path,
+                clip: child_clip,
+                parent_perspective: child_perspective,
+                in_3d_context: child_context,
+                level: stacking_context_level(child),
+                order: *order,
+            });
+            *order = order.wrapping_add(1);
+        } else if !node_requires_projected_path(child) {
+            let descendant_clip = if child.style.overflow.clips_any_axis() {
+                child_clip.intersect(layout_clip(child.layout))
+            } else {
+                Some(child_clip)
+            };
+            if let Some(descendant_clip) = descendant_clip {
+                collect_deferred_hit_stacking_contexts(
+                    child,
+                    &child_path,
+                    descendant_clip,
+                    child_perspective,
+                    child_context,
+                    order,
+                    deferred,
+                );
+            }
+        }
+    }
+}
+
+fn sort_deferred_hit_contexts(entries: &mut [DeferredHitStackingContext<'_>]) {
+    entries.sort_by(|left, right| {
+        left.level
+            .cmp(&right.level)
+            .then(left.order.cmp(&right.order))
+    });
+}
+
+fn hit_deferred_context_for_event(
+    entry: &DeferredHitStackingContext<'_>,
+    x: f32,
+    y: f32,
+    event: MouseEventKind,
+) -> Option<EventHandler> {
+    if !node_requires_projected_path(entry.node) {
+        hit_test_node_for_event(
+            entry.node,
+            x,
+            y,
+            entry.clip,
+            entry.parent_perspective,
+            entry.in_3d_context,
+            event,
+        )
+    } else {
+        hit_test_node_for_event_transformed(
+            entry.node,
+            x,
+            y,
+            &ClipState::new(entry.clip),
+            TransformMatrix3d::IDENTITY,
+            entry.parent_perspective,
+            entry.in_3d_context,
+            event,
+        )
+    }
+}
+
+fn hit_deferred_context_element_path(
+    entry: &DeferredHitStackingContext<'_>,
+    x: f32,
+    y: f32,
+) -> Option<ElementPath> {
+    if !node_requires_projected_path(entry.node) {
+        hit_test_element_path_node(
+            entry.node,
+            x,
+            y,
+            entry.clip,
+            entry.parent_perspective,
+            entry.in_3d_context,
+            &entry.path,
+        )
+    } else {
+        hit_test_element_path_node_transformed(
+            entry.node,
+            x,
+            y,
+            &ClipState::new(entry.clip),
+            TransformMatrix3d::IDENTITY,
+            entry.parent_perspective,
+            entry.in_3d_context,
+            &entry.path,
+        )
+    }
+}
+
 fn hit_test_element_path_node(
     node: &RenderNode,
     x: f32,
@@ -3099,7 +3595,11 @@ fn hit_test_element_path_node(
     in_3d_context: bool,
     path: &ElementPath,
 ) -> Option<ElementPath> {
-    if !clip.contains(x, y) || !layout_contains(node.layout, x, y) {
+    if !clip.contains(x, y) {
+        return None;
+    }
+    let contains = layout_contains(node.layout, x, y);
+    if !contains && node.style.overflow.clips_any_axis() {
         return None;
     }
 
@@ -3111,7 +3611,29 @@ fn hit_test_element_path_node(
 
     let child_context = child_3d_context(node, in_3d_context);
     let child_perspective = active_child_perspective(node, parent_perspective, child_context);
+    let mut deferred = Vec::new();
+    let mut order = 0;
+    collect_deferred_hit_stacking_contexts(
+        node,
+        path,
+        child_clip,
+        parent_perspective,
+        in_3d_context,
+        &mut order,
+        &mut deferred,
+    );
+    sort_deferred_hit_contexts(&mut deferred);
+
+    for entry in deferred.iter().rev().filter(|entry| entry.level >= 0) {
+        if let Some(hit) = hit_deferred_context_element_path(entry, x, y) {
+            return Some(hit);
+        }
+    }
+
     for (index, child) in node.children.iter().enumerate().rev() {
+        if establishes_stacking_context(child) {
+            continue;
+        }
         let child_path = path.with_child(index);
         let hit = if !node_requires_projected_path(child) {
             hit_test_element_path_node(
@@ -3140,7 +3662,13 @@ fn hit_test_element_path_node(
         }
     }
 
-    node.element_path.clone().or_else(|| Some(path.clone()))
+    for entry in deferred.iter().rev().filter(|entry| entry.level < 0) {
+        if let Some(hit) = hit_deferred_context_element_path(entry, x, y) {
+            return Some(hit);
+        }
+    }
+
+    contains.then(|| node.element_path.clone().or_else(|| Some(path.clone())))?
 }
 
 fn hit_test_node_for_event_transformed(
@@ -3164,7 +3692,8 @@ fn hit_test_node_for_event_transformed(
     let matrix = project_world_transform_matrix(node.layout, world_matrix, parent_perspective)?;
     let inverse = matrix.invert()?;
     let (local_x, local_y) = inverse.transform_point(x, y);
-    if !layout_contains(node.layout, local_x, local_y) {
+    let contains = layout_contains(node.layout, local_x, local_y);
+    if !contains && node.style.overflow.clips_any_axis() {
         return None;
     }
 
@@ -3198,7 +3727,7 @@ fn hit_test_node_for_event_transformed(
         }
     }
 
-    event_handler(node, event)
+    contains.then(|| event_handler(node, event)).flatten()
 }
 
 fn hit_test_element_path_node_transformed(
@@ -3222,7 +3751,8 @@ fn hit_test_element_path_node_transformed(
     let matrix = project_world_transform_matrix(node.layout, world_matrix, parent_perspective)?;
     let inverse = matrix.invert()?;
     let (local_x, local_y) = inverse.transform_point(x, y);
-    if !layout_contains(node.layout, local_x, local_y) {
+    let contains = layout_contains(node.layout, local_x, local_y);
+    if !contains && node.style.overflow.clips_any_axis() {
         return None;
     }
 
@@ -3257,7 +3787,7 @@ fn hit_test_element_path_node_transformed(
         }
     }
 
-    node.element_path.clone().or_else(|| Some(path.clone()))
+    contains.then(|| node.element_path.clone().or_else(|| Some(path.clone())))?
 }
 
 fn settle_element_interaction<P>(
@@ -4953,6 +5483,8 @@ fn can_tighten_own_dirty_region(previous: &RenderNode, current: &RenderNode) -> 
         && previous.content_inset == current.content_inset
         && previous.scrollbars == current.scrollbars
         && previous.style.overflow == current.style.overflow
+        && previous.style.positioned == current.style.positioned
+        && previous.style.z_index == current.style.z_index
 }
 
 fn push_dirty_region(region: Option<ClipRect>, dirty_regions: &mut Vec<ClipRect>) {
@@ -5815,7 +6347,7 @@ mod tests {
         GradientVertical, Insets, LayoutBox, LengthPercentageValue, LinearGradient, NativeMaterial,
         Overflow, RadialGradient, RadialShape, RenderNode, ShadowEffect, TextEditDecoration,
         TextSelectionRange, TextSelectionStyle, TextStrokeStyle, Transform2D, TransformMatrix3d,
-        TransformOperation, TransformStyleMode, VisualStyle,
+        TransformOperation, TransformStyleMode, VisualStyle, ZIndex,
     };
 
     use crate::{
@@ -5989,6 +6521,192 @@ mod tests {
         render_to_buffer(&scene, &mut buffer, 20, 20, Color::WHITE);
 
         assert!(buffer.contains(&pack_rgb(Color::rgb(40, 120, 220))));
+    }
+
+    #[test]
+    fn positioned_z_index_paints_the_whole_subtree_above_later_siblings() {
+        let menu_color = Color::rgb(34, 197, 94);
+        let option_color = Color::rgb(37, 99, 235);
+        let covered_color = Color::rgb(239, 68, 68);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::WHITE),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(4.0, 4.0, 24.0, 24.0))
+                        .with_style(VisualStyle {
+                            background: Some(menu_color),
+                            positioned: true,
+                            z_index: ZIndex::Integer(1000),
+                            ..VisualStyle::default()
+                        })
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(8.0, 8.0, 8.0, 8.0)).with_style(
+                                VisualStyle {
+                                    background: Some(option_color),
+                                    ..VisualStyle::default()
+                                },
+                            ),
+                        ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(6.0, 6.0, 24.0, 24.0)).with_style(
+                        VisualStyle {
+                            background: Some(covered_color),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 40 * 40];
+
+        render_to_buffer(&scene, &mut buffer, 40, 40, Color::WHITE);
+
+        assert_eq!(buffer[5 * 40 + 5], pack_rgb(menu_color));
+        assert_eq!(buffer[10 * 40 + 10], pack_rgb(option_color));
+    }
+
+    #[test]
+    fn nested_positioned_z_index_paints_above_later_uncle_without_lifting_parent() {
+        let wrapper_color = Color::rgb(34, 197, 94);
+        let menu_color = Color::rgb(37, 99, 235);
+        let covered_color = Color::rgb(239, 68, 68);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                .with_style(VisualStyle {
+                    background: Some(Color::WHITE),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 32.0, 32.0))
+                        .with_style(VisualStyle {
+                            background: Some(wrapper_color),
+                            ..VisualStyle::default()
+                        })
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(8.0, 8.0, 12.0, 12.0)).with_style(
+                                VisualStyle {
+                                    background: Some(menu_color),
+                                    positioned: true,
+                                    z_index: ZIndex::Integer(1000),
+                                    ..VisualStyle::default()
+                                },
+                            ),
+                        ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(4.0, 4.0, 24.0, 24.0)).with_style(
+                        VisualStyle {
+                            background: Some(covered_color),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 40 * 40];
+
+        render_to_buffer(&scene, &mut buffer, 40, 40, Color::WHITE);
+
+        assert_eq!(buffer[5 * 40 + 5], pack_rgb(covered_color));
+        assert_eq!(buffer[10 * 40 + 10], pack_rgb(menu_color));
+    }
+
+    #[test]
+    fn non_positioned_z_index_does_not_reorder_siblings() {
+        let early_color = Color::rgb(34, 197, 94);
+        let later_color = Color::rgb(239, 68, 68);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 24.0, 24.0))
+                .with_child(
+                    RenderNode::container(LayoutBox::new(2.0, 2.0, 16.0, 16.0)).with_style(
+                        VisualStyle {
+                            background: Some(early_color),
+                            z_index: ZIndex::Integer(1000),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(4.0, 4.0, 16.0, 16.0)).with_style(
+                        VisualStyle {
+                            background: Some(later_color),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 24 * 24];
+
+        render_to_buffer(&scene, &mut buffer, 24, 24, Color::WHITE);
+
+        assert_eq!(buffer[8 * 24 + 8], pack_rgb(later_color));
+    }
+
+    #[test]
+    fn hit_testing_uses_positioned_z_index_order() {
+        let root_path = ElementPath::root(0);
+        let menu_path = root_path.with_child(0);
+        let option_path = menu_path.with_child(0);
+        let covered_path = root_path.with_child(1);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                .with_element_path(root_path)
+                .with_child(
+                    RenderNode::container(LayoutBox::new(4.0, 4.0, 24.0, 24.0))
+                        .with_element_path(menu_path)
+                        .with_style(VisualStyle {
+                            positioned: true,
+                            z_index: ZIndex::Integer(1000),
+                            ..VisualStyle::default()
+                        })
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(8.0, 8.0, 8.0, 8.0))
+                                .with_element_path(option_path.clone()),
+                        ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(6.0, 6.0, 24.0, 24.0))
+                        .with_element_path(covered_path),
+                ),
+        ];
+
+        let hit = hit_test_element_path(&scene, 10.0, 10.0);
+
+        assert_eq!(hit, Some(option_path));
+    }
+
+    #[test]
+    fn hit_testing_promotes_nested_positioned_z_index_without_lifting_parent() {
+        let root_path = ElementPath::root(0);
+        let wrapper_path = root_path.with_child(0);
+        let menu_path = wrapper_path.with_child(0);
+        let covered_path = root_path.with_child(1);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                .with_element_path(root_path)
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 32.0, 32.0))
+                        .with_element_path(wrapper_path)
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(8.0, 8.0, 12.0, 12.0))
+                                .with_element_path(menu_path.clone())
+                                .with_style(VisualStyle {
+                                    positioned: true,
+                                    z_index: ZIndex::Integer(1000),
+                                    ..VisualStyle::default()
+                                }),
+                        ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(4.0, 4.0, 24.0, 24.0))
+                        .with_element_path(covered_path.clone()),
+                ),
+        ];
+
+        assert_eq!(hit_test_element_path(&scene, 10.0, 10.0), Some(menu_path));
+        assert_eq!(hit_test_element_path(&scene, 5.0, 5.0), Some(covered_path));
     }
 
     #[test]
@@ -7311,6 +8029,27 @@ mod tests {
         assert!(dispatch_click(&scene, 12.0, 12.0));
         assert_eq!(CLICK_COUNT.load(Ordering::SeqCst), 1);
         assert!(!dispatch_click(&scene, 28.0, 28.0));
+    }
+
+    #[test]
+    fn hit_testing_reaches_visible_overflow_children() {
+        CLICK_COUNT.store(0, Ordering::SeqCst);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_child(
+                RenderNode::container(LayoutBox::new(4.0, 24.0, 48.0, 22.0))
+                    .on_click(increment_click_count),
+            ),
+        ];
+
+        assert!(dispatch_click(&scene, 12.0, 30.0));
+        assert_eq!(CLICK_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            hit_test_element_path(&scene, 12.0, 30.0),
+            Some(ElementPath {
+                root: 0,
+                children: vec![0],
+            })
+        );
     }
 
     #[test]
@@ -9160,6 +9899,7 @@ mod tests {
         ];
         let cached_bounds = super::cache_scene_subtree_bounds(&scene);
         let root_indices = super::root_indices_intersecting_clip(
+            &scene,
             &cached_bounds.roots,
             ClipRect {
                 x0: 70.0,

@@ -286,6 +286,81 @@ Acceptance
 
 ---
 
+## E4. Z-index stacking contexts and positioned overlays
+Depends: C2, C4, E1, E2, F1, G3  
+Status: planned  
+
+Purpose:
+- Support positioned overlay UI, such as dropdowns and popovers, whose backgrounds, shadows, borders, text, and descendants must paint as one coherent subtree above covered siblings
+- Keep existing paint order effectively unchanged for layouts that do not opt into explicit `z-index`
+
+Problem:
+- Paint extraction currently orders individual paint items by path and phase
+- That lets a positioned overlay's background paint before unrelated later sibling text because backgrounds have an earlier phase than text
+- `z-index` is not represented in resolved visual style, and positioned stacking contexts are not used by paint ordering or hit testing
+
+CSS support:
+- `z-index: auto`
+- `z-index: 0`
+- positive integer values, such as `z-index: 10`
+- negative integer values, such as `z-index: -1`
+
+Style model:
+```rust
+pub enum ZIndex {
+    Auto,
+    Integer(i32),
+}
+```
+
+Rules:
+- Default `z-index` is `auto`
+- `z-index` belongs to visual or computed style, not layout style
+- Integer `z-index` applies only to positioned elements
+- A positioned element with integer `z-index` creates a stacking context
+- Higher sibling stacking contexts paint above lower sibling stacking contexts
+- Same `z-index` preserves DOM/tree order
+- `z-index` does not affect layout
+- Existing overflow clipping remains authoritative; `z-index` must not bypass ancestor clipping
+
+Parser and style resolution:
+- Parse `Property::ZIndex`
+- Map Lightning CSS `ZIndex::Auto` to `ZIndex::Auto`
+- Map Lightning CSS integer values to `ZIndex::Integer(value)`
+- Classify `z-index` invalidation as paint or structure according to the current paint-order extraction architecture, but avoid layout invalidation unless required for correctness
+
+Paint ordering:
+- Treat each stacking context as a subtree-level paint unit for ordering against sibling contexts
+- A high-`z-index` overlay must move all descendant paint with it, not just its own background item
+- Preserve existing internal phase order inside a stacking context:
+  - shadows
+  - background
+  - border
+  - text / svg
+  - children
+  - scrollbars
+- Carry a stacking key with extracted paint items, including ancestor stacking-context order, local `z-index` group, DOM/tree-order tie breakers, and local paint phase
+
+Hit testing:
+- Use the same effective stacking order as painting
+- If a high-`z-index` dropdown overlaps a later sibling, pointer events target the dropdown or its option rather than the covered sibling
+- Respect the existing clipping model during hit testing
+
+Regression coverage:
+- Resolved style carries `auto`, positive, zero, and negative `z-index` values
+- A positioned absolute menu with `z-index: 1000` paints its background, border, shadow, text, and descendants above later sibling text
+- Hit testing a point where a high-`z-index` menu overlaps another interactive node returns the menu path or menu-option path
+- Scenes without explicit `z-index` keep their current visual order
+
+Acceptance:
+- `z-index` parses and resolves into visual style
+- Positioned elements with integer `z-index` form stacking contexts
+- Overlay backgrounds no longer paint underneath unrelated later sibling text
+- Hit testing follows the visual stacking order
+- Existing tests pass, except intentional overlap regressions that now assert correct stacking behavior
+
+---
+
 # Epic H - Typography & font system
 
 ## H1. Typography model

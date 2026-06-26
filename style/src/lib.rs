@@ -6,7 +6,7 @@ use cssimpler_core::{
     BackdropOcclusion, BorderLineStyle, Color, CustomProperties, ElementInteractionState,
     ElementNode, ElementPath, LayoutStyle, LengthPercentageCalc, NativeMaterial, Node,
     OverflowMode, ScrollbarWidth, Style, SvgPaint, TextSelectionStyle, TransformOperation,
-    TransformOrigin, TransformStyleMode, TransitionPropertyName, TransitionTimingFunction,
+    TransformOrigin, TransformStyleMode, TransitionPropertyName, TransitionTimingFunction, ZIndex,
     fonts::{OverflowWrap, TextAlign, TextStyle, TextTransform, WhiteSpace, WordBreak},
 };
 use lightningcss::declaration::DeclarationBlock;
@@ -26,7 +26,7 @@ use lightningcss::properties::grid::{
     TrackBreadth, TrackListItem, TrackSize, TrackSizing as CssTrackSizing,
 };
 use lightningcss::properties::overflow::OverflowKeyword as CssOverflowKeyword;
-use lightningcss::properties::position::Position as CssPosition;
+use lightningcss::properties::position::{Position as CssPosition, ZIndex as CssZIndex};
 use lightningcss::properties::size::{MaxSize as CssMaxSize, Size as CssSize};
 use lightningcss::rules::style::StyleRule as LightningStyleRule;
 use lightningcss::rules::{CssRule, CssRuleList};
@@ -417,12 +417,16 @@ pub enum Declaration {
     TransformOrigin(TransformOrigin),
     Perspective(Option<f32>),
     TransformStyle(TransformStyleMode),
+    ZIndex(ZIndex),
     OverflowX(OverflowMode),
     OverflowY(OverflowMode),
     ScrollbarWidth(ScrollbarWidth),
     ScrollbarColors(Option<Color>, Option<Color>),
     Display(TaffyDisplay),
-    Position(TaffyPosition),
+    Position {
+        taffy: TaffyPosition,
+        positioned: bool,
+    },
     InsetTop(TaffyLengthPercentageAuto),
     InsetTopCalc(LengthPercentageCalc),
     InsetRight(TaffyLengthPercentageAuto),
@@ -816,9 +820,8 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
         Property::OverflowX(value) => Ok(vec![overflow_x_declaration(*value)]),
         Property::OverflowY(value) => Ok(vec![overflow_y_declaration(*value)]),
         Property::Display(display) => Ok(vec![Declaration::Display(display_from_css(display)?)]),
-        Property::Position(position) => {
-            Ok(vec![Declaration::Position(position_from_css(position))])
-        }
+        Property::Position(position) => Ok(vec![position_declaration_from_css(position)]),
+        Property::ZIndex(value) => Ok(vec![Declaration::ZIndex(z_index_from_css(value))]),
         Property::Top(value) => Ok(vec![inset_top_declaration(value)?]),
         Property::Right(value) => Ok(vec![inset_right_declaration(value)?]),
         Property::Bottom(value) => Ok(vec![inset_bottom_declaration(value)?]),
@@ -1069,12 +1072,19 @@ fn display_from_css(display: &CssDisplay) -> Result<TaffyDisplay, StyleError> {
     }
 }
 
-fn position_from_css(position: &CssPosition) -> TaffyPosition {
-    match position {
-        CssPosition::Absolute | CssPosition::Fixed => TaffyPosition::Absolute,
-        CssPosition::Static | CssPosition::Relative | CssPosition::Sticky(_) => {
-            TaffyPosition::Relative
-        }
+fn position_declaration_from_css(position: &CssPosition) -> Declaration {
+    let (taffy, positioned) = match position {
+        CssPosition::Absolute | CssPosition::Fixed => (TaffyPosition::Absolute, true),
+        CssPosition::Relative | CssPosition::Sticky(_) => (TaffyPosition::Relative, true),
+        CssPosition::Static => (TaffyPosition::Relative, false),
+    };
+    Declaration::Position { taffy, positioned }
+}
+
+fn z_index_from_css(value: &CssZIndex) -> ZIndex {
+    match value {
+        CssZIndex::Auto => ZIndex::Auto,
+        CssZIndex::Integer(value) => ZIndex::Integer(*value),
     }
 }
 
@@ -1603,13 +1613,15 @@ fn apply_declaration(
             visual::sync_scrollbar_gutter(style);
         }
         Declaration::Display(display) => style.layout.taffy.display = *display,
-        Declaration::Position(position) => {
-            style.layout.taffy.position = *position;
+        Declaration::Position { taffy, positioned } => {
+            style.layout.taffy.position = *taffy;
+            style.visual.positioned = *positioned;
             *position_explicit = true;
         }
         Declaration::InsetTop(value) => {
             if !*position_explicit {
                 style.layout.taffy.position = TaffyPosition::Absolute;
+                style.visual.positioned = true;
             }
             style.layout.taffy.inset.top = *value;
             style.layout.calc.inset_top = None;
@@ -1617,6 +1629,7 @@ fn apply_declaration(
         Declaration::InsetTopCalc(value) => {
             if !*position_explicit {
                 style.layout.taffy.position = TaffyPosition::Absolute;
+                style.visual.positioned = true;
             }
             style.layout.taffy.inset.top = length_percentage_auto_hint_from_calc(*value);
             style.layout.calc.inset_top = Some(*value);
@@ -1624,6 +1637,7 @@ fn apply_declaration(
         Declaration::InsetRight(value) => {
             if !*position_explicit {
                 style.layout.taffy.position = TaffyPosition::Absolute;
+                style.visual.positioned = true;
             }
             style.layout.taffy.inset.right = *value;
             style.layout.calc.inset_right = None;
@@ -1631,6 +1645,7 @@ fn apply_declaration(
         Declaration::InsetRightCalc(value) => {
             if !*position_explicit {
                 style.layout.taffy.position = TaffyPosition::Absolute;
+                style.visual.positioned = true;
             }
             style.layout.taffy.inset.right = length_percentage_auto_hint_from_calc(*value);
             style.layout.calc.inset_right = Some(*value);
@@ -1638,6 +1653,7 @@ fn apply_declaration(
         Declaration::InsetBottom(value) => {
             if !*position_explicit {
                 style.layout.taffy.position = TaffyPosition::Absolute;
+                style.visual.positioned = true;
             }
             style.layout.taffy.inset.bottom = *value;
             style.layout.calc.inset_bottom = None;
@@ -1645,6 +1661,7 @@ fn apply_declaration(
         Declaration::InsetBottomCalc(value) => {
             if !*position_explicit {
                 style.layout.taffy.position = TaffyPosition::Absolute;
+                style.visual.positioned = true;
             }
             style.layout.taffy.inset.bottom = length_percentage_auto_hint_from_calc(*value);
             style.layout.calc.inset_bottom = Some(*value);
@@ -1652,6 +1669,7 @@ fn apply_declaration(
         Declaration::InsetLeft(value) => {
             if !*position_explicit {
                 style.layout.taffy.position = TaffyPosition::Absolute;
+                style.visual.positioned = true;
             }
             style.layout.taffy.inset.left = *value;
             style.layout.calc.inset_left = None;
@@ -1659,6 +1677,7 @@ fn apply_declaration(
         Declaration::InsetLeftCalc(value) => {
             if !*position_explicit {
                 style.layout.taffy.position = TaffyPosition::Absolute;
+                style.visual.positioned = true;
             }
             style.layout.taffy.inset.left = length_percentage_auto_hint_from_calc(*value);
             style.layout.calc.inset_left = Some(*value);
@@ -1852,7 +1871,7 @@ mod tests {
         GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
         LengthPercentageValue, LinearGradient, NativeMaterial, Node, RadialShape, ScrollbarWidth,
         ShapeExtent, TransformMatrix3d, TransformOperation, TransformOrigin, TransformStyleMode,
-        TransitionPropertyName, TransitionTimingFunction,
+        TransitionPropertyName, TransitionTimingFunction, ZIndex,
         fonts::{
             FontFamily, LineHeight, OverflowWrap, TextAlign, TextStyle, TextTransform, WhiteSpace,
             WordBreak, layout_text_block, register_font_file,
@@ -2145,6 +2164,36 @@ mod tests {
             resolved.layout.taffy.inset.left,
             TaffyLengthPercentageAuto::Length(0.0)
         );
+        assert!(resolved.visual.positioned);
+    }
+
+    #[test]
+    fn z_index_parses_and_resolves_as_visual_style() {
+        let stylesheet = parse_stylesheet(
+            ".panel { position: absolute; z-index: 1000; }
+             .auto { z-index: auto; }
+             .negative { position: relative; z-index: -1; }
+             .plain { z-index: 10; }",
+        )
+        .expect("z-index stylesheet should parse");
+
+        let panel = resolve_style(&Node::element("div").with_class("panel"), &stylesheet);
+        assert_eq!(panel.layout.taffy.position, TaffyPosition::Absolute);
+        assert!(panel.visual.positioned);
+        assert_eq!(panel.visual.z_index, ZIndex::Integer(1000));
+
+        let auto = resolve_style(&Node::element("div").with_class("auto"), &stylesheet);
+        assert!(!auto.visual.positioned);
+        assert_eq!(auto.visual.z_index, ZIndex::Auto);
+
+        let negative = resolve_style(&Node::element("div").with_class("negative"), &stylesheet);
+        assert_eq!(negative.layout.taffy.position, TaffyPosition::Relative);
+        assert!(negative.visual.positioned);
+        assert_eq!(negative.visual.z_index, ZIndex::Integer(-1));
+
+        let plain = resolve_style(&Node::element("div").with_class("plain"), &stylesheet);
+        assert!(!plain.visual.positioned);
+        assert_eq!(plain.visual.z_index, ZIndex::Integer(10));
     }
 
     #[test]

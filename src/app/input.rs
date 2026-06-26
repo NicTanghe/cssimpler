@@ -25,10 +25,16 @@ struct ActiveInputDrag {
     anchor: usize,
 }
 
+#[derive(Clone, Debug)]
+struct FocusedInput {
+    key: String,
+    path: ElementPath,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct NativeTextInputs {
     states: HashMap<String, NativeTextInputState>,
-    focused: Option<String>,
+    focused: Option<FocusedInput>,
     pointer_position: Option<PointerPosition>,
     active_drag: Option<ActiveInputDrag>,
 }
@@ -44,7 +50,8 @@ impl NativeTextInputs {
         scene: Option<&[RenderNode]>,
         runtime_world: &RuntimeWorld,
     ) -> bool {
-        match event {
+        let before = self.focused_value();
+        let changed = match event {
             EngineEvent::PointerMoved { position, .. } => {
                 self.pointer_position = Some(*position);
                 self.update_drag_selection(scene)
@@ -68,7 +75,13 @@ impl NativeTextInputs {
             EngineEvent::TextInput(TextInputEvent::Preedit { .. }) => false,
             EngineEvent::Key(event) => self.handle_key_event(event),
             _ => false,
+        };
+
+        if changed {
+            self.dispatch_input_if_value_changed(before, runtime_world);
         }
+
+        changed
     }
 
     fn materialize_node(&mut self, node: Node, element_path: Option<ElementPath>) -> Node {
@@ -80,6 +93,7 @@ impl NativeTextInputs {
                 {
                     let key = text_input_key(&element, path);
                     let initial_value = element.attribute("value").unwrap_or_default().to_string();
+                    let is_controlled = element.handlers.input.is_some();
                     let state =
                         self.states
                             .entry(key.clone())
@@ -88,7 +102,24 @@ impl NativeTextInputs {
                                 value: initial_value,
                                 selection_anchor: None,
                             });
+                    if is_controlled {
+                        let authored_value =
+                            element.attribute("value").unwrap_or_default().to_string();
+                        if state.value != authored_value {
+                            state.value = authored_value;
+                        }
+                    }
                     state.normalize_selection();
+                    if self
+                        .focused
+                        .as_ref()
+                        .is_some_and(|focused| focused.key == key)
+                    {
+                        self.focused = Some(FocusedInput {
+                            key: key.clone(),
+                            path: path.clone(),
+                        });
+                    }
 
                     element.set_attribute("value", state.value.clone());
                     element.children.clear();
@@ -147,7 +178,10 @@ impl NativeTextInputs {
             && is_native_text_input(element)
         {
             let key = text_input_key(element, &path);
-            if self.focused.as_deref() == Some(key.as_str())
+            if self
+                .focused
+                .as_ref()
+                .is_some_and(|focused| focused.key == key)
                 && let Some(state) = self.states.get(&key)
             {
                 node.text_edit = Some(text_edit_decoration(
@@ -206,12 +240,18 @@ impl NativeTextInputs {
         let cursor =
             caret_index_from_pointer_or_value(Some(scene), &path, &state.value, position.x)
                 .unwrap_or_else(|| clamp_to_char_boundary(&state.value, fallback_cursor));
-        let changed = self.focused.as_deref() != Some(key.as_str())
+        let changed = !self
+            .focused
+            .as_ref()
+            .is_some_and(|focused| focused.key == key && focused.path == path)
             || state.cursor != cursor
             || state.selection_anchor.is_some();
 
         state.set_cursor(cursor);
-        self.focused = Some(key.clone());
+        self.focused = Some(FocusedInput {
+            key: key.clone(),
+            path: path.clone(),
+        });
         self.active_drag = Some(ActiveInputDrag {
             key,
             path,
@@ -259,20 +299,20 @@ impl NativeTextInputs {
 
     fn clear_focus(&mut self) -> bool {
         self.active_drag = None;
-        let Some(key) = self.focused.take() else {
+        let Some(focused) = self.focused.take() else {
             return false;
         };
-        if let Some(state) = self.states.get_mut(&key) {
+        if let Some(state) = self.states.get_mut(&focused.key) {
             state.selection_anchor = None;
         }
         true
     }
 
     fn insert_focused_text(&mut self, text: &str) -> bool {
-        let Some(key) = self.focused.clone() else {
+        let Some(focused) = self.focused.clone() else {
             return false;
         };
-        let Some(state) = self.states.get_mut(&key) else {
+        let Some(state) = self.states.get_mut(&focused.key) else {
             return false;
         };
         let text = text
@@ -319,14 +359,54 @@ impl NativeTextInputs {
         &mut self,
         action: impl FnOnce(&mut NativeTextInputState) -> bool,
     ) -> bool {
-        let Some(key) = self.focused.clone() else {
+        let Some(focused) = self.focused.clone() else {
             return false;
         };
-        let Some(state) = self.states.get_mut(&key) else {
+        let Some(state) = self.states.get_mut(&focused.key) else {
             return false;
         };
         state.cursor = clamp_to_char_boundary(&state.value, state.cursor);
         action(state)
+    }
+
+    fn focused_value(&self) -> Option<(String, String)> {
+        let focused = self.focused.as_ref()?;
+        let value = self.states.get(&focused.key)?.value.clone();
+        Some((focused.key.clone(), value))
+    }
+
+    fn dispatch_input_if_value_changed(
+        &self,
+        before: Option<(String, String)>,
+        runtime_world: &RuntimeWorld,
+    ) {
+        let Some(focused) = self.focused.as_ref() else {
+            return;
+        };
+        let Some(state) = self.states.get(&focused.key) else {
+            return;
+        };
+        if before.as_ref().map(|(key, _)| key) != Some(&focused.key) {
+            return;
+        }
+        if before
+            .as_ref()
+            .is_some_and(|(_, value)| value == &state.value)
+        {
+            return;
+        }
+        let Some(root) = runtime_world.root_as_node(focused.path.root) else {
+            return;
+        };
+        let Some(element) = element_at_path(&root, &focused.path) else {
+            return;
+        };
+        if !is_native_text_input(element) || text_input_key(element, &focused.path) != focused.key {
+            return;
+        }
+        if let Some(handler) = element.handlers.input {
+            handler(&state.value);
+        }
     }
 
     fn backspace_focused(&mut self) -> bool {

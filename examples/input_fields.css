@@ -24,6 +24,14 @@ h2 {
     line-height: 1.2;
 }
 
+.letter-preview {
+    margin: 8px 0 0 0;
+    color: #0f766e;
+    font-size: 18px;
+    font-weight: 700;
+    line-height: 1.4;
+}
+
 label {
     display: block;
     margin: 14px 0 6px 0;

@@ -109,6 +109,7 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::TransformOrigin(_)
         | Declaration::Perspective(_)
         | Declaration::TransformStyle(_)
+        | Declaration::ZIndex(_)
         | Declaration::ScrollbarColors(_, _)
         | Declaration::TextAlign(_) => StyleInvalidation::Paint,
         Declaration::FontFamilies(_)
@@ -124,7 +125,7 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::OverflowX(_)
         | Declaration::OverflowY(_)
         | Declaration::ScrollbarWidth(_)
-        | Declaration::Position(_)
+        | Declaration::Position { .. }
         | Declaration::InsetTop(_)
         | Declaration::InsetTopCalc(_)
         | Declaration::InsetRight(_)
@@ -223,7 +224,8 @@ fn variable_property_invalidation(property_name: &str) -> StyleInvalidation {
         | "perspective"
         | "translate"
         | "rotate"
-        | "scale" => StyleInvalidation::Paint,
+        | "scale"
+        | "z-index" => StyleInvalidation::Paint,
         "display" => StyleInvalidation::Structure,
         _ => StyleInvalidation::Layout,
     }

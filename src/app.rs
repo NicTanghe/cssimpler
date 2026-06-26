@@ -1401,6 +1401,7 @@ fn duration_to_us(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use crate::core::{
@@ -1418,6 +1419,50 @@ mod tests {
         render_to_buffer,
     };
     use crate::style::{Stylesheet, parse_stylesheet};
+
+    static CONTROLLED_INPUT_CHANGE: Mutex<Option<String>> = Mutex::new(None);
+
+    #[derive(Clone, Debug, Default)]
+    struct ControlledInputState {
+        q: String,
+    }
+
+    fn capture_controlled_input(value: &str) {
+        *CONTROLLED_INPUT_CHANGE
+            .lock()
+            .expect("controlled input mutex should not be poisoned") = Some(value.to_string());
+    }
+
+    fn update_controlled_input(
+        state: &mut ControlledInputState,
+        _frame: FrameInfo,
+    ) -> Invalidation {
+        let Some(value) = CONTROLLED_INPUT_CHANGE
+            .lock()
+            .expect("controlled input mutex should not be poisoned")
+            .take()
+        else {
+            return Invalidation::Clean;
+        };
+
+        state.q = value;
+        Invalidation::Structure
+    }
+
+    fn build_controlled_input(state: &ControlledInputState) -> Node {
+        ui! {
+            <div id="app">
+                <input
+                    type="text"
+                    id="q"
+                    name="q"
+                    value={state.q.clone()}
+                    oninput={capture_controlled_input}
+                >
+                <p>{format!("You typed: {}", state.q)}</p>
+            </div>
+        }
+    }
 
     #[test]
     fn initial_frame_builds_the_scene() {
@@ -1509,6 +1554,66 @@ mod tests {
         let edited = app.frame(frame(3));
         assert_eq!(text_nodes(&edited), vec!["hi".to_string()]);
         assert_eq!(input_text_edit(&edited, "field").caret, Some(2));
+    }
+
+    #[test]
+    fn controlled_native_text_input_updates_app_state_through_oninput() {
+        *CONTROLLED_INPUT_CHANGE
+            .lock()
+            .expect("controlled input mutex should not be poisoned") = None;
+        let stylesheet = parse_stylesheet(
+            "#app { width: 260px; height: 90px; }
+             input[type=text] { width: 160px; height: 24px; padding: 0; }
+             p { display: block; }",
+        )
+        .expect("text input stylesheet should parse");
+        let mut app = App::new(
+            ControlledInputState::default(),
+            &stylesheet,
+            update_controlled_input,
+            build_controlled_input,
+        );
+
+        let initial = app.frame(frame(0));
+        assert!(
+            text_nodes(&initial)
+                .iter()
+                .any(|text| text == "You typed: ")
+        );
+
+        assert!(!SceneProvider::handle_engine_event(
+            &mut app,
+            &EngineEvent::PointerMoved {
+                position: PointerPosition { x: 80.0, y: 4.0 },
+                modifiers: Default::default(),
+            },
+        ));
+        assert!(SceneProvider::handle_engine_event(
+            &mut app,
+            &EngineEvent::PointerButton {
+                button: PointerButton::Primary,
+                state: ButtonState::Pressed,
+                modifiers: Default::default(),
+            },
+        ));
+        let focused = app.frame(frame(1));
+        assert_eq!(input_text_edit(&focused, "q").caret, Some(0));
+
+        assert!(SceneProvider::handle_engine_event(
+            &mut app,
+            &EngineEvent::TextInput(TextInputEvent::Commit("bobs are great".to_string())),
+        ));
+        let typed = app.frame(frame(2));
+
+        assert_eq!(app.state().q, "bobs are great");
+        let typed_text = text_nodes(&typed);
+        assert!(typed_text.iter().any(|text| text == "bobs are great"));
+        assert!(
+            typed_text
+                .iter()
+                .any(|text| text == "You typed: bobs are great")
+        );
+        assert_eq!(input_text_edit(&typed, "q").caret, Some(14));
     }
 
     #[test]

@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use cssimpler_core::{Color, CornerRadius, LayoutBox, LinearRgba, RenderNode};
+use cssimpler_core::{
+    Color, CornerRadius, LayoutBox, LinearRgba, RenderNode, TransformStyleMode,
+    establishes_stacking_context, stacking_context_level,
+};
 
 use crate::{
     ClipRect, PreparedBlendColor, blend_prepared_pixel, draw_rounded_rect, inset_layout,
@@ -66,6 +69,14 @@ struct ScrollbarHit {
     path: Vec<usize>,
     axis: ScrollbarAxis,
     part: ScrollbarPart,
+}
+
+#[derive(Clone)]
+struct DeferredScrollbarStackingContext {
+    path: Vec<usize>,
+    clip: ClipRect,
+    level: i32,
+    order: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -329,7 +340,11 @@ impl ScrollbarController {
         delta_x: f32,
         delta_y: f32,
     ) -> bool {
-        if !clip.contains(x, y) || !layout_contains(node.layout, x, y) {
+        if !clip.contains(x, y) {
+            return false;
+        }
+        let contains = layout_contains(node.layout, x, y);
+        if !contains && node.style.overflow.clips_any_axis() {
             return false;
         }
 
@@ -342,7 +357,24 @@ impl ScrollbarController {
             clip
         };
 
+        let deferred = sorted_deferred_scrollbar_contexts(node, path, child_clip);
+        for entry in deferred.iter().rev().filter(|entry| entry.level >= 0) {
+            let relative_path = &entry.path[path.len()..];
+            let original_len = path.len();
+            path.extend_from_slice(relative_path);
+            let handled = node_mut_at_relative_path(node, relative_path).is_some_and(|target| {
+                self.handle_wheel_on_node(target, path, x, y, entry.clip, delta_x, delta_y)
+            });
+            path.truncate(original_len);
+            if handled {
+                return true;
+            }
+        }
+
         for index in (0..node.children.len()).rev() {
+            if establishes_stacking_context(&node.children[index]) {
+                continue;
+            }
             path.push(index);
             if self.handle_wheel_on_node(
                 &mut node.children[index],
@@ -357,6 +389,23 @@ impl ScrollbarController {
                 return true;
             }
             path.pop();
+        }
+
+        for entry in deferred.iter().rev().filter(|entry| entry.level < 0) {
+            let relative_path = &entry.path[path.len()..];
+            let original_len = path.len();
+            path.extend_from_slice(relative_path);
+            let handled = node_mut_at_relative_path(node, relative_path).is_some_and(|target| {
+                self.handle_wheel_on_node(target, path, x, y, entry.clip, delta_x, delta_y)
+            });
+            path.truncate(original_len);
+            if handled {
+                return true;
+            }
+        }
+
+        if !contains {
+            return false;
         }
 
         let Some(scrollbars) = node.scrollbars else {
@@ -713,10 +762,95 @@ pub(crate) fn auto_scroll_indicator_bounds(indicator: AutoScrollIndicator) -> La
     centered_layout(indicator.x, indicator.y, AUTO_SCROLL_INDICATOR_RADIUS + 6.0)
 }
 
+fn sorted_stacking_indices(nodes: &[RenderNode]) -> Vec<usize> {
+    let mut indices = (0..nodes.len()).collect::<Vec<_>>();
+    indices.sort_by(|left, right| {
+        let left_level = nodes
+            .get(*left)
+            .map(stacking_context_level)
+            .unwrap_or_default();
+        let right_level = nodes
+            .get(*right)
+            .map(stacking_context_level)
+            .unwrap_or_default();
+        left_level.cmp(&right_level).then(left.cmp(right))
+    });
+    indices
+}
+
+fn node_stops_stacking_descent(node: &RenderNode) -> bool {
+    !node.style.transform.is_identity()
+        || node.style.perspective.is_some()
+        || node.style.transform_style == TransformStyleMode::Preserve3d
+}
+
+fn collect_deferred_scrollbar_stacking_contexts(
+    node: &RenderNode,
+    base_path: &[usize],
+    child_clip: ClipRect,
+    order: &mut u64,
+    deferred: &mut Vec<DeferredScrollbarStackingContext>,
+) {
+    for (index, child) in node.children.iter().enumerate() {
+        let mut child_path = base_path.to_vec();
+        child_path.push(index);
+        if establishes_stacking_context(child) {
+            deferred.push(DeferredScrollbarStackingContext {
+                path: child_path,
+                clip: child_clip,
+                level: stacking_context_level(child),
+                order: *order,
+            });
+            *order = order.wrapping_add(1);
+        } else if !node_stops_stacking_descent(child) {
+            let descendant_clip = if child.style.overflow.clips_any_axis() {
+                child_clip.intersect(layout_clip(child.layout))
+            } else {
+                Some(child_clip)
+            };
+            if let Some(descendant_clip) = descendant_clip {
+                collect_deferred_scrollbar_stacking_contexts(
+                    child,
+                    &child_path,
+                    descendant_clip,
+                    order,
+                    deferred,
+                );
+            }
+        }
+    }
+}
+
+fn sorted_deferred_scrollbar_contexts(
+    node: &RenderNode,
+    base_path: &[usize],
+    child_clip: ClipRect,
+) -> Vec<DeferredScrollbarStackingContext> {
+    let mut deferred = Vec::new();
+    let mut order = 0;
+    collect_deferred_scrollbar_stacking_contexts(
+        node,
+        base_path,
+        child_clip,
+        &mut order,
+        &mut deferred,
+    );
+    deferred.sort_by(|left, right| {
+        left.level
+            .cmp(&right.level)
+            .then(left.order.cmp(&right.order))
+    });
+    deferred
+}
+
 fn find_scrollbar_hit(scene: &[RenderNode], x: f32, y: f32) -> Option<ScrollbarHit> {
-    scene.iter().enumerate().rev().find_map(|(index, node)| {
-        find_scrollbar_hit_node(node, x, y, ClipRect::unbounded(), &[index])
-    })
+    sorted_stacking_indices(scene)
+        .into_iter()
+        .rev()
+        .find_map(|index| {
+            let node = &scene[index];
+            find_scrollbar_hit_node(node, x, y, ClipRect::unbounded(), &[index])
+        })
 }
 
 fn centered_layout(x: f32, y: f32, radius: f32) -> LayoutBox {
@@ -724,9 +858,13 @@ fn centered_layout(x: f32, y: f32, radius: f32) -> LayoutBox {
 }
 
 fn find_auto_scroll_target(scene: &[RenderNode], x: f32, y: f32) -> Option<Vec<usize>> {
-    scene.iter().enumerate().rev().find_map(|(index, node)| {
-        find_auto_scroll_target_node(node, x, y, ClipRect::unbounded(), &[index])
-    })
+    sorted_stacking_indices(scene)
+        .into_iter()
+        .rev()
+        .find_map(|index| {
+            let node = &scene[index];
+            find_auto_scroll_target_node(node, x, y, ClipRect::unbounded(), &[index])
+        })
 }
 
 fn find_auto_scroll_target_node(
@@ -736,7 +874,11 @@ fn find_auto_scroll_target_node(
     clip: ClipRect,
     path: &[usize],
 ) -> Option<Vec<usize>> {
-    if !clip.contains(x, y) || !layout_contains(node.layout, x, y) {
+    if !clip.contains(x, y) {
+        return None;
+    }
+    let contains = layout_contains(node.layout, x, y);
+    if !contains && node.style.overflow.clips_any_axis() {
         return None;
     }
 
@@ -746,12 +888,38 @@ fn find_auto_scroll_target_node(
         clip
     };
 
+    let deferred = sorted_deferred_scrollbar_contexts(node, path, child_clip);
+    for entry in deferred.iter().rev().filter(|entry| entry.level >= 0) {
+        let relative_path = &entry.path[path.len()..];
+        if let Some(target) = node_at_relative_path(node, relative_path)
+            && let Some(path) = find_auto_scroll_target_node(target, x, y, entry.clip, &entry.path)
+        {
+            return Some(path);
+        }
+    }
+
     for (index, child) in node.children.iter().enumerate().rev() {
+        if establishes_stacking_context(child) {
+            continue;
+        }
         let mut next_path = path.to_vec();
         next_path.push(index);
         if let Some(path) = find_auto_scroll_target_node(child, x, y, child_clip, &next_path) {
             return Some(path);
         }
+    }
+
+    for entry in deferred.iter().rev().filter(|entry| entry.level < 0) {
+        let relative_path = &entry.path[path.len()..];
+        if let Some(target) = node_at_relative_path(node, relative_path)
+            && let Some(path) = find_auto_scroll_target_node(target, x, y, entry.clip, &entry.path)
+        {
+            return Some(path);
+        }
+    }
+
+    if !contains {
+        return None;
     }
 
     node.scrollbars
@@ -766,12 +934,12 @@ fn find_scrollbar_hit_node(
     clip: ClipRect,
     path: &[usize],
 ) -> Option<ScrollbarHit> {
-    if !clip.contains(x, y) || !layout_contains(node.layout, x, y) {
+    if !clip.contains(x, y) {
         return None;
     }
-
-    if let Some(hit) = scrollbar_hit_in_node(node, x, y, path) {
-        return Some(hit);
+    let contains = layout_contains(node.layout, x, y);
+    if !contains && node.style.overflow.clips_any_axis() {
+        return None;
     }
 
     let child_clip = if node.style.overflow.clips_any_axis() {
@@ -780,15 +948,41 @@ fn find_scrollbar_hit_node(
         clip
     };
 
-    node.children
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, child)| {
-            let mut next_path = path.to_vec();
-            next_path.push(index);
-            find_scrollbar_hit_node(child, x, y, child_clip, &next_path)
-        })
+    let deferred = sorted_deferred_scrollbar_contexts(node, path, child_clip);
+    for entry in deferred.iter().rev().filter(|entry| entry.level >= 0) {
+        let relative_path = &entry.path[path.len()..];
+        if let Some(target) = node_at_relative_path(node, relative_path)
+            && let Some(hit) = find_scrollbar_hit_node(target, x, y, entry.clip, &entry.path)
+        {
+            return Some(hit);
+        }
+    }
+
+    if contains && let Some(hit) = scrollbar_hit_in_node(node, x, y, path) {
+        return Some(hit);
+    }
+
+    for (index, child) in node.children.iter().enumerate().rev() {
+        if establishes_stacking_context(child) {
+            continue;
+        }
+        let mut next_path = path.to_vec();
+        next_path.push(index);
+        if let Some(hit) = find_scrollbar_hit_node(child, x, y, child_clip, &next_path) {
+            return Some(hit);
+        }
+    }
+
+    for entry in deferred.iter().rev().filter(|entry| entry.level < 0) {
+        let relative_path = &entry.path[path.len()..];
+        if let Some(target) = node_at_relative_path(node, relative_path)
+            && let Some(hit) = find_scrollbar_hit_node(target, x, y, entry.clip, &entry.path)
+        {
+            return Some(hit);
+        }
+    }
+
+    None
 }
 
 fn scrollbar_hit_in_node(
@@ -1020,6 +1214,25 @@ fn node_mut_at_path<'a>(nodes: &'a mut [RenderNode], path: &[usize]) -> Option<&
     }
 }
 
+fn node_at_relative_path<'a>(node: &'a RenderNode, path: &[usize]) -> Option<&'a RenderNode> {
+    let mut current = node;
+    for &index in path {
+        current = current.children.get(index)?;
+    }
+    Some(current)
+}
+
+fn node_mut_at_relative_path<'a>(
+    node: &'a mut RenderNode,
+    path: &[usize],
+) -> Option<&'a mut RenderNode> {
+    let mut current = node;
+    for &index in path {
+        current = current.children.get_mut(index)?;
+    }
+    Some(current)
+}
+
 fn axis_coordinate(x: f32, y: f32, axis: ScrollbarAxis) -> f32 {
     match axis {
         ScrollbarAxis::Horizontal => x,
@@ -1203,7 +1416,8 @@ mod tests {
     use std::time::Duration;
 
     use cssimpler_core::{
-        LayoutBox, OverflowMode, ScrollbarData, ScrollbarMetrics, ScrollbarStyle,
+        LayoutBox, OverflowMode, ScrollbarData, ScrollbarMetrics, ScrollbarStyle, VisualStyle,
+        ZIndex,
     };
 
     use super::{
@@ -1292,6 +1506,90 @@ mod tests {
         controller.apply_to_scene(&mut scene);
 
         assert_eq!(scene[0].children[0].layout.y, -20.0);
+    }
+
+    #[test]
+    fn wheel_scroll_reaches_visible_overflow_children() {
+        let mut controller = ScrollbarController::default();
+        let mut scene = vec![
+            cssimpler_core::RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_child(
+                cssimpler_core::RenderNode::container(LayoutBox::new(4.0, 24.0, 80.0, 36.0))
+                    .with_scrollbars(ScrollbarData::new(
+                        OverflowMode::Hidden,
+                        OverflowMode::Auto,
+                        ScrollbarStyle::default(),
+                        ScrollbarMetrics {
+                            offset_x: 0.0,
+                            offset_y: 0.0,
+                            max_offset_x: 0.0,
+                            max_offset_y: 80.0,
+                            reserved_width: 0.0,
+                            reserved_height: 0.0,
+                        },
+                    )),
+            ),
+        ];
+
+        assert!(controller.handle_wheel(&mut scene, Some((12.0, 30.0)), Some((0.0, -1.0))));
+        assert!(
+            scene[0].children[0]
+                .scrollbars
+                .is_some_and(|scrollbars| scrollbars.metrics.offset_y > 0.0)
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_uses_nested_positioned_z_index_order() {
+        let mut controller = ScrollbarController::default();
+        let scrollbars = || {
+            ScrollbarData::new(
+                OverflowMode::Hidden,
+                OverflowMode::Auto,
+                ScrollbarStyle::default(),
+                ScrollbarMetrics {
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    max_offset_x: 0.0,
+                    max_offset_y: 80.0,
+                    reserved_width: 0.0,
+                    reserved_height: 0.0,
+                },
+            )
+        };
+        let mut scene = vec![
+            cssimpler_core::RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                .with_child(
+                    cssimpler_core::RenderNode::container(LayoutBox::new(0.0, 0.0, 36.0, 36.0))
+                        .with_child(
+                            cssimpler_core::RenderNode::container(LayoutBox::new(
+                                4.0, 4.0, 28.0, 28.0,
+                            ))
+                            .with_style(VisualStyle {
+                                positioned: true,
+                                z_index: ZIndex::Integer(1000),
+                                ..VisualStyle::default()
+                            })
+                            .with_scrollbars(scrollbars()),
+                        ),
+                )
+                .with_child(
+                    cssimpler_core::RenderNode::container(LayoutBox::new(6.0, 6.0, 28.0, 28.0))
+                        .with_scrollbars(scrollbars()),
+                ),
+        ];
+
+        assert!(controller.handle_wheel(&mut scene, Some((10.0, 10.0)), Some((0.0, -1.0))));
+
+        assert!(
+            scene[0].children[0].children[0]
+                .scrollbars
+                .is_some_and(|scrollbars| scrollbars.metrics.offset_y > 0.0)
+        );
+        assert!(
+            scene[0].children[1]
+                .scrollbars
+                .is_some_and(|scrollbars| scrollbars.metrics.offset_y == 0.0)
+        );
     }
 
     #[test]

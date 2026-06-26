@@ -228,6 +228,10 @@ pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) ->
             transform::apply_transform_style(style, *mode);
             true
         }
+        Declaration::ZIndex(value) => {
+            style.visual.z_index = *value;
+            true
+        }
         Declaration::ScrollbarWidth(width) => {
             scrollbar::apply_scrollbar_width(style, *width);
             true

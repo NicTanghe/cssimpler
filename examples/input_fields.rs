@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation};
@@ -7,35 +7,127 @@ use cssimpler::renderer::{FrameInfo, WindowConfig};
 use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
 
+static PENDING_INPUT_CHANGES: Mutex<PendingInputChanges> = Mutex::new(PendingInputChanges {
+    first_name: None,
+    last_name: None,
+});
+
+#[derive(Debug)]
+struct InputFieldsState {
+    first_name: String,
+    last_name: String,
+}
+
+impl Default for InputFieldsState {
+    fn default() -> Self {
+        clear_pending_input_changes();
+        Self {
+            first_name: "Ada".to_string(),
+            last_name: "Lovelace".to_string(),
+        }
+    }
+}
+
+impl InputFieldsState {
+    fn separated_caps(&self) -> String {
+        format!("{} {}", self.first_name, self.last_name)
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .flat_map(char::to_uppercase)
+            .map(|character| character.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 #[derive(Debug, Default)]
-struct InputFieldsState;
+struct PendingInputChanges {
+    first_name: Option<String>,
+    last_name: Option<String>,
+}
 
 fn main() -> Result<()> {
     let config = WindowConfig::new("cssimpler / input fields", 640, 420);
 
-    App::new(InputFieldsState, stylesheet(), update, build_ui)
+    App::new(InputFieldsState::default(), stylesheet(), update, build_ui)
         .run(config)
         .map_err(Into::into)
 }
 
-fn update(_state: &mut InputFieldsState, _frame: FrameInfo) -> Invalidation {
-    Invalidation::Clean
+fn update(state: &mut InputFieldsState, _frame: FrameInfo) -> Invalidation {
+    let mut pending = PENDING_INPUT_CHANGES
+        .lock()
+        .expect("input changes mutex should not be poisoned");
+    let mut changed = false;
+
+    if let Some(first_name) = pending.first_name.take()
+        && state.first_name != first_name
+    {
+        state.first_name = first_name;
+        changed = true;
+    }
+    if let Some(last_name) = pending.last_name.take()
+        && state.last_name != last_name
+    {
+        state.last_name = last_name;
+        changed = true;
+    }
+
+    if changed {
+        Invalidation::Structure
+    } else {
+        Invalidation::Clean
+    }
 }
 
-fn build_ui(_state: &InputFieldsState) -> Node {
+fn build_ui(state: &InputFieldsState) -> Node {
     ui! {
         <div id="app">
             <form class="panel">
                 <h2>Input Fields with Padding</h2>
 
                 <label for="fname">First Name</label>
-                <input type="text" id="fname" name="fname" value="Ada">
+                <input
+                    type="text"
+                    id="fname"
+                    name="fname"
+                    value={state.first_name.clone()}
+                    oninput={capture_first_name}
+                >
 
                 <label for="lname">Last Name</label>
-                <input type="text" id="lname" name="lname" value="Lovelace">
+                <input
+                    type="text"
+                    id="lname"
+                    name="lname"
+                    value={state.last_name.clone()}
+                    oninput={capture_last_name}
+                >
+
+                <h3 class="letter-preview">{state.separated_caps()}</h3>
             </form>
         </div>
     }
+}
+
+fn capture_first_name(value: &str) {
+    PENDING_INPUT_CHANGES
+        .lock()
+        .expect("input changes mutex should not be poisoned")
+        .first_name = Some(value.to_string());
+}
+
+fn capture_last_name(value: &str) {
+    PENDING_INPUT_CHANGES
+        .lock()
+        .expect("input changes mutex should not be poisoned")
+        .last_name = Some(value.to_string());
+}
+
+fn clear_pending_input_changes() {
+    *PENDING_INPUT_CHANGES
+        .lock()
+        .expect("input changes mutex should not be poisoned") = PendingInputChanges::default();
 }
 
 fn stylesheet() -> &'static Stylesheet {
@@ -64,7 +156,7 @@ mod tests {
     #[test]
     fn input_fields_example_builds_the_expected_markup() {
         let _ = stylesheet();
-        let tree = build_ui(&InputFieldsState);
+        let tree = build_ui(&InputFieldsState::default());
 
         let cssimpler::core::Node::Element(root) = tree else {
             panic!("root should be an element");
@@ -73,7 +165,7 @@ mod tests {
             panic!("form should be the first root child");
         };
 
-        assert_eq!(form.children.len(), 5);
+        assert_eq!(form.children.len(), 6);
         let cssimpler::core::Node::Element(first_input) = &form.children[2] else {
             panic!("expected first input");
         };
@@ -82,15 +174,22 @@ mod tests {
         assert_eq!(first_input.attribute("type"), Some("text"));
         assert_eq!(first_input.attribute("id"), Some("fname"));
         assert!(first_input.children.is_empty());
+
+        let cssimpler::core::Node::Element(preview) = &form.children[5] else {
+            panic!("expected letter preview");
+        };
+        assert_eq!(preview.tag, "h3");
+        assert_eq!(preview.children.len(), 1);
     }
 
     #[test]
     fn input_fields_example_accepts_text_in_each_field() {
-        let mut app = App::new(InputFieldsState, stylesheet(), update, build_ui);
+        let mut app = App::new(InputFieldsState::default(), stylesheet(), update, build_ui);
 
         let initial = app.frame(frame(0));
         assert_text_present(&initial, "Ada");
         assert_text_present(&initial, "Lovelace");
+        assert_text_present(&initial, "A D A L O V E L A C E");
 
         focus_input(&mut app, &initial, "fname");
         let first_focused = app.frame(frame(1));
@@ -100,6 +199,7 @@ mod tests {
         type_text(&mut app, " Marie");
         let first_typed = app.frame(frame(2));
         assert_text_present(&first_typed, "Ada Marie");
+        assert_text_present(&first_typed, "A D A M A R I E L O V E L A C E");
         assert_input_caret(&first_typed, "fname", 9);
 
         focus_input(&mut app, &first_typed, "lname");
@@ -113,12 +213,13 @@ mod tests {
         let second_typed = app.frame(frame(4));
         assert_text_present(&second_typed, "Ada Marie");
         assert_text_present(&second_typed, "Lovelace Byron");
+        assert_text_present(&second_typed, "A D A M A R I E L O V E L A C E B Y R O N");
         assert_input_caret(&second_typed, "lname", 14);
     }
 
     #[test]
     fn input_fields_example_places_caret_and_replaces_drag_selection() {
-        let mut app = App::new(InputFieldsState, stylesheet(), update, build_ui);
+        let mut app = App::new(InputFieldsState::default(), stylesheet(), update, build_ui);
 
         let initial = app.frame(frame(0));
         press_input_after_prefix(&mut app, &initial, "fname", "A");
@@ -130,6 +231,7 @@ mod tests {
         type_text(&mut app, "X");
         let inserted = app.frame(frame(2));
         assert_text_present(&inserted, "AXda");
+        assert_text_present(&inserted, "A X D A L O V E L A C E");
         assert_input_caret(&inserted, "fname", 2);
 
         press_input_after_prefix(&mut app, &inserted, "fname", "A");
@@ -142,6 +244,7 @@ mod tests {
         type_text(&mut app, "lice");
         let replaced = app.frame(frame(4));
         assert_text_present(&replaced, "Alice");
+        assert_text_present(&replaced, "A L I C E L O V E L A C E");
         assert_input_caret(&replaced, "fname", 5);
     }
 
@@ -278,7 +381,7 @@ mod tests {
             .as_ref()
             .expect("input should have an active selection");
         assert_eq!((selection.start, selection.end), (start, end));
-        assert_eq!(selection.style.background, Color::rgb(255, 0, 153));
+        assert_eq!(selection.style.background, Color::rgb(154, 229, 237));
         assert_eq!(selection.style.foreground, Color::BLACK);
         assert!(selection.style.text_shadows.is_empty());
     }

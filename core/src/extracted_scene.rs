@@ -1,7 +1,7 @@
 use crate::{
     BackdropOcclusion, Color, ElementPath, EventHandlers, Insets, LayoutBox, NativeMaterial,
     PreparedTextLayout, RenderKind, RenderNode, ScrollbarData, SvgScene, Transform2D,
-    TransitionStyle, VisualStyle,
+    TransitionStyle, VisualStyle, establishes_stacking_context, stacking_context_level,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,8 +47,9 @@ pub struct ExtractedScene {
 impl ExtractedScene {
     pub fn from_render_roots(roots: &[RenderNode]) -> Self {
         let mut items = Vec::new();
+        let mut stable_sort_key = 0;
         for (root_index, root) in roots.iter().enumerate() {
-            collect_paint_items(root, vec![root_index], &mut items);
+            collect_paint_items(root, vec![root_index], &mut stable_sort_key, &mut items);
         }
         items.sort_by_key(|item| item.stable_sort_key);
 
@@ -75,17 +76,130 @@ impl ExtractedScene {
     }
 }
 
-fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<ExtractedPaintItem>) {
+fn collect_paint_items(
+    node: &RenderNode,
+    path: Vec<usize>,
+    stable_sort_key: &mut u64,
+    items: &mut Vec<ExtractedPaintItem>,
+) {
+    collect_stacking_context_paint_items(node, path, stable_sort_key, items);
+}
+
+fn collect_stacking_context_paint_items(
+    node: &RenderNode,
+    path: Vec<usize>,
+    stable_sort_key: &mut u64,
+    items: &mut Vec<ExtractedPaintItem>,
+) {
+    push_node_paint_items_before_children(node, &path, stable_sort_key, items);
+
+    let mut deferred = Vec::new();
+    let mut order = 0;
+    collect_deferred_stacking_contexts(node, &path, &mut order, &mut deferred);
+
+    deferred.sort_by(|left, right| {
+        left.level
+            .cmp(&right.level)
+            .then(left.order.cmp(&right.order))
+    });
+
+    for entry in deferred.iter().filter(|entry| entry.level < 0) {
+        collect_stacking_context_paint_items(
+            entry.node,
+            entry.path.clone(),
+            stable_sort_key,
+            items,
+        );
+    }
+
+    collect_normal_child_paint_items(node, &path, stable_sort_key, items);
+    push_node_scrollbar_item(node, &path, stable_sort_key, items);
+
+    for entry in deferred.iter().filter(|entry| entry.level >= 0) {
+        collect_stacking_context_paint_items(
+            entry.node,
+            entry.path.clone(),
+            stable_sort_key,
+            items,
+        );
+    }
+}
+
+fn collect_normal_paint_items(
+    node: &RenderNode,
+    path: &[usize],
+    stable_sort_key: &mut u64,
+    items: &mut Vec<ExtractedPaintItem>,
+) {
+    push_node_paint_items_before_children(node, path, stable_sort_key, items);
+    collect_normal_child_paint_items(node, path, stable_sort_key, items);
+    push_node_scrollbar_item(node, path, stable_sort_key, items);
+}
+
+fn collect_normal_child_paint_items(
+    node: &RenderNode,
+    path: &[usize],
+    stable_sort_key: &mut u64,
+    items: &mut Vec<ExtractedPaintItem>,
+) {
+    for (child_index, child) in node.children.iter().enumerate() {
+        if establishes_stacking_context(child) {
+            continue;
+        }
+        let mut child_path = path.to_vec();
+        child_path.push(child_index);
+        collect_normal_paint_items(child, &child_path, stable_sort_key, items);
+    }
+}
+
+#[derive(Clone)]
+struct DeferredStackingContext<'a> {
+    node: &'a RenderNode,
+    path: Vec<usize>,
+    level: i32,
+    order: u64,
+}
+
+fn collect_deferred_stacking_contexts<'a>(
+    node: &'a RenderNode,
+    path: &[usize],
+    order: &mut u64,
+    deferred: &mut Vec<DeferredStackingContext<'a>>,
+) {
+    for (child_index, child) in node.children.iter().enumerate() {
+        let mut child_path = path.to_vec();
+        child_path.push(child_index);
+        if establishes_stacking_context(child) {
+            deferred.push(DeferredStackingContext {
+                node: child,
+                path: child_path,
+                level: stacking_context_level(child),
+                order: *order,
+            });
+            *order = order.wrapping_add(1);
+        } else {
+            collect_deferred_stacking_contexts(child, &child_path, order, deferred);
+        }
+    }
+}
+
+fn push_node_paint_items_before_children(
+    node: &RenderNode,
+    path: &[usize],
+    stable_sort_key: &mut u64,
+    items: &mut Vec<ExtractedPaintItem>,
+) {
     let clip = node.style.overflow.clips_any_axis().then_some(node.layout);
 
     if node.style.native_material == NativeMaterial::Glass {
         push_item(
             node,
-            &path,
+            path,
             0,
             ExtractedPaintKind::GlassReveal,
             clip,
             None,
+            stable_sort_key,
             items,
         );
     }
@@ -93,11 +207,12 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
     if node.style.backdrop_occlusion == BackdropOcclusion::Scene {
         push_item(
             node,
-            &path,
+            path,
             4,
             ExtractedPaintKind::BackdropOcclude,
             clip,
             None,
+            stable_sort_key,
             items,
         );
     }
@@ -105,11 +220,12 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
     if node.style.backdrop_blur_radius > f32::EPSILON {
         push_item(
             node,
-            &path,
+            path,
             8,
             ExtractedPaintKind::BackdropBlur,
             clip,
             None,
+            stable_sort_key,
             items,
         );
     }
@@ -117,11 +233,12 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
     for (index, _) in node.style.shadows.iter().enumerate() {
         push_item(
             node,
-            &path,
+            path,
             16 + index as u8,
             ExtractedPaintKind::BoxShadow,
             clip,
             None,
+            stable_sort_key,
             items,
         );
     }
@@ -130,11 +247,12 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
         for (index, _) in node.style.filter_drop_shadows.iter().enumerate() {
             push_item(
                 node,
-                &path,
+                path,
                 32 + index as u8,
                 ExtractedPaintKind::FilterDropShadow,
                 clip,
                 None,
+                stable_sort_key,
                 items,
             );
         }
@@ -143,11 +261,12 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
     if node.style.background.is_some() || !node.style.background_layers.is_empty() {
         push_item(
             node,
-            &path,
+            path,
             64,
             ExtractedPaintKind::Background,
             clip,
             None,
+            stable_sort_key,
             items,
         );
     }
@@ -155,11 +274,12 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
     if !node.style.border.widths.is_zero() {
         push_item(
             node,
-            &path,
+            path,
             80,
             ExtractedPaintKind::Border,
             clip,
             None,
+            stable_sort_key,
             items,
         );
     }
@@ -167,11 +287,12 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
     for (index, _) in node.style.inset_shadows.iter().enumerate() {
         push_item(
             node,
-            &path,
+            path,
             88 + index as u8,
             ExtractedPaintKind::BoxShadow,
             clip,
             None,
+            stable_sort_key,
             items,
         );
     }
@@ -181,41 +302,46 @@ fn collect_paint_items(node: &RenderNode, path: Vec<usize>, items: &mut Vec<Extr
         RenderKind::Text(text) => {
             push_item(
                 node,
-                &path,
+                path,
                 96,
                 ExtractedPaintKind::TextRun,
                 clip,
                 Some(ExtractedPayload::Text(text.clone())),
+                stable_sort_key,
                 items,
             );
         }
         RenderKind::Svg(scene) => {
             push_item(
                 node,
-                &path,
+                path,
                 112,
                 ExtractedPaintKind::Svg,
                 clip,
                 Some(ExtractedPayload::Svg(scene.clone())),
+                stable_sort_key,
                 items,
             );
         }
     }
+}
 
-    for (child_index, child) in node.children.iter().enumerate() {
-        let mut child_path = path.clone();
-        child_path.push(child_index);
-        collect_paint_items(child, child_path, items);
-    }
-
+fn push_node_scrollbar_item(
+    node: &RenderNode,
+    path: &[usize],
+    stable_sort_key: &mut u64,
+    items: &mut Vec<ExtractedPaintItem>,
+) {
+    let clip = node.style.overflow.clips_any_axis().then_some(node.layout);
     if node.scrollbars.is_some() {
         push_item(
             node,
-            &path,
+            path,
             240,
             ExtractedPaintKind::Scrollbar,
             clip,
             None,
+            stable_sort_key,
             items,
         );
     }
@@ -229,10 +355,11 @@ enum ExtractedPayload {
 fn push_item(
     node: &RenderNode,
     path: &[usize],
-    phase: u8,
+    _phase: u8,
     kind: ExtractedPaintKind,
     clip: Option<LayoutBox>,
     payload: Option<ExtractedPayload>,
+    stable_sort_key: &mut u64,
     items: &mut Vec<ExtractedPaintItem>,
 ) {
     let (text, svg_scene) = match payload {
@@ -242,7 +369,7 @@ fn push_item(
     };
 
     items.push(ExtractedPaintItem {
-        stable_sort_key: stable_sort_key(path, phase),
+        stable_sort_key: next_stable_sort_key(stable_sort_key),
         path: path.to_vec(),
         kind,
         layout: node.layout,
@@ -261,13 +388,9 @@ fn push_item(
     });
 }
 
-fn stable_sort_key(path: &[usize], phase: u8) -> u64 {
-    let mut key = phase as u64;
-    for &segment in path {
-        key = key
-            .wrapping_mul(1_099_511_628_211)
-            .wrapping_add(segment as u64 + 1);
-    }
+fn next_stable_sort_key(stable_sort_key: &mut u64) -> u64 {
+    let key = *stable_sort_key;
+    *stable_sort_key = stable_sort_key.wrapping_add(1);
     key
 }
 
@@ -276,7 +399,7 @@ mod tests {
     use crate::{
         BackdropOcclusion, BoxShadow, Color, CornerRadius, Insets, LayoutBox, Overflow,
         PreparedTextLayout, RenderNode, ScrollbarData, ScrollbarMetrics, ScrollbarStyle,
-        ScrollbarWidth, TextStyle, VisualStyle, fonts::TextLayout,
+        ScrollbarWidth, TextStyle, VisualStyle, ZIndex, fonts::TextLayout,
     };
 
     use super::{ExtractedPaintKind, ExtractedScene};
@@ -475,5 +598,95 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(left_keys, right_keys);
+    }
+
+    #[test]
+    fn extracted_scene_keeps_positioned_z_index_subtrees_together() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                .with_child(
+                    RenderNode::container(LayoutBox::new(4.0, 4.0, 24.0, 24.0))
+                        .with_style(VisualStyle {
+                            background: Some(Color::rgb(34, 197, 94)),
+                            positioned: true,
+                            z_index: ZIndex::Integer(1000),
+                            ..VisualStyle::default()
+                        })
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(8.0, 8.0, 8.0, 8.0)).with_style(
+                                VisualStyle {
+                                    background: Some(Color::rgb(37, 99, 235)),
+                                    ..VisualStyle::default()
+                                },
+                            ),
+                        ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(6.0, 6.0, 24.0, 24.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(239, 68, 68)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+
+        let extracted = ExtractedScene::from_render_roots(&scene);
+        let background_paths = extracted
+            .items
+            .iter()
+            .filter(|item| item.kind == ExtractedPaintKind::Background)
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            background_paths,
+            vec![vec![0, 1], vec![0, 0], vec![0, 0, 0]]
+        );
+    }
+
+    #[test]
+    fn extracted_scene_promotes_nested_positioned_z_index_to_nearest_context() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 32.0, 32.0))
+                        .with_style(VisualStyle {
+                            background: Some(Color::rgb(34, 197, 94)),
+                            ..VisualStyle::default()
+                        })
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(8.0, 8.0, 12.0, 12.0)).with_style(
+                                VisualStyle {
+                                    background: Some(Color::rgb(37, 99, 235)),
+                                    positioned: true,
+                                    z_index: ZIndex::Integer(1000),
+                                    ..VisualStyle::default()
+                                },
+                            ),
+                        ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(4.0, 4.0, 24.0, 24.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgb(239, 68, 68)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+
+        let extracted = ExtractedScene::from_render_roots(&scene);
+        let background_paths = extracted
+            .items
+            .iter()
+            .filter(|item| item.kind == ExtractedPaintKind::Background)
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            background_paths,
+            vec![vec![0, 0], vec![0, 1], vec![0, 0, 0]]
+        );
     }
 }
