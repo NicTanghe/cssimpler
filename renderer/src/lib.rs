@@ -2612,6 +2612,17 @@ struct DeferredRenderStackingContext<'a> {
     order: u64,
 }
 
+struct DeferredTransformedRenderStackingContext<'a> {
+    node: &'a RenderNode,
+    cached_bounds: &'a CachedSubtreeBounds,
+    clip_state: ClipState,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    level: i32,
+    order: u64,
+}
+
 fn draw_node_with_cached_bounds(
     node: &RenderNode,
     cached_bounds: &CachedSubtreeBounds,
@@ -2723,8 +2734,7 @@ fn collect_deferred_render_stacking_contexts<'a>(
                 order: *order,
             });
             *order = order.wrapping_add(1);
-        } else if matches!(child_clip, DeferredRenderClip::Rect(_))
-            && !node_requires_projected_path(child)
+        } else if !node_requires_projected_path(child)
             && let Some(descendant_clip) = descendant_render_clip(&child_clip, child)
         {
             collect_deferred_render_stacking_contexts(
@@ -2835,6 +2845,109 @@ fn draw_deferred_render_context(
             allow_surface_promotion,
         ),
     }
+}
+
+fn collect_deferred_transformed_render_stacking_contexts<'a>(
+    node: &'a RenderNode,
+    cached_bounds: &'a CachedSubtreeBounds,
+    child_clip_state: &ClipState,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    order: &mut u64,
+    deferred: &mut Vec<DeferredTransformedRenderStackingContext<'a>>,
+) {
+    let child_context = child_3d_context(node, in_3d_context);
+    let child_perspective = active_child_perspective(node, parent_perspective, child_context);
+    for (index, child) in node.children.iter().enumerate() {
+        let Some(child_bounds) = cached_bounds.children.get(index) else {
+            continue;
+        };
+        if establishes_stacking_context(child) {
+            deferred.push(DeferredTransformedRenderStackingContext {
+                node: child,
+                cached_bounds: child_bounds,
+                clip_state: child_clip_state.clone(),
+                parent_world_matrix,
+                parent_perspective: child_perspective,
+                in_3d_context: child_context,
+                level: stacking_context_level(child),
+                order: *order,
+            });
+            *order = order.wrapping_add(1);
+        } else if !node_requires_projected_path(child)
+            && let Some(descendant_clip_state) = descendant_transformed_render_clip(
+                child_clip_state,
+                parent_world_matrix,
+                child_perspective,
+                child,
+            )
+        {
+            collect_deferred_transformed_render_stacking_contexts(
+                child,
+                child_bounds,
+                &descendant_clip_state,
+                parent_world_matrix,
+                child_perspective,
+                child_context,
+                order,
+                deferred,
+            );
+        }
+    }
+}
+
+fn descendant_transformed_render_clip(
+    parent_child_clip_state: &ClipState,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
+    node: &RenderNode,
+) -> Option<ClipState> {
+    if !node.style.overflow.clips_any_axis() {
+        return Some(parent_child_clip_state.clone());
+    }
+
+    let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
+        node.layout,
+        &node.style.transform,
+    ));
+    let matrix = project_world_transform_matrix(node.layout, world_matrix, parent_perspective)?;
+    parent_child_clip_state.push_layout_clip(node.layout, node.style.corner_radius, matrix)
+}
+
+fn sort_deferred_transformed_render_contexts(
+    entries: &mut [DeferredTransformedRenderStackingContext<'_>],
+) {
+    entries.sort_by(|left, right| {
+        left.level
+            .cmp(&right.level)
+            .then(left.order.cmp(&right.order))
+    });
+}
+
+fn draw_deferred_transformed_render_context(
+    entry: &DeferredTransformedRenderStackingContext<'_>,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+    glass_mode: GlassRenderMode,
+    allow_surface_promotion: bool,
+) {
+    draw_node_transformed_internal(
+        entry.node,
+        entry.cached_bounds,
+        buffer,
+        width,
+        height,
+        entry.parent_world_matrix,
+        entry.parent_perspective,
+        &entry.clip_state,
+        entry.in_3d_context,
+        clear_color,
+        glass_mode,
+        allow_surface_promotion,
+    );
 }
 
 fn draw_node_contents_internal(
@@ -3062,20 +3175,37 @@ fn draw_node_contents_internal_impl(
                 continue;
             }
             let child_bounds = &cached_bounds.children[index];
-            draw_node_transformed_internal(
-                child,
-                child_bounds,
-                buffer,
-                width,
-                height,
-                TransformMatrix3d::IDENTITY,
-                child_perspective,
-                &child_clip_state,
-                child_context,
-                clear_color,
-                glass_mode,
-                allow_surface_promotion,
-            );
+            if !node_requires_projected_path(child) {
+                draw_node_transformed_in_current_stacking_context(
+                    child,
+                    child_bounds,
+                    buffer,
+                    width,
+                    height,
+                    TransformMatrix3d::IDENTITY,
+                    child_perspective,
+                    &child_clip_state,
+                    child_context,
+                    clear_color,
+                    glass_mode,
+                    allow_surface_promotion,
+                );
+            } else {
+                draw_node_transformed_internal(
+                    child,
+                    child_bounds,
+                    buffer,
+                    width,
+                    height,
+                    TransformMatrix3d::IDENTITY,
+                    child_perspective,
+                    &child_clip_state,
+                    child_context,
+                    clear_color,
+                    glass_mode,
+                    allow_surface_promotion,
+                );
+            }
         }
 
         scrollbar::draw_scrollbars(node, buffer, width, height, clip);
@@ -3895,6 +4025,69 @@ fn draw_node_transformed_internal(
     glass_mode: GlassRenderMode,
     allow_surface_promotion: bool,
 ) {
+    draw_node_transformed_internal_impl(
+        node,
+        cached_bounds,
+        buffer,
+        width,
+        height,
+        parent_world_matrix,
+        parent_perspective,
+        clip_state,
+        in_3d_context,
+        clear_color,
+        glass_mode,
+        allow_surface_promotion,
+        true,
+    );
+}
+
+fn draw_node_transformed_in_current_stacking_context(
+    node: &RenderNode,
+    cached_bounds: &CachedSubtreeBounds,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
+    clip_state: &ClipState,
+    in_3d_context: bool,
+    clear_color: Color,
+    glass_mode: GlassRenderMode,
+    allow_surface_promotion: bool,
+) {
+    draw_node_transformed_internal_impl(
+        node,
+        cached_bounds,
+        buffer,
+        width,
+        height,
+        parent_world_matrix,
+        parent_perspective,
+        clip_state,
+        in_3d_context,
+        clear_color,
+        glass_mode,
+        allow_surface_promotion,
+        false,
+    );
+}
+
+fn draw_node_transformed_internal_impl(
+    node: &RenderNode,
+    cached_bounds: &CachedSubtreeBounds,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    parent_world_matrix: TransformMatrix3d,
+    parent_perspective: Option<PerspectiveContext>,
+    clip_state: &ClipState,
+    in_3d_context: bool,
+    clear_color: Color,
+    glass_mode: GlassRenderMode,
+    allow_surface_promotion: bool,
+    draw_deferred_stacking_contexts: bool,
+) {
     let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
         node.layout,
         &node.style.transform,
@@ -4058,33 +4251,89 @@ fn draw_node_transformed_internal(
 
     let child_context = child_3d_context(node, in_3d_context);
     let child_perspective = active_child_perspective(node, parent_perspective, child_context);
-    let children = projected_children(
-        node,
-        world_matrix,
-        child_perspective,
-        node_sorts_projected_children(node, child_context),
-    );
-    for entry in children {
-        let child = &node.children[entry.index];
-        let child_bounds = &cached_bounds.children[entry.index];
-        draw_node_transformed_internal(
-            child,
-            child_bounds,
+    let sort_by_depth = node_sorts_projected_children(node, child_context);
+    let mut deferred = Vec::new();
+    if draw_deferred_stacking_contexts && !sort_by_depth {
+        let mut order = 0;
+        collect_deferred_transformed_render_stacking_contexts(
+            node,
+            cached_bounds,
+            &child_clip_state,
+            world_matrix,
+            parent_perspective,
+            in_3d_context,
+            &mut order,
+            &mut deferred,
+        );
+        sort_deferred_transformed_render_contexts(&mut deferred);
+    }
+
+    for entry in deferred.iter().filter(|entry| entry.level < 0) {
+        draw_deferred_transformed_render_context(
+            entry,
             buffer,
             width,
             height,
-            world_matrix,
-            child_perspective,
-            &child_clip_state,
-            child_context,
             clear_color,
             glass_mode,
             allow_surface_promotion,
         );
     }
 
+    let children = projected_children(node, world_matrix, child_perspective, sort_by_depth);
+    for entry in children {
+        let child = &node.children[entry.index];
+        if establishes_stacking_context(child) && !sort_by_depth {
+            continue;
+        }
+        let child_bounds = &cached_bounds.children[entry.index];
+        if !node_requires_projected_path(child) {
+            draw_node_transformed_in_current_stacking_context(
+                child,
+                child_bounds,
+                buffer,
+                width,
+                height,
+                world_matrix,
+                child_perspective,
+                &child_clip_state,
+                child_context,
+                clear_color,
+                glass_mode,
+                allow_surface_promotion,
+            );
+        } else {
+            draw_node_transformed_internal(
+                child,
+                child_bounds,
+                buffer,
+                width,
+                height,
+                world_matrix,
+                child_perspective,
+                &child_clip_state,
+                child_context,
+                clear_color,
+                glass_mode,
+                allow_surface_promotion,
+            );
+        }
+    }
+
     if matrix.is_identity() {
         scrollbar::draw_scrollbars(node, buffer, width, height, clip_state.coarse);
+    }
+
+    for entry in deferred.iter().filter(|entry| entry.level >= 0) {
+        draw_deferred_transformed_render_context(
+            entry,
+            buffer,
+            width,
+            height,
+            clear_color,
+            glass_mode,
+            allow_surface_promotion,
+        );
     }
 }
 
@@ -6611,6 +6860,206 @@ mod tests {
 
         assert_eq!(buffer[5 * 40 + 5], pack_rgb(covered_color));
         assert_eq!(buffer[10 * 40 + 10], pack_rgb(menu_color));
+    }
+
+    #[test]
+    fn nested_positioned_z_index_dropdown_background_covers_later_text_siblings() {
+        let dropdown_path = ElementPath::root(0)
+            .with_child(0)
+            .with_child(0)
+            .with_child(0);
+        let covered_path = ElementPath::root(0).with_child(1);
+        let text_style = TextStyle {
+            size_px: 14.0,
+            ..TextStyle::default()
+        };
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 180.0, 140.0))
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 160.0, 64.0)).with_child(
+                        RenderNode::container(LayoutBox::new(0.0, 0.0, 160.0, 64.0)).with_child(
+                            RenderNode::container(LayoutBox::new(8.0, 28.0, 128.0, 92.0))
+                                .with_element_path(dropdown_path.clone())
+                                .with_style(VisualStyle {
+                                    background: Some(Color::WHITE),
+                                    positioned: true,
+                                    z_index: ZIndex::Integer(1000),
+                                    ..VisualStyle::default()
+                                })
+                                .with_child(
+                                    RenderNode::container(LayoutBox::new(16.0, 78.0, 36.0, 18.0))
+                                        .with_style(VisualStyle {
+                                            background: Some(Color::rgb(37, 99, 235)),
+                                            ..VisualStyle::default()
+                                        }),
+                                ),
+                        ),
+                    ),
+                )
+                .with_child(
+                    RenderNode::text(LayoutBox::new(0.0, 44.0, 160.0, 20.0), "Finishers added.")
+                        .with_element_path(covered_path.clone())
+                        .with_style(VisualStyle {
+                            foreground: Color::BLACK,
+                            text: text_style.clone(),
+                            ..VisualStyle::default()
+                        }),
+                )
+                .with_child(
+                    RenderNode::text(LayoutBox::new(0.0, 66.0, 160.0, 20.0), "Discount (%)")
+                        .with_style(VisualStyle {
+                            foreground: Color::BLACK,
+                            text: text_style,
+                            ..VisualStyle::default()
+                        }),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 180 * 140];
+
+        render_to_buffer(&scene, &mut buffer, 180, 140, Color::WHITE);
+
+        let black = pack_rgb(Color::BLACK);
+        let dropdown_text_overlap_has_black = (44..86).any(|y| {
+            (8..136).any(|x| {
+                let pixel = buffer[y * 180 + x];
+                pixel == black || unpack_rgb(pixel) == Color::BLACK
+            })
+        });
+        assert!(
+            !dropdown_text_overlap_has_black,
+            "later normal-flow text should not paint over the raised dropdown background"
+        );
+        assert_eq!(
+            hit_test_element_path(&scene, 12.0, 50.0),
+            Some(dropdown_path),
+            "hit testing should prefer the raised dropdown over the later text sibling"
+        );
+        assert_eq!(
+            hit_test_element_path(&scene, 2.0, 50.0),
+            Some(covered_path),
+            "normal-flow text outside the dropdown should still be reachable"
+        );
+    }
+
+    #[test]
+    fn nested_positioned_z_index_dropdown_covers_later_text_inside_rounded_clip_path() {
+        let text_style = TextStyle {
+            size_px: 14.0,
+            ..TextStyle::default()
+        };
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 180.0, 140.0))
+                .with_style(VisualStyle {
+                    corner_radius: CornerRadius::all(4.0),
+                    overflow: Overflow::CLIP,
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 160.0, 64.0)).with_child(
+                        RenderNode::container(LayoutBox::new(0.0, 0.0, 160.0, 64.0)).with_child(
+                            RenderNode::container(LayoutBox::new(8.0, 28.0, 128.0, 92.0))
+                                .with_style(VisualStyle {
+                                    background: Some(Color::WHITE),
+                                    positioned: true,
+                                    z_index: ZIndex::Integer(1000),
+                                    ..VisualStyle::default()
+                                }),
+                        ),
+                    ),
+                )
+                .with_child(
+                    RenderNode::text(LayoutBox::new(0.0, 44.0, 160.0, 20.0), "Finishers added.")
+                        .with_style(VisualStyle {
+                            foreground: Color::BLACK,
+                            text: text_style.clone(),
+                            ..VisualStyle::default()
+                        }),
+                )
+                .with_child(
+                    RenderNode::text(LayoutBox::new(0.0, 66.0, 160.0, 20.0), "Discount (%)")
+                        .with_style(VisualStyle {
+                            foreground: Color::BLACK,
+                            text: text_style,
+                            ..VisualStyle::default()
+                        }),
+                ),
+        ];
+        let mut buffer = vec![0_u32; 180 * 140];
+
+        render_to_buffer(&scene, &mut buffer, 180, 140, Color::WHITE);
+
+        let black = pack_rgb(Color::BLACK);
+        let dropdown_text_overlap_has_black = (44..86).any(|y| {
+            (8..136).any(|x| {
+                let pixel = buffer[y * 180 + x];
+                pixel == black || unpack_rgb(pixel) == Color::BLACK
+            })
+        });
+        assert!(
+            !dropdown_text_overlap_has_black,
+            "later text should not paint over a raised dropdown on the rounded clip path"
+        );
+    }
+
+    #[test]
+    fn incremental_opening_nested_z_index_dropdown_matches_full_render() {
+        fn scene(dropdown_open: bool) -> Vec<RenderNode> {
+            let text_style = TextStyle {
+                size_px: 14.0,
+                ..TextStyle::default()
+            };
+            let mut size_control = RenderNode::container(LayoutBox::new(0.0, 0.0, 160.0, 64.0));
+            if dropdown_open {
+                size_control = size_control.with_child(
+                    RenderNode::container(LayoutBox::new(8.0, 28.0, 128.0, 92.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::WHITE),
+                            positioned: true,
+                            z_index: ZIndex::Integer(1000),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                );
+            }
+
+            vec![
+                RenderNode::container(LayoutBox::new(0.0, 0.0, 180.0, 140.0))
+                    .with_child(
+                        RenderNode::container(LayoutBox::new(0.0, 0.0, 160.0, 64.0))
+                            .with_child(size_control),
+                    )
+                    .with_child(
+                        RenderNode::text(
+                            LayoutBox::new(0.0, 44.0, 160.0, 20.0),
+                            "Finishers added.",
+                        )
+                        .with_style(VisualStyle {
+                            foreground: Color::BLACK,
+                            text: text_style.clone(),
+                            ..VisualStyle::default()
+                        }),
+                    )
+                    .with_child(
+                        RenderNode::text(LayoutBox::new(0.0, 66.0, 160.0, 20.0), "Discount (%)")
+                            .with_style(VisualStyle {
+                                foreground: Color::BLACK,
+                                text: text_style,
+                                ..VisualStyle::default()
+                            }),
+                    ),
+            ]
+        }
+
+        let previous = scene(false);
+        let next = scene(true);
+        let mut incremental = vec![0_u32; 180 * 140];
+        let mut full = vec![0_u32; 180 * 140];
+
+        render_to_buffer(&previous, &mut incremental, 180, 140, Color::WHITE);
+        render_scene_update(&previous, &next, &mut incremental, 180, 140, Color::WHITE);
+        render_to_buffer(&next, &mut full, 180, 140, Color::WHITE);
+
+        assert_eq!(incremental, full);
     }
 
     #[test]
