@@ -4724,6 +4724,42 @@ fn draw_background_and_border(
     height: usize,
     clip: ClipRect,
 ) {
+    if node.style.native_material != NativeMaterial::Glass {
+        if let Some(background) = node.style.background {
+            if !draw_axis_aligned_opaque_rect(
+                buffer,
+                width,
+                height,
+                node.layout,
+                node.style.corner_radius,
+                background,
+                clip,
+            ) {
+                draw_rounded_rect(
+                    buffer,
+                    width,
+                    height,
+                    node.layout,
+                    node.style.corner_radius,
+                    background,
+                    clip,
+                );
+            }
+        }
+
+        for layer in node.style.background_layers.iter().rev() {
+            draw_background_layer(
+                buffer,
+                width,
+                height,
+                node.layout,
+                node.style.corner_radius,
+                layer,
+                clip,
+            );
+        }
+    }
+
     if !node.style.border.widths.is_zero() {
         let inner_layout = inset_layout(node.layout, node.style.border.widths);
         let inner_radius = inset_corner_radius(
@@ -4769,36 +4805,6 @@ fn draw_background_and_border(
             }
         }
     }
-
-    let (fill_layout, fill_radius) = node_fill_layout_and_radius(node);
-
-    if node.style.native_material != NativeMaterial::Glass {
-        if let Some(background) = node.style.background {
-            if !draw_axis_aligned_opaque_rect(
-                buffer,
-                width,
-                height,
-                fill_layout,
-                fill_radius,
-                background,
-                clip,
-            ) {
-                draw_rounded_rect(
-                    buffer,
-                    width,
-                    height,
-                    fill_layout,
-                    fill_radius,
-                    background,
-                    clip,
-                );
-            }
-        }
-
-        for layer in node.style.background_layers.iter().rev() {
-            draw_background_layer(buffer, width, height, fill_layout, fill_radius, layer, clip);
-        }
-    }
 }
 
 fn draw_background_and_border_transformed(
@@ -4809,6 +4815,34 @@ fn draw_background_and_border_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
+    if node.style.native_material != NativeMaterial::Glass {
+        if let Some(background) = node.style.background {
+            draw_transformed_rounded_rect(
+                buffer,
+                width,
+                height,
+                node.layout,
+                node.style.corner_radius,
+                background,
+                matrix,
+                clip_state,
+            );
+        }
+
+        for layer in node.style.background_layers.iter().rev() {
+            gradient::draw_background_layer_transformed(
+                buffer,
+                width,
+                height,
+                node.layout,
+                node.style.corner_radius,
+                layer,
+                matrix,
+                clip_state,
+            );
+        }
+    }
+
     if !node.style.border.widths.is_zero() {
         let inner_layout = inset_layout(node.layout, node.style.border.widths);
         let inner_radius = inset_corner_radius(
@@ -4843,36 +4877,6 @@ fn draw_background_and_border_transformed(
                     clip_state,
                 );
             }
-        }
-    }
-
-    let (fill_layout, fill_radius) = node_fill_layout_and_radius(node);
-
-    if node.style.native_material != NativeMaterial::Glass {
-        if let Some(background) = node.style.background {
-            draw_transformed_rounded_rect(
-                buffer,
-                width,
-                height,
-                fill_layout,
-                fill_radius,
-                background,
-                matrix,
-                clip_state,
-            );
-        }
-
-        for layer in node.style.background_layers.iter().rev() {
-            gradient::draw_background_layer_transformed(
-                buffer,
-                width,
-                height,
-                fill_layout,
-                fill_radius,
-                layer,
-                matrix,
-                clip_state,
-            );
         }
     }
 }
@@ -7599,6 +7603,82 @@ mod tests {
         assert!(
             observed_partial_edge,
             "rounded gradient rendering should produce at least one partially covered edge pixel"
+        );
+    }
+
+    #[test]
+    fn rounded_border_background_seam_does_not_leak_clear_color() {
+        let layout = LayoutBox::new(2.25, 2.25, 10.0, 10.0);
+        let radius = CornerRadius::all(4.0);
+        let border_widths = Insets::all(1.0);
+        let background = Color::rgb(40, 70, 100);
+        let border = Color::rgb(10, 20, 30);
+        let scene = vec![RenderNode::container(layout).with_style(VisualStyle {
+            background: Some(background),
+            border: cssimpler_core::BorderStyle {
+                color: border,
+                widths: border_widths,
+                line_style: BorderLineStyle::Solid,
+            },
+            corner_radius: radius,
+            ..VisualStyle::default()
+        })];
+        let mut buffer = vec![0_u32; 16 * 16];
+
+        render_to_buffer(&scene, &mut buffer, 16, 16, Color::WHITE);
+
+        let clip = ClipRect::full(16.0, 16.0);
+        let inner_layout = super::shapes::inset_layout(layout, border_widths);
+        let inner_radius = super::shapes::inset_corner_radius(layout, radius, border_widths);
+        let mut checked_seam_pixels = 0;
+
+        for y in 0_usize..16 {
+            for x in 0_usize..16 {
+                let x_i32 = x as i32;
+                let y_i32 = y as i32;
+                let outer_coverage =
+                    super::shapes::rounded_rect_coverage(layout, radius, clip, x_i32, y_i32);
+                if outer_coverage != u8::MAX {
+                    continue;
+                }
+
+                let border_coverage = super::shapes::rounded_ring_coverage(
+                    layout,
+                    radius,
+                    Some((inner_layout, inner_radius)),
+                    clip,
+                    x_i32,
+                    y_i32,
+                );
+                let fill_coverage = super::shapes::rounded_rect_coverage(
+                    inner_layout,
+                    inner_radius,
+                    clip,
+                    x_i32,
+                    y_i32,
+                );
+                if border_coverage == 0
+                    || border_coverage == u8::MAX
+                    || fill_coverage == 0
+                    || fill_coverage == u8::MAX
+                {
+                    continue;
+                }
+
+                checked_seam_pixels += 1;
+                let pixel = unpack_rgb(buffer[y * 16 + x]);
+                assert!(
+                    pixel.r <= background.r.max(border.r) + 1
+                        && pixel.g <= background.g.max(border.g) + 1
+                        && pixel.b <= background.b.max(border.b) + 1,
+                    "clear color leaked into rounded border/background seam at ({x}, {y}): {pixel:?}"
+                );
+            }
+        }
+
+        assert!(
+            checked_seam_pixels > 0,
+            "test fixture should include partially covered border/background seam pixels"
         );
     }
 
