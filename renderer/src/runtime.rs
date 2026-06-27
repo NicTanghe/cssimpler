@@ -585,7 +585,7 @@ where
                 self.buffer_height,
                 self.config.clear_color,
             );
-            if let Some(surface) = self.surface.as_mut() {
+            let present_result = if let Some(surface) = self.surface.as_mut() {
                 match surface.buffer_mut() {
                     Ok(mut target) => {
                         let target_width = target.width().get() as usize;
@@ -599,16 +599,16 @@ where
                             self.buffer_height,
                             pack_softbuffer_rgb(self.config.clear_color),
                         );
-                        if let Err(error) = target.present() {
-                            self.fail(event_loop, error);
-                            return;
-                        }
+                        target.present()
                     }
-                    Err(error) => {
-                        self.fail(event_loop, error);
-                        return;
-                    }
+                    Err(error) => Err(error),
                 }
+            } else {
+                Ok(())
+            };
+            if let Err(error) = present_result {
+                self.fail(event_loop, error);
+                return;
             }
             frame_stats.present_us = duration_to_us(present_start.elapsed());
             self.previous_presented_scene = Some(extracted_scene);
