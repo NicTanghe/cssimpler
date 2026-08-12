@@ -5,7 +5,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use cssimpler_core::{Color, ExtractedScene};
+use cssimpler_core::{
+    Color, NativeMaterial, RenderNode, establishes_stacking_context, stacking_context_level,
+};
 #[cfg(test)]
 use softbuffer::Rect;
 use softbuffer::{Context, Surface};
@@ -30,14 +32,131 @@ use super::{
     MouseEventKind, RedrawSchedule, RendererError, Result, SceneProvider, WindowConfig,
     dispatch_hover_transition_events, dispatch_mouse_event, drawable_viewport_size, duration_to_us,
     is_transparent, native_glass, pack_softbuffer_rgb, record_frame_timing_stats,
-    redraw_auto_scroll_indicator_regions, render_scene_update_internal, render_to_buffer_internal,
-    render_to_buffer_internal_with_alpha, resize_buffer, scrollbar, settle_element_interaction,
-    should_present_frame, should_suspend_updates, to_softbuffer_rgb_blue_noise,
-    to_softbuffer_rgb_blue_noise_with_alpha,
+    redraw_auto_scroll_indicator_regions, render_scene_update_internal_from_roots_with_glass,
+    render_to_buffer_internal_from_roots, render_to_buffer_internal_from_roots_with_alpha,
+    resize_buffer, scrollbar, settle_element_interaction, should_present_frame_from_roots,
+    should_suspend_updates, to_softbuffer_rgb_blue_noise, to_softbuffer_rgb_blue_noise_with_alpha,
 };
 
 const DEFAULT_NATIVE_GLASS_TINT: Color = Color::rgba(245, 250, 255, 128);
 static SYSTEM_DRAG_OVERRIDE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NativeGlassSummary {
+    required: bool,
+    preferred_tint: Option<Color>,
+}
+
+#[derive(Clone, Copy)]
+struct DeferredGlassStackingContext<'a> {
+    node: &'a RenderNode,
+    level: i32,
+    order: u64,
+}
+
+fn summarize_native_glass(roots: &[RenderNode]) -> NativeGlassSummary {
+    if !roots.iter().any(subtree_has_native_glass) {
+        return NativeGlassSummary::default();
+    }
+
+    let mut summary = NativeGlassSummary::default();
+    for root in roots {
+        summarize_glass_stacking_context(root, &mut summary);
+        if summary.preferred_tint.is_some() {
+            break;
+        }
+    }
+    summary
+}
+
+fn subtree_has_native_glass(node: &RenderNode) -> bool {
+    node.style.native_material == NativeMaterial::Glass
+        || node.children.iter().any(subtree_has_native_glass)
+}
+
+fn summarize_glass_stacking_context(node: &RenderNode, summary: &mut NativeGlassSummary) {
+    summarize_glass_node(node, summary);
+    if summary.preferred_tint.is_some() {
+        return;
+    }
+
+    let mut deferred = Vec::new();
+    let mut order = 0;
+    collect_deferred_glass_stacking_contexts(node, &mut order, &mut deferred);
+    deferred.sort_by(|left, right| {
+        left.level
+            .cmp(&right.level)
+            .then(left.order.cmp(&right.order))
+    });
+
+    for entry in deferred.iter().filter(|entry| entry.level < 0) {
+        summarize_glass_stacking_context(entry.node, summary);
+        if summary.preferred_tint.is_some() {
+            return;
+        }
+    }
+
+    summarize_glass_normal_children(node, summary);
+    if summary.preferred_tint.is_some() {
+        return;
+    }
+
+    for entry in deferred.iter().filter(|entry| entry.level >= 0) {
+        summarize_glass_stacking_context(entry.node, summary);
+        if summary.preferred_tint.is_some() {
+            return;
+        }
+    }
+}
+
+fn summarize_glass_normal_node(node: &RenderNode, summary: &mut NativeGlassSummary) {
+    summarize_glass_node(node, summary);
+    if summary.preferred_tint.is_none() {
+        summarize_glass_normal_children(node, summary);
+    }
+}
+
+fn summarize_glass_normal_children(node: &RenderNode, summary: &mut NativeGlassSummary) {
+    for child in &node.children {
+        if establishes_stacking_context(child) {
+            continue;
+        }
+        summarize_glass_normal_node(child, summary);
+        if summary.preferred_tint.is_some() {
+            return;
+        }
+    }
+}
+
+fn collect_deferred_glass_stacking_contexts<'a>(
+    node: &'a RenderNode,
+    order: &mut u64,
+    deferred: &mut Vec<DeferredGlassStackingContext<'a>>,
+) {
+    for child in &node.children {
+        if establishes_stacking_context(child) {
+            deferred.push(DeferredGlassStackingContext {
+                node: child,
+                level: stacking_context_level(child),
+                order: *order,
+            });
+            *order = order.wrapping_add(1);
+        } else {
+            collect_deferred_glass_stacking_contexts(child, order, deferred);
+        }
+    }
+}
+
+fn summarize_glass_node(node: &RenderNode, summary: &mut NativeGlassSummary) {
+    if node.style.native_material != NativeMaterial::Glass {
+        return;
+    }
+
+    summary.required = true;
+    if summary.preferred_tint.is_none() {
+        summary.preferred_tint = node.style.glass_tint;
+    }
+}
 
 pub(super) fn run_with_scene_provider<P>(config: WindowConfig, scene_provider: P) -> Result<()>
 where
@@ -92,7 +211,7 @@ struct RuntimeApp<P> {
     left_press_target: Option<ElementPath>,
     last_click: Option<(Instant, ElementPath)>,
     element_interaction: ElementInteractionState,
-    previous_presented_scene: Option<ExtractedScene>,
+    previous_presented_scene: Option<Vec<RenderNode>>,
     previous_presented_indicator: Option<scrollbar::AutoScrollIndicator>,
     scrollbar_controller: scrollbar::ScrollbarController,
     native_glass_active: bool,
@@ -554,8 +673,8 @@ where
             self.config.clear_color,
         );
 
-        let extracted_scene = ExtractedScene::from_render_roots(&scene);
-        self.sync_native_glass(&extracted_scene);
+        let native_glass = summarize_native_glass(&scene);
+        self.sync_native_glass(native_glass);
         let glass_mode = self.glass_render_mode();
         let use_alpha_buffer = self.native_glass_active;
         if use_alpha_buffer {
@@ -565,17 +684,17 @@ where
             );
         }
 
-        if should_present_frame(
-            self.previous_presented_scene.as_ref(),
-            &extracted_scene,
+        if should_present_frame_from_roots(
+            self.previous_presented_scene.as_deref(),
+            &scene,
             self.previous_presented_indicator,
             auto_scroll_indicator,
             resized,
         ) {
             let paint_start = Instant::now();
             let paint_stats = if use_alpha_buffer {
-                render_to_buffer_internal_with_alpha(
-                    &extracted_scene,
+                render_to_buffer_internal_from_roots_with_alpha(
+                    &scene,
                     &mut self.buffer,
                     self.buffer_width,
                     self.buffer_height,
@@ -584,18 +703,18 @@ where
                     Some(&mut self.alpha_buffer),
                 )
             } else if resized {
-                render_to_buffer_internal(
-                    &extracted_scene,
+                render_to_buffer_internal_from_roots(
+                    &scene,
                     &mut self.buffer,
                     self.buffer_width,
                     self.buffer_height,
                     self.config.clear_color,
                     glass_mode,
                 )
-            } else if let Some(previous_scene) = self.previous_presented_scene.as_ref() {
-                render_scene_update_internal(
+            } else if let Some(previous_scene) = self.previous_presented_scene.as_deref() {
+                render_scene_update_internal_from_roots_with_glass(
                     previous_scene,
-                    &extracted_scene,
+                    &scene,
                     &mut self.buffer,
                     self.buffer_width,
                     self.buffer_height,
@@ -603,8 +722,8 @@ where
                     glass_mode,
                 )
             } else {
-                render_to_buffer_internal(
-                    &extracted_scene,
+                render_to_buffer_internal_from_roots(
+                    &scene,
                     &mut self.buffer,
                     self.buffer_width,
                     self.buffer_height,
@@ -694,7 +813,7 @@ where
                 }
             }
             frame_stats.present_us = duration_to_us(present_start.elapsed());
-            self.previous_presented_scene = Some(extracted_scene);
+            self.previous_presented_scene = Some(scene);
             self.previous_presented_indicator = auto_scroll_indicator;
         }
 
@@ -711,8 +830,8 @@ where
             .then_some(now + self.config.frame_time);
     }
 
-    fn sync_native_glass(&mut self, scene: &ExtractedScene) {
-        if !scene.requires_native_glass() {
+    fn sync_native_glass(&mut self, summary: NativeGlassSummary) {
+        if !summary.required {
             self.clear_native_glass();
             self.clear_native_glass_diagnostic();
             return;
@@ -727,9 +846,7 @@ where
             return;
         }
 
-        let tint = scene
-            .preferred_glass_tint()
-            .unwrap_or(DEFAULT_NATIVE_GLASS_TINT);
+        let tint = summary.preferred_tint.unwrap_or(DEFAULT_NATIVE_GLASS_TINT);
         if self.native_glass_active && self.native_glass_tint == Some(tint) {
             return;
         }
@@ -1227,7 +1344,9 @@ fn normalize_physical_key(key: PhysicalKey) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use cssimpler_core::Color;
+    use cssimpler_core::{
+        Color, ExtractedScene, LayoutBox, NativeMaterial, RenderNode, VisualStyle, ZIndex,
+    };
     use winit::dpi::PhysicalPosition;
     use winit::event::{ElementState, MouseScrollDelta};
     use winit::keyboard::{
@@ -1245,9 +1364,132 @@ mod tests {
     use super::{
         copy_render_buffer_into_surface, non_transparent_damage_rects, normalize_button_state,
         normalize_key_location, normalize_logical_key, normalize_modifiers, normalize_physical_key,
-        normalize_pointer_button, normalize_scroll_delta, window_uses_native_glass,
+        normalize_pointer_button, normalize_scroll_delta, summarize_native_glass,
+        window_uses_native_glass,
     };
     use crate::WindowConfig;
+
+    fn glass_node(tint: Option<Color>) -> RenderNode {
+        RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_style(VisualStyle {
+            native_material: NativeMaterial::Glass,
+            glass_tint: tint,
+            ..VisualStyle::default()
+        })
+    }
+
+    fn stacking_glass_node(level: i32, tint: Option<Color>) -> RenderNode {
+        glass_node(tint).with_style(VisualStyle {
+            native_material: NativeMaterial::Glass,
+            glass_tint: tint,
+            positioned: true,
+            z_index: ZIndex::Integer(level),
+            ..VisualStyle::default()
+        })
+    }
+
+    fn assert_native_glass_summary_matches_extraction(label: &str, roots: &[RenderNode]) {
+        let summary = summarize_native_glass(roots);
+        let extracted = ExtractedScene::from_render_roots(roots);
+        assert_eq!(
+            summary.required,
+            extracted.requires_native_glass(),
+            "native-glass requirement differs for {label}"
+        );
+        assert_eq!(
+            summary.preferred_tint,
+            extracted.preferred_glass_tint(),
+            "preferred native-glass tint differs for {label}"
+        );
+    }
+
+    #[test]
+    fn lightweight_native_glass_summary_matches_extracted_scene() {
+        let first = Color::rgba(20, 40, 60, 80);
+        let second = Color::rgba(90, 110, 130, 150);
+
+        let cases = [
+            ("empty", Vec::new()),
+            (
+                "plain nested tree",
+                vec![
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 80.0, 80.0))
+                        .with_child(RenderNode::container(LayoutBox::new(1.0, 1.0, 10.0, 10.0)))
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(2.0, 2.0, 10.0, 10.0)).with_style(
+                                VisualStyle {
+                                    positioned: true,
+                                    z_index: ZIndex::Integer(7),
+                                    ..VisualStyle::default()
+                                },
+                            ),
+                        ),
+                ],
+            ),
+            ("untinted glass", vec![glass_node(None)]),
+            (
+                "untinted ancestor then tinted descendant",
+                vec![glass_node(None).with_child(glass_node(Some(first)))],
+            ),
+            (
+                "multiple roots",
+                vec![glass_node(None), glass_node(Some(second))],
+            ),
+            (
+                "equal-level deferred contexts",
+                vec![
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 80.0, 80.0))
+                        .with_child(
+                            RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                                .with_child(stacking_glass_node(2, Some(first))),
+                        )
+                        .with_child(stacking_glass_node(2, Some(second))),
+                ],
+            ),
+        ];
+
+        for (label, roots) in cases {
+            assert_native_glass_summary_matches_extraction(label, &roots);
+        }
+    }
+
+    #[test]
+    fn lightweight_native_glass_summary_preserves_stacking_order_tint_preference() {
+        let normal_tint = Color::rgba(10, 20, 30, 40);
+        let negative_tint = Color::rgba(50, 60, 70, 80);
+        let positive_tint = Color::rgba(90, 100, 110, 120);
+
+        let negative_before_normal = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 80.0, 80.0))
+                .with_child(glass_node(Some(normal_tint)))
+                .with_child(stacking_glass_node(-3, Some(negative_tint)))
+                .with_child(stacking_glass_node(4, Some(positive_tint))),
+        ];
+        assert_native_glass_summary_matches_extraction(
+            "negative stacking context before normal flow",
+            &negative_before_normal,
+        );
+        assert_eq!(
+            summarize_native_glass(&negative_before_normal).preferred_tint,
+            Some(negative_tint)
+        );
+
+        let positive_after_normal = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 80.0, 80.0))
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                        .with_child(stacking_glass_node(4, Some(positive_tint))),
+                )
+                .with_child(glass_node(Some(normal_tint))),
+        ];
+        assert_native_glass_summary_matches_extraction(
+            "promoted positive context after normal flow",
+            &positive_after_normal,
+        );
+        assert_eq!(
+            summarize_native_glass(&positive_after_normal).preferred_tint,
+            Some(normal_tint)
+        );
+    }
 
     #[test]
     fn modifiers_are_normalized_without_winit_types() {
@@ -1467,6 +1709,3 @@ mod tests {
         assert_eq!(simplified, vec![(0, 0, 2, 2)]);
     }
 }
-
-
-

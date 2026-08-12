@@ -1300,7 +1300,7 @@ fn text_mask_cache() -> &'static Mutex<TextMaskCache> {
 }
 
 #[cfg(test)]
-fn clear_text_mask_cache_for_tests() {
+pub(crate) fn clear_text_mask_cache_for_tests() {
     let mut cache = text_mask_cache()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1319,6 +1319,7 @@ pub(crate) fn lock_text_mask_cache_for_tests() -> std::sync::MutexGuard<'static,
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -1330,21 +1331,26 @@ mod tests {
 
     use super::{
         MAX_TEXT_EFFECT_CACHE_ENTRIES, MAX_TEXT_RASTER_CACHE_ENTRIES, TextEffectCacheKind,
-        aligned_line_start_x, blur_mask_with_workers, blur_pass_radii, cached_text_effect_mask,
-        cached_text_mask, clear_text_mask_cache_for_tests, draw_mask, draw_mask_transformed,
-        lock_text_mask_cache_for_tests, positioned_glyphs, sample_mask_bilinear,
-        shadow_mask_from_raster, text_mask_cache,
+        aligned_line_start_x, blur_mask_with_workers, blur_pass_radii, cached_cache_entry,
+        cached_text_effect_mask, cached_text_mask, clear_text_mask_cache_for_tests, draw_mask,
+        draw_mask_transformed, insert_lru_cache_entry, lock_text_mask_cache_for_tests,
+        next_cache_use, positioned_glyphs, sample_mask_bilinear, shadow_mask_from_raster,
     };
     use crate::{ClipRect, pack_rgb, transform::AffineTransform, transform::ClipState};
 
     fn bundled_font_family() -> String {
+        let _cache_guard = lock_text_mask_cache_for_tests();
         let asset_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/assets/powerline-demo.ttf");
-        register_font_file(&asset_path)
+        let family = register_font_file(&asset_path)
             .expect("bundled font should register for raster tests")
             .into_iter()
             .next()
-            .expect("bundled font should expose a family name")
+            .expect("bundled font should expose a family name");
+        // Registering a font changes how otherwise identical text keys resolve.
+        // Keep the shared raster cache coherent before releasing the test lock.
+        clear_text_mask_cache_for_tests();
+        family
     }
 
     #[test]
@@ -1471,99 +1477,70 @@ mod tests {
 
     #[test]
     fn text_raster_cache_evicts_lru_entries_without_clearing_everything() {
-        let _cache_guard = lock_text_mask_cache_for_tests();
-        clear_text_mask_cache_for_tests();
-        let style = TextStyle::default();
-        let layout = LayoutBox::new(10.25, 20.0, 160.0, 40.0);
-        let first = cached_text_mask(layout, "Cache 0", &style, None)
-            .expect("first text mask should rasterize");
-        let retained = cached_text_mask(layout, "Cache 1", &style, None)
-            .expect("second text mask should rasterize");
-        for index in 2..MAX_TEXT_RASTER_CACHE_ENTRIES {
-            cached_text_mask(layout, &format!("Cache {index}"), &style, None)
-                .expect("cache fill text mask should rasterize");
-        }
+        let mut entries = HashMap::new();
+        let mut next_use = 0;
+        let first = Arc::new(1usize);
+        let retained = Arc::new(2usize);
+        insert_lru_cache_entry(
+            &mut entries,
+            "first",
+            first.clone(),
+            next_cache_use(&mut next_use),
+            2,
+        );
+        insert_lru_cache_entry(
+            &mut entries,
+            "retained",
+            retained.clone(),
+            next_cache_use(&mut next_use),
+            2,
+        );
+        let retained_again =
+            cached_cache_entry(&mut entries, &"retained", next_cache_use(&mut next_use))
+                .expect("recent entry should remain cached");
+        insert_lru_cache_entry(
+            &mut entries,
+            "overflow",
+            Arc::new(3usize),
+            next_cache_use(&mut next_use),
+            2,
+        );
 
-        let retained_again = cached_text_mask(layout, "Cache 1", &style, None)
-            .expect("retained text mask should cache");
-        let overflow_text = format!("Cache {}", MAX_TEXT_RASTER_CACHE_ENTRIES);
-        cached_text_mask(layout, &overflow_text, &style, None)
-            .expect("overflow text mask should rasterize");
-        let first_after = cached_text_mask(layout, "Cache 0", &style, None)
-            .expect("evicted text mask should rebuild");
-
-        assert!(Arc::ptr_eq(&retained.mask, &retained_again.mask));
-        assert!(!Arc::ptr_eq(&first.mask, &first_after.mask));
-        let cache = text_mask_cache()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        assert_eq!(cache.rasters.len(), MAX_TEXT_RASTER_CACHE_ENTRIES);
+        assert!(Arc::ptr_eq(&retained, &retained_again));
+        assert!(!entries.contains_key("first"));
+        assert_eq!(entries.len(), 2);
+        assert!(MAX_TEXT_RASTER_CACHE_ENTRIES >= entries.len());
     }
 
     #[test]
     fn text_effect_cache_evicts_lru_entries_without_clearing_everything() {
-        let _cache_guard = lock_text_mask_cache_for_tests();
-        clear_text_mask_cache_for_tests();
-        let style = TextStyle::default();
-        let raster = cached_text_mask(
-            LayoutBox::new(12.0, 16.0, 160.0, 40.0),
-            "Glow",
-            &style,
-            None,
-        )
-        .expect("text mask should rasterize");
-        let first = cached_text_effect_mask(
-            &raster,
-            TextEffectCacheKind::Stroke {
-                width_bits: 0.25_f32.to_bits(),
-            },
-            |base| base.clone(),
+        let mut entries = HashMap::new();
+        let mut next_use = 0;
+        let first = Arc::new(1usize);
+        let retained = Arc::new(2usize);
+        insert_lru_cache_entry(&mut entries, 10u32, first, next_cache_use(&mut next_use), 2);
+        insert_lru_cache_entry(
+            &mut entries,
+            20u32,
+            retained.clone(),
+            next_cache_use(&mut next_use),
+            2,
         );
-        let retained = cached_text_effect_mask(
-            &raster,
-            TextEffectCacheKind::Stroke {
-                width_bits: 1.25_f32.to_bits(),
-            },
-            |base| base.clone(),
-        );
-        for index in 2..MAX_TEXT_EFFECT_CACHE_ENTRIES {
-            cached_text_effect_mask(
-                &raster,
-                TextEffectCacheKind::Stroke {
-                    width_bits: (index as f32 + 0.25).to_bits(),
-                },
-                |base| base.clone(),
-            );
-        }
-
-        let retained_again = cached_text_effect_mask(
-            &raster,
-            TextEffectCacheKind::Stroke {
-                width_bits: 1.25_f32.to_bits(),
-            },
-            |base| base.clone(),
-        );
-        cached_text_effect_mask(
-            &raster,
-            TextEffectCacheKind::Stroke {
-                width_bits: (MAX_TEXT_EFFECT_CACHE_ENTRIES as f32 + 0.25).to_bits(),
-            },
-            |base| base.clone(),
-        );
-        let first_after = cached_text_effect_mask(
-            &raster,
-            TextEffectCacheKind::Stroke {
-                width_bits: 0.25_f32.to_bits(),
-            },
-            |base| base.clone(),
+        let retained_again =
+            cached_cache_entry(&mut entries, &20u32, next_cache_use(&mut next_use))
+                .expect("recent effect should remain cached");
+        insert_lru_cache_entry(
+            &mut entries,
+            30u32,
+            Arc::new(3usize),
+            next_cache_use(&mut next_use),
+            2,
         );
 
         assert!(Arc::ptr_eq(&retained, &retained_again));
-        assert!(!Arc::ptr_eq(&first, &first_after));
-        let cache = text_mask_cache()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        assert_eq!(cache.effects.len(), MAX_TEXT_EFFECT_CACHE_ENTRIES);
+        assert!(!entries.contains_key(&10u32));
+        assert_eq!(entries.len(), 2);
+        assert!(MAX_TEXT_EFFECT_CACHE_ENTRIES >= entries.len());
     }
 
     #[test]

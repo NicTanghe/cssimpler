@@ -9,7 +9,10 @@ use cssimpler_core::{
     RadialGradient, RadialShape, ShapeExtent,
 };
 
-use super::shapes::{pixel_bounds, rounded_rect_coverage, transformed_rounded_rect_coverage};
+use super::shapes::{
+    pixel_bounds, rounded_rect_coverage, rounded_rect_full_coverage_row_span,
+    transformed_rounded_rect_coverage,
+};
 use super::{
     ClipRect, blend_linear_over, clip_pixel_bounds, current_render_buffer_rows, pack_linear_rgb,
     set_current_alpha_at,
@@ -966,12 +969,15 @@ fn draw_linear_gradient(
     let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
     let projection_step = direction.0;
     for y in y0..y1 {
+        let full_coverage_span =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
         let py = y as f32 + 0.5;
         let mut projection =
             ((x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
         for x in x0..x1 {
             let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
-            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            let coverage =
+                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
             if coverage != 0 {
                 blend_gradient_sample_with_coverage(buffer, width, height, x, y, color, coverage);
             }
@@ -1019,12 +1025,15 @@ fn rasterize_linear_gradient(
     let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
     let projection_step = direction.0;
     for y in y0..y1 {
+        let full_coverage_span =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
         let py = y as f32 + 0.5;
         let mut projection =
             ((x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
         for x in x0..x1 {
             let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
-            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            let coverage =
+                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
             if coverage != 0 {
                 write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
             }
@@ -1075,6 +1084,8 @@ fn draw_radial_gradient(
     let inverse_radius_y_squared = 1.0 / (resolved_shape.radius_y * resolved_shape.radius_y);
 
     for y in y0..y1 {
+        let full_coverage_span =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
         let py = y as f32 + 0.5;
         for x in x0..x1 {
             let px = x as f32 + 0.5;
@@ -1100,7 +1111,8 @@ fn draw_radial_gradient(
                     gradient.repeating,
                 )
             };
-            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            let coverage =
+                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
             if coverage != 0 {
                 blend_gradient_sample_with_coverage(buffer, width, height, x, y, color, coverage);
             }
@@ -1149,6 +1161,8 @@ fn rasterize_radial_gradient(
     let inverse_radius_y_squared = 1.0 / (resolved_shape.radius_y * resolved_shape.radius_y);
 
     for y in y0..y1 {
+        let full_coverage_span =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
         let py = y as f32 + 0.5;
         for x in x0..x1 {
             let px = x as f32 + 0.5;
@@ -1174,7 +1188,8 @@ fn rasterize_radial_gradient(
                     gradient.repeating,
                 )
             };
-            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            let coverage =
+                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
             if coverage != 0 {
                 write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
             }
@@ -1204,6 +1219,8 @@ fn draw_conic_gradient(
     let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
 
     for y in y0..y1 {
+        let full_coverage_span =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
         for x in x0..x1 {
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
@@ -1216,7 +1233,8 @@ fn draw_conic_gradient(
             };
             let position = (angle - gradient.angle).rem_euclid(360.0);
             let color = sample_prepared_gradient(&prepared, position, gradient.repeating);
-            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            let coverage =
+                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
             if coverage != 0 {
                 blend_gradient_sample_with_coverage(buffer, width, height, x, y, color, coverage);
             }
@@ -1246,6 +1264,8 @@ fn rasterize_conic_gradient(
     let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
 
     for y in y0..y1 {
+        let full_coverage_span =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
         for x in x0..x1 {
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
@@ -1258,7 +1278,8 @@ fn rasterize_conic_gradient(
             };
             let position = (angle - gradient.angle).rem_euclid(360.0);
             let color = sample_prepared_gradient(&prepared, position, gradient.repeating);
-            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            let coverage =
+                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
             if coverage != 0 {
                 write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
             }
@@ -1279,8 +1300,11 @@ fn fill_gradient_rounded_rect(
         return;
     };
     for y in y0..y1 {
+        let full_coverage_span =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
         for x in x0..x1 {
-            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            let coverage =
+                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
             if coverage != 0 {
                 blend_gradient_sample_with_coverage(buffer, width, height, x, y, color, coverage);
             }
@@ -1301,12 +1325,31 @@ fn fill_rasterized_rounded_rect(
         return;
     };
     for y in y0..y1 {
+        let full_coverage_span =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
         for x in x0..x1 {
-            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            let coverage =
+                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
             if coverage != 0 {
                 write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
             }
         }
+    }
+}
+
+#[inline]
+fn rounded_rect_row_coverage(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    clip: ClipRect,
+    full_coverage_span: Option<(i32, i32)>,
+    x: i32,
+    y: i32,
+) -> u8 {
+    if full_coverage_span.is_some_and(|(span_x0, span_x1)| x >= span_x0 && x < span_x1) {
+        u8::MAX
+    } else {
+        rounded_rect_coverage(layout, radius, clip, x, y)
     }
 }
 
@@ -1960,9 +2003,11 @@ mod tests {
         PreparedLengthGradient, ResolvedGradientStop, cached_gradient_layer,
         cached_static_gradient_layer, clear_gradient_layer_cache_for_tests,
         length_stops_use_fraction_only, lock_gradient_cache_for_tests, prepare_length_gradient,
-        prepare_resolved_gradient, resolve_length_stops, sample_gradient, sample_prepared_gradient,
-        sample_prepared_length_gradient,
+        prepare_resolved_gradient, resolve_length_stops, rounded_rect_row_coverage,
+        sample_gradient, sample_prepared_gradient, sample_prepared_length_gradient,
     };
+    use crate::ClipRect;
+    use crate::shapes::{rounded_rect_coverage, rounded_rect_full_coverage_row_span};
 
     fn assert_close(left: cssimpler_core::LinearRgba, right: cssimpler_core::LinearRgba) {
         let epsilon = 0.0005;
@@ -1970,6 +2015,50 @@ mod tests {
         assert!((left.g - right.g).abs() <= epsilon);
         assert!((left.b - right.b).abs() <= epsilon);
         assert!((left.a - right.a).abs() <= epsilon);
+    }
+
+    #[test]
+    fn rounded_gradient_span_preserves_sampled_coverage() {
+        let cases = [
+            (
+                LayoutBox::new(0.35, 0.6, 15.2, 11.4),
+                CornerRadius::all(3.75),
+                ClipRect::full(20.0, 16.0),
+            ),
+            (
+                LayoutBox::new(0.4, 3.35, 18.2, 0.45),
+                CornerRadius::all(4.0),
+                ClipRect::full(20.0, 16.0),
+            ),
+            (
+                LayoutBox::new(1.25, 1.5, 16.0, 12.0),
+                CornerRadius {
+                    top_left: 6.0,
+                    top_right: 2.0,
+                    bottom_right: 5.0,
+                    bottom_left: 1.0,
+                },
+                ClipRect {
+                    x0: 2.25,
+                    y0: 0.75,
+                    x1: 14.75,
+                    y1: 13.25,
+                },
+            ),
+        ];
+
+        for (layout, radius, clip) in cases {
+            for y in 0..16 {
+                let span = rounded_rect_full_coverage_row_span(layout, radius, clip, y, 0, 20);
+                for x in 0..20 {
+                    assert_eq!(
+                        rounded_rect_row_coverage(layout, radius, clip, span, x, y),
+                        rounded_rect_coverage(layout, radius, clip, x, y),
+                        "gradient coverage changed at ({x}, {y}) for {layout:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

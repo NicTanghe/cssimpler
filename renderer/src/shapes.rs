@@ -1,13 +1,33 @@
 use cssimpler_core::{Color, CornerRadius, Insets, LayoutBox};
 
 use super::{
-    ClipRect, PreparedBlendColor, blend_prepared_pixel_with_coverage, current_render_buffer_rows,
-    fill_current_alpha_span, pack_rgb,
+    ClipRect, PreparedBlendColor, blend_prepared_pixel_with_coverage,
+    blend_prepared_pixel_with_coverage_at_index,
+    blend_prepared_pixel_with_coverage_at_index_opaque_target, current_render_buffer_rows,
+    fill_current_alpha_span, pack_rgb, render_alpha_target_active,
     transform::{AffineTransform, ClipState},
 };
 
-const AXIS_ALIGNED_EDGE_COARSE_COVERAGE_SAMPLES: [(f32, f32); 4] =
-    [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+const AXIS_ALIGNED_COARSE_SAMPLE_MIN: f32 = 0.25;
+const AXIS_ALIGNED_COARSE_SAMPLE_MAX: f32 = 0.75;
+const AXIS_ALIGNED_EDGE_COARSE_COVERAGE_SAMPLES: [(f32, f32); 4] = [
+    (
+        AXIS_ALIGNED_COARSE_SAMPLE_MIN,
+        AXIS_ALIGNED_COARSE_SAMPLE_MIN,
+    ),
+    (
+        AXIS_ALIGNED_COARSE_SAMPLE_MAX,
+        AXIS_ALIGNED_COARSE_SAMPLE_MIN,
+    ),
+    (
+        AXIS_ALIGNED_COARSE_SAMPLE_MIN,
+        AXIS_ALIGNED_COARSE_SAMPLE_MAX,
+    ),
+    (
+        AXIS_ALIGNED_COARSE_SAMPLE_MAX,
+        AXIS_ALIGNED_COARSE_SAMPLE_MAX,
+    ),
+];
 const AXIS_ALIGNED_EDGE_FINE_COVERAGE_SAMPLES: [(f32, f32); 16] = [
     (0.125, 0.125),
     (0.375, 0.125),
@@ -65,22 +85,82 @@ pub(crate) fn draw_rounded_rect(
     };
 
     let prepared_color = PreparedBlendColor::new(color);
-    for y in y0..y1 {
-        for x in x0..x1 {
+    let rows = current_render_buffer_rows();
+    let draw_y0 = y0.max(rows.start.min(height) as i32);
+    let draw_y1 = y1.min(rows.end.min(height) as i32);
+    let has_alpha_target = render_alpha_target_active();
+    for y in draw_y0..draw_y1 {
+        let row_start = (y as usize - rows.start) * width;
+        let (full_x0, full_x1) =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1)
+                .unwrap_or((x0, x0));
+        for x in x0..full_x0 {
             let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
             if coverage == 0 {
                 continue;
             }
-            blend_prepared_pixel_with_coverage(
-                buffer,
-                width,
-                height,
-                x,
-                y,
-                prepared_color,
-                color.a,
-                coverage,
-            );
+            let index = row_start + x as usize;
+            if has_alpha_target {
+                blend_prepared_pixel_with_coverage_at_index(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            } else {
+                blend_prepared_pixel_with_coverage_at_index_opaque_target(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            }
+        }
+        for x in full_x0..full_x1 {
+            let index = row_start + x as usize;
+            if has_alpha_target {
+                blend_prepared_pixel_with_coverage_at_index(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    u8::MAX,
+                );
+            } else {
+                blend_prepared_pixel_with_coverage_at_index_opaque_target(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    u8::MAX,
+                );
+            }
+        }
+        for x in full_x1..x1 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            if coverage == 0 {
+                continue;
+            }
+            let index = row_start + x as usize;
+            if has_alpha_target {
+                blend_prepared_pixel_with_coverage_at_index(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            } else {
+                blend_prepared_pixel_with_coverage_at_index_opaque_target(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            }
         }
     }
 }
@@ -399,6 +479,60 @@ pub(crate) fn rounded_rect_coverage(
     axis_aligned_shape_coverage(clip, x, y, |sample_x, sample_y| {
         point_in_rounded_rect(sample_x, sample_y, layout, radius)
     })
+}
+
+pub(crate) fn rounded_rect_full_coverage_row_span(
+    layout: LayoutBox,
+    radius: CornerRadius,
+    clip: ClipRect,
+    y: i32,
+    x0: i32,
+    x1: i32,
+) -> Option<(i32, i32)> {
+    if x0 >= x1 {
+        return None;
+    }
+
+    let layout_right = layout.x + layout.width;
+    let layout_bottom = layout.y + layout.height;
+    let sample_y0 = y as f32 + AXIS_ALIGNED_COARSE_SAMPLE_MIN;
+    let sample_y1 = y as f32 + AXIS_ALIGNED_COARSE_SAMPLE_MAX;
+    let vertical_start = layout.y.max(clip.y0);
+    let vertical_end = layout_bottom.min(clip.y1);
+    if !(sample_y0 >= vertical_start && sample_y1 < vertical_end) {
+        return None;
+    }
+
+    let radius = clamp_corner_radius(radius, layout.width, layout.height);
+    let left_guard = if sample_y0 < layout.y + radius.top_left {
+        radius.top_left
+    } else {
+        0.0
+    }
+    .max(if sample_y1 > layout_bottom - radius.bottom_left {
+        radius.bottom_left
+    } else {
+        0.0
+    });
+    let right_guard = if sample_y0 < layout.y + radius.top_right {
+        radius.top_right
+    } else {
+        0.0
+    }
+    .max(if sample_y1 > layout_bottom - radius.bottom_right {
+        radius.bottom_right
+    } else {
+        0.0
+    });
+
+    // This deliberately excludes each active corner's entire horizontal radius band.
+    // It may omit some fully covered circle pixels, but every returned pixel is guaranteed
+    // to pass all four coarse samples and therefore has exactly u8::MAX coverage.
+    let safe_start = clip.x0.max(layout.x + left_guard);
+    let safe_end = clip.x1.min(layout_right - right_guard);
+    let span_x0 = x0.max((safe_start - AXIS_ALIGNED_COARSE_SAMPLE_MIN).ceil() as i32);
+    let span_x1 = x1.min((safe_end - AXIS_ALIGNED_COARSE_SAMPLE_MAX).ceil() as i32);
+    (span_x0 < span_x1).then_some((span_x0, span_x1))
 }
 
 pub(crate) fn transformed_rounded_ring_coverage(
@@ -900,9 +1034,9 @@ mod tests {
     use cssimpler_core::{Color, CornerRadius, LayoutBox};
 
     use super::{
-        draw_dashed_rounded_ring, draw_rounded_ring, point_in_rounded_rect, rounded_rect_row_span,
-        rounded_ring_coverage, transformed_rounded_rect_coverage,
-        transformed_rounded_ring_coverage,
+        draw_dashed_rounded_ring, draw_rounded_ring, point_in_rounded_rect, rounded_rect_coverage,
+        rounded_rect_full_coverage_row_span, rounded_rect_row_span, rounded_ring_coverage,
+        transformed_rounded_rect_coverage, transformed_rounded_ring_coverage,
     };
     use crate::transform::{AffineTransform, ClipState};
     use crate::{ClipRect, pack_rgb};
@@ -929,6 +1063,158 @@ mod tests {
                 }
                 None => assert!(sampled.is_empty()),
             }
+        }
+    }
+
+    fn assert_full_coverage_span_preserves_sampled_coverage(
+        layout: LayoutBox,
+        radius: CornerRadius,
+        clip: ClipRect,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+    ) {
+        for y in y0..y1 {
+            let span = rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
+            if let Some((span_x0, span_x1)) = span {
+                assert!(
+                    x0 <= span_x0 && span_x0 < span_x1 && span_x1 <= x1,
+                    "invalid span {span:?} at y={y} for {layout:?}, {radius:?}, {clip:?}"
+                );
+            }
+
+            for x in x0..x1 {
+                let sampled = rounded_rect_coverage(layout, radius, clip, x, y);
+                let covered_by_span =
+                    span.is_some_and(|(span_x0, span_x1)| x >= span_x0 && x < span_x1);
+                if covered_by_span {
+                    assert_eq!(
+                        sampled,
+                        u8::MAX,
+                        "non-full pixel ({x}, {y}) included for {layout:?}, {radius:?}, {clip:?}"
+                    );
+                }
+                let optimized = if covered_by_span { u8::MAX } else { sampled };
+                assert_eq!(
+                    optimized, sampled,
+                    "coverage changed at ({x}, {y}) for {layout:?}, {radius:?}, {clip:?}"
+                );
+            }
+        }
+    }
+
+    fn next_test_unit(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((*state >> 40) as u32) as f32 / ((1_u32 << 24) - 1) as f32
+    }
+
+    #[test]
+    fn rounded_rect_full_coverage_span_preserves_sampled_coverage() {
+        let cases = [
+            (
+                LayoutBox::new(0.35, 0.6, 15.2, 11.4),
+                CornerRadius::all(3.75),
+                ClipRect::full(20.0, 16.0),
+            ),
+            (
+                LayoutBox::new(1.25, 1.5, 16.0, 12.0),
+                CornerRadius {
+                    top_left: 6.0,
+                    top_right: 2.0,
+                    bottom_right: 5.0,
+                    bottom_left: 1.0,
+                },
+                ClipRect {
+                    x0: 2.4,
+                    y0: 0.75,
+                    x1: 14.6,
+                    y1: 13.25,
+                },
+            ),
+            (
+                LayoutBox::new(0.25, 0.25, 18.5, 13.5),
+                CornerRadius::ZERO,
+                ClipRect {
+                    x0: 2.25,
+                    y0: 1.25,
+                    x1: 16.75,
+                    y1: 12.75,
+                },
+            ),
+            (
+                LayoutBox::new(1.1, 0.9, 15.75, 15.75),
+                CornerRadius::all(20.0),
+                ClipRect::full(20.0, 20.0),
+            ),
+            (
+                LayoutBox::new(0.4, 3.35, 18.2, 0.45),
+                CornerRadius::all(4.0),
+                ClipRect::full(20.0, 20.0),
+            ),
+            (
+                LayoutBox::new(7.35, 0.4, 0.55, 18.2),
+                CornerRadius::all(4.0),
+                ClipRect::full(20.0, 20.0),
+            ),
+            (
+                LayoutBox::new(0.75, 1.25, 17.5, 13.0),
+                CornerRadius {
+                    top_left: -0.25,
+                    top_right: -0.75,
+                    bottom_right: -1.0,
+                    bottom_left: -0.5,
+                },
+                ClipRect {
+                    x0: 1.25,
+                    y0: 1.75,
+                    x1: 17.75,
+                    y1: 13.75,
+                },
+            ),
+        ];
+
+        for (layout, radius, clip) in cases {
+            assert_full_coverage_span_preserves_sampled_coverage(
+                layout, radius, clip, 0, 0, 20, 20,
+            );
+        }
+
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..512 {
+            let layout = LayoutBox::new(
+                -2.0 + next_test_unit(&mut state) * 8.0,
+                -2.0 + next_test_unit(&mut state) * 8.0,
+                0.05 + next_test_unit(&mut state) * 26.0,
+                0.05 + next_test_unit(&mut state) * 26.0,
+            );
+            let mut radius_value = || {
+                let value = next_test_unit(&mut state);
+                if next_test_unit(&mut state) < 0.25 {
+                    -value
+                } else {
+                    value * 18.0
+                }
+            };
+            let radius = CornerRadius {
+                top_left: radius_value(),
+                top_right: radius_value(),
+                bottom_right: radius_value(),
+                bottom_left: radius_value(),
+            };
+            let clip_x0 = -1.0 + next_test_unit(&mut state) * 10.0;
+            let clip_y0 = -1.0 + next_test_unit(&mut state) * 10.0;
+            let clip = ClipRect {
+                x0: clip_x0,
+                y0: clip_y0,
+                x1: clip_x0 + 0.05 + next_test_unit(&mut state) * 24.0,
+                y1: clip_y0 + 0.05 + next_test_unit(&mut state) * 24.0,
+            };
+            assert_full_coverage_span_preserves_sampled_coverage(
+                layout, radius, clip, 0, 0, 32, 32,
+            );
         }
     }
 

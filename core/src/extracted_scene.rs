@@ -46,15 +46,26 @@ pub struct ExtractedScene {
 
 impl ExtractedScene {
     pub fn from_render_roots(roots: &[RenderNode]) -> Self {
+        Self::from_roots_and_owned(roots, roots.to_vec())
+    }
+
+    pub fn from_render_roots_owned(roots: Vec<RenderNode>) -> Self {
         let mut items = Vec::new();
         let mut stable_sort_key = 0;
-        for (root_index, root) in roots.iter().enumerate() {
-            collect_paint_items(root, vec![root_index], &mut stable_sort_key, &mut items);
-        }
+        collect_scene_paint_items(&roots, &mut stable_sort_key, &mut items);
+        items.sort_by_key(|item| item.stable_sort_key);
+
+        Self { roots, items }
+    }
+
+    fn from_roots_and_owned(roots: &[RenderNode], owned_roots: Vec<RenderNode>) -> Self {
+        let mut items = Vec::new();
+        let mut stable_sort_key = 0;
+        collect_scene_paint_items(roots, &mut stable_sort_key, &mut items);
         items.sort_by_key(|item| item.stable_sort_key);
 
         Self {
-            roots: roots.to_vec(),
+            roots: owned_roots,
             items,
         }
     }
@@ -73,6 +84,16 @@ impl ExtractedScene {
 
     pub fn preferred_glass_tint(&self) -> Option<Color> {
         self.glass_regions().find_map(|item| item.style.glass_tint)
+    }
+}
+
+fn collect_scene_paint_items(
+    roots: &[RenderNode],
+    stable_sort_key: &mut u64,
+    items: &mut Vec<ExtractedPaintItem>,
+) {
+    for (root_index, root) in roots.iter().enumerate() {
+        collect_paint_items(root, vec![root_index], stable_sort_key, items);
     }
 }
 
@@ -598,6 +619,37 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(left_keys, right_keys);
+    }
+
+    #[test]
+    fn owned_extraction_preserves_roots_and_paint_items() {
+        let roots = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 100.0, 80.0)).with_child(
+                RenderNode::text(LayoutBox::new(8.0, 12.0, 64.0, 20.0), "owned").with_style(
+                    VisualStyle {
+                        foreground: Color::WHITE,
+                        ..VisualStyle::default()
+                    },
+                ),
+            ),
+        ];
+        let expected = ExtractedScene::from_render_roots(&roots);
+        let extracted = ExtractedScene::from_render_roots_owned(roots);
+
+        assert_eq!(extracted.roots.len(), expected.roots.len());
+        assert_eq!(extracted.items.len(), expected.items.len());
+        assert_eq!(
+            extracted
+                .items
+                .iter()
+                .map(|item| (item.stable_sort_key, item.kind, item.path.as_slice()))
+                .collect::<Vec<_>>(),
+            expected
+                .items
+                .iter()
+                .map(|item| (item.stable_sort_key, item.kind, item.path.as_slice()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

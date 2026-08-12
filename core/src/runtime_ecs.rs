@@ -316,7 +316,7 @@ impl RuntimeWorld {
         result: &mut RuntimeSyncResult,
     ) {
         let interaction = self.interaction.clone();
-        let (children, authored_children) = {
+        let children = {
             let data = self
                 .entity_mut(entity)
                 .expect("patched runtime entities should exist");
@@ -332,19 +332,16 @@ impl RuntimeWorld {
                 interaction_component(&interaction, data.computed.element_path.as_ref());
             result.reused_entities += 1;
 
-            let authored_children = match node {
-                Node::Element(element) => Some(element.children.clone()),
-                Node::Text(_) => None,
-            };
-            (data.children.clone(), authored_children)
+            data.children.clone()
         };
 
-        let Some(authored_children) = authored_children else {
+        let Node::Element(element) = node else {
             return;
         };
+        debug_assert_eq!(children.len(), element.children.len());
 
         let mut element_child_index = 0;
-        for (child_entity, child_node) in children.into_iter().zip(&authored_children) {
+        for (child_entity, child_node) in children.into_iter().zip(&element.children) {
             let child_element_path = match child_node {
                 Node::Element(_) => {
                     let path = element_path.map(|path| path.with_child(element_child_index));
@@ -589,6 +586,112 @@ mod tests {
             panic!("roundtripped grandchild should stay text");
         };
         assert_eq!(text, "second");
+    }
+
+    #[test]
+    fn prefer_patch_reuses_branched_descendants_and_updates_authored_data() {
+        let mut world = RuntimeWorld::default();
+        let first = Node::element("main")
+            .with_child(Node::text("prefix"))
+            .with_child(
+                Node::element("section")
+                    .with_attribute("data-version", "first")
+                    .with_child(
+                        Node::element("p")
+                            .with_child(Node::text("first body"))
+                            .into(),
+                    )
+                    .into(),
+            )
+            .with_child(
+                Node::element("aside")
+                    .with_child(Node::text("first aside"))
+                    .into(),
+            )
+            .into();
+        let second = Node::element("main")
+            .with_child(Node::text("updated prefix"))
+            .with_child(
+                Node::element("section")
+                    .with_attribute("data-version", "second")
+                    .with_child(
+                        Node::element("p")
+                            .with_child(Node::text("second body"))
+                            .into(),
+                    )
+                    .into(),
+            )
+            .with_child(
+                Node::element("aside")
+                    .with_child(Node::text("second aside"))
+                    .into(),
+            )
+            .into();
+
+        world.sync_root(
+            0,
+            &first,
+            RuntimeSyncPolicy::ForceRebuild,
+            RuntimeDirtyClass::Structure,
+        );
+        let root = world.root_entity(0).expect("root should exist");
+        let original_children = world
+            .entity(root)
+            .expect("root data should exist")
+            .children
+            .clone();
+        let section_children = world
+            .entity(original_children[1])
+            .expect("section data should exist")
+            .children
+            .clone();
+
+        let result = world.sync_root(
+            0,
+            &second,
+            RuntimeSyncPolicy::PreferPatch,
+            RuntimeDirtyClass::Paint,
+        );
+
+        assert_eq!(result.action, RuntimeSyncAction::Patched);
+        assert_eq!(result.reused_entities, 7);
+        assert_eq!(result.spawned_entities, 0);
+        assert_eq!(result.despawned_entities, 0);
+        assert_eq!(world.root_entity(0), Some(root));
+        assert_eq!(
+            world
+                .entity(root)
+                .expect("patched root data should exist")
+                .children,
+            original_children
+        );
+        assert_eq!(
+            world
+                .entity(original_children[1])
+                .expect("patched section data should exist")
+                .children,
+            section_children
+        );
+
+        let roundtrip = world
+            .root_as_node(0)
+            .expect("patched root should roundtrip");
+        let Node::Element(root_element) = roundtrip else {
+            panic!("roundtripped root should stay an element");
+        };
+        assert!(matches!(&root_element.children[0], Node::Text(text) if text == "updated prefix"));
+        let Node::Element(section) = &root_element.children[1] else {
+            panic!("roundtripped section should stay an element");
+        };
+        assert_eq!(section.attribute("data-version"), Some("second"));
+        let Node::Element(paragraph) = &section.children[0] else {
+            panic!("roundtripped paragraph should stay an element");
+        };
+        assert!(matches!(&paragraph.children[0], Node::Text(text) if text == "second body"));
+        let Node::Element(aside) = &root_element.children[2] else {
+            panic!("roundtripped aside should stay an element");
+        };
+        assert!(matches!(&aside.children[0], Node::Text(text) if text == "second aside"));
     }
 
     #[test]

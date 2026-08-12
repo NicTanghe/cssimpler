@@ -230,6 +230,7 @@ impl ScrollbarController {
                 ClipRect::unbounded(),
                 delta_x,
                 delta_y,
+                true,
             ) {
                 return true;
             }
@@ -339,6 +340,7 @@ impl ScrollbarController {
         clip: ClipRect,
         delta_x: f32,
         delta_y: f32,
+        collect_deferred_stacking_contexts: bool,
     ) -> bool {
         if !clip.contains(x, y) {
             return false;
@@ -357,13 +359,17 @@ impl ScrollbarController {
             clip
         };
 
-        let deferred = sorted_deferred_scrollbar_contexts(node, path, child_clip);
+        let deferred = if collect_deferred_stacking_contexts {
+            sorted_deferred_scrollbar_contexts(node, path, child_clip)
+        } else {
+            Vec::new()
+        };
         for entry in deferred.iter().rev().filter(|entry| entry.level >= 0) {
             let relative_path = &entry.path[path.len()..];
             let original_len = path.len();
             path.extend_from_slice(relative_path);
             let handled = node_mut_at_relative_path(node, relative_path).is_some_and(|target| {
-                self.handle_wheel_on_node(target, path, x, y, entry.clip, delta_x, delta_y)
+                self.handle_wheel_on_node(target, path, x, y, entry.clip, delta_x, delta_y, true)
             });
             path.truncate(original_len);
             if handled {
@@ -375,6 +381,7 @@ impl ScrollbarController {
             if establishes_stacking_context(&node.children[index]) {
                 continue;
             }
+            let child_starts_context = node_stops_stacking_descent(&node.children[index]);
             path.push(index);
             if self.handle_wheel_on_node(
                 &mut node.children[index],
@@ -384,6 +391,7 @@ impl ScrollbarController {
                 child_clip,
                 delta_x,
                 delta_y,
+                child_starts_context,
             ) {
                 path.pop();
                 return true;
@@ -396,7 +404,7 @@ impl ScrollbarController {
             let original_len = path.len();
             path.extend_from_slice(relative_path);
             let handled = node_mut_at_relative_path(node, relative_path).is_some_and(|target| {
-                self.handle_wheel_on_node(target, path, x, y, entry.clip, delta_x, delta_y)
+                self.handle_wheel_on_node(target, path, x, y, entry.clip, delta_x, delta_y, true)
             });
             path.truncate(original_len);
             if handled {
@@ -784,19 +792,38 @@ fn node_stops_stacking_descent(node: &RenderNode) -> bool {
         || node.style.transform_style == TransformStyleMode::Preserve3d
 }
 
+#[cfg(test)]
+thread_local! {
+    static DEFERRED_SCROLLBAR_COLLECTION_VISITS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_deferred_scrollbar_collection_visits() {
+    DEFERRED_SCROLLBAR_COLLECTION_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn deferred_scrollbar_collection_visits() -> usize {
+    DEFERRED_SCROLLBAR_COLLECTION_VISITS.with(std::cell::Cell::get)
+}
+
 fn collect_deferred_scrollbar_stacking_contexts(
     node: &RenderNode,
-    base_path: &[usize],
+    path: &mut Vec<usize>,
     child_clip: ClipRect,
     order: &mut u64,
     deferred: &mut Vec<DeferredScrollbarStackingContext>,
 ) {
+    #[cfg(test)]
+    DEFERRED_SCROLLBAR_COLLECTION_VISITS.with(|visits| visits.set(visits.get() + 1));
+
     for (index, child) in node.children.iter().enumerate() {
-        let mut child_path = base_path.to_vec();
-        child_path.push(index);
+        path.push(index);
         if establishes_stacking_context(child) {
             deferred.push(DeferredScrollbarStackingContext {
-                path: child_path,
+                path: path.clone(),
                 clip: child_clip,
                 level: stacking_context_level(child),
                 order: *order,
@@ -811,13 +838,14 @@ fn collect_deferred_scrollbar_stacking_contexts(
             if let Some(descendant_clip) = descendant_clip {
                 collect_deferred_scrollbar_stacking_contexts(
                     child,
-                    &child_path,
+                    path,
                     descendant_clip,
                     order,
                     deferred,
                 );
             }
         }
+        path.pop();
     }
 }
 
@@ -828,9 +856,10 @@ fn sorted_deferred_scrollbar_contexts(
 ) -> Vec<DeferredScrollbarStackingContext> {
     let mut deferred = Vec::new();
     let mut order = 0;
+    let mut path = base_path.to_vec();
     collect_deferred_scrollbar_stacking_contexts(
         node,
-        base_path,
+        &mut path,
         child_clip,
         &mut order,
         &mut deferred,
@@ -849,7 +878,7 @@ fn find_scrollbar_hit(scene: &[RenderNode], x: f32, y: f32) -> Option<ScrollbarH
         .rev()
         .find_map(|index| {
             let node = &scene[index];
-            find_scrollbar_hit_node(node, x, y, ClipRect::unbounded(), &[index])
+            find_scrollbar_hit_node(node, x, y, ClipRect::unbounded(), &[index], true)
         })
 }
 
@@ -863,7 +892,7 @@ fn find_auto_scroll_target(scene: &[RenderNode], x: f32, y: f32) -> Option<Vec<u
         .rev()
         .find_map(|index| {
             let node = &scene[index];
-            find_auto_scroll_target_node(node, x, y, ClipRect::unbounded(), &[index])
+            find_auto_scroll_target_node(node, x, y, ClipRect::unbounded(), &[index], true)
         })
 }
 
@@ -873,6 +902,7 @@ fn find_auto_scroll_target_node(
     y: f32,
     clip: ClipRect,
     path: &[usize],
+    collect_deferred_stacking_contexts: bool,
 ) -> Option<Vec<usize>> {
     if !clip.contains(x, y) {
         return None;
@@ -888,11 +918,16 @@ fn find_auto_scroll_target_node(
         clip
     };
 
-    let deferred = sorted_deferred_scrollbar_contexts(node, path, child_clip);
+    let deferred = if collect_deferred_stacking_contexts {
+        sorted_deferred_scrollbar_contexts(node, path, child_clip)
+    } else {
+        Vec::new()
+    };
     for entry in deferred.iter().rev().filter(|entry| entry.level >= 0) {
         let relative_path = &entry.path[path.len()..];
         if let Some(target) = node_at_relative_path(node, relative_path)
-            && let Some(path) = find_auto_scroll_target_node(target, x, y, entry.clip, &entry.path)
+            && let Some(path) =
+                find_auto_scroll_target_node(target, x, y, entry.clip, &entry.path, true)
         {
             return Some(path);
         }
@@ -904,7 +939,14 @@ fn find_auto_scroll_target_node(
         }
         let mut next_path = path.to_vec();
         next_path.push(index);
-        if let Some(path) = find_auto_scroll_target_node(child, x, y, child_clip, &next_path) {
+        if let Some(path) = find_auto_scroll_target_node(
+            child,
+            x,
+            y,
+            child_clip,
+            &next_path,
+            node_stops_stacking_descent(child),
+        ) {
             return Some(path);
         }
     }
@@ -912,7 +954,8 @@ fn find_auto_scroll_target_node(
     for entry in deferred.iter().rev().filter(|entry| entry.level < 0) {
         let relative_path = &entry.path[path.len()..];
         if let Some(target) = node_at_relative_path(node, relative_path)
-            && let Some(path) = find_auto_scroll_target_node(target, x, y, entry.clip, &entry.path)
+            && let Some(path) =
+                find_auto_scroll_target_node(target, x, y, entry.clip, &entry.path, true)
         {
             return Some(path);
         }
@@ -933,6 +976,7 @@ fn find_scrollbar_hit_node(
     y: f32,
     clip: ClipRect,
     path: &[usize],
+    collect_deferred_stacking_contexts: bool,
 ) -> Option<ScrollbarHit> {
     if !clip.contains(x, y) {
         return None;
@@ -948,11 +992,15 @@ fn find_scrollbar_hit_node(
         clip
     };
 
-    let deferred = sorted_deferred_scrollbar_contexts(node, path, child_clip);
+    let deferred = if collect_deferred_stacking_contexts {
+        sorted_deferred_scrollbar_contexts(node, path, child_clip)
+    } else {
+        Vec::new()
+    };
     for entry in deferred.iter().rev().filter(|entry| entry.level >= 0) {
         let relative_path = &entry.path[path.len()..];
         if let Some(target) = node_at_relative_path(node, relative_path)
-            && let Some(hit) = find_scrollbar_hit_node(target, x, y, entry.clip, &entry.path)
+            && let Some(hit) = find_scrollbar_hit_node(target, x, y, entry.clip, &entry.path, true)
         {
             return Some(hit);
         }
@@ -968,7 +1016,14 @@ fn find_scrollbar_hit_node(
         }
         let mut next_path = path.to_vec();
         next_path.push(index);
-        if let Some(hit) = find_scrollbar_hit_node(child, x, y, child_clip, &next_path) {
+        if let Some(hit) = find_scrollbar_hit_node(
+            child,
+            x,
+            y,
+            child_clip,
+            &next_path,
+            node_stops_stacking_descent(child),
+        ) {
             return Some(hit);
         }
     }
@@ -976,7 +1031,7 @@ fn find_scrollbar_hit_node(
     for entry in deferred.iter().rev().filter(|entry| entry.level < 0) {
         let relative_path = &entry.path[path.len()..];
         if let Some(target) = node_at_relative_path(node, relative_path)
-            && let Some(hit) = find_scrollbar_hit_node(target, x, y, entry.clip, &entry.path)
+            && let Some(hit) = find_scrollbar_hit_node(target, x, y, entry.clip, &entry.path, true)
         {
             return Some(hit);
         }
@@ -1422,8 +1477,28 @@ mod tests {
 
     use super::{
         AutoScrollIndicator, ScrollbarAxis, ScrollbarController, auto_scroll_delta,
-        scrollbar_rects, text_layout,
+        deferred_scrollbar_collection_visits, find_auto_scroll_target, find_scrollbar_hit,
+        reset_deferred_scrollbar_collection_visits, scrollbar_rects, text_layout,
     };
+
+    fn vertical_scrollbars(width: f32) -> ScrollbarData {
+        ScrollbarData::new(
+            OverflowMode::Hidden,
+            OverflowMode::Auto,
+            ScrollbarStyle {
+                width: cssimpler_core::ScrollbarWidth::Px(width),
+                ..ScrollbarStyle::default()
+            },
+            ScrollbarMetrics {
+                offset_x: 0.0,
+                offset_y: 0.0,
+                max_offset_x: 0.0,
+                max_offset_y: 200.0,
+                reserved_width: width,
+                reserved_height: 0.0,
+            },
+        )
+    }
 
     #[test]
     fn text_layout_expands_by_scroll_extent_and_applies_offset() {
@@ -1588,6 +1663,99 @@ mod tests {
         assert!(
             scene[0].children[1]
                 .scrollbars
+                .is_some_and(|scrollbars| scrollbars.metrics.offset_y == 0.0)
+        );
+    }
+
+    #[test]
+    fn scrollbar_traversals_collect_deep_nodes_once_per_context() {
+        const DEPTH: usize = 192;
+
+        let mut node = cssimpler_core::RenderNode::container(LayoutBox::new(0.0, 0.0, 120.0, 80.0))
+            .with_scrollbars(vertical_scrollbars(12.0));
+        for _ in 1..DEPTH {
+            node = cssimpler_core::RenderNode::container(LayoutBox::new(0.0, 0.0, 120.0, 80.0))
+                .with_child(node);
+        }
+        let mut scene = vec![node];
+        let mut expected_path = vec![0];
+        expected_path.resize(DEPTH, 0);
+
+        reset_deferred_scrollbar_collection_visits();
+        let hit = find_scrollbar_hit(&scene, 114.0, 60.0)
+            .expect("deepest vertical scrollbar track should be hit");
+        assert_eq!(hit.path, expected_path);
+        assert_eq!(deferred_scrollbar_collection_visits(), DEPTH);
+
+        reset_deferred_scrollbar_collection_visits();
+        assert_eq!(
+            find_auto_scroll_target(&scene, 40.0, 20.0),
+            Some(expected_path.clone())
+        );
+        assert_eq!(deferred_scrollbar_collection_visits(), DEPTH);
+
+        let mut controller = ScrollbarController::default();
+        reset_deferred_scrollbar_collection_visits();
+        assert!(controller.handle_wheel(&mut scene, Some((40.0, 20.0)), Some((0.0, -1.0))));
+        assert_eq!(deferred_scrollbar_collection_visits(), DEPTH);
+        assert!(
+            super::node_mut_at_path(&mut scene, &expected_path)
+                .and_then(|node| node.scrollbars)
+                .is_some_and(|scrollbars| scrollbars.metrics.offset_y > 0.0)
+        );
+    }
+
+    #[test]
+    fn scrollbar_traversals_preserve_nested_z_index_across_perspective_boundary() {
+        let positive_path = vec![0, 0, 0, 0];
+        let normal_path = vec![0, 0, 1];
+        let mut scene = vec![
+            cssimpler_core::RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0)).with_child(
+                cssimpler_core::RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                    .with_style(VisualStyle {
+                        perspective: Some(200.0),
+                        ..VisualStyle::default()
+                    })
+                    .with_child(
+                        cssimpler_core::RenderNode::container(LayoutBox::new(0.0, 0.0, 36.0, 36.0))
+                            .with_child(
+                                cssimpler_core::RenderNode::container(LayoutBox::new(
+                                    4.0, 4.0, 28.0, 28.0,
+                                ))
+                                .with_style(VisualStyle {
+                                    positioned: true,
+                                    z_index: ZIndex::Integer(1000),
+                                    ..VisualStyle::default()
+                                })
+                                .with_scrollbars(vertical_scrollbars(6.0)),
+                            ),
+                    )
+                    .with_child(
+                        cssimpler_core::RenderNode::container(LayoutBox::new(4.0, 4.0, 28.0, 28.0))
+                            .with_scrollbars(vertical_scrollbars(6.0)),
+                    ),
+            ),
+        ];
+
+        assert_eq!(
+            find_scrollbar_hit(&scene, 29.0, 24.0).map(|hit| hit.path),
+            Some(positive_path.clone())
+        );
+        assert_eq!(
+            find_auto_scroll_target(&scene, 20.0, 20.0),
+            Some(positive_path.clone())
+        );
+
+        let mut controller = ScrollbarController::default();
+        assert!(controller.handle_wheel(&mut scene, Some((20.0, 20.0)), Some((0.0, -1.0))));
+        assert!(
+            super::node_mut_at_path(&mut scene, &positive_path)
+                .and_then(|node| node.scrollbars)
+                .is_some_and(|scrollbars| scrollbars.metrics.offset_y > 0.0)
+        );
+        assert!(
+            super::node_mut_at_path(&mut scene, &normal_path)
+                .and_then(|node| node.scrollbars)
                 .is_some_and(|scrollbars| scrollbars.metrics.offset_y == 0.0)
         );
     }

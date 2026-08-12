@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use ab_glyph::{Font, FontArc, FontVec, ScaleFont};
+use ab_glyph::{Font, FontArc, FontVec, GlyphId, ScaleFont};
 use unicode_segmentation::UnicodeSegmentation;
 
 const DEFAULT_FONT_SIZE_PX: f32 = 16.0;
@@ -171,6 +171,14 @@ pub struct TextLayout {
     pub width: f32,
     pub height: f32,
     pub line_height: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextCaretStop {
+    /// UTF-8 byte offset in the original, untransformed text.
+    pub byte_index: usize,
+    /// Horizontal width of the rendered prefix ending at `byte_index`.
+    pub offset_px: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -521,6 +529,39 @@ pub fn layout_text_block(text: &str, style: &TextStyle, wrap_width: Option<f32>)
     }
 }
 
+/// Measures every UTF-8 character caret position in one glyph-metrics pass.
+///
+/// The byte indices refer to `text`, while offsets reflect the rendered text after applying the
+/// style's text transform and whitespace rules. This makes transform expansions such as `ß` to
+/// `SS` safe to use for editing without losing the source UTF-8 position.
+pub fn layout_text_caret_stops(text: &str, style: &TextStyle) -> Vec<TextCaretStop> {
+    let mut stops = Vec::with_capacity(text.chars().count().saturating_add(1));
+    stops.push(TextCaretStop {
+        byte_index: 0,
+        offset_px: 0.0,
+    });
+    if text.is_empty() {
+        return stops;
+    }
+
+    let backend = resolve_font(style)
+        .map(MeasurementBackend::Real)
+        .unwrap_or_else(|| MeasurementBackend::Bitmap(BitmapFontMetrics::from_style(style)));
+    let mut measurement =
+        CaretTextMeasurement::new(&backend, style.letter_spacing_px, style.white_space);
+    let mut transform = IncrementalTextTransform::new(style.text_transform);
+
+    for (character_start, character) in text.char_indices() {
+        transform.emit(character, |transformed| measurement.push(transformed));
+        stops.push(TextCaretStop {
+            byte_index: character_start + character.len_utf8(),
+            offset_px: measurement.width(),
+        });
+    }
+
+    stops
+}
+
 fn wrap_width_bits(wrap_width: Option<f32>) -> Option<u32> {
     wrap_width.map(f32::to_bits)
 }
@@ -528,6 +569,153 @@ fn wrap_width_bits(wrap_width: Option<f32>) -> Option<u32> {
 enum MeasurementBackend {
     Real(ResolvedFont),
     Bitmap(BitmapFontMetrics),
+}
+
+#[derive(Clone, Copy, Default)]
+struct TextWidthAccumulator {
+    base_width: f32,
+    character_count: usize,
+    previous_glyph: Option<GlyphId>,
+}
+
+impl TextWidthAccumulator {
+    fn push(&mut self, backend: &MeasurementBackend, character: char) {
+        match backend {
+            MeasurementBackend::Real(font) => {
+                let scaled_font = font.font.as_scaled(font.size_px);
+                let glyph = scaled_font.glyph_id(character);
+                if let Some(previous) = self.previous_glyph {
+                    self.base_width += scaled_font.kern(previous, glyph);
+                }
+                self.base_width += scaled_font.h_advance(glyph);
+                self.previous_glyph = Some(glyph);
+            }
+            MeasurementBackend::Bitmap(metrics) => {
+                self.base_width += metrics.glyph_advance_px;
+            }
+        }
+        self.character_count += 1;
+    }
+
+    fn width(self, letter_spacing_px: f32) -> f32 {
+        self.base_width + self.character_count.saturating_sub(1) as f32 * letter_spacing_px
+    }
+}
+
+struct CaretTextMeasurement<'a> {
+    backend: &'a MeasurementBackend,
+    letter_spacing_px: f32,
+    collapse_whitespace: bool,
+    current_line: TextWidthAccumulator,
+    widest_completed_line: f32,
+    pending_collapsed_space: bool,
+    pending_carriage_return: bool,
+}
+
+impl<'a> CaretTextMeasurement<'a> {
+    fn new(
+        backend: &'a MeasurementBackend,
+        letter_spacing_px: f32,
+        white_space: WhiteSpace,
+    ) -> Self {
+        Self {
+            backend,
+            letter_spacing_px,
+            collapse_whitespace: matches!(white_space, WhiteSpace::Normal | WhiteSpace::NoWrap),
+            current_line: TextWidthAccumulator::default(),
+            widest_completed_line: 0.0,
+            pending_collapsed_space: false,
+            pending_carriage_return: false,
+        }
+    }
+
+    fn push(&mut self, character: char) {
+        if self.pending_carriage_return {
+            self.pending_carriage_return = false;
+            if character == '\n' {
+                self.finish_line();
+                return;
+            }
+            self.push_to_line('\r');
+        }
+
+        match character {
+            '\r' => self.pending_carriage_return = true,
+            '\n' => self.finish_line(),
+            _ => self.push_to_line(character),
+        }
+    }
+
+    fn push_to_line(&mut self, character: char) {
+        if self.collapse_whitespace && character.is_whitespace() {
+            self.pending_collapsed_space = self.current_line.character_count != 0;
+            return;
+        }
+
+        if self.pending_collapsed_space {
+            self.current_line.push(self.backend, ' ');
+            self.pending_collapsed_space = false;
+        }
+        self.current_line.push(self.backend, character);
+    }
+
+    fn finish_line(&mut self) {
+        self.widest_completed_line = self.widest_completed_line.max(self.current_line_width());
+        self.current_line = TextWidthAccumulator::default();
+        self.pending_collapsed_space = false;
+    }
+
+    fn current_line_width(&self) -> f32 {
+        self.current_line.width(self.letter_spacing_px)
+    }
+
+    fn width(&self) -> f32 {
+        let current_width = if self.pending_carriage_return {
+            let mut preview = self.current_line;
+            if self.collapse_whitespace {
+                // A trailing collapsible carriage return is omitted just like any trailing space.
+                preview.width(self.letter_spacing_px)
+            } else {
+                preview.push(self.backend, '\r');
+                preview.width(self.letter_spacing_px)
+            }
+        } else {
+            self.current_line_width()
+        };
+        self.widest_completed_line.max(current_width)
+    }
+}
+
+struct IncrementalTextTransform {
+    kind: TextTransform,
+    capitalize_next: bool,
+}
+
+impl IncrementalTextTransform {
+    fn new(kind: TextTransform) -> Self {
+        Self {
+            kind,
+            capitalize_next: true,
+        }
+    }
+
+    fn emit(&mut self, character: char, mut emit: impl FnMut(char)) {
+        match self.kind {
+            TextTransform::None => emit(character),
+            TextTransform::Uppercase => character.to_uppercase().for_each(emit),
+            TextTransform::Lowercase => character.to_lowercase().for_each(emit),
+            TextTransform::Capitalize => {
+                if self.capitalize_next && character.is_alphabetic() {
+                    character.to_uppercase().for_each(emit);
+                    self.capitalize_next = false;
+                    return;
+                }
+
+                emit(character);
+                self.capitalize_next = !(character.is_alphanumeric() || character == '\'');
+            }
+        }
+    }
 }
 
 impl MeasurementBackend {
@@ -849,8 +1037,8 @@ mod tests {
 
     use super::{
         BitmapFontMetrics, FontFamily, GenericFontFamily, LineHeight, OverflowWrap, TextStyle,
-        TextTransform, WhiteSpace, WordBreak, layout_text_block, query_families,
-        register_font_file, resolve_font,
+        TextTransform, WhiteSpace, WordBreak, layout_text_block, layout_text_caret_stops,
+        query_families, register_font_file, resolve_font,
     };
 
     fn bundled_font_family() -> String {
@@ -1081,6 +1269,102 @@ mod tests {
         let spaced_layout = layout_text_block("ABCD", &spaced, None);
 
         assert!((spaced_layout.width - (baseline_layout.width + 6.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn caret_stops_match_unicode_prefix_layout_after_transform_and_whitespace() {
+        let text = "  Stra\u{df}e  a\u{301}\r\n\u{130} \u{1f469}\u{200d}\u{1f680}  ";
+
+        for white_space in [
+            WhiteSpace::Normal,
+            WhiteSpace::NoWrap,
+            WhiteSpace::Pre,
+            WhiteSpace::PreWrap,
+        ] {
+            for text_transform in [
+                TextTransform::None,
+                TextTransform::Uppercase,
+                TextTransform::Lowercase,
+                TextTransform::Capitalize,
+            ] {
+                let style = TextStyle {
+                    families: vec![FontFamily::Named(
+                        "cssimpler-missing-font-for-caret-tests".to_string(),
+                    )],
+                    letter_spacing_px: 1.25,
+                    text_transform,
+                    white_space,
+                    ..TextStyle::default()
+                };
+                let stops = layout_text_caret_stops(text, &style);
+
+                assert_eq!(stops.first().map(|stop| stop.byte_index), Some(0));
+                assert_eq!(stops.last().map(|stop| stop.byte_index), Some(text.len()));
+                for stop in stops {
+                    let prefix_width =
+                        layout_text_block(&text[..stop.byte_index], &style, None).width;
+                    assert!(
+                        (stop.offset_px - prefix_width).abs() < 0.001,
+                        "caret width mismatch at byte {} for {text_transform:?}/{white_space:?}: {} != {}",
+                        stop.byte_index,
+                        stop.offset_px,
+                        prefix_width,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn caret_stops_match_real_font_kerning_and_utf8_boundaries() {
+        let style = TextStyle {
+            families: vec![FontFamily::Named(bundled_font_family())],
+            size_px: 24.0,
+            letter_spacing_px: 0.75,
+            white_space: WhiteSpace::Pre,
+            ..TextStyle::default()
+        };
+        let text = "AVATAR a\u{301} \u{1f469}\u{200d}\u{1f680}";
+        let stops = layout_text_caret_stops(text, &style);
+
+        assert!(stops.iter().any(|stop| stop.byte_index == 8));
+        assert!(
+            stops
+                .iter()
+                .all(|stop| text.is_char_boundary(stop.byte_index))
+        );
+        for stop in stops {
+            let prefix_width = layout_text_block(&text[..stop.byte_index], &style, None).width;
+            assert!((stop.offset_px - prefix_width).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn long_unicode_caret_layout_emits_one_source_character_stop() {
+        let unit = "a\u{301}\u{1f469}\u{200d}\u{1f680}\u{df}";
+        let repetitions = 2_048;
+        let text = unit.repeat(repetitions);
+        let style = TextStyle {
+            families: vec![FontFamily::Named(
+                "cssimpler-missing-font-for-long-caret-test".to_string(),
+            )],
+            text_transform: TextTransform::Uppercase,
+            white_space: WhiteSpace::Pre,
+            ..TextStyle::default()
+        };
+
+        let stops = layout_text_caret_stops(&text, &style);
+
+        assert_eq!(stops.len(), repetitions * 6 + 1);
+        assert_eq!(stops.last().map(|stop| stop.byte_index), Some(text.len()));
+        assert!(
+            stops
+                .iter()
+                .all(|stop| text.is_char_boundary(stop.byte_index))
+        );
+        assert!(stops.windows(2).all(|pair| {
+            pair[0].byte_index < pair[1].byte_index && pair[0].offset_px < pair[1].offset_px
+        }));
     }
 
     #[test]

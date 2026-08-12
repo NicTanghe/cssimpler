@@ -91,7 +91,6 @@ const SCENE_TRAVERSAL_COST_PER_NODE: usize = 96;
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 const MAX_SUBTREE_SURFACE_CACHE_ENTRIES: usize = 64;
 const MAX_WORKER_BUFFER_POOL_BYTES: usize = 32 * 1024 * 1024;
-const MAX_WORKER_ALPHA_BUFFER_POOL_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FramePaintMode {
@@ -156,7 +155,6 @@ struct DirtyRenderJob {
 
 static FRAME_TIMING_STATS: OnceLock<Mutex<FrameTimingStats>> = OnceLock::new();
 static WORKER_BUFFER_POOL: OnceLock<Mutex<Vec<Vec<u32>>>> = OnceLock::new();
-static WORKER_ALPHA_BUFFER_POOL: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
 static SUBTREE_SURFACE_CACHE: OnceLock<Mutex<SubtreeSurfaceCache>> = OnceLock::new();
 #[cfg(test)]
 static SUBTREE_SURFACE_CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -246,27 +244,13 @@ fn worker_buffer_pool() -> &'static Mutex<Vec<Vec<u32>>> {
     WORKER_BUFFER_POOL.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn worker_alpha_buffer_pool() -> &'static Mutex<Vec<Vec<u8>>> {
-    WORKER_ALPHA_BUFFER_POOL.get_or_init(|| Mutex::new(Vec::new()))
-}
-
 fn buffer_storage_bytes(capacity: usize) -> usize {
     capacity.saturating_mul(size_of::<u32>())
-}
-
-fn alpha_buffer_storage_bytes(capacity: usize) -> usize {
-    capacity.saturating_mul(size_of::<u8>())
 }
 
 fn worker_buffer_pool_reserved_bytes(pool: &[Vec<u32>]) -> usize {
     pool.iter()
         .map(|buffer| buffer_storage_bytes(buffer.capacity()))
-        .sum()
-}
-
-fn worker_alpha_buffer_pool_reserved_bytes(pool: &[Vec<u8>]) -> usize {
-    pool.iter()
-        .map(|buffer| alpha_buffer_storage_bytes(buffer.capacity()))
         .sum()
 }
 
@@ -286,42 +270,10 @@ fn trim_worker_buffer_pool_to_budget(pool: &mut Vec<Vec<u32>>, budget_bytes: usi
     }
 }
 
-fn trim_worker_alpha_buffer_pool_to_budget(pool: &mut Vec<Vec<u8>>, budget_bytes: usize) {
-    let mut reserved_bytes = worker_alpha_buffer_pool_reserved_bytes(pool);
-    if reserved_bytes <= budget_bytes {
-        return;
-    }
-
-    pool.sort_by_key(|buffer| buffer.capacity());
-    while reserved_bytes > budget_bytes {
-        let Some(buffer) = pool.pop() else {
-            break;
-        };
-        reserved_bytes =
-            reserved_bytes.saturating_sub(alpha_buffer_storage_bytes(buffer.capacity()));
-    }
-}
-
 fn acquire_worker_buffers(lengths: &[usize]) -> Vec<Vec<u32>> {
     let mut pool = worker_buffer_pool()
         .lock()
         .expect("worker buffer pool mutex should not be poisoned");
-    let mut buffers = Vec::with_capacity(lengths.len());
-    for &len in lengths {
-        let mut buffer = pool.pop().unwrap_or_default();
-        buffer.resize(len, 0);
-        if buffer.capacity() > len.saturating_mul(2).max(1) {
-            buffer.shrink_to(len);
-        }
-        buffers.push(buffer);
-    }
-    buffers
-}
-
-fn acquire_worker_alpha_buffers(lengths: &[usize]) -> Vec<Vec<u8>> {
-    let mut pool = worker_alpha_buffer_pool()
-        .lock()
-        .expect("worker alpha buffer pool mutex should not be poisoned");
     let mut buffers = Vec::with_capacity(lengths.len());
     for &len in lengths {
         let mut buffer = pool.pop().unwrap_or_default();
@@ -340,14 +292,6 @@ fn release_worker_buffers(buffers: Vec<Vec<u32>>) {
         .expect("worker buffer pool mutex should not be poisoned");
     pool.extend(buffers);
     trim_worker_buffer_pool_to_budget(&mut pool, MAX_WORKER_BUFFER_POOL_BYTES);
-}
-
-fn release_worker_alpha_buffers(buffers: Vec<Vec<u8>>) {
-    let mut pool = worker_alpha_buffer_pool()
-        .lock()
-        .expect("worker alpha buffer pool mutex should not be poisoned");
-    pool.extend(buffers);
-    trim_worker_alpha_buffer_pool_to_budget(&mut pool, MAX_WORKER_ALPHA_BUFFER_POOL_BYTES);
 }
 
 fn subtree_surface_cache() -> &'static Mutex<SubtreeSurfaceCache> {
@@ -1494,17 +1438,19 @@ pub fn render_to_buffer(
     height: usize,
     clear_color: Color,
 ) {
-    let extracted = ExtractedScene::from_render_roots(scene);
-    let _ = render_to_buffer_internal(
-        &extracted,
+    let _ = render_to_buffer_internal_with_cached_bounds(
+        scene,
+        None,
         buffer,
         width,
         height,
         clear_color,
         GlassRenderMode::Fallback,
+        None,
     );
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn render_to_buffer_internal(
     scene: &ExtractedScene,
     buffer: &mut [u32],
@@ -1513,7 +1459,25 @@ fn render_to_buffer_internal(
     clear_color: Color,
     glass_mode: GlassRenderMode,
 ) -> PaintStats {
-    render_to_buffer_internal_with_alpha(
+    render_to_buffer_internal_from_roots(
+        &scene.roots,
+        buffer,
+        width,
+        height,
+        clear_color,
+        glass_mode,
+    )
+}
+
+fn render_to_buffer_internal_from_roots(
+    scene: &[RenderNode],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+    glass_mode: GlassRenderMode,
+) -> PaintStats {
+    render_to_buffer_internal_from_roots_with_alpha(
         scene,
         buffer,
         width,
@@ -1524,8 +1488,29 @@ fn render_to_buffer_internal(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn render_to_buffer_internal_with_alpha(
     scene: &ExtractedScene,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+    glass_mode: GlassRenderMode,
+    alpha_buffer: Option<&mut [u8]>,
+) -> PaintStats {
+    render_to_buffer_internal_from_roots_with_alpha(
+        &scene.roots,
+        buffer,
+        width,
+        height,
+        clear_color,
+        glass_mode,
+        alpha_buffer,
+    )
+}
+
+fn render_to_buffer_internal_from_roots_with_alpha(
+    scene: &[RenderNode],
     buffer: &mut [u32],
     width: usize,
     height: usize,
@@ -1546,7 +1531,7 @@ fn render_to_buffer_internal_with_alpha(
 }
 
 fn render_to_buffer_internal_with_cached_bounds(
-    scene: &ExtractedScene,
+    scene: &[RenderNode],
     cached_bounds: Option<&CachedSceneBounds>,
     buffer: &mut [u32],
     width: usize,
@@ -1564,7 +1549,7 @@ fn render_to_buffer_internal_with_cached_bounds(
     let cached_bounds = if let Some(cached_bounds) = cached_bounds {
         cached_bounds
     } else {
-        owned_bounds = cache_scene_subtree_bounds(&scene.roots);
+        owned_bounds = cache_scene_subtree_bounds(scene);
         &owned_bounds
     };
     let worker_count = if cached_bounds
@@ -1578,7 +1563,7 @@ fn render_to_buffer_internal_with_cached_bounds(
     };
     if worker_count <= 1 {
         render_to_buffer_serial(
-            &scene.roots,
+            scene,
             &cached_bounds.roots,
             buffer,
             width,
@@ -1589,7 +1574,7 @@ fn render_to_buffer_internal_with_cached_bounds(
         );
     } else {
         render_to_buffer_parallel(
-            &scene.roots,
+            scene,
             cached_bounds,
             buffer,
             width,
@@ -1656,9 +1641,26 @@ fn render_to_buffer_parallel(
     glass_mode: GlassRenderMode,
     mut alpha_buffer: Option<&mut [u8]>,
 ) {
+    let expected_pixel_count = width
+        .checked_mul(height)
+        .expect("parallel render dimensions should fit in usize");
+    assert_eq!(
+        buffer.len(),
+        expected_pixel_count,
+        "parallel render buffer length must match width * height"
+    );
+    if let Some(alpha_buffer) = alpha_buffer.as_deref() {
+        assert_eq!(
+            alpha_buffer.len(),
+            expected_pixel_count,
+            "parallel alpha buffer length must match width * height"
+        );
+    }
+
     let clear = pack_rgb(clear_color);
     let band_count = worker_count.max(1).min(height.max(1));
     let rows_per_worker = height.div_ceil(band_count);
+    let pixels_per_band = rows_per_worker.saturating_mul(width).max(1);
     let bands = (0..height)
         .step_by(rows_per_worker)
         .map(|row_start| BufferRows::new(row_start, (row_start + rows_per_worker).min(height)))
@@ -1678,21 +1680,13 @@ fn render_to_buffer_parallel(
             )
         })
         .collect::<Vec<_>>();
-    let worker_buffer_lengths = bands
-        .iter()
-        .map(|rows| rows.pixel_len(width))
-        .collect::<Vec<_>>();
-    let mut worker_buffers = acquire_worker_buffers(&worker_buffer_lengths);
-    let mut worker_alpha_buffers = alpha_buffer
-        .as_ref()
-        .map(|_| acquire_worker_alpha_buffers(&worker_buffer_lengths));
 
-    if let Some(worker_alpha_buffers) = worker_alpha_buffers.as_mut() {
+    if let Some(alpha_buffer) = alpha_buffer.as_deref_mut() {
         thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for (((worker_buffer, worker_alpha_buffer), rows), root_indices) in worker_buffers
-                .iter_mut()
-                .zip(worker_alpha_buffers.iter_mut())
+            let mut handles = Vec::with_capacity(bands.len());
+            for (((worker_buffer, worker_alpha_buffer), rows), root_indices) in buffer
+                .chunks_mut(pixels_per_band)
+                .zip(alpha_buffer.chunks_mut(pixels_per_band))
                 .zip(bands.iter().copied())
                 .zip(band_root_indices.iter())
             {
@@ -1703,7 +1697,7 @@ fn render_to_buffer_parallel(
                     y1: rows.end as f32,
                 };
                 handles.push(scope.spawn(move || {
-                    with_render_alpha_target(Some(worker_alpha_buffer.as_mut_slice()), || {
+                    with_render_alpha_target(Some(worker_alpha_buffer), || {
                         with_render_buffer_rows(rows, || {
                             worker_buffer.fill(clear);
                             fill_current_alpha_span(0, worker_buffer.len(), u8::MAX);
@@ -1729,9 +1723,9 @@ fn render_to_buffer_parallel(
         });
     } else {
         thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for ((worker_buffer, rows), root_indices) in worker_buffers
-                .iter_mut()
+            let mut handles = Vec::with_capacity(bands.len());
+            for ((worker_buffer, rows), root_indices) in buffer
+                .chunks_mut(pixels_per_band)
                 .zip(bands.iter().copied())
                 .zip(band_root_indices.iter())
             {
@@ -1764,27 +1758,6 @@ fn render_to_buffer_parallel(
             }
         });
     }
-
-    for (worker_buffer, rows) in worker_buffers.iter().zip(bands.iter().copied()) {
-        let start = rows.start * width;
-        let end = rows.end * width;
-        buffer[start..end].copy_from_slice(worker_buffer);
-    }
-
-    if let Some(worker_alpha_buffers) = worker_alpha_buffers {
-        if let Some(alpha_buffer) = alpha_buffer.as_deref_mut() {
-            for (worker_alpha_buffer, rows) in
-                worker_alpha_buffers.iter().zip(bands.iter().copied())
-            {
-                let start = rows.start * width;
-                let end = rows.end * width;
-                alpha_buffer[start..end].copy_from_slice(worker_alpha_buffer);
-            }
-        }
-        release_worker_alpha_buffers(worker_alpha_buffers);
-    }
-
-    release_worker_buffers(worker_buffers);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1796,11 +1769,9 @@ pub fn render_scene_update(
     height: usize,
     clear_color: Color,
 ) {
-    let previous_extracted = ExtractedScene::from_render_roots(previous_scene);
-    let extracted = ExtractedScene::from_render_roots(scene);
-    let _ = render_scene_update_internal(
-        &previous_extracted,
-        &extracted,
+    let _ = render_scene_update_roots(
+        previous_scene,
+        scene,
         buffer,
         width,
         height,
@@ -1818,11 +1789,9 @@ fn render_scene_update_internal_from_roots(
     height: usize,
     clear_color: Color,
 ) -> PaintStats {
-    let previous_extracted = ExtractedScene::from_render_roots(previous_scene);
-    let extracted = ExtractedScene::from_render_roots(scene);
-    render_scene_update_internal(
-        &previous_extracted,
-        &extracted,
+    render_scene_update_internal_from_roots_with_glass(
+        previous_scene,
+        scene,
         buffer,
         width,
         height,
@@ -1831,22 +1800,42 @@ fn render_scene_update_internal_from_roots(
     )
 }
 
-fn render_scene_update_internal(
-    previous_scene: &ExtractedScene,
-    scene: &ExtractedScene,
+fn render_scene_update_internal_from_roots_with_glass(
+    previous_scene: &[RenderNode],
+    scene: &[RenderNode],
     buffer: &mut [u32],
     width: usize,
     height: usize,
     clear_color: Color,
     glass_mode: GlassRenderMode,
 ) -> PaintStats {
-    let scene_diff = prepare_scene_diff(&previous_scene.roots, &scene.roots);
+    render_scene_update_roots(
+        previous_scene,
+        scene,
+        buffer,
+        width,
+        height,
+        clear_color,
+        glass_mode,
+    )
+}
+
+fn render_scene_update_roots(
+    previous_scene: &[RenderNode],
+    scene: &[RenderNode],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+    glass_mode: GlassRenderMode,
+) -> PaintStats {
+    let scene_diff = prepare_scene_diff(previous_scene, scene);
     let mut dirty_regions = scene_diff.dirty_regions;
     if dirty_regions.is_empty() {
         return PaintStats::default();
     }
-    let max_backdrop_blur_radius = scene_max_backdrop_blur_radius(&previous_scene.roots)
-        .max(scene_max_backdrop_blur_radius(&scene.roots));
+    let max_backdrop_blur_radius =
+        scene_max_backdrop_blur_radius(previous_scene).max(scene_max_backdrop_blur_radius(scene));
     if max_backdrop_blur_radius > 0.0 {
         dirty_regions.iter_mut().for_each(|region| {
             *region = region.expand(max_backdrop_blur_radius);
@@ -1909,7 +1898,7 @@ fn render_scene_update_internal(
 
     if max_backdrop_blur_radius <= 0.0 && incremental_worker_count > 1 {
         render_scene_update_parallel(
-            &scene.roots,
+            scene,
             &scene_diff.current_bounds.roots,
             buffer,
             width,
@@ -1933,13 +1922,10 @@ fn render_scene_update_internal(
 
     for dirty_region in snapped_dirty_regions {
         clear_clip(buffer, width, height, dirty_region, clear_color);
-        let root_indices = root_indices_intersecting_clip(
-            &scene.roots,
-            &scene_diff.current_bounds.roots,
-            dirty_region,
-        );
+        let root_indices =
+            root_indices_intersecting_clip(scene, &scene_diff.current_bounds.roots, dirty_region);
         draw_cached_root_indices(
-            &scene.roots,
+            scene,
             &scene_diff.current_bounds.roots,
             &root_indices,
             buffer,
@@ -2236,9 +2222,22 @@ fn incremental_scene_passes_for_full_redraw_heuristic(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn should_present_scene(
     previous_scene: Option<&ExtractedScene>,
     scene: &ExtractedScene,
+    resized: bool,
+) -> bool {
+    should_present_scene_from_roots(
+        previous_scene.map(|previous_scene| previous_scene.roots.as_slice()),
+        &scene.roots,
+        resized,
+    )
+}
+
+fn should_present_scene_from_roots(
+    previous_scene: Option<&[RenderNode]>,
+    scene: &[RenderNode],
     resized: bool,
 ) -> bool {
     if resized {
@@ -2249,9 +2248,10 @@ fn should_present_scene(
         return true;
     };
 
-    !scenes_match_visuals(&previous_scene.roots, &scene.roots)
+    !scenes_match_visuals(previous_scene, scene)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn should_present_frame(
     previous_scene: Option<&ExtractedScene>,
     scene: &ExtractedScene,
@@ -2259,7 +2259,24 @@ fn should_present_frame(
     indicator: Option<scrollbar::AutoScrollIndicator>,
     resized: bool,
 ) -> bool {
-    should_present_scene(previous_scene, scene, resized) || previous_indicator != indicator
+    should_present_frame_from_roots(
+        previous_scene.map(|previous_scene| previous_scene.roots.as_slice()),
+        &scene.roots,
+        previous_indicator,
+        indicator,
+        resized,
+    )
+}
+
+fn should_present_frame_from_roots(
+    previous_scene: Option<&[RenderNode]>,
+    scene: &[RenderNode],
+    previous_indicator: Option<scrollbar::AutoScrollIndicator>,
+    indicator: Option<scrollbar::AutoScrollIndicator>,
+    resized: bool,
+) -> bool {
+    should_present_scene_from_roots(previous_scene, scene, resized)
+        || previous_indicator != indicator
 }
 
 fn redraw_auto_scroll_indicator_regions(
@@ -2273,6 +2290,10 @@ fn redraw_auto_scroll_indicator_regions(
     glass_mode: GlassRenderMode,
     alpha_buffer: Option<&mut [u8]>,
 ) {
+    if previous_indicator.is_none() && indicator.is_none() {
+        return;
+    }
+
     with_render_alpha_target(alpha_buffer, || {
         let cached_bounds = cache_scene_subtree_bounds(scene);
         let mut bounds = Vec::new();
@@ -3459,6 +3480,49 @@ fn hit_test_node_for_event(
     in_3d_context: bool,
     event: MouseEventKind,
 ) -> Option<EventHandler> {
+    hit_test_node_for_event_internal(
+        node,
+        x,
+        y,
+        clip,
+        parent_perspective,
+        in_3d_context,
+        event,
+        true,
+    )
+}
+
+fn hit_test_node_for_event_in_current_stacking_context(
+    node: &RenderNode,
+    x: f32,
+    y: f32,
+    clip: ClipRect,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    event: MouseEventKind,
+) -> Option<EventHandler> {
+    hit_test_node_for_event_internal(
+        node,
+        x,
+        y,
+        clip,
+        parent_perspective,
+        in_3d_context,
+        event,
+        false,
+    )
+}
+
+fn hit_test_node_for_event_internal(
+    node: &RenderNode,
+    x: f32,
+    y: f32,
+    clip: ClipRect,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    event: MouseEventKind,
+    collect_deferred_stacking_contexts: bool,
+) -> Option<EventHandler> {
     if !clip.contains(x, y) {
         return None;
     }
@@ -3476,20 +3540,23 @@ fn hit_test_node_for_event(
     let child_context = child_3d_context(node, in_3d_context);
     let child_perspective = active_child_perspective(node, parent_perspective, child_context);
     let mut deferred = Vec::new();
-    let mut order = 0;
-    collect_deferred_hit_stacking_contexts(
-        node,
-        &ElementPath {
+    if collect_deferred_stacking_contexts {
+        let mut order = 0;
+        let mut traversal_path = ElementPath {
             root: usize::MAX,
             children: Vec::new(),
-        },
-        child_clip,
-        parent_perspective,
-        in_3d_context,
-        &mut order,
-        &mut deferred,
-    );
-    sort_deferred_hit_contexts(&mut deferred);
+        };
+        collect_deferred_hit_stacking_contexts(
+            node,
+            &mut traversal_path,
+            child_clip,
+            parent_perspective,
+            in_3d_context,
+            &mut order,
+            &mut deferred,
+        );
+        sort_deferred_hit_contexts(&mut deferred);
+    }
 
     for entry in deferred.iter().rev().filter(|entry| entry.level >= 0) {
         if let Some(handler) = hit_deferred_context_for_event(entry, x, y, event) {
@@ -3502,7 +3569,7 @@ fn hit_test_node_for_event(
             continue;
         }
         let hit = if !node_requires_projected_path(child) {
-            hit_test_node_for_event(
+            hit_test_node_for_event_in_current_stacking_context(
                 child,
                 x,
                 y,
@@ -3608,23 +3675,43 @@ struct DeferredHitStackingContext<'a> {
     order: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    static DEFERRED_HIT_COLLECTION_VISITS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_deferred_hit_collection_visits() {
+    DEFERRED_HIT_COLLECTION_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn deferred_hit_collection_visits() -> usize {
+    DEFERRED_HIT_COLLECTION_VISITS.with(std::cell::Cell::get)
+}
+
 fn collect_deferred_hit_stacking_contexts<'a>(
     node: &'a RenderNode,
-    path: &ElementPath,
+    path: &mut ElementPath,
     child_clip: ClipRect,
     parent_perspective: Option<PerspectiveContext>,
     in_3d_context: bool,
     order: &mut u64,
     deferred: &mut Vec<DeferredHitStackingContext<'a>>,
 ) {
+    #[cfg(test)]
+    DEFERRED_HIT_COLLECTION_VISITS.with(|visits| visits.set(visits.get() + 1));
+
     let child_context = child_3d_context(node, in_3d_context);
     let child_perspective = active_child_perspective(node, parent_perspective, child_context);
     for (index, child) in node.children.iter().enumerate() {
-        let child_path = path.with_child(index);
+        path.children.push(index);
         if establishes_stacking_context(child) {
             deferred.push(DeferredHitStackingContext {
                 node: child,
-                path: child_path,
+                path: path.clone(),
                 clip: child_clip,
                 parent_perspective: child_perspective,
                 in_3d_context: child_context,
@@ -3641,7 +3728,7 @@ fn collect_deferred_hit_stacking_contexts<'a>(
             if let Some(descendant_clip) = descendant_clip {
                 collect_deferred_hit_stacking_contexts(
                     child,
-                    &child_path,
+                    path,
                     descendant_clip,
                     child_perspective,
                     child_context,
@@ -3650,6 +3737,7 @@ fn collect_deferred_hit_stacking_contexts<'a>(
                 );
             }
         }
+        path.children.pop();
     }
 }
 
@@ -3729,6 +3817,49 @@ fn hit_test_element_path_node(
     in_3d_context: bool,
     path: &ElementPath,
 ) -> Option<ElementPath> {
+    hit_test_element_path_node_internal(
+        node,
+        x,
+        y,
+        clip,
+        parent_perspective,
+        in_3d_context,
+        path,
+        true,
+    )
+}
+
+fn hit_test_element_path_node_in_current_stacking_context(
+    node: &RenderNode,
+    x: f32,
+    y: f32,
+    clip: ClipRect,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    path: &ElementPath,
+) -> Option<ElementPath> {
+    hit_test_element_path_node_internal(
+        node,
+        x,
+        y,
+        clip,
+        parent_perspective,
+        in_3d_context,
+        path,
+        false,
+    )
+}
+
+fn hit_test_element_path_node_internal(
+    node: &RenderNode,
+    x: f32,
+    y: f32,
+    clip: ClipRect,
+    parent_perspective: Option<PerspectiveContext>,
+    in_3d_context: bool,
+    path: &ElementPath,
+    collect_deferred_stacking_contexts: bool,
+) -> Option<ElementPath> {
     if !clip.contains(x, y) {
         return None;
     }
@@ -3746,17 +3877,20 @@ fn hit_test_element_path_node(
     let child_context = child_3d_context(node, in_3d_context);
     let child_perspective = active_child_perspective(node, parent_perspective, child_context);
     let mut deferred = Vec::new();
-    let mut order = 0;
-    collect_deferred_hit_stacking_contexts(
-        node,
-        path,
-        child_clip,
-        parent_perspective,
-        in_3d_context,
-        &mut order,
-        &mut deferred,
-    );
-    sort_deferred_hit_contexts(&mut deferred);
+    if collect_deferred_stacking_contexts {
+        let mut order = 0;
+        let mut traversal_path = path.clone();
+        collect_deferred_hit_stacking_contexts(
+            node,
+            &mut traversal_path,
+            child_clip,
+            parent_perspective,
+            in_3d_context,
+            &mut order,
+            &mut deferred,
+        );
+        sort_deferred_hit_contexts(&mut deferred);
+    }
 
     for entry in deferred.iter().rev().filter(|entry| entry.level >= 0) {
         if let Some(hit) = hit_deferred_context_element_path(entry, x, y) {
@@ -3770,7 +3904,7 @@ fn hit_test_element_path_node(
         }
         let child_path = path.with_child(index);
         let hit = if !node_requires_projected_path(child) {
-            hit_test_element_path_node(
+            hit_test_element_path_node_in_current_stacking_context(
                 child,
                 x,
                 y,
@@ -6252,16 +6386,120 @@ fn blend_prepared_pixel_with_coverage(
         return;
     }
 
+    if coverage == u8::MAX {
+        blend_prepared_pixel(buffer, width, height, x, y, color);
+        return;
+    }
+
     let Some(index) = buffer_pixel_index(width, height, x, y) else {
         return;
     };
-    blend_mask_row(
-        &mut buffer[index..index + 1],
-        index,
-        &[coverage],
-        color,
-        base_alpha,
-    );
+    blend_prepared_pixel_with_coverage_at_index(buffer, index, color, base_alpha, coverage);
+}
+
+fn blend_prepared_pixel_with_coverage_at_index(
+    buffer: &mut [u32],
+    index: usize,
+    color: PreparedBlendColor,
+    base_alpha: u8,
+    coverage: u8,
+) {
+    if coverage == 0 || base_alpha == 0 {
+        return;
+    }
+    if coverage == u8::MAX {
+        if color.linear.a <= 0.0 {
+            return;
+        }
+        if color.linear.a >= 1.0 {
+            buffer[index] = color.packed;
+            set_current_alpha_at(index, u8::MAX);
+        } else {
+            blend_linear_over(buffer, index, color.linear);
+        }
+        return;
+    }
+
+    blend_mask_pixel_scalar(&mut buffer[index], index, coverage, color, base_alpha);
+}
+
+fn blend_prepared_pixel_with_coverage_at_index_opaque_target(
+    buffer: &mut [u32],
+    index: usize,
+    color: PreparedBlendColor,
+    base_alpha: u8,
+    coverage: u8,
+) {
+    let alpha = if coverage == u8::MAX {
+        color.linear.a
+    } else {
+        f32::from(scale_alpha(coverage, base_alpha)) / 255.0
+    };
+    if alpha <= 0.0 {
+        return;
+    }
+    if alpha >= 1.0 {
+        buffer[index] = color.packed;
+        return;
+    }
+
+    let destination = unpack_linear_rgb(buffer[index]);
+    let inverse_alpha = 1.0 - alpha;
+    buffer[index] = pack_linear_rgb(LinearRgba {
+        r: color.linear.r * alpha + destination.r * inverse_alpha,
+        g: color.linear.g * alpha + destination.g * inverse_alpha,
+        b: color.linear.b * alpha + destination.b * inverse_alpha,
+        a: 1.0,
+    });
+}
+
+fn blend_mask_pixel_scalar(
+    pixel: &mut u32,
+    index: usize,
+    coverage: u8,
+    color: PreparedBlendColor,
+    base_alpha: u8,
+) {
+    let alpha = scale_alpha(coverage, base_alpha);
+    if alpha == 0 {
+        return;
+    }
+    if alpha == u8::MAX {
+        *pixel = color.packed;
+        set_current_alpha_at(index, u8::MAX);
+        return;
+    }
+
+    let alpha = alpha as f32 / 255.0;
+    let inverse_alpha = 1.0 - alpha;
+    let destination = unpack_linear_rgb(*pixel);
+    let Some(destination_alpha) = current_alpha_at(index).map(|alpha| f32::from(alpha) / 255.0)
+    else {
+        *pixel = pack_linear_rgb(LinearRgba {
+            r: color.linear.r * alpha + destination.r * inverse_alpha,
+            g: color.linear.g * alpha + destination.g * inverse_alpha,
+            b: color.linear.b * alpha + destination.b * inverse_alpha,
+            a: 1.0,
+        });
+        return;
+    };
+    let output_alpha = alpha + destination_alpha * inverse_alpha;
+    if output_alpha <= f32::EPSILON {
+        *pixel = pack_transparent();
+        set_current_alpha_at(index, 0);
+        return;
+    }
+
+    *pixel = pack_linear_rgb(LinearRgba {
+        r: (color.linear.r * alpha + destination.r * destination_alpha * inverse_alpha)
+            / output_alpha,
+        g: (color.linear.g * alpha + destination.g * destination_alpha * inverse_alpha)
+            / output_alpha,
+        b: (color.linear.b * alpha + destination.b * destination_alpha * inverse_alpha)
+            / output_alpha,
+        a: 1.0,
+    });
+    set_current_alpha_at(index, alpha_to_u8(output_alpha));
 }
 
 fn blend_mask_row(
@@ -6321,47 +6559,7 @@ fn blend_mask_row_scalar(
     base_alpha: u8,
 ) {
     for (offset, (pixel, &coverage)) in buffer_row.iter_mut().zip(coverages).enumerate() {
-        let alpha = scale_alpha(coverage, base_alpha);
-        if alpha == 0 {
-            continue;
-        }
-        if alpha == u8::MAX {
-            *pixel = color.packed;
-            set_current_alpha_at(buffer_start + offset, u8::MAX);
-            continue;
-        }
-
-        let alpha = alpha as f32 / 255.0;
-        let inverse_alpha = 1.0 - alpha;
-        let destination = unpack_linear_rgb(*pixel);
-        let Some(destination_alpha) =
-            current_alpha_at(buffer_start + offset).map(|alpha| f32::from(alpha) / 255.0)
-        else {
-            *pixel = pack_linear_rgb(LinearRgba {
-                r: color.linear.r * alpha + destination.r * inverse_alpha,
-                g: color.linear.g * alpha + destination.g * inverse_alpha,
-                b: color.linear.b * alpha + destination.b * inverse_alpha,
-                a: 1.0,
-            });
-            continue;
-        };
-        let output_alpha = alpha + destination_alpha * inverse_alpha;
-        if output_alpha <= f32::EPSILON {
-            *pixel = pack_transparent();
-            set_current_alpha_at(buffer_start + offset, 0);
-            continue;
-        }
-
-        *pixel = pack_linear_rgb(LinearRgba {
-            r: (color.linear.r * alpha + destination.r * destination_alpha * inverse_alpha)
-                / output_alpha,
-            g: (color.linear.g * alpha + destination.g * destination_alpha * inverse_alpha)
-                / output_alpha,
-            b: (color.linear.b * alpha + destination.b * destination_alpha * inverse_alpha)
-                / output_alpha,
-            a: 1.0,
-        });
-        set_current_alpha_at(buffer_start + offset, alpha_to_u8(output_alpha));
+        blend_mask_pixel_scalar(pixel, buffer_start + offset, coverage, color, base_alpha);
     }
 }
 
@@ -6610,13 +6808,14 @@ mod tests {
     use crate::{
         ClipRect, DirtyRenderJob, FramePaintMode, FramePaintReason, GlassRenderMode,
         MouseEventKind, ViewportSize, WindowConfig, blend_pixel, build_incremental_render_jobs,
-        coalesce_dirty_regions, dirty_job_group_rows, dirty_regions_between_scenes, dispatch_click,
-        dispatch_hover_transition_events, dispatch_mouse_event, distribute_dirty_render_jobs,
-        drawable_viewport_size, hit_test_element_path,
-        incremental_scene_passes_for_full_redraw_heuristic, is_transparent, pack_rgb, pack_rgba,
-        render_scene_update, render_scene_update_internal_from_roots, render_to_buffer,
-        resize_buffer, scenes_match_visuals, should_full_redraw, should_present_frame,
-        should_present_scene, should_suspend_updates, unpack_alpha8, unpack_rgb,
+        coalesce_dirty_regions, deferred_hit_collection_visits, dirty_job_group_rows,
+        dirty_regions_between_scenes, dispatch_click, dispatch_hover_transition_events,
+        dispatch_mouse_event, distribute_dirty_render_jobs, drawable_viewport_size,
+        hit_test_element_path, incremental_scene_passes_for_full_redraw_heuristic, is_transparent,
+        pack_rgb, pack_rgba, render_scene_update, render_scene_update_internal_from_roots,
+        render_to_buffer, reset_deferred_hit_collection_visits, resize_buffer,
+        scenes_match_visuals, should_full_redraw, should_present_frame, should_present_scene,
+        should_suspend_updates, unpack_alpha8, unpack_rgb,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -6736,10 +6935,12 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/assets/powerline-demo.ttf");
         let families = register_font_file(&asset_path)
             .expect("bundled powerline demo font should register during renderer tests");
-        families
+        let family = families
             .into_iter()
             .next()
-            .expect("bundled powerline font should expose at least one family name")
+            .expect("bundled powerline font should expose at least one family name");
+        super::fonts::clear_text_mask_cache_for_tests();
+        family
     }
 
     fn text_scene_with_content(style: TextStyle, content: &str) -> Vec<RenderNode> {
@@ -7167,6 +7368,93 @@ mod tests {
     }
 
     #[test]
+    fn event_hit_testing_promotes_nested_positioned_z_index() {
+        CLICK_TARGET.store(0, Ordering::SeqCst);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                .with_child(
+                    RenderNode::container(LayoutBox::new(0.0, 0.0, 32.0, 32.0)).with_child(
+                        RenderNode::container(LayoutBox::new(8.0, 8.0, 12.0, 12.0))
+                            .with_style(VisualStyle {
+                                positioned: true,
+                                z_index: ZIndex::Integer(1000),
+                                ..VisualStyle::default()
+                            })
+                            .on_click(mark_child_clicked),
+                    ),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(4.0, 4.0, 24.0, 24.0))
+                        .on_click(mark_parent_clicked),
+                ),
+        ];
+
+        assert!(dispatch_click(&scene, 10.0, 10.0));
+        assert_eq!(CLICK_TARGET.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn hit_testing_keeps_negative_z_index_behind_normal_content() {
+        CLICK_TARGET.store(0, Ordering::SeqCst);
+        let negative_path = ElementPath::root(0).with_child(0);
+        let normal_path = ElementPath::root(0).with_child(1);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 40.0))
+                .with_child(
+                    RenderNode::container(LayoutBox::new(4.0, 4.0, 24.0, 24.0))
+                        .with_element_path(negative_path)
+                        .with_style(VisualStyle {
+                            positioned: true,
+                            z_index: ZIndex::Integer(-1),
+                            ..VisualStyle::default()
+                        })
+                        .on_click(mark_child_clicked),
+                )
+                .with_child(
+                    RenderNode::container(LayoutBox::new(4.0, 4.0, 24.0, 24.0))
+                        .with_element_path(normal_path.clone())
+                        .on_click(mark_parent_clicked),
+                ),
+        ];
+
+        assert_eq!(hit_test_element_path(&scene, 10.0, 10.0), Some(normal_path));
+        assert!(dispatch_click(&scene, 10.0, 10.0));
+        assert_eq!(CLICK_TARGET.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn axis_aligned_hit_collection_visits_deep_nodes_once_per_context() {
+        const DEPTH: usize = 192;
+
+        let deepest_path = ElementPath {
+            root: 0,
+            children: vec![0; DEPTH - 1],
+        };
+        let mut root = RenderNode::container(LayoutBox::new(0.0, 0.0, 32.0, 32.0))
+            .with_element_path(deepest_path.clone())
+            .on_click(mark_child_clicked);
+        for level in (0..DEPTH - 1).rev() {
+            root = RenderNode::container(LayoutBox::new(0.0, 0.0, 32.0, 32.0))
+                .with_element_path(ElementPath {
+                    root: 0,
+                    children: vec![0; level],
+                })
+                .with_child(root);
+        }
+        let scene = vec![root];
+
+        reset_deferred_hit_collection_visits();
+        assert_eq!(hit_test_element_path(&scene, 8.0, 8.0), Some(deepest_path));
+        assert_eq!(deferred_hit_collection_visits(), DEPTH);
+
+        CLICK_TARGET.store(0, Ordering::SeqCst);
+        reset_deferred_hit_collection_visits();
+        assert!(dispatch_click(&scene, 8.0, 8.0));
+        assert_eq!(CLICK_TARGET.load(Ordering::SeqCst), 2);
+        assert_eq!(deferred_hit_collection_visits(), DEPTH);
+    }
+
+    #[test]
     fn multithreaded_full_redraw_matches_the_single_threaded_result() {
         let _shadow_cache_guard = super::shadow::lock_shadow_mask_cache_for_tests();
         let scene = vec![
@@ -7302,6 +7590,157 @@ mod tests {
 
         assert_eq!(single, threaded);
         assert_eq!(single_alpha, threaded_alpha);
+    }
+
+    #[test]
+    fn multithreaded_alpha_full_redraw_matches_across_odd_band_seams() {
+        let width = 173_usize;
+        let height = 103_usize;
+        let worker_count = 6_usize;
+        let rows_per_worker = height.div_ceil(worker_count);
+        let glass_alpha = 104;
+        let mut scene = vec![
+            RenderNode::container(LayoutBox::new(0.35, 0.4, 172.1, 102.2)).with_style(
+                VisualStyle {
+                    background_layers: vec![BackgroundLayer::LinearGradient(LinearGradient {
+                        direction: GradientDirection::Angle(127.0),
+                        interpolation: GradientInterpolation::Oklab,
+                        repeating: false,
+                        stops: vec![
+                            GradientStop {
+                                color: Color::rgba(14, 165, 233, 224),
+                                position: LengthPercentageValue::from_fraction(0.0),
+                            },
+                            GradientStop {
+                                color: Color::rgba(168, 85, 247, 192),
+                                position: LengthPercentageValue::from_fraction(0.48),
+                            },
+                            GradientStop {
+                                color: Color::rgba(244, 63, 94, 232),
+                                position: LengthPercentageValue::from_fraction(1.0),
+                            },
+                        ],
+                    })],
+                    corner_radius: CornerRadius::all(15.25),
+                    ..VisualStyle::default()
+                },
+            ),
+            RenderNode::container(LayoutBox::new(4.25, 0.65, 29.5, 101.7)).with_style(
+                VisualStyle {
+                    native_material: NativeMaterial::Glass,
+                    glass_tint: Some(Color::rgba(238, 246, 255, glass_alpha)),
+                    corner_radius: CornerRadius::all(8.75),
+                    ..VisualStyle::default()
+                },
+            ),
+        ];
+
+        let seam_rows = (rows_per_worker..height)
+            .step_by(rows_per_worker)
+            .collect::<Vec<_>>();
+        for (index, seam_y) in seam_rows.iter().copied().enumerate() {
+            scene.push(
+                RenderNode::container(LayoutBox::new(
+                    42.2 + index as f32 * 24.5,
+                    seam_y as f32 - 10.75,
+                    23.6,
+                    21.5,
+                ))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgba(
+                        224 - index as u8 * 18,
+                        76 + index as u8 * 21,
+                        112 + index as u8 * 17,
+                        176 + index as u8 * 12,
+                    )),
+                    corner_radius: CornerRadius::all(10.75),
+                    ..VisualStyle::default()
+                }),
+            );
+        }
+
+        let cached_bounds = super::cache_scene_subtree_bounds(&scene);
+        let mut single = vec![0_u32; width * height];
+        let mut threaded = vec![0_u32; width * height];
+        let mut single_alpha = vec![0_u8; width * height];
+        let mut threaded_alpha = vec![0_u8; width * height];
+
+        super::render_to_buffer_serial(
+            &scene,
+            &cached_bounds.roots,
+            &mut single,
+            width,
+            height,
+            Color::rgb(7, 11, 19),
+            GlassRenderMode::NativeWithTint,
+            Some(&mut single_alpha),
+        );
+        super::render_to_buffer_parallel(
+            &scene,
+            &cached_bounds,
+            &mut threaded,
+            width,
+            height,
+            Color::rgb(7, 11, 19),
+            worker_count,
+            GlassRenderMode::NativeWithTint,
+            Some(&mut threaded_alpha),
+        );
+
+        assert_eq!(single, threaded);
+        assert_eq!(single_alpha, threaded_alpha);
+        assert_eq!(seam_rows.len(), worker_count - 1);
+        for seam_y in seam_rows {
+            assert_eq!(threaded_alpha[seam_y * width + 15], glass_alpha);
+        }
+    }
+
+    #[test]
+    fn multithreaded_full_redraw_handles_uneven_last_band_without_copying() {
+        let width = 641;
+        let height = 481;
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, width as f32, height as f32))
+                .with_style(VisualStyle {
+                    background: Some(Color::rgb(18, 32, 56)),
+                    ..VisualStyle::default()
+                })
+                .with_child(
+                    RenderNode::container(LayoutBox::new(11.0, 403.0, 607.0, 71.0)).with_style(
+                        VisualStyle {
+                            background: Some(Color::rgba(220, 72, 48, 176)),
+                            ..VisualStyle::default()
+                        },
+                    ),
+                ),
+        ];
+        let cached_bounds = super::cache_scene_subtree_bounds(&scene);
+        let mut single = vec![0_u32; width * height];
+        let mut threaded = vec![0_u32; width * height];
+
+        super::render_to_buffer_serial(
+            &scene,
+            &cached_bounds.roots,
+            &mut single,
+            width,
+            height,
+            Color::BLACK,
+            GlassRenderMode::Fallback,
+            None,
+        );
+        super::render_to_buffer_parallel(
+            &scene,
+            &cached_bounds,
+            &mut threaded,
+            width,
+            height,
+            Color::BLACK,
+            6,
+            GlassRenderMode::Fallback,
+            None,
+        );
+
+        assert_eq!(single, threaded);
     }
 
     #[test]
