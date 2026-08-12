@@ -1,5 +1,8 @@
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use cssimpler_core::{Color, ExtractedScene};
@@ -34,6 +37,7 @@ use super::{
 };
 
 const DEFAULT_NATIVE_GLASS_TINT: Color = Color::rgba(245, 250, 255, 128);
+static SYSTEM_DRAG_OVERRIDE: AtomicBool = AtomicBool::new(false);
 
 pub(super) fn run_with_scene_provider<P>(config: WindowConfig, scene_provider: P) -> Result<()>
 where
@@ -44,6 +48,14 @@ where
     let mut app = RuntimeApp::new(config, scene_provider, context);
     event_loop.run_app(&mut app).map_err(RendererError::from)?;
     app.finish()
+}
+
+pub(super) fn set_system_drag_override(active: bool) {
+    SYSTEM_DRAG_OVERRIDE.store(active, Ordering::Relaxed);
+}
+
+fn system_drag_override_active() -> bool {
+    SYSTEM_DRAG_OVERRIDE.load(Ordering::Relaxed)
 }
 
 struct RuntimeApp<P> {
@@ -361,8 +373,11 @@ where
         };
         let mut frame_stats = FrameTimingStats::default();
 
-        let suppress_pointer_for_system_drag =
-            should_suspend_updates(self.left_down, self.modifiers.super_key, false);
+        let suppress_pointer_for_system_drag = should_suspend_updates(
+            self.left_down,
+            self.modifiers.super_key,
+            system_drag_override_active(),
+        );
         if suppress_pointer_for_system_drag {
             self.suppress_left_pointer_until_release = true;
         } else if !self.left_down {
@@ -1452,3 +1467,6 @@ mod tests {
         assert_eq!(simplified, vec![(0, 0, 2, 2)]);
     }
 }
+
+
+

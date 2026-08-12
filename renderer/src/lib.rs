@@ -1483,6 +1483,10 @@ where
     */
 }
 
+pub fn set_system_drag_override(active: bool) {
+    runtime::set_system_drag_override(active);
+}
+
 pub fn render_to_buffer(
     scene: &[RenderNode],
     buffer: &mut [u32],
