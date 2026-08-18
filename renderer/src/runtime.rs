@@ -1178,20 +1178,35 @@ fn copy_render_buffer_into_surface(
             return;
         }
 
-        for row in 0..source_height {
-            let row_start = row * source_width;
-            for column in 0..source_width {
-                let index = row_start + column;
-                target[index] = surface_pixel(
-                    source[index],
-                    source_alpha.map(|alpha| alpha[index]),
-                    column,
-                    row,
-                    clear,
-                    preserve_transparency,
-                );
+        let chunk_size = source_height.div_ceil(12).max(1);
+        crate::global_worker_pool().scope(|scope| {
+            for (chunk_idx, target_chunk) in target.chunks_mut(chunk_size * source_width).enumerate() {
+                let start_row = chunk_idx * chunk_size;
+                let end_row = (start_row + chunk_size).min(source_height);
+                let source_slice = &source[start_row * source_width..end_row * source_width];
+                let alpha_slice = source_alpha.map(|a| &a[start_row * source_width..end_row * source_width]);
+                scope.spawn(move || {
+                    for (row_offset, (target_row, source_row)) in target_chunk
+                        .chunks_mut(source_width)
+                        .zip(source_slice.chunks(source_width))
+                        .enumerate()
+                    {
+                        let row = start_row + row_offset;
+                        let alpha_row = alpha_slice.map(|a| &a[row_offset * source_width..(row_offset + 1) * source_width]);
+                        for column in 0..source_width {
+                            target_row[column] = surface_pixel(
+                                source_row[column],
+                                alpha_row.map(|a| a[column]),
+                                column,
+                                row,
+                                clear,
+                                preserve_transparency,
+                            );
+                        }
+                    }
+                });
             }
-        }
+        });
         return;
     }
 

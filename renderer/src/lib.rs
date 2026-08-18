@@ -6,7 +6,7 @@ use std::fmt::{Display, Formatter};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -74,7 +74,7 @@ use self::{
     shapes::{expand_corner_radius, expand_layout},
 };
 
-const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 32;
+const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 48;
 const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.85;
 const SINGLE_REGION_MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.94;
 const DIRTY_BRANCH_COLLAPSE_THRESHOLD: usize = 3;
@@ -84,6 +84,7 @@ const MAX_BRANCH_COLLAPSE_WASTED_PIXELS: f32 = 8192.0;
 const DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO: f32 = 1.35;
 const MAX_MERGE_WASTED_PIXELS: f32 = 16384.0;
 const MAX_WASTE_TO_MIN_AREA_RATIO: f32 = 0.60;
+const MAX_MERGED_DIRTY_REGION_AREA: f32 = 131072.0;
 const MAX_DIMENSION_MISMATCH_RATIO: f32 = 2.5;
 const MAX_SUBTREE_SURFACE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_BYTES: usize = 4 * 1024 * 1024;
@@ -316,7 +317,7 @@ struct DirtyRenderJob {
 
 static FRAME_TIMING_STATS: OnceLock<Mutex<FrameTimingStats>> = OnceLock::new();
 static WORKER_BUFFER_POOL: OnceLock<Mutex<Vec<Vec<u32>>>> = OnceLock::new();
-static SUBTREE_SURFACE_CACHE: OnceLock<Mutex<SubtreeSurfaceCache>> = OnceLock::new();
+static SUBTREE_SURFACE_CACHE: OnceLock<RwLock<SubtreeSurfaceCache>> = OnceLock::new();
 #[cfg(test)]
 static SUBTREE_SURFACE_CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -455,8 +456,8 @@ fn release_worker_buffers(buffers: Vec<Vec<u32>>) {
     trim_worker_buffer_pool_to_budget(&mut pool, MAX_WORKER_BUFFER_POOL_BYTES);
 }
 
-fn subtree_surface_cache() -> &'static Mutex<SubtreeSurfaceCache> {
-    SUBTREE_SURFACE_CACHE.get_or_init(|| Mutex::new(SubtreeSurfaceCache::default()))
+fn subtree_surface_cache() -> &'static RwLock<SubtreeSurfaceCache> {
+    SUBTREE_SURFACE_CACHE.get_or_init(|| RwLock::new(SubtreeSurfaceCache::default()))
 }
 
 fn next_surface_cache_use(next_use: &mut u64) -> u64 {
@@ -690,11 +691,11 @@ fn cached_promoted_surface(
     let surface_root = neutralized_surface_root(node);
     let key = hash_surface_subtree(&surface_root);
     {
-        let mut cache = subtree_surface_cache()
-            .lock()
+        let cache = subtree_surface_cache()
+            .read()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(surface) = cached_subtree_surface_entry(&mut cache, key) {
-            return Some(surface);
+        if let Some(entry) = cache.surfaces.get(&key) {
+            return Some(entry.surface.clone());
         }
     }
 
@@ -771,7 +772,7 @@ fn cached_promoted_surface(
     let surface = Arc::new(surface?);
 
     let mut cache = subtree_surface_cache()
-        .lock()
+        .write()
         .unwrap_or_else(|poison| poison.into_inner());
     cache.last_build_surface_bytes = surface_storage_bytes;
     cache.last_build_temp_bytes = temp_bytes;
@@ -846,7 +847,7 @@ fn node_can_use_promoted_surface(node: &RenderNode, cached_bounds: &CachedSubtre
 #[cfg(test)]
 fn clear_subtree_surface_cache_for_tests() {
     let mut cache = subtree_surface_cache()
-        .lock()
+        .write()
         .unwrap_or_else(|poison| poison.into_inner());
     cache.next_use = 0;
     cache.builds = 0;
@@ -859,7 +860,7 @@ fn clear_subtree_surface_cache_for_tests() {
 #[cfg(test)]
 fn subtree_surface_cache_builds_for_tests() -> usize {
     subtree_surface_cache()
-        .lock()
+        .read()
         .unwrap_or_else(|poison| poison.into_inner())
         .builds
 }
@@ -867,7 +868,7 @@ fn subtree_surface_cache_builds_for_tests() -> usize {
 #[cfg(test)]
 fn subtree_surface_cache_bytes_for_tests() -> usize {
     subtree_surface_cache()
-        .lock()
+        .read()
         .unwrap_or_else(|poison| poison.into_inner())
         .total_bytes
 }
@@ -875,7 +876,7 @@ fn subtree_surface_cache_bytes_for_tests() -> usize {
 #[cfg(test)]
 fn subtree_surface_last_build_surface_bytes_for_tests() -> usize {
     subtree_surface_cache()
-        .lock()
+        .read()
         .unwrap_or_else(|poison| poison.into_inner())
         .last_build_surface_bytes
 }
@@ -883,7 +884,7 @@ fn subtree_surface_last_build_surface_bytes_for_tests() -> usize {
 #[cfg(test)]
 fn subtree_surface_last_build_temp_bytes_for_tests() -> usize {
     subtree_surface_cache()
-        .lock()
+        .read()
         .unwrap_or_else(|poison| poison.into_inner())
         .last_build_temp_bytes
 }
@@ -4417,6 +4418,29 @@ fn draw_node_transformed_internal_impl(
         return;
     };
 
+    if matrix.is_identity()
+        && clip_state.is_simple()
+        && !in_3d_context
+        && parent_perspective.is_none()
+        && !node_requires_projected_path(node)
+    {
+        draw_node_contents_internal_impl(
+            node,
+            cached_bounds,
+            buffer,
+            width,
+            height,
+            clip_state.coarse,
+            parent_perspective,
+            in_3d_context,
+            clear_color,
+            glass_mode,
+            allow_surface_promotion,
+            draw_deferred_stacking_contexts,
+        );
+        return;
+    }
+
     if allow_surface_promotion && node_can_use_promoted_surface(node, cached_bounds) {
         if let Some(surface) = cached_promoted_surface(node, width, height) {
             draw_cached_surface_transformed(
@@ -5134,6 +5158,11 @@ fn draw_background_and_border_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
+    if matrix.is_identity() && clip_state.is_simple() {
+        draw_background_and_border(node, buffer, width, height, clip_state.coarse);
+        return;
+    }
+
     if node.style.native_material != NativeMaterial::Glass {
         if let Some(background) = node.style.background {
             draw_transformed_rounded_rect(
@@ -6137,12 +6166,19 @@ fn should_merge_dirty_regions(left: ClipRect, right: ClipRect) -> bool {
     let right_area = right.area();
     let min_area = left_area.min(right_area);
     if min_area <= f32::EPSILON {
-        return false;
+        return true;
     }
 
     let union = left.union(right);
     let union_area = union.area();
+    if union_area > MAX_MERGED_DIRTY_REGION_AREA {
+        return false;
+    }
     let combined_area = left_area + right_area;
+
+    if union_area <= combined_area {
+        return true;
+    }
 
     // Check 1: Relative expansion ratio
     if union_area > combined_area * DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO {

@@ -119,6 +119,10 @@ impl ClipState {
         }
     }
 
+    pub(crate) fn is_simple(&self) -> bool {
+        self.regions.is_empty()
+    }
+
     pub(crate) fn contains(&self, x: f32, y: f32) -> bool {
         self.coarse.contains(x, y)
             && self.regions.iter().all(|region| {

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use cssimpler_core::{Color, CornerRadius, LayoutBox, TextStrokeStyle};
 
@@ -119,15 +121,15 @@ where
     }
 }
 
-fn shadow_mask_cache() -> &'static Mutex<ShadowMaskCache> {
-    static CACHE: OnceLock<Mutex<ShadowMaskCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(ShadowMaskCache::default()))
+fn shadow_mask_cache() -> &'static RwLock<ShadowMaskCache> {
+    static CACHE: OnceLock<RwLock<ShadowMaskCache>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(ShadowMaskCache::default()))
 }
 
 #[cfg(test)]
 pub(crate) fn clear_shadow_mask_cache_for_tests() {
     let mut cache = shadow_mask_cache()
-        .lock()
+        .write()
         .unwrap_or_else(|poison| poison.into_inner());
     cache.next_use = 0;
     cache.masks.clear();
@@ -141,13 +143,19 @@ pub(crate) fn lock_shadow_mask_cache_for_tests() -> std::sync::MutexGuard<'stati
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
+fn quantize_shadow_subpixel(v: f32) -> f32 {
+    (v * 4.0).round() / 4.0
+}
+
 fn split_layout_for_shadow_cache(layout: LayoutBox) -> (LayoutBox, i32, i32) {
     let offset_x = layout.x.floor() as i32;
     let offset_y = layout.y.floor() as i32;
+    let frac_x = quantize_shadow_subpixel((layout.x - offset_x as f32).clamp(0.0, 0.999));
+    let frac_y = quantize_shadow_subpixel((layout.y - offset_y as f32).clamp(0.0, 0.999));
     (
         LayoutBox::new(
-            layout.x - offset_x as f32,
-            layout.y - offset_y as f32,
+            frac_x,
+            frac_y,
             layout.width,
             layout.height,
         ),
@@ -183,18 +191,18 @@ pub(crate) fn cached_shadow_mask(
     let (relative_layout, offset_x, offset_y) = split_layout_for_shadow_cache(layout);
     let key = shadow_mask_cache_key(relative_layout, radius, blur_radius);
 
-    let mut cache = shadow_mask_cache()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let last_used = next_cache_use(&mut cache.next_use);
-    if let Some(mask) = cached_cache_entry(&mut cache.masks, &key, last_used) {
-        return (mask, offset_x, offset_y);
+    {
+        let cache = shadow_mask_cache()
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(entry) = cache.masks.get(&key) {
+            return (entry.value.clone(), offset_x, offset_y);
+        }
     }
-    drop(cache);
 
     let mask = Arc::new(rasterize_shadow_mask(relative_layout, radius, blur_radius));
     let mut cache = shadow_mask_cache()
-        .lock()
+        .write()
         .unwrap_or_else(|poison| poison.into_inner());
     let last_used = next_cache_use(&mut cache.next_use);
     if let Some(existing) = cached_cache_entry(&mut cache.masks, &key, last_used) {
@@ -219,6 +227,9 @@ pub(crate) fn draw_shadow(
     shadow: cssimpler_core::BoxShadow,
     clip: ClipRect,
 ) {
+    if shadow.color.a == 0 {
+        return;
+    }
     let base_layout = offset_layout(
         expand_layout(layout, shadow.spread),
         shadow.offset_x,
@@ -226,6 +237,10 @@ pub(crate) fn draw_shadow(
     );
     let base_radius = expand_corner_radius(layout, radius, shadow.spread);
     let blur_radius = shadow.blur_radius.max(0.0);
+    let blurred_bounds = expand_layout(base_layout, blur_radius);
+    if layout_clip(blurred_bounds).intersect(clip).is_none() {
+        return;
+    }
 
     if blur_radius <= 0.0 {
         draw_rounded_rect(
@@ -263,6 +278,9 @@ pub(crate) fn draw_shadow_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
+    if shadow.color.a == 0 {
+        return;
+    }
     let base_layout = offset_layout(
         expand_layout(layout, shadow.spread),
         shadow.offset_x,
@@ -270,6 +288,14 @@ pub(crate) fn draw_shadow_transformed(
     );
     let base_radius = expand_corner_radius(layout, radius, shadow.spread);
     let blur_radius = shadow.blur_radius.max(0.0);
+    let blurred_bounds = expand_layout(base_layout, blur_radius);
+    let Some(transformed_bounds) = transform_clip_rect(layout_clip(blurred_bounds), matrix) else {
+        return;
+    };
+    if transformed_bounds.intersect(clip_state.coarse).is_none() {
+        return;
+    }
+
     let (mask, offset_x, offset_y) = cached_shadow_mask(base_layout, base_radius, blur_radius);
     draw_shadow_mask_transformed(
         buffer,
@@ -503,23 +529,52 @@ fn rasterize_shadow_mask(layout: LayoutBox, radius: CornerRadius, blur_radius: f
         return mask;
     }
 
+    let clamped_radius = clamp_corner_radius(radius, layout.width, layout.height);
+    let left = layout.x;
+    let top = layout.y;
+    let right = layout.x + layout.width;
+    let bottom = layout.y + layout.height;
+    let max_corner_r = clamped_radius
+        .top_left
+        .max(clamped_radius.top_right)
+        .max(clamped_radius.bottom_left)
+        .max(clamped_radius.bottom_right);
+
+    let inner_left = (left + max_corner_r).ceil() as i32;
+    let inner_right = (right - max_corner_r).floor() as i32;
+    let inner_top = (top + max_corner_r).ceil() as i32;
+    let inner_bottom = (bottom - max_corner_r).floor() as i32;
+
     for y in y0..y1 {
         let local_row_start = (y - y0) as usize * mask.width;
-        for x in x0..x1 {
-            let alpha = shadow_alpha(
-                x as f32 + 0.5,
-                y as f32 + 0.5,
-                layout,
-                radius,
-                blur_radius,
-                u8::MAX,
-            );
-            if alpha == 0 {
-                continue;
-            }
+        let py = y as f32 + 0.5;
 
-            let index = local_row_start + (x - x0) as usize;
-            mask.alpha[index] = alpha;
+        if y >= inner_top && y < inner_bottom && inner_left < inner_right {
+            for x in x0..inner_left {
+                let px = x as f32 + 0.5;
+                let alpha = shadow_alpha(px, py, layout, clamped_radius, blur_radius, u8::MAX);
+                if alpha > 0 {
+                    mask.alpha[local_row_start + (x - x0) as usize] = alpha;
+                }
+            }
+            let s_start = (inner_left - x0) as usize;
+            let s_end = (inner_right - x0) as usize;
+            mask.alpha[local_row_start + s_start..local_row_start + s_end].fill(u8::MAX);
+            for x in inner_right..x1 {
+                let px = x as f32 + 0.5;
+                let alpha = shadow_alpha(px, py, layout, clamped_radius, blur_radius, u8::MAX);
+                if alpha > 0 {
+                    mask.alpha[local_row_start + (x - x0) as usize] = alpha;
+                }
+            }
+        } else {
+            for x in x0..x1 {
+                let px = x as f32 + 0.5;
+                let alpha = shadow_alpha(px, py, layout, clamped_radius, blur_radius, u8::MAX);
+                if alpha > 0 {
+                    mask.alpha[local_row_start + (x - x0) as usize] = alpha;
+                }
+            }
         }
     }
 
@@ -590,6 +645,20 @@ fn draw_shadow_mask_transformed(
     clip_state: &ClipState,
 ) {
     if color.a == 0 || mask.width == 0 || mask.height == 0 {
+        return;
+    }
+
+    if matrix.is_identity() && clip_state.is_simple() {
+        draw_shadow_mask(
+            buffer,
+            width,
+            height,
+            mask,
+            color,
+            offset_x,
+            offset_y,
+            clip_state.coarse,
+        );
         return;
     }
 

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::mem::size_of;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use cssimpler_core::{
     AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, CornerRadius,
@@ -289,6 +291,19 @@ pub(crate) fn draw_background_layer_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
+    if matrix.is_identity() && clip_state.is_simple() {
+        draw_background_layer(
+            buffer,
+            width,
+            height,
+            layout,
+            radius,
+            layer,
+            clip_state.coarse,
+        );
+        return;
+    }
+
     let Some(inverse) = matrix.invert() else {
         return;
     };
@@ -450,14 +465,14 @@ pub(crate) fn draw_background_layer_transformed(
     }
 }
 
-fn gradient_layer_cache() -> &'static Mutex<GradientLayerCache> {
-    static CACHE: OnceLock<Mutex<GradientLayerCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(GradientLayerCache::default()))
+fn gradient_layer_cache() -> &'static RwLock<GradientLayerCache> {
+    static CACHE: OnceLock<RwLock<GradientLayerCache>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(GradientLayerCache::default()))
 }
 
-fn static_gradient_layer_cache() -> &'static Mutex<GradientLayerCache> {
-    static CACHE: OnceLock<Mutex<GradientLayerCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(GradientLayerCache::default()))
+fn static_gradient_layer_cache() -> &'static RwLock<GradientLayerCache> {
+    static CACHE: OnceLock<RwLock<GradientLayerCache>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(GradientLayerCache::default()))
 }
 
 #[cfg(test)]
@@ -471,13 +486,13 @@ fn reset_gradient_layer_cache(cache: &mut GradientLayerCache) {
 #[cfg(test)]
 pub(crate) fn clear_gradient_layer_cache_for_tests() {
     let mut cache = gradient_layer_cache()
-        .lock()
+        .write()
         .unwrap_or_else(|poison| poison.into_inner());
     reset_gradient_layer_cache(&mut cache);
     drop(cache);
 
     let mut static_cache = static_gradient_layer_cache()
-        .lock()
+        .write()
         .unwrap_or_else(|poison| poison.into_inner());
     reset_gradient_layer_cache(&mut static_cache);
 }
@@ -529,7 +544,7 @@ fn cached_static_gradient_layer(
 }
 
 fn cached_gradient_layer_with_policy(
-    cache: &'static Mutex<GradientLayerCache>,
+    cache: &'static RwLock<GradientLayerCache>,
     layout: LayoutBox,
     radius: CornerRadius,
     layer: &BackgroundLayer,
@@ -548,11 +563,8 @@ fn cached_gradient_layer_with_policy(
     };
 
     {
-        let mut cache_guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
-        cache_guard.access_counter = cache_guard.access_counter.wrapping_add(1);
-        let counter = cache_guard.access_counter;
-        if let Some(entry) = cache_guard.layers.get_mut(&key) {
-            entry.last_accessed = counter;
+        let cache_guard = cache.read().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(entry) = cache_guard.layers.get(&key) {
             return Some((entry.layer.clone(), offset_x, offset_y));
         }
     }
@@ -562,7 +574,7 @@ fn cached_gradient_layer_with_policy(
     }
 
     let seen_enough = {
-        let mut cache_guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut cache_guard = cache.write().unwrap_or_else(|poison| poison.into_inner());
         let seen = cache_guard.seen_counts.entry(key.clone()).or_insert(0);
         *seen = seen.saturating_add(1);
         *seen >= min_reuses
@@ -576,7 +588,7 @@ fn cached_gradient_layer_with_policy(
     if raster_bytes > max_raster_bytes {
         return None;
     }
-    let mut cache_guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut cache_guard = cache.write().unwrap_or_else(|poison| poison.into_inner());
     cache_guard.access_counter = cache_guard.access_counter.wrapping_add(1);
     let counter = cache_guard.access_counter;
     if let Some(entry) = cache_guard.layers.get_mut(&key) {

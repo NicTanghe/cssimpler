@@ -132,6 +132,7 @@ enum BaselineScenario {
 }
 
 impl BaselineScenario {
+    #[allow(dead_code)]
     const ALL: [Self; 3] = [Self::Idle, Self::AnimatedPaint, Self::PulseLayout];
 
     fn label(self) -> &'static str {
