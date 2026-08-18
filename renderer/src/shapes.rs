@@ -1,8 +1,7 @@
 use cssimpler_core::{Color, CornerRadius, Insets, LayoutBox, LinearRgba};
 
 use super::{
-    ClipRect, PreparedBlendColor, blend_linear_over,
-    blend_prepared_pixel_with_coverage_at_index,
+    ClipRect, PreparedBlendColor, blend_linear_over, blend_prepared_pixel_with_coverage_at_index,
     blend_prepared_pixel_with_coverage_at_index_opaque_target, current_render_buffer_rows,
     fill_current_alpha_span, pack_linear_rgb, pack_rgb, render_alpha_target_active,
     transform::{AffineTransform, ClipState},
@@ -73,10 +72,7 @@ const DASH_MIN_LENGTH: f32 = 2.0;
 const DASH_MIN_GAP: f32 = 1.0;
 
 #[inline(always)]
-fn blend_constant_alpha_span_opaque_target(
-    slice: &mut [u32],
-    color: PreparedBlendColor,
-) {
+fn blend_constant_alpha_span_opaque_target(slice: &mut [u32], color: PreparedBlendColor) {
     let alpha = color.linear.a;
     let inv_alpha = 1.0 - alpha;
     let src_r = color.linear.r * alpha;

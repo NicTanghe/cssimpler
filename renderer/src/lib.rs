@@ -47,8 +47,8 @@ use self::{
 use cssimpler_core::{
     BackdropOcclusion, BorderLineStyle, Color, CornerRadius, ElementInteractionState, ElementPath,
     EventHandler, ExtractedScene, LayoutBox, LinearRgba, NativeMaterial, RenderKind, RenderNode,
-    TextEditDecoration, TextSelectionRange, Transform2D, TransformMatrix3d, TransformStyleMode,
-    VisualStyle, establishes_stacking_context,
+    TextEditDecoration, TextSelectionRange, TransformMatrix3d, TransformStyleMode, VisualStyle,
+    establishes_stacking_context,
     fonts::{PreparedTextLayout, TextAlign, TextStyle, layout_text_block},
     stacking_context_level,
 };
@@ -146,6 +146,7 @@ pub(crate) struct PaintStats {
     pub(crate) mode: FramePaintMode,
     pub(crate) reason: FramePaintReason,
     pub(crate) damage_rects: Option<Vec<ClipRect>>,
+    pub(crate) scene_bounds: Option<CachedSceneBounds>,
 }
 
 type BoxedRenderTask<'a> = Box<dyn FnOnce() + Send + 'a>;
@@ -243,10 +244,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     }
 
     fn join(&self) {
-        let mut tasks = self
-            .tasks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         if tasks.is_empty() {
             return;
         }
@@ -274,7 +272,11 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         if background_count > 0 {
             let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
             while self.shared.active_tasks.load(AtomicOrdering::Acquire) > 0 {
-                state = self.shared.done.wait(state).unwrap_or_else(|p| p.into_inner());
+                state = self
+                    .shared
+                    .done
+                    .wait(state)
+                    .unwrap_or_else(|p| p.into_inner());
             }
         }
     }
@@ -285,7 +287,10 @@ fn worker_loop(shared: Arc<WorkerPoolShared>) {
         let task = {
             let mut state = shared.state.lock().unwrap_or_else(|p| p.into_inner());
             while state.tasks.is_empty() && !shared.shutdown.load(AtomicOrdering::Relaxed) {
-                state = shared.has_work.wait(state).unwrap_or_else(|p| p.into_inner());
+                state = shared
+                    .has_work
+                    .wait(state)
+                    .unwrap_or_else(|p| p.into_inner());
             }
             if shared.shutdown.load(AtomicOrdering::Relaxed) && state.tasks.is_empty() {
                 return;
@@ -1758,6 +1763,7 @@ fn render_to_buffer_internal_with_cached_bounds(
         mode: FramePaintMode::Full,
         reason: FramePaintReason::FullRedraw,
         damage_rects: None,
+        scene_bounds: Some(cached_bounds.clone()),
     }
 }
 
@@ -1924,6 +1930,7 @@ pub fn render_scene_update(
 ) {
     let _ = render_scene_update_roots(
         previous_scene,
+        None,
         scene,
         buffer,
         width,
@@ -1944,6 +1951,7 @@ fn render_scene_update_internal_from_roots(
 ) -> PaintStats {
     render_scene_update_internal_from_roots_with_glass(
         previous_scene,
+        None,
         scene,
         buffer,
         width,
@@ -1955,6 +1963,7 @@ fn render_scene_update_internal_from_roots(
 
 fn render_scene_update_internal_from_roots_with_glass(
     previous_scene: &[RenderNode],
+    previous_bounds: Option<&CachedSceneBounds>,
     scene: &[RenderNode],
     buffer: &mut [u32],
     width: usize,
@@ -1964,6 +1973,7 @@ fn render_scene_update_internal_from_roots_with_glass(
 ) -> PaintStats {
     render_scene_update_roots(
         previous_scene,
+        previous_bounds,
         scene,
         buffer,
         width,
@@ -1975,6 +1985,7 @@ fn render_scene_update_internal_from_roots_with_glass(
 
 fn render_scene_update_roots(
     previous_scene: &[RenderNode],
+    previous_bounds: Option<&CachedSceneBounds>,
     scene: &[RenderNode],
     buffer: &mut [u32],
     width: usize,
@@ -1982,10 +1993,14 @@ fn render_scene_update_roots(
     clear_color: Color,
     glass_mode: GlassRenderMode,
 ) -> PaintStats {
-    let scene_diff = prepare_scene_diff(previous_scene, scene);
+    let scene_diff =
+        prepare_scene_diff_with_previous_bounds(previous_scene, previous_bounds, scene);
     let mut dirty_regions = scene_diff.dirty_regions;
     if dirty_regions.is_empty() {
-        return PaintStats::default();
+        return PaintStats {
+            scene_bounds: Some(scene_diff.current_bounds),
+            ..PaintStats::default()
+        };
     }
     let max_backdrop_blur_radius =
         scene_max_backdrop_blur_radius(previous_scene).max(scene_max_backdrop_blur_radius(scene));
@@ -2006,14 +2021,21 @@ fn render_scene_update_roots(
         })
         .collect::<Vec<_>>();
     if snapped_dirty_regions.is_empty() {
-        return PaintStats::default();
+        return PaintStats {
+            scene_bounds: Some(scene_diff.current_bounds),
+            ..PaintStats::default()
+        };
     }
 
     coalesce_dirty_regions(&mut snapped_dirty_regions);
     let dirty_region_count = snapped_dirty_regions.len();
     let dirty_pixels = clip_rects_pixel_count(&snapped_dirty_regions, width, height);
     let planned_dirty_jobs = build_incremental_render_jobs(&snapped_dirty_regions, width, height);
-    let incremental_worker_count = incremental_render_worker_count(&planned_dirty_jobs);
+    let incremental_worker_count = if max_backdrop_blur_radius > 0.0 {
+        1
+    } else {
+        incremental_render_worker_count(&planned_dirty_jobs)
+    };
     let incremental_dirty_jobs = incremental_scene_pass_count(
         dirty_region_count,
         planned_dirty_jobs.len(),
@@ -2046,6 +2068,7 @@ fn render_scene_update_roots(
         stats.dirty_jobs = incremental_dirty_jobs;
         stats.damage_pixels = dirty_pixels;
         stats.reason = reason;
+        stats.scene_bounds = Some(scene_diff.current_bounds);
         return stats;
     }
 
@@ -2071,6 +2094,7 @@ fn render_scene_update_roots(
             mode: FramePaintMode::Incremental,
             reason: FramePaintReason::IncrementalDamage,
             damage_rects: Some(snapped_dirty_regions),
+            scene_bounds: Some(scene_diff.current_bounds),
         };
     }
 
@@ -2102,6 +2126,7 @@ fn render_scene_update_roots(
         mode: FramePaintMode::Incremental,
         reason: FramePaintReason::IncrementalDamage,
         damage_rects,
+        scene_bounds: Some(scene_diff.current_bounds),
     }
 }
 
@@ -2545,38 +2570,47 @@ fn render_nodes_match_own_visuals_ignoring_projection(
 }
 
 fn visual_styles_match_ignoring_projection(left: &VisualStyle, right: &VisualStyle) -> bool {
-    let mut left = left.clone();
-    normalize_visual_style_projection(&mut left);
-    let mut right = right.clone();
-    normalize_visual_style_projection(&mut right);
-    left == right
-}
-
-fn normalize_visual_style_projection(style: &mut VisualStyle) {
-    style.transform = Transform2D::default();
-    style.perspective = None;
-    style.transform_style = TransformStyleMode::Flat;
+    left.background == right.background
+        && left.background_layers == right.background_layers
+        && left.foreground == right.foreground
+        && left.svg == right.svg
+        && left.text == right.text
+        && left.text_stroke == right.text_stroke
+        && left.text_shadows == right.text_shadows
+        && left.filter_drop_shadows == right.filter_drop_shadows
+        && left.backdrop_blur_radius == right.backdrop_blur_radius
+        && left.backdrop_occlusion == right.backdrop_occlusion
+        && left.native_material == right.native_material
+        && left.glass_tint == right.glass_tint
+        && left.corner_radius == right.corner_radius
+        && left.border == right.border
+        && left.shadows == right.shadows
+        && left.inset_shadows == right.inset_shadows
+        && left.positioned == right.positioned
+        && left.z_index == right.z_index
+        && left.overflow == right.overflow
+        && left.scrollbar == right.scrollbar
 }
 
 fn should_suspend_updates(left_down: bool, left_super_down: bool, right_super_down: bool) -> bool {
     left_down && (left_super_down || right_super_down)
 }
 
-#[derive(Clone, Debug)]
-struct CachedSceneBounds {
-    roots: Vec<CachedSubtreeBounds>,
-    node_count: usize,
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CachedSceneBounds {
+    pub(crate) roots: Vec<CachedSubtreeBounds>,
+    pub(crate) node_count: usize,
 }
 
-#[derive(Clone, Debug)]
-struct CachedSubtreeBounds {
-    own_bounds: Option<ClipRect>,
-    bounds: Option<ClipRect>,
-    subtree_uses_depth: bool,
-    subtree_uses_backdrop_blur: bool,
-    subtree_uses_backdrop_occlusion: bool,
-    subtree_uses_native_glass: bool,
-    children: Vec<CachedSubtreeBounds>,
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CachedSubtreeBounds {
+    pub(crate) own_bounds: Option<ClipRect>,
+    pub(crate) bounds: Option<ClipRect>,
+    pub(crate) subtree_uses_depth: bool,
+    pub(crate) subtree_uses_backdrop_blur: bool,
+    pub(crate) subtree_uses_backdrop_occlusion: bool,
+    pub(crate) subtree_uses_native_glass: bool,
+    pub(crate) children: Vec<CachedSubtreeBounds>,
 }
 
 fn root_indices_intersecting_clip(
@@ -5158,7 +5192,9 @@ fn draw_background_and_border_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
-    if matrix.is_identity() && (clip_state.is_simple() || clip_state.is_unclipped_by_regions(node.layout)) {
+    if matrix.is_identity()
+        && (clip_state.is_simple() || clip_state.is_unclipped_by_regions(node.layout))
+    {
         draw_background_and_border(node, buffer, width, height, clip_state.coarse);
         return;
     }
@@ -5832,12 +5868,27 @@ struct SceneDiff {
 }
 
 fn prepare_scene_diff(previous_scene: &[RenderNode], scene: &[RenderNode]) -> SceneDiff {
-    let previous_bounds = cache_scene_subtree_bounds(previous_scene);
+    prepare_scene_diff_with_previous_bounds(previous_scene, None, scene)
+}
+
+fn prepare_scene_diff_with_previous_bounds(
+    previous_scene: &[RenderNode],
+    previous_bounds: Option<&CachedSceneBounds>,
+    scene: &[RenderNode],
+) -> SceneDiff {
+    let computed_previous_bounds;
+    let previous_bounds_ref = match previous_bounds {
+        Some(bounds) => bounds,
+        None => {
+            computed_previous_bounds = cache_scene_subtree_bounds(previous_scene);
+            &computed_previous_bounds
+        }
+    };
     let current_bounds = cache_scene_subtree_bounds(scene);
     let mut dirty_regions = Vec::new();
     let _ = collect_scene_dirty_regions(
         previous_scene,
-        &previous_bounds.roots,
+        &previous_bounds_ref.roots,
         scene,
         &current_bounds.roots,
         &mut dirty_regions,
@@ -6188,7 +6239,8 @@ fn should_merge_dirty_regions(left: ClipRect, right: ClipRect) -> bool {
     // Check 2: Absolute and relative wasted area
     let intersection_area = left.intersect(right).map(|i| i.area()).unwrap_or(0.0);
     let wasted_area = (union_area - (combined_area - intersection_area)).max(0.0);
-    if wasted_area > MAX_MERGE_WASTED_PIXELS || wasted_area > min_area * MAX_WASTE_TO_MIN_AREA_RATIO {
+    if wasted_area > MAX_MERGE_WASTED_PIXELS || wasted_area > min_area * MAX_WASTE_TO_MIN_AREA_RATIO
+    {
         return false;
     }
 
@@ -11810,5 +11862,107 @@ mod tests {
         render_to_buffer(&next, &mut full, 32, 16, Color::WHITE);
 
         assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn visual_styles_match_ignoring_projection_matches_when_only_transforms_differ() {
+        let base = VisualStyle {
+            background: Some(Color::rgb(20, 40, 60)),
+            corner_radius: CornerRadius::all(8.0),
+            ..VisualStyle::default()
+        };
+        let mut transformed = base.clone();
+        transformed.transform = Transform2D {
+            operations: vec![TransformOperation::Translate {
+                x: LengthPercentageValue::from_px(10.0),
+                y: LengthPercentageValue::from_px(20.0),
+            }],
+            ..Transform2D::default()
+        };
+        transformed.perspective = Some(800.0);
+        transformed.transform_style = TransformStyleMode::Preserve3d;
+
+        assert!(super::visual_styles_match_ignoring_projection(
+            &base,
+            &transformed
+        ));
+
+        let mut color_diff = transformed.clone();
+        color_diff.background = Some(Color::rgb(99, 99, 99));
+        assert!(!super::visual_styles_match_ignoring_projection(
+            &base,
+            &color_diff
+        ));
+    }
+
+    #[test]
+    fn prepare_scene_diff_with_previous_bounds_reuses_cached_bounds() {
+        let previous = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 100.0, 100.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(10, 20, 30)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let next = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 100.0, 100.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(50, 60, 70)),
+                ..VisualStyle::default()
+            }),
+        ];
+
+        let precomputed_bounds = super::cache_scene_subtree_bounds(&previous);
+        let diff_with_bounds = super::prepare_scene_diff_with_previous_bounds(
+            &previous,
+            Some(&precomputed_bounds),
+            &next,
+        );
+        let diff_without_bounds = super::prepare_scene_diff(&previous, &next);
+
+        assert_eq!(
+            diff_with_bounds.dirty_regions,
+            diff_without_bounds.dirty_regions
+        );
+        assert_eq!(
+            diff_with_bounds.current_bounds,
+            diff_without_bounds.current_bounds
+        );
+    }
+
+    #[test]
+    fn render_scene_update_retains_scene_bounds_in_paint_stats() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 50.0, 50.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(100, 150, 200)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let mut buffer = vec![0_u32; 50 * 50];
+        let full_stats = super::render_to_buffer_internal_from_roots(
+            &scene,
+            &mut buffer,
+            50,
+            50,
+            Color::WHITE,
+            GlassRenderMode::Fallback,
+        );
+        assert!(full_stats.scene_bounds.is_some());
+
+        let next_scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 50.0, 50.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(200, 150, 100)),
+                ..VisualStyle::default()
+            }),
+        ];
+        let inc_stats = super::render_scene_update_internal_from_roots_with_glass(
+            &scene,
+            full_stats.scene_bounds.as_ref(),
+            &next_scene,
+            &mut buffer,
+            50,
+            50,
+            Color::WHITE,
+            GlassRenderMode::Fallback,
+        );
+        assert!(inc_stats.scene_bounds.is_some());
     }
 }

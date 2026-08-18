@@ -28,9 +28,9 @@ use crate::input::{
 };
 
 use super::{
-    ClipRect, ElementInteractionState, ElementPath, FrameInfo, FrameTimingStats, GlassRenderMode,
-    MouseEventKind, RedrawSchedule, RendererError, Result, SceneProvider, WindowConfig,
-    clip_pixel_bounds, dispatch_hover_transition_events, dispatch_mouse_event,
+    CachedSceneBounds, ClipRect, ElementInteractionState, ElementPath, FrameInfo, FrameTimingStats,
+    GlassRenderMode, MouseEventKind, RedrawSchedule, RendererError, Result, SceneProvider,
+    WindowConfig, clip_pixel_bounds, dispatch_hover_transition_events, dispatch_mouse_event,
     drawable_viewport_size, duration_to_us, is_transparent, native_glass, pack_softbuffer_rgb,
     record_frame_timing_stats, redraw_auto_scroll_indicator_regions,
     render_scene_update_internal_from_roots_with_glass, render_to_buffer_internal_from_roots,
@@ -213,6 +213,7 @@ struct RuntimeApp<P> {
     last_click: Option<(Instant, ElementPath)>,
     element_interaction: ElementInteractionState,
     previous_presented_scene: Option<Vec<RenderNode>>,
+    previous_presented_bounds: Option<CachedSceneBounds>,
     previous_presented_indicator: Option<scrollbar::AutoScrollIndicator>,
     scrollbar_controller: scrollbar::ScrollbarController,
     native_glass_active: bool,
@@ -260,6 +261,7 @@ where
             last_click: None,
             element_interaction: ElementInteractionState::default(),
             previous_presented_scene: None,
+            previous_presented_bounds: None,
             previous_presented_indicator: None,
             scrollbar_controller: scrollbar::ScrollbarController::default(),
             native_glass_active: false,
@@ -715,6 +717,7 @@ where
             } else if let Some(previous_scene) = self.previous_presented_scene.as_deref() {
                 render_scene_update_internal_from_roots_with_glass(
                     previous_scene,
+                    self.previous_presented_bounds.as_ref(),
                     &scene,
                     &mut self.buffer,
                     self.buffer_width,
@@ -816,6 +819,7 @@ where
             }
             frame_stats.present_us = duration_to_us(present_start.elapsed());
             self.previous_presented_scene = Some(scene);
+            self.previous_presented_bounds = paint_stats.scene_bounds;
             self.previous_presented_indicator = auto_scroll_indicator;
         }
 
@@ -1180,11 +1184,14 @@ fn copy_render_buffer_into_surface(
 
         let chunk_size = source_height.div_ceil(12).max(1);
         crate::global_worker_pool().scope(|scope| {
-            for (chunk_idx, target_chunk) in target.chunks_mut(chunk_size * source_width).enumerate() {
+            for (chunk_idx, target_chunk) in
+                target.chunks_mut(chunk_size * source_width).enumerate()
+            {
                 let start_row = chunk_idx * chunk_size;
                 let end_row = (start_row + chunk_size).min(source_height);
                 let source_slice = &source[start_row * source_width..end_row * source_width];
-                let alpha_slice = source_alpha.map(|a| &a[start_row * source_width..end_row * source_width]);
+                let alpha_slice =
+                    source_alpha.map(|a| &a[start_row * source_width..end_row * source_width]);
                 scope.spawn(move || {
                     for (row_offset, (target_row, source_row)) in target_chunk
                         .chunks_mut(source_width)
@@ -1192,7 +1199,9 @@ fn copy_render_buffer_into_surface(
                         .enumerate()
                     {
                         let row = start_row + row_offset;
-                        let alpha_row = alpha_slice.map(|a| &a[row_offset * source_width..(row_offset + 1) * source_width]);
+                        let alpha_row = alpha_slice.map(|a| {
+                            &a[row_offset * source_width..(row_offset + 1) * source_width]
+                        });
                         for column in 0..source_width {
                             target_row[column] = surface_pixel(
                                 source_row[column],

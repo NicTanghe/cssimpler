@@ -291,7 +291,9 @@ pub(crate) fn draw_background_layer_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
-    if matrix.is_identity() && (clip_state.is_simple() || clip_state.is_unclipped_by_regions(layout)) {
+    if matrix.is_identity()
+        && (clip_state.is_simple() || clip_state.is_unclipped_by_regions(layout))
+    {
         draw_background_layer(
             buffer,
             width,
@@ -1091,11 +1093,7 @@ fn draw_linear_gradient(
         let mut projection = row_proj_start + (full_x0 - x0) as f32 * projection_step;
         for x in full_x0..full_x1 {
             let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
-            blend_gradient_pixel_at_index_full_coverage(
-                buffer,
-                row_start + x as usize,
-                color,
-            );
+            blend_gradient_pixel_at_index_full_coverage(buffer, row_start + x as usize, color);
             projection += projection_step;
         }
 
@@ -1226,7 +1224,11 @@ fn draw_radial_gradient(
     let is_circle = (resolved_shape.radius_x - resolved_shape.radius_y).abs() <= f32::EPSILON;
     let fraction_only = length_stops_use_fraction_only(&gradient.stops);
     let prepared_unit_gradient = (fraction_only || is_circle).then(|| {
-        let span = if is_circle { resolved_shape.radius_x } else { 1.0 };
+        let span = if is_circle {
+            resolved_shape.radius_x
+        } else {
+            1.0
+        };
         let unit_stops = resolve_length_stops(&gradient.stops, span, 0.0);
         prepare_resolved_gradient(&unit_stops, gradient.interpolation)
     });
@@ -1295,11 +1297,7 @@ fn draw_radial_gradient(
 
         for x in full_x0..full_x1 {
             let color = sample_pixel(x as f32 + 0.5);
-            blend_gradient_pixel_at_index_full_coverage(
-                buffer,
-                row_start + x as usize,
-                color,
-            );
+            blend_gradient_pixel_at_index_full_coverage(buffer, row_start + x as usize, color);
         }
 
         for x in full_x1..x1 {
@@ -1351,7 +1349,11 @@ fn rasterize_radial_gradient(
     let is_circle = (resolved_shape.radius_x - resolved_shape.radius_y).abs() <= f32::EPSILON;
     let fraction_only = length_stops_use_fraction_only(&gradient.stops);
     let prepared_unit_gradient = (fraction_only || is_circle).then(|| {
-        let span = if is_circle { resolved_shape.radius_x } else { 1.0 };
+        let span = if is_circle {
+            resolved_shape.radius_x
+        } else {
+            1.0
+        };
         let unit_stops = resolve_length_stops(&gradient.stops, span, 0.0);
         prepare_resolved_gradient(&unit_stops, gradient.interpolation)
     });
@@ -1483,11 +1485,7 @@ fn draw_conic_gradient(
 
         for x in full_x0..full_x1 {
             let color = sample_pixel(x as f32 + 0.5);
-            blend_gradient_pixel_at_index_full_coverage(
-                buffer,
-                row_start + x as usize,
-                color,
-            );
+            blend_gradient_pixel_at_index_full_coverage(buffer, row_start + x as usize, color);
         }
 
         for x in full_x1..x1 {
@@ -1604,11 +1602,7 @@ fn fill_gradient_rounded_rect(
             }
         }
         for x in full_x0..full_x1 {
-            blend_gradient_pixel_at_index_full_coverage(
-                buffer,
-                row_start + x as usize,
-                color,
-            );
+            blend_gradient_pixel_at_index_full_coverage(buffer, row_start + x as usize, color);
         }
         for x in full_x1..x1 {
             let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
@@ -1834,7 +1828,9 @@ pub(crate) fn prepare_resolved_gradient(
         let mut table = Box::new([LinearRgba::TRANSPARENT; GRADIENT_LUT_SIZE]);
         for i in 0..GRADIENT_LUT_SIZE {
             let t = start_pos + (i as f32 / (GRADIENT_LUT_SIZE - 1) as f32) * span;
-            let mut sampled = first.map(|stop| stop.color).unwrap_or(LinearRgba::TRANSPARENT);
+            let mut sampled = first
+                .map(|stop| stop.color)
+                .unwrap_or(LinearRgba::TRANSPARENT);
             for segment in &segments {
                 if t <= segment.end {
                     sampled = segment.sample(t, interpolation);
@@ -1883,7 +1879,8 @@ pub(crate) fn sample_prepared_gradient(
     if matches!(gradient.interpolation, GradientInterpolation::Oklab)
         && let Some(lut) = &gradient.lut
     {
-        let normalized = (t - gradient.start) * gradient.lut_inverse_span * (GRADIENT_LUT_SIZE - 1) as f32;
+        let normalized =
+            (t - gradient.start) * gradient.lut_inverse_span * (GRADIENT_LUT_SIZE - 1) as f32;
         let i0 = (normalized.floor() as usize).min(GRADIENT_LUT_SIZE - 1);
         let i1 = (i0 + 1).min(GRADIENT_LUT_SIZE - 1);
         let fract = normalized - i0 as f32;
@@ -2688,12 +2685,9 @@ mod tests {
         assert!(cached_gradient_layer(layout, radius, &layer).is_none());
         let (first, _, _) = cached_gradient_layer(layout, radius, &layer)
             .expect("308x272 gradient layer should now fit in gradient cache");
-        let (second, _, _) = cached_gradient_layer(
-            LayoutBox::new(50.0, 50.0, 308.0, 272.0),
-            radius,
-            &layer,
-        )
-        .expect("translated 308x272 gradient layer should reuse cache");
+        let (second, _, _) =
+            cached_gradient_layer(LayoutBox::new(50.0, 50.0, 308.0, 272.0), radius, &layer)
+                .expect("translated 308x272 gradient layer should reuse cache");
         assert!(Arc::ptr_eq(&first, &second));
     }
 
@@ -2725,7 +2719,7 @@ mod tests {
         assert!(
             cached_static_gradient_layer(LayoutBox::new(12.5, 18.25, 512.0, 512.0), radius, &layer)
                 .is_none()
-            );
+        );
         let (first, first_offset_x, first_offset_y) =
             cached_static_gradient_layer(LayoutBox::new(12.5, 18.25, 512.0, 512.0), radius, &layer)
                 .expect("large gradient raster should enter the static cache");

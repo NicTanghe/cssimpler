@@ -153,12 +153,7 @@ fn split_layout_for_shadow_cache(layout: LayoutBox) -> (LayoutBox, i32, i32) {
     let frac_x = quantize_shadow_subpixel((layout.x - offset_x as f32).clamp(0.0, 0.999));
     let frac_y = quantize_shadow_subpixel((layout.y - offset_y as f32).clamp(0.0, 0.999));
     (
-        LayoutBox::new(
-            frac_x,
-            frac_y,
-            layout.width,
-            layout.height,
-        ),
+        LayoutBox::new(frac_x, frac_y, layout.width, layout.height),
         offset_x,
         offset_y,
     )
@@ -654,7 +649,9 @@ fn draw_shadow_mask_transformed(
         mask.width as f32,
         mask.height as f32,
     );
-    if matrix.is_identity() && (clip_state.is_simple() || clip_state.is_unclipped_by_regions(mask_layout)) {
+    if matrix.is_identity()
+        && (clip_state.is_simple() || clip_state.is_unclipped_by_regions(mask_layout))
+    {
         draw_shadow_mask(
             buffer,
             width,
