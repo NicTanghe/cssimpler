@@ -79,6 +79,8 @@ const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.85;
 const SINGLE_REGION_MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.94;
 const DIRTY_BRANCH_COLLAPSE_THRESHOLD: usize = 3;
 const DIRTY_BRANCH_COLLAPSE_MAX_AREA_RATIO: f32 = 1.5;
+const MAX_BRANCH_COLLAPSE_AREA: f32 = 65536.0;
+const MAX_BRANCH_COLLAPSE_WASTED_PIXELS: f32 = 8192.0;
 const DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO: f32 = 1.35;
 const MAX_MERGE_WASTED_PIXELS: f32 = 16384.0;
 const MAX_WASTE_TO_MIN_AREA_RATIO: f32 = 0.60;
@@ -2102,6 +2104,27 @@ fn render_scene_update_roots(
     }
 }
 
+fn coalesce_contiguous_dirty_jobs(jobs: &[DirtyRenderJob]) -> Vec<DirtyRenderJob> {
+    if jobs.len() <= 1 {
+        return jobs.to_vec();
+    }
+    let mut merged: Vec<DirtyRenderJob> = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        if let Some(last) = merged.last_mut() {
+            if (last.clip.x0 - job.clip.x0).abs() <= f32::EPSILON
+                && (last.clip.x1 - job.clip.x1).abs() <= f32::EPSILON
+                && (last.clip.y1 - job.clip.y0).abs() <= f32::EPSILON
+            {
+                last.clip.y1 = job.clip.y1;
+                last.pixel_count = last.pixel_count.saturating_add(job.pixel_count);
+                continue;
+            }
+        }
+        merged.push(job.clone());
+    }
+    merged
+}
+
 fn render_scene_update_parallel(
     scene: &[RenderNode],
     cached_bounds: &[CachedSubtreeBounds],
@@ -2115,6 +2138,10 @@ fn render_scene_update_parallel(
 ) {
     let worker_count = worker_count.max(1).min(dirty_jobs.len().max(1));
     let job_groups = distribute_dirty_render_jobs(dirty_jobs, worker_count);
+    let coalesced_job_groups = job_groups
+        .iter()
+        .map(|jobs| coalesce_contiguous_dirty_jobs(jobs))
+        .collect::<Vec<_>>();
     let group_rows = job_groups
         .iter()
         .map(|jobs| {
@@ -2140,7 +2167,7 @@ fn render_scene_update_parallel(
     global_worker_pool().scope(|scope| {
         for (((worker_buffer, jobs), rows), root_indices) in worker_buffers
             .iter_mut()
-            .zip(job_groups.iter())
+            .zip(coalesced_job_groups.iter())
             .zip(group_rows.iter().copied())
             .zip(group_root_indices.iter())
         {
@@ -2167,7 +2194,7 @@ fn render_scene_update_parallel(
 
     for ((worker_buffer, jobs), rows) in worker_buffers
         .iter()
-        .zip(job_groups.iter())
+        .zip(coalesced_job_groups.iter())
         .zip(group_rows.iter().copied())
     {
         for job in jobs {
@@ -6024,8 +6051,7 @@ fn push_cached_subtree_dirty_region(
 
 fn can_tighten_own_dirty_region(previous: &RenderNode, current: &RenderNode) -> bool {
     previous.kind == current.kind
-        && previous.layout == current.layout
-        && previous.content_inset == current.content_inset
+        && previous.children.len() == current.children.len()
         && previous.scrollbars == current.scrollbars
         && previous.style.overflow == current.style.overflow
         && previous.style.positioned == current.style.positioned
@@ -6055,6 +6081,11 @@ fn maybe_collapse_branch_dirty_regions(
         return;
     };
 
+    let branch_area = branch_bounds.area();
+    if branch_area > MAX_BRANCH_COLLAPSE_AREA {
+        return;
+    }
+
     let descendant_area: f32 = dirty_regions[start_len..]
         .iter()
         .filter_map(|region| region.intersect(branch_bounds))
@@ -6065,7 +6096,10 @@ fn maybe_collapse_branch_dirty_regions(
         return;
     }
 
-    if branch_bounds.area() > descendant_area * DIRTY_BRANCH_COLLAPSE_MAX_AREA_RATIO {
+    let wasted_area = (branch_area - descendant_area).max(0.0);
+    if wasted_area > MAX_BRANCH_COLLAPSE_WASTED_PIXELS
+        || branch_area > descendant_area * DIRTY_BRANCH_COLLAPSE_MAX_AREA_RATIO
+    {
         return;
     }
 
@@ -6129,9 +6163,7 @@ fn should_merge_dirty_regions(left: ClipRect, right: ClipRect) -> bool {
     let right_h = right.height();
     let width_ratio = left_w.max(right_w) / left_w.min(right_w).max(1.0);
     let height_ratio = left_h.max(right_h) / left_h.min(right_h).max(1.0);
-    if (width_ratio > MAX_DIMENSION_MISMATCH_RATIO && height_ratio <= 1.5)
-        || (height_ratio > MAX_DIMENSION_MISMATCH_RATIO && width_ratio <= 1.5)
-    {
+    if width_ratio > MAX_DIMENSION_MISMATCH_RATIO || height_ratio > MAX_DIMENSION_MISMATCH_RATIO {
         return false;
     }
 
@@ -7778,6 +7810,7 @@ mod tests {
 
     #[test]
     fn multithreaded_alpha_full_redraw_matches_across_odd_band_seams() {
+        let _cache_guard = crate::gradient::lock_gradient_cache_for_tests();
         let width = 173_usize;
         let height = 103_usize;
         let worker_count = 6_usize;
