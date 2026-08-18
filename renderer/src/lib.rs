@@ -4419,7 +4419,7 @@ fn draw_node_transformed_internal_impl(
     };
 
     if matrix.is_identity()
-        && clip_state.is_simple()
+        && (clip_state.is_simple() || clip_state.is_unclipped_by_regions(node.layout))
         && !in_3d_context
         && parent_perspective.is_none()
         && !node_requires_projected_path(node)
@@ -5158,7 +5158,7 @@ fn draw_background_and_border_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
-    if matrix.is_identity() && clip_state.is_simple() {
+    if matrix.is_identity() && (clip_state.is_simple() || clip_state.is_unclipped_by_regions(node.layout)) {
         draw_background_and_border(node, buffer, width, height, clip_state.coarse);
         return;
     }

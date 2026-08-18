@@ -123,6 +123,28 @@ impl ClipState {
         self.regions.is_empty()
     }
 
+    pub(crate) fn is_unclipped_by_regions(&self, layout: LayoutBox) -> bool {
+        if self.regions.is_empty() {
+            return true;
+        }
+
+        self.regions.iter().all(|region| {
+            if !region.inverse.is_identity() {
+                return false;
+            }
+            let r = &region.radius;
+            let left = region.layout.x + r.top_left.max(r.bottom_left);
+            let right = region.layout.x + region.layout.width - r.top_right.max(r.bottom_right);
+            let top = region.layout.y + r.top_left.max(r.top_right);
+            let bottom = region.layout.y + region.layout.height - r.bottom_left.max(r.bottom_right);
+
+            layout.x >= left
+                && layout.x + layout.width <= right
+                && layout.y >= top
+                && layout.y + layout.height <= bottom
+        })
+    }
+
     pub(crate) fn contains(&self, x: f32, y: f32) -> bool {
         self.coarse.contains(x, y)
             && self.regions.iter().all(|region| {

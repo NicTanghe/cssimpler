@@ -291,7 +291,7 @@ pub(crate) fn draw_background_layer_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
-    if matrix.is_identity() && clip_state.is_simple() {
+    if matrix.is_identity() && (clip_state.is_simple() || clip_state.is_unclipped_by_regions(layout)) {
         draw_background_layer(
             buffer,
             width,

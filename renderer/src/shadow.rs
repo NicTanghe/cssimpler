@@ -648,7 +648,13 @@ fn draw_shadow_mask_transformed(
         return;
     }
 
-    if matrix.is_identity() && clip_state.is_simple() {
+    let mask_layout = LayoutBox::new(
+        (mask.origin_x + offset_x) as f32,
+        (mask.origin_y + offset_y) as f32,
+        mask.width as f32,
+        mask.height as f32,
+    );
+    if matrix.is_identity() && (clip_state.is_simple() || clip_state.is_unclipped_by_regions(mask_layout)) {
         draw_shadow_mask(
             buffer,
             width,
