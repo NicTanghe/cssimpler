@@ -5,7 +5,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem::size_of;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -79,6 +80,9 @@ const SINGLE_REGION_MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.94;
 const DIRTY_BRANCH_COLLAPSE_THRESHOLD: usize = 3;
 const DIRTY_BRANCH_COLLAPSE_MAX_AREA_RATIO: f32 = 1.5;
 const DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO: f32 = 1.35;
+const MAX_MERGE_WASTED_PIXELS: f32 = 16384.0;
+const MAX_WASTE_TO_MIN_AREA_RATIO: f32 = 0.60;
+const MAX_DIMENSION_MISMATCH_RATIO: f32 = 2.5;
 const MAX_SUBTREE_SURFACE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_TEMP_BYTES: usize = 8 * 1024 * 1024;
@@ -128,16 +132,171 @@ pub struct FrameTimingStats {
     pub paint_reason: FramePaintReason,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct PaintStats {
-    workers: usize,
-    dirty_regions: usize,
-    dirty_jobs: usize,
-    damage_pixels: usize,
-    painted_pixels: usize,
-    scene_passes: usize,
-    mode: FramePaintMode,
-    reason: FramePaintReason,
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct PaintStats {
+    pub(crate) workers: usize,
+    pub(crate) dirty_regions: usize,
+    pub(crate) dirty_jobs: usize,
+    pub(crate) damage_pixels: usize,
+    pub(crate) painted_pixels: usize,
+    pub(crate) scene_passes: usize,
+    pub(crate) mode: FramePaintMode,
+    pub(crate) reason: FramePaintReason,
+    pub(crate) damage_rects: Option<Vec<ClipRect>>,
+}
+
+type BoxedRenderTask<'a> = Box<dyn FnOnce() + Send + 'a>;
+
+struct WorkerPoolShared {
+    state: Mutex<WorkerPoolState>,
+    has_work: Condvar,
+    done: Condvar,
+    shutdown: AtomicBool,
+    active_tasks: AtomicUsize,
+}
+
+struct WorkerPoolState {
+    tasks: Vec<BoxedRenderTask<'static>>,
+}
+
+pub(crate) struct WorkerPool {
+    _threads: Vec<thread::JoinHandle<()>>,
+    shared: Arc<WorkerPoolShared>,
+}
+
+static WORKER_POOL: OnceLock<WorkerPool> = OnceLock::new();
+
+pub(crate) fn global_worker_pool() -> &'static WorkerPool {
+    WORKER_POOL.get_or_init(|| {
+        let worker_count = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(MAX_RENDER_WORKERS)
+            .saturating_sub(1);
+
+        WorkerPool::new(worker_count)
+    })
+}
+
+impl WorkerPool {
+    pub(crate) fn new(num_workers: usize) -> Self {
+        let shared = Arc::new(WorkerPoolShared {
+            state: Mutex::new(WorkerPoolState { tasks: Vec::new() }),
+            has_work: Condvar::new(),
+            done: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            active_tasks: AtomicUsize::new(0),
+        });
+
+        let mut threads = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let shared = Arc::clone(&shared);
+            threads.push(
+                thread::Builder::new()
+                    .name("cssimpler-render-worker".into())
+                    .spawn(move || worker_loop(shared))
+                    .expect("failed to spawn persistent render worker"),
+            );
+        }
+
+        Self {
+            _threads: threads,
+            shared,
+        }
+    }
+
+    pub(crate) fn scope<'env, F, R>(&self, f: F) -> R
+    where
+        F: for<'scope> FnOnce(&Scope<'scope, 'env>) -> R,
+    {
+        let scope = Scope {
+            shared: Arc::clone(&self.shared),
+            tasks: Mutex::new(Vec::new()),
+            _marker: std::marker::PhantomData,
+        };
+        let result = f(&scope);
+        scope.join();
+        result
+    }
+}
+
+pub(crate) struct Scope<'scope, 'env: 'scope> {
+    shared: Arc<WorkerPoolShared>,
+    tasks: Mutex<Vec<BoxedRenderTask<'static>>>,
+    _marker: std::marker::PhantomData<(&'scope (), &'env ())>,
+}
+
+impl<'scope, 'env> Scope<'scope, 'env> {
+    pub(crate) fn spawn<F>(&self, task: F)
+    where
+        F: FnOnce() + Send + 'scope,
+    {
+        let boxed: BoxedRenderTask<'scope> = Box::new(task);
+        let static_task: BoxedRenderTask<'static> = unsafe { std::mem::transmute(boxed) };
+        self.tasks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(static_task);
+    }
+
+    fn join(&self) {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if tasks.is_empty() {
+            return;
+        }
+
+        let master_task = tasks.pop();
+        let background_count = tasks.len();
+
+        if background_count > 0 {
+            self.shared
+                .active_tasks
+                .store(background_count, AtomicOrdering::Release);
+            {
+                let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+                state.tasks = std::mem::take(&mut *tasks);
+                self.shared.has_work.notify_all();
+            }
+        }
+
+        drop(tasks);
+
+        if let Some(task) = master_task {
+            task();
+        }
+
+        if background_count > 0 {
+            let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+            while self.shared.active_tasks.load(AtomicOrdering::Acquire) > 0 {
+                state = self.shared.done.wait(state).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+    }
+}
+
+fn worker_loop(shared: Arc<WorkerPoolShared>) {
+    loop {
+        let task = {
+            let mut state = shared.state.lock().unwrap_or_else(|p| p.into_inner());
+            while state.tasks.is_empty() && !shared.shutdown.load(AtomicOrdering::Relaxed) {
+                state = shared.has_work.wait(state).unwrap_or_else(|p| p.into_inner());
+            }
+            if shared.shutdown.load(AtomicOrdering::Relaxed) && state.tasks.is_empty() {
+                return;
+            }
+            state.tasks.pop()
+        };
+
+        if let Some(task) = task {
+            task();
+            if shared.active_tasks.fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
+                shared.done.notify_all();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1595,6 +1754,7 @@ fn render_to_buffer_internal_with_cached_bounds(
         scene_passes: worker_count.max(1),
         mode: FramePaintMode::Full,
         reason: FramePaintReason::FullRedraw,
+        damage_rects: None,
     }
 }
 
@@ -1682,8 +1842,7 @@ fn render_to_buffer_parallel(
         .collect::<Vec<_>>();
 
     if let Some(alpha_buffer) = alpha_buffer.as_deref_mut() {
-        thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(bands.len());
+        global_worker_pool().scope(|scope| {
             for (((worker_buffer, worker_alpha_buffer), rows), root_indices) in buffer
                 .chunks_mut(pixels_per_band)
                 .zip(alpha_buffer.chunks_mut(pixels_per_band))
@@ -1696,7 +1855,7 @@ fn render_to_buffer_parallel(
                     x1: width as f32,
                     y1: rows.end as f32,
                 };
-                handles.push(scope.spawn(move || {
+                scope.spawn(move || {
                     with_render_alpha_target(Some(worker_alpha_buffer), || {
                         with_render_buffer_rows(rows, || {
                             worker_buffer.fill(clear);
@@ -1714,16 +1873,11 @@ fn render_to_buffer_parallel(
                             );
                         });
                     });
-                }));
-            }
-
-            for handle in handles {
-                handle.join().expect("render worker should not panic");
+                });
             }
         });
     } else {
-        thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(bands.len());
+        global_worker_pool().scope(|scope| {
             for ((worker_buffer, rows), root_indices) in buffer
                 .chunks_mut(pixels_per_band)
                 .zip(bands.iter().copied())
@@ -1735,7 +1889,7 @@ fn render_to_buffer_parallel(
                     x1: width as f32,
                     y1: rows.end as f32,
                 };
-                handles.push(scope.spawn(move || {
+                scope.spawn(move || {
                     with_render_buffer_rows(rows, || {
                         worker_buffer.fill(clear);
                         draw_cached_root_indices(
@@ -1750,11 +1904,7 @@ fn render_to_buffer_parallel(
                             glass_mode,
                         );
                     });
-                }));
-            }
-
-            for handle in handles {
-                handle.join().expect("render worker should not panic");
+                });
             }
         });
     }
@@ -1917,9 +2067,11 @@ fn render_scene_update_roots(
             scene_passes: incremental_dirty_jobs,
             mode: FramePaintMode::Incremental,
             reason: FramePaintReason::IncrementalDamage,
+            damage_rects: Some(snapped_dirty_regions),
         };
     }
 
+    let damage_rects = Some(snapped_dirty_regions.clone());
     for dirty_region in snapped_dirty_regions {
         clear_clip(buffer, width, height, dirty_region, clear_color);
         let root_indices =
@@ -1946,6 +2098,7 @@ fn render_scene_update_roots(
         scene_passes: incremental_dirty_jobs,
         mode: FramePaintMode::Incremental,
         reason: FramePaintReason::IncrementalDamage,
+        damage_rects,
     }
 }
 
@@ -1984,15 +2137,14 @@ fn render_scene_update_parallel(
         .collect::<Vec<_>>();
     let mut worker_buffers = acquire_worker_buffers(&worker_buffer_lengths);
 
-    thread::scope(|scope| {
-        let mut handles = Vec::new();
+    global_worker_pool().scope(|scope| {
         for (((worker_buffer, jobs), rows), root_indices) in worker_buffers
             .iter_mut()
             .zip(job_groups.iter())
             .zip(group_rows.iter().copied())
             .zip(group_root_indices.iter())
         {
-            handles.push(scope.spawn(move || {
+            scope.spawn(move || {
                 with_render_buffer_rows(rows, || {
                     for job in jobs {
                         clear_clip_packed(worker_buffer, width, height, job.clip, clear);
@@ -2009,13 +2161,7 @@ fn render_scene_update_parallel(
                         );
                     }
                 });
-            }));
-        }
-
-        for handle in handles {
-            handle
-                .join()
-                .expect("incremental render worker should not panic");
+            });
         }
     });
 
@@ -2607,6 +2753,14 @@ impl ClipRect {
 
     fn is_empty(self) -> bool {
         self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+
+    fn width(self) -> f32 {
+        (self.x1 - self.x0).max(0.0)
+    }
+
+    fn height(self) -> f32 {
+        (self.y1 - self.y0).max(0.0)
     }
 }
 
@@ -5945,13 +6099,43 @@ fn should_merge_dirty_regions(left: ClipRect, right: ClipRect) -> bool {
         return false;
     }
 
-    let union = left.union(right);
-    let combined_area = left.area() + right.area();
-    if combined_area <= f32::EPSILON {
+    let left_area = left.area();
+    let right_area = right.area();
+    let min_area = left_area.min(right_area);
+    if min_area <= f32::EPSILON {
         return false;
     }
 
-    union.area() <= combined_area * DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO
+    let union = left.union(right);
+    let union_area = union.area();
+    let combined_area = left_area + right_area;
+
+    // Check 1: Relative expansion ratio
+    if union_area > combined_area * DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO {
+        return false;
+    }
+
+    // Check 2: Absolute and relative wasted area
+    let intersection_area = left.intersect(right).map(|i| i.area()).unwrap_or(0.0);
+    let wasted_area = (union_area - (combined_area - intersection_area)).max(0.0);
+    if wasted_area > MAX_MERGE_WASTED_PIXELS || wasted_area > min_area * MAX_WASTE_TO_MIN_AREA_RATIO {
+        return false;
+    }
+
+    // Check 3: Dimension mismatch (e.g., full-width header vs small tile)
+    let left_w = left.width();
+    let right_w = right.width();
+    let left_h = left.height();
+    let right_h = right.height();
+    let width_ratio = left_w.max(right_w) / left_w.min(right_w).max(1.0);
+    let height_ratio = left_h.max(right_h) / left_h.min(right_h).max(1.0);
+    if (width_ratio > MAX_DIMENSION_MISMATCH_RATIO && height_ratio <= 1.5)
+        || (height_ratio > MAX_DIMENSION_MISMATCH_RATIO && width_ratio <= 1.5)
+    {
+        return false;
+    }
+
+    true
 }
 
 fn should_full_redraw(

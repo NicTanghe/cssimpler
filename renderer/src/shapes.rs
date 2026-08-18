@@ -1,11 +1,12 @@
-use cssimpler_core::{Color, CornerRadius, Insets, LayoutBox};
+use cssimpler_core::{Color, CornerRadius, Insets, LayoutBox, LinearRgba};
 
 use super::{
-    ClipRect, PreparedBlendColor, blend_prepared_pixel_with_coverage,
+    ClipRect, PreparedBlendColor, blend_linear_over,
     blend_prepared_pixel_with_coverage_at_index,
     blend_prepared_pixel_with_coverage_at_index_opaque_target, current_render_buffer_rows,
-    fill_current_alpha_span, pack_rgb, render_alpha_target_active,
+    fill_current_alpha_span, pack_linear_rgb, pack_rgb, render_alpha_target_active,
     transform::{AffineTransform, ClipState},
+    unpack_linear_rgb,
 };
 
 const AXIS_ALIGNED_COARSE_SAMPLE_MIN: f32 = 0.25;
@@ -71,6 +72,28 @@ const DASH_GAP_LENGTH_MULTIPLIER: f32 = 2.0;
 const DASH_MIN_LENGTH: f32 = 2.0;
 const DASH_MIN_GAP: f32 = 1.0;
 
+#[inline(always)]
+fn blend_constant_alpha_span_opaque_target(
+    slice: &mut [u32],
+    color: PreparedBlendColor,
+) {
+    let alpha = color.linear.a;
+    let inv_alpha = 1.0 - alpha;
+    let src_r = color.linear.r * alpha;
+    let src_g = color.linear.g * alpha;
+    let src_b = color.linear.b * alpha;
+
+    for pixel in slice.iter_mut() {
+        let dst = unpack_linear_rgb(*pixel);
+        *pixel = pack_linear_rgb(LinearRgba {
+            r: src_r + dst.r * inv_alpha,
+            g: src_g + dst.g * inv_alpha,
+            b: src_b + dst.b * inv_alpha,
+            a: 1.0,
+        });
+    }
+}
+
 pub(crate) fn draw_rounded_rect(
     buffer: &mut [u32],
     width: usize,
@@ -94,6 +117,8 @@ pub(crate) fn draw_rounded_rect(
         let (full_x0, full_x1) =
             rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1)
                 .unwrap_or((x0, x0));
+
+        // Left antialiased edge
         for x in x0..full_x0 {
             let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
             if coverage == 0 {
@@ -118,26 +143,26 @@ pub(crate) fn draw_rounded_rect(
                 );
             }
         }
-        for x in full_x0..full_x1 {
-            let index = row_start + x as usize;
-            if has_alpha_target {
-                blend_prepared_pixel_with_coverage_at_index(
-                    buffer,
-                    index,
-                    prepared_color,
-                    color.a,
-                    u8::MAX,
-                );
+
+        // Middle full-coverage span
+        if full_x0 < full_x1 {
+            let start = row_start + full_x0 as usize;
+            let end = row_start + full_x1 as usize;
+            if color.a == u8::MAX {
+                buffer[start..end].fill(prepared_color.packed);
+                if has_alpha_target {
+                    fill_current_alpha_span(start, end - start, u8::MAX);
+                }
+            } else if !has_alpha_target {
+                blend_constant_alpha_span_opaque_target(&mut buffer[start..end], prepared_color);
             } else {
-                blend_prepared_pixel_with_coverage_at_index_opaque_target(
-                    buffer,
-                    index,
-                    prepared_color,
-                    color.a,
-                    u8::MAX,
-                );
+                for index in start..end {
+                    blend_linear_over(buffer, index, prepared_color.linear);
+                }
             }
         }
+
+        // Right antialiased edge
         for x in full_x1..x1 {
             let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
             if coverage == 0 {
@@ -200,22 +225,70 @@ pub(crate) fn draw_rounded_ring(
     };
 
     let prepared_color = PreparedBlendColor::new(color);
-    for y in y0..y1 {
-        for x in x0..x1 {
+    let rows = current_render_buffer_rows();
+    let draw_y0 = y0.max(rows.start.min(height) as i32);
+    let draw_y1 = y1.min(rows.end.min(height) as i32);
+    let has_alpha_target = render_alpha_target_active();
+
+    for y in draw_y0..draw_y1 {
+        let row_start = (y as usize - rows.start) * width;
+        let inner_span = inner.and_then(|(inner_layout, inner_radius)| {
+            rounded_rect_full_coverage_row_span(inner_layout, inner_radius, clip, y, x0, x1)
+        });
+
+        let (left_x1, right_x0) = match inner_span {
+            Some((ix0, ix1)) => (ix0.min(x1), ix1.max(x0)),
+            None => (x1, x1),
+        };
+
+        for x in x0..left_x1 {
             let coverage = rounded_ring_coverage(outer_layout, outer_radius, inner, clip, x, y);
             if coverage == 0 {
                 continue;
             }
-            blend_prepared_pixel_with_coverage(
-                buffer,
-                width,
-                height,
-                x,
-                y,
-                prepared_color,
-                color.a,
-                coverage,
-            );
+            let index = row_start + x as usize;
+            if has_alpha_target {
+                blend_prepared_pixel_with_coverage_at_index(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            } else {
+                blend_prepared_pixel_with_coverage_at_index_opaque_target(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            }
+        }
+
+        for x in right_x0..x1 {
+            let coverage = rounded_ring_coverage(outer_layout, outer_radius, inner, clip, x, y);
+            if coverage == 0 {
+                continue;
+            }
+            let index = row_start + x as usize;
+            if has_alpha_target {
+                blend_prepared_pixel_with_coverage_at_index(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            } else {
+                blend_prepared_pixel_with_coverage_at_index_opaque_target(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            }
         }
     }
 }
@@ -235,23 +308,72 @@ pub(crate) fn draw_dashed_rounded_ring(
     };
 
     let prepared_color = PreparedBlendColor::new(color);
-    for y in y0..y1 {
-        for x in x0..x1 {
+    let rows = current_render_buffer_rows();
+    let draw_y0 = y0.max(rows.start.min(height) as i32);
+    let draw_y1 = y1.min(rows.end.min(height) as i32);
+    let has_alpha_target = render_alpha_target_active();
+
+    for y in draw_y0..draw_y1 {
+        let row_start = (y as usize - rows.start) * width;
+        let inner_span = inner.and_then(|(inner_layout, inner_radius)| {
+            rounded_rect_full_coverage_row_span(inner_layout, inner_radius, clip, y, x0, x1)
+        });
+
+        let (left_x1, right_x0) = match inner_span {
+            Some((ix0, ix1)) => (ix0.min(x1), ix1.max(x0)),
+            None => (x1, x1),
+        };
+
+        for x in x0..left_x1 {
             let coverage =
                 dashed_rounded_ring_coverage(outer_layout, outer_radius, inner, clip, x, y);
             if coverage == 0 {
                 continue;
             }
-            blend_prepared_pixel_with_coverage(
-                buffer,
-                width,
-                height,
-                x,
-                y,
-                prepared_color,
-                color.a,
-                coverage,
-            );
+            let index = row_start + x as usize;
+            if has_alpha_target {
+                blend_prepared_pixel_with_coverage_at_index(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            } else {
+                blend_prepared_pixel_with_coverage_at_index_opaque_target(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            }
+        }
+
+        for x in right_x0..x1 {
+            let coverage =
+                dashed_rounded_ring_coverage(outer_layout, outer_radius, inner, clip, x, y);
+            if coverage == 0 {
+                continue;
+            }
+            let index = row_start + x as usize;
+            if has_alpha_target {
+                blend_prepared_pixel_with_coverage_at_index(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            } else {
+                blend_prepared_pixel_with_coverage_at_index_opaque_target(
+                    buffer,
+                    index,
+                    prepared_color,
+                    color.a,
+                    coverage,
+                );
+            }
         }
     }
 }
@@ -739,11 +861,20 @@ fn transformed_shape_sample_hits<const N: usize>(
     hits
 }
 
+const FINE_COVERAGE_LUT: [u8; 17] = [
+    0, 16, 32, 48, 64, 80, 96, 112, 128, 143, 159, 175, 191, 207, 223, 239, 255,
+];
+
+#[inline(always)]
 fn coverage_from_sample_hits(hits: u8, total_samples: u8) -> u8 {
-    match hits {
-        0 => 0,
-        hits if hits >= total_samples => u8::MAX,
-        hits => ((hits as f32 / total_samples as f32) * 255.0).round() as u8,
+    if hits == 0 {
+        0
+    } else if hits >= total_samples {
+        u8::MAX
+    } else if total_samples == 16 && (hits as usize) < FINE_COVERAGE_LUT.len() {
+        FINE_COVERAGE_LUT[hits as usize]
+    } else {
+        ((hits as f32 / total_samples as f32) * 255.0).round() as u8
     }
 }
 

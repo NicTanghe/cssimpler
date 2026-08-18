@@ -6,7 +6,6 @@ const TEN_BIT_MAX: u32 = 1023;
 const TWO_BIT_MAX: u32 = 3;
 
 const TEN_BIT_CHANNEL_COUNT: usize = 1024;
-const LINEAR_TO_TEN_BIT_BOUNDARY_COUNT: usize = 1023;
 
 const RED_SHIFT: u32 = 22;
 const GREEN_SHIFT: u32 = 12;
@@ -103,8 +102,13 @@ pub(crate) fn u10_channel_to_linear(channel: u16) -> f32 {
 
 #[inline(always)]
 pub(crate) fn linear_to_u10_channel(value: f32) -> u16 {
-    let value = value.clamp(0.0, 1.0) as f64;
-    linear_to_u10_boundaries().partition_point(|boundary| *boundary <= value) as u16
+    let clamped = value.clamp(0.0, 1.0) as f64;
+    let srgb = if clamped <= 0.0031308 {
+        clamped * 12.92
+    } else {
+        1.055 * clamped.powf(1.0 / 2.4) - 0.055
+    };
+    ((srgb * TEN_BIT_MAX as f64 + 0.5) as u32).min(TEN_BIT_MAX) as u16
 }
 
 fn u10_to_linear_table() -> &'static [f32; TEN_BIT_CHANNEL_COUNT] {
@@ -118,23 +122,6 @@ fn u10_to_linear_table() -> &'static [f32; TEN_BIT_CHANNEL_COUNT] {
         }
         table
     })
-}
-
-fn linear_to_srgb_boundaries() -> &'static [f64; LINEAR_TO_TEN_BIT_BOUNDARY_COUNT] {
-    static BOUNDARIES: OnceLock<[f64; LINEAR_TO_TEN_BIT_BOUNDARY_COUNT]> = OnceLock::new();
-    BOUNDARIES.get_or_init(|| {
-        let mut boundaries = [0.0; LINEAR_TO_TEN_BIT_BOUNDARY_COUNT];
-        let mut channel = 0;
-        while channel < LINEAR_TO_TEN_BIT_BOUNDARY_COUNT {
-            boundaries[channel] = srgb_unit_to_linear_f64((channel as f64 + 0.5) / TEN_BIT_MAX as f64);
-            channel += 1;
-        }
-        boundaries
-    })
-}
-
-fn linear_to_u10_boundaries() -> &'static [f64; LINEAR_TO_TEN_BIT_BOUNDARY_COUNT] {
-    linear_to_srgb_boundaries()
 }
 
 fn u8_to_u2_alpha(alpha: u8) -> u16 {
@@ -165,14 +152,6 @@ fn extract_alpha(pixel: u32) -> u16 {
 }
 
 fn srgb_unit_to_linear(value: f32) -> f32 {
-    if value <= 0.04045 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn srgb_unit_to_linear_f64(value: f64) -> f64 {
     if value <= 0.04045 {
         value / 12.92
     } else {
@@ -247,4 +226,31 @@ mod tests {
     fn softbuffer_pixels_are_opaque_for_transparent_windows() {
         assert_eq!(pack_softbuffer_rgb(Color::rgb(10, 20, 30)), 0xff0a141e);
     }
+
+    #[test]
+    fn linear_to_u10_round_trips_all_10bit_quantized_channels() {
+        use super::{linear_to_u10_channel, u10_channel_to_linear};
+        for channel in 0..=1023_u16 {
+            let linear = u10_channel_to_linear(channel);
+            let recovered = linear_to_u10_channel(linear);
+            assert_eq!(
+                recovered, channel,
+                "channel {} failed round-trip (linear: {})",
+                channel, linear
+            );
+        }
+    }
+
+    #[test]
+    fn linear_to_u10_is_monotonic() {
+        use super::linear_to_u10_channel;
+        let mut prev = 0;
+        for i in 0..=10000 {
+            let v = i as f32 / 10000.0;
+            let current = linear_to_u10_channel(v);
+            assert!(current >= prev);
+            prev = current;
+        }
+    }
 }
+

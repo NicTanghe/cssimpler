@@ -28,14 +28,15 @@ use crate::input::{
 };
 
 use super::{
-    ElementInteractionState, ElementPath, FrameInfo, FrameTimingStats, GlassRenderMode,
+    ClipRect, ElementInteractionState, ElementPath, FrameInfo, FrameTimingStats, GlassRenderMode,
     MouseEventKind, RedrawSchedule, RendererError, Result, SceneProvider, WindowConfig,
-    dispatch_hover_transition_events, dispatch_mouse_event, drawable_viewport_size, duration_to_us,
-    is_transparent, native_glass, pack_softbuffer_rgb, record_frame_timing_stats,
-    redraw_auto_scroll_indicator_regions, render_scene_update_internal_from_roots_with_glass,
-    render_to_buffer_internal_from_roots, render_to_buffer_internal_from_roots_with_alpha,
-    resize_buffer, scrollbar, settle_element_interaction, should_present_frame_from_roots,
-    should_suspend_updates, to_softbuffer_rgb_blue_noise, to_softbuffer_rgb_blue_noise_with_alpha,
+    clip_pixel_bounds, dispatch_hover_transition_events, dispatch_mouse_event,
+    drawable_viewport_size, duration_to_us, is_transparent, native_glass, pack_softbuffer_rgb,
+    record_frame_timing_stats, redraw_auto_scroll_indicator_regions,
+    render_scene_update_internal_from_roots_with_glass, render_to_buffer_internal_from_roots,
+    render_to_buffer_internal_from_roots_with_alpha, resize_buffer, scrollbar,
+    settle_element_interaction, should_present_frame_from_roots, should_suspend_updates,
+    to_softbuffer_rgb_blue_noise, to_softbuffer_rgb_blue_noise_with_alpha,
 };
 
 const DEFAULT_NATIVE_GLASS_TINT: Color = Color::rgba(245, 250, 255, 128);
@@ -796,6 +797,7 @@ where
                                 },
                                 pack_softbuffer_rgb(self.config.clear_color),
                                 self.native_glass_active,
+                                paint_stats.damage_rects.as_deref(),
                             );
                             // Transparent pixels reveal native glass on Windows. Present the full
                             // surface so cleared transparent regions also replace stale pixels
@@ -1145,12 +1147,37 @@ fn copy_render_buffer_into_surface(
     source_alpha: Option<&[u8]>,
     clear: u32,
     preserve_transparency: bool,
+    damage_rects: Option<&[ClipRect]>,
 ) {
     debug_assert_eq!(target.len(), target_width.saturating_mul(target_height));
     debug_assert_eq!(source.len(), source_width.saturating_mul(source_height));
     debug_assert!(source_alpha.is_none_or(|alpha| alpha.len() == source.len()));
 
     if target_width == source_width && target_height == source_height {
+        if let Some(rects) = damage_rects {
+            for &rect in rects {
+                let Some((x0, y0, x1, y1)) = clip_pixel_bounds(rect, source_width, source_height)
+                else {
+                    continue;
+                };
+                for row in y0 as usize..y1 as usize {
+                    let row_start = row * source_width;
+                    for column in x0 as usize..x1 as usize {
+                        let index = row_start + column;
+                        target[index] = surface_pixel(
+                            source[index],
+                            source_alpha.map(|alpha| alpha[index]),
+                            column,
+                            row,
+                            clear,
+                            preserve_transparency,
+                        );
+                    }
+                }
+            }
+            return;
+        }
+
         for row in 0..source_height {
             let row_start = row * source_width;
             for column in 0..source_width {
@@ -1357,7 +1384,7 @@ mod tests {
         ButtonState, KeyIdentity, KeyLocation, KeyboardModifiers, PointerButton, ScrollDelta,
     };
     use crate::{
-        pack_rgb, pack_transparent, to_softbuffer_rgb_blue_noise,
+        ClipRect, pack_rgb, pack_transparent, to_softbuffer_rgb_blue_noise,
         to_softbuffer_rgb_blue_noise_with_alpha,
     };
 
@@ -1574,7 +1601,7 @@ mod tests {
             pack_rgb(Color::rgb(16, 17, 18)),
         ];
         let mut target = vec![9; 10];
-        copy_render_buffer_into_surface(&mut target, 5, 2, &source, 3, 2, None, 0, false);
+        copy_render_buffer_into_surface(&mut target, 5, 2, &source, 3, 2, None, 0, false, None);
         assert_eq!(
             target,
             vec![
@@ -1605,7 +1632,7 @@ mod tests {
             pack_rgb(Color::rgb(22, 23, 24)),
         ];
         let mut target = vec![9; 6];
-        copy_render_buffer_into_surface(&mut target, 3, 2, &source, 4, 2, None, 0, false);
+        copy_render_buffer_into_surface(&mut target, 3, 2, &source, 4, 2, None, 0, false, None);
         assert_eq!(
             target,
             vec![
@@ -1629,7 +1656,7 @@ mod tests {
         ];
         let mut target = vec![clear; 3];
 
-        copy_render_buffer_into_surface(&mut target, 3, 1, &source, 3, 1, None, clear, true);
+        copy_render_buffer_into_surface(&mut target, 3, 1, &source, 3, 1, None, clear, true, None);
 
         assert_eq!(
             target,
@@ -1640,7 +1667,7 @@ mod tests {
             ]
         );
 
-        copy_render_buffer_into_surface(&mut target, 3, 1, &source, 3, 1, None, clear, false);
+        copy_render_buffer_into_surface(&mut target, 3, 1, &source, 3, 1, None, clear, false, None);
 
         assert_eq!(target[1], clear);
     }
@@ -1666,6 +1693,7 @@ mod tests {
             Some(&alpha),
             clear,
             true,
+            None,
         );
 
         assert_eq!(
@@ -1674,6 +1702,47 @@ mod tests {
                 to_softbuffer_rgb_blue_noise_with_alpha(source[0], alpha[0], 0, 0),
                 0,
                 to_softbuffer_rgb_blue_noise_with_alpha(source[2], alpha[2], 2, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn blit_to_surface_respects_damage_rects() {
+        let source = vec![
+            pack_rgb(Color::rgb(10, 20, 30)),
+            pack_rgb(Color::rgb(40, 50, 60)),
+            pack_rgb(Color::rgb(70, 80, 90)),
+            pack_rgb(Color::rgb(100, 110, 120)),
+        ];
+        let clear = 0x000000;
+        let mut target = vec![clear; 4];
+        let damage = [ClipRect {
+            x0: 1.0,
+            y0: 0.0,
+            x1: 2.0,
+            y1: 2.0,
+        }];
+
+        copy_render_buffer_into_surface(
+            &mut target,
+            2,
+            2,
+            &source,
+            2,
+            2,
+            None,
+            clear,
+            false,
+            Some(&damage),
+        );
+
+        assert_eq!(
+            target,
+            vec![
+                clear,
+                to_softbuffer_rgb_blue_noise(source[1], 1, 0),
+                clear,
+                to_softbuffer_rgb_blue_noise(source[3], 1, 1),
             ]
         );
     }

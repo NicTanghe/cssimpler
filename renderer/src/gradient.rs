@@ -20,13 +20,13 @@ use super::{
 };
 
 const MAX_GRADIENT_LAYER_CACHE_ENTRIES: usize = 128;
-const MAX_GRADIENT_LAYER_CACHE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_SINGLE_GRADIENT_LAYER_CACHE_BYTES: usize = 512 * 1024;
-const MIN_GRADIENT_LAYER_CACHE_PIXELS: usize = 512;
+const MAX_GRADIENT_LAYER_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SINGLE_GRADIENT_LAYER_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const MIN_GRADIENT_LAYER_CACHE_PIXELS: usize = 256;
 const MIN_GRADIENT_LAYER_CACHE_REUSES: u8 = 2;
-const MAX_STATIC_GRADIENT_LAYER_CACHE_ENTRIES: usize = 4;
-const MAX_STATIC_GRADIENT_LAYER_CACHE_BYTES: usize = 20 * 1024 * 1024;
-const MAX_SINGLE_STATIC_GRADIENT_LAYER_CACHE_BYTES: usize = 6 * 1024 * 1024;
+const MAX_STATIC_GRADIENT_LAYER_CACHE_ENTRIES: usize = 16;
+const MAX_STATIC_GRADIENT_LAYER_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SINGLE_STATIC_GRADIENT_LAYER_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const MIN_STATIC_GRADIENT_LAYER_CACHE_PIXELS: usize = 250_000;
 const MIN_STATIC_GRADIENT_LAYER_CACHE_REUSES: u8 = 2;
 
@@ -152,10 +152,18 @@ enum EllipseRadiusCacheKey {
     Extent(u8),
 }
 
+#[derive(Clone)]
+struct GradientCacheEntry {
+    layer: Arc<CachedGradientLayer>,
+    bytes: usize,
+    last_accessed: u64,
+}
+
 #[derive(Default)]
 struct GradientLayerCache {
     total_bytes: usize,
-    layers: HashMap<GradientLayerCacheKey, Arc<CachedGradientLayer>>,
+    access_counter: u64,
+    layers: HashMap<GradientLayerCacheKey, GradientCacheEntry>,
     seen_counts: HashMap<GradientLayerCacheKey, u8>,
 }
 
@@ -455,6 +463,7 @@ fn static_gradient_layer_cache() -> &'static Mutex<GradientLayerCache> {
 #[cfg(test)]
 fn reset_gradient_layer_cache(cache: &mut GradientLayerCache) {
     cache.total_bytes = 0;
+    cache.access_counter = 0;
     cache.layers.clear();
     cache.seen_counts.clear();
 }
@@ -538,14 +547,14 @@ fn cached_gradient_layer_with_policy(
         layer: background_layer_cache_key(layer),
     };
 
-    if let Some(cached) = cache
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .layers
-        .get(&key)
-        .cloned()
     {
-        return Some((cached, offset_x, offset_y));
+        let mut cache_guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+        cache_guard.access_counter = cache_guard.access_counter.wrapping_add(1);
+        let counter = cache_guard.access_counter;
+        if let Some(entry) = cache_guard.layers.get_mut(&key) {
+            entry.last_accessed = counter;
+            return Some((entry.layer.clone(), offset_x, offset_y));
+        }
     }
 
     if !should_prerasterize(relative_layout) {
@@ -568,17 +577,42 @@ fn cached_gradient_layer_with_policy(
         return None;
     }
     let mut cache_guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
-    if let Some(cached) = cache_guard.layers.get(&key).cloned() {
-        return Some((cached, offset_x, offset_y));
+    cache_guard.access_counter = cache_guard.access_counter.wrapping_add(1);
+    let counter = cache_guard.access_counter;
+    if let Some(entry) = cache_guard.layers.get_mut(&key) {
+        entry.last_accessed = counter;
+        return Some((entry.layer.clone(), offset_x, offset_y));
     }
 
-    if cache_guard.layers.len() >= max_entries
-        || cache_guard.total_bytes.saturating_add(raster_bytes) > max_total_bytes
+    while (cache_guard.layers.len() >= max_entries
+        || cache_guard.total_bytes.saturating_add(raster_bytes) > max_total_bytes)
+        && !cache_guard.layers.is_empty()
     {
-        return None;
+        let lru_key = cache_guard
+            .layers
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_accessed)
+            .map(|(k, _)| k.clone());
+        if let Some(lru_key) = lru_key {
+            if let Some(removed) = cache_guard.layers.remove(&lru_key) {
+                cache_guard.total_bytes = cache_guard.total_bytes.saturating_sub(removed.bytes);
+            }
+        } else {
+            break;
+        }
     }
-    cache_guard.total_bytes = cache_guard.total_bytes.saturating_add(raster_bytes);
-    cache_guard.layers.insert(key, raster.clone());
+
+    if cache_guard.total_bytes.saturating_add(raster_bytes) <= max_total_bytes {
+        cache_guard.total_bytes += raster_bytes;
+        cache_guard.layers.insert(
+            key,
+            GradientCacheEntry {
+                layer: raster.clone(),
+                bytes: raster_bytes,
+                last_accessed: counter,
+            },
+        );
+    }
     Some((raster, offset_x, offset_y))
 }
 
@@ -933,6 +967,44 @@ fn draw_cached_gradient_layer(
     }
 }
 
+#[inline(always)]
+fn blend_gradient_pixel_at_index_full_coverage(
+    buffer: &mut [u32],
+    index: usize,
+    color: LinearRgba,
+) {
+    let alpha = color.a.clamp(0.0, 1.0);
+    if alpha <= f32::EPSILON {
+        return;
+    }
+    if alpha >= 1.0 - f32::EPSILON {
+        buffer[index] = pack_linear_rgb(LinearRgba { a: 1.0, ..color });
+        set_current_alpha_at(index, u8::MAX);
+    } else {
+        blend_linear_over(buffer, index, LinearRgba { a: alpha, ..color });
+    }
+}
+
+#[inline(always)]
+fn blend_gradient_pixel_at_index_with_coverage(
+    buffer: &mut [u32],
+    index: usize,
+    color: LinearRgba,
+    coverage: u8,
+) {
+    let cov = coverage as f32 / 255.0;
+    let alpha = (color.a * cov).clamp(0.0, 1.0);
+    if alpha <= f32::EPSILON {
+        return;
+    }
+    if alpha >= 1.0 - f32::EPSILON {
+        buffer[index] = pack_linear_rgb(LinearRgba { a: 1.0, ..color });
+        set_current_alpha_at(index, u8::MAX);
+    } else {
+        blend_linear_over(buffer, index, LinearRgba { a: alpha, ..color });
+    }
+}
+
 fn draw_linear_gradient(
     buffer: &mut [u32],
     width: usize,
@@ -972,18 +1044,60 @@ fn draw_linear_gradient(
     let stops = resolve_length_stops(&gradient.stops, projection_span, min_projection);
     let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
     let projection_step = direction.0;
-    for y in y0..y1 {
-        let full_coverage_span =
-            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
+
+    let rows = current_render_buffer_rows();
+    let draw_y0 = y0.max(rows.start.min(height) as i32);
+    let draw_y1 = y1.min(rows.end.min(height) as i32);
+    if x0 >= x1 || draw_y0 >= draw_y1 {
+        return;
+    }
+
+    for y in draw_y0..draw_y1 {
+        let (full_x0, full_x1) =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1)
+                .unwrap_or((x0, x0));
         let py = y as f32 + 0.5;
-        let mut projection =
+        let row_proj_start =
             ((x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
-        for x in x0..x1 {
-            let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
-            let coverage =
-                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
+        let row_start = (y as usize - rows.start) * width;
+
+        let mut projection = row_proj_start;
+        for x in x0..full_x0 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
             if coverage != 0 {
-                blend_gradient_sample_with_coverage(buffer, width, height, x, y, color, coverage);
+                let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
+                blend_gradient_pixel_at_index_with_coverage(
+                    buffer,
+                    row_start + x as usize,
+                    color,
+                    coverage,
+                );
+            }
+            projection += projection_step;
+        }
+
+        let mut projection = row_proj_start + (full_x0 - x0) as f32 * projection_step;
+        for x in full_x0..full_x1 {
+            let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
+            blend_gradient_pixel_at_index_full_coverage(
+                buffer,
+                row_start + x as usize,
+                color,
+            );
+            projection += projection_step;
+        }
+
+        let mut projection = row_proj_start + (full_x1 - x0) as f32 * projection_step;
+        for x in full_x1..x1 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            if coverage != 0 {
+                let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
+                blend_gradient_pixel_at_index_with_coverage(
+                    buffer,
+                    row_start + x as usize,
+                    color,
+                    coverage,
+                );
             }
             projection += projection_step;
         }
@@ -1029,16 +1143,35 @@ fn rasterize_linear_gradient(
     let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
     let projection_step = direction.0;
     for y in y0..y1 {
-        let full_coverage_span =
-            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
+        let (full_x0, full_x1) =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1)
+                .unwrap_or((x0, x0));
         let py = y as f32 + 0.5;
-        let mut projection =
+        let row_proj_start =
             ((x0 as f32 + 0.5 - center_x) * direction.0) + ((py - center_y) * direction.1);
-        for x in x0..x1 {
-            let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
-            let coverage =
-                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
+
+        let mut projection = row_proj_start;
+        for x in x0..full_x0 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
             if coverage != 0 {
+                let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
+                write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
+            }
+            projection += projection_step;
+        }
+
+        let mut projection = row_proj_start + (full_x0 - x0) as f32 * projection_step;
+        for x in full_x0..full_x1 {
+            let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
+            write_raster_pixel(pixels, width, x, y, color);
+            projection += projection_step;
+        }
+
+        let mut projection = row_proj_start + (full_x1 - x0) as f32 * projection_step;
+        for x in full_x1..x1 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            if coverage != 0 {
+                let color = sample_prepared_gradient(&prepared, projection, gradient.repeating);
                 write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
             }
             projection += projection_step;
@@ -1078,47 +1211,95 @@ fn draw_radial_gradient(
         return;
     }
 
-    let prepared_length_gradient = prepare_length_gradient(&gradient.stops, gradient.interpolation);
+    let is_circle = (resolved_shape.radius_x - resolved_shape.radius_y).abs() <= f32::EPSILON;
     let fraction_only = length_stops_use_fraction_only(&gradient.stops);
-    let prepared_unit_gradient = fraction_only.then(|| {
-        let unit_stops = resolve_length_stops(&gradient.stops, 1.0, 0.0);
+    let prepared_unit_gradient = (fraction_only || is_circle).then(|| {
+        let span = if is_circle { resolved_shape.radius_x } else { 1.0 };
+        let unit_stops = resolve_length_stops(&gradient.stops, span, 0.0);
         prepare_resolved_gradient(&unit_stops, gradient.interpolation)
     });
+    let prepared_length_gradient = prepared_unit_gradient
+        .is_none()
+        .then(|| prepare_length_gradient(&gradient.stops, gradient.interpolation));
+
     let inverse_radius_x_squared = 1.0 / (resolved_shape.radius_x * resolved_shape.radius_x);
     let inverse_radius_y_squared = 1.0 / (resolved_shape.radius_y * resolved_shape.radius_y);
 
-    for y in y0..y1 {
-        let full_coverage_span =
-            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
+    let rows = current_render_buffer_rows();
+    let draw_y0 = y0.max(rows.start.min(height) as i32);
+    let draw_y1 = y1.min(rows.end.min(height) as i32);
+    if x0 >= x1 || draw_y0 >= draw_y1 {
+        return;
+    }
+
+    for y in draw_y0..draw_y1 {
+        let (full_x0, full_x1) =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1)
+                .unwrap_or((x0, x0));
         let py = y as f32 + 0.5;
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
+        let dy = py - center_y;
+        let dy_sq = dy * dy;
+        let dy_scaled_sq = dy_sq * inverse_radius_y_squared;
+        let row_start = (y as usize - rows.start) * width;
+
+        let sample_pixel = |px: f32| -> LinearRgba {
             let dx = px - center_x;
-            let dy = py - center_y;
-            let color = if let Some(prepared_unit_gradient) = &prepared_unit_gradient {
-                let normalized_distance = ((dx * dx) * inverse_radius_x_squared
-                    + (dy * dy) * inverse_radius_y_squared)
-                    .sqrt();
+            if let Some(prepared_unit_gradient) = &prepared_unit_gradient {
+                let normalized_distance = if is_circle {
+                    (dx * dx + dy_sq).sqrt()
+                } else {
+                    ((dx * dx) * inverse_radius_x_squared + dy_scaled_sq).sqrt()
+                };
                 sample_prepared_gradient(
                     prepared_unit_gradient,
                     normalized_distance,
                     gradient.repeating,
                 )
             } else {
-                let distance = (dx * dx + dy * dy).sqrt();
+                let distance = (dx * dx + dy_sq).sqrt();
                 let ray_length = radial_ray_length(dx, dy, resolved_shape);
                 sample_prepared_length_gradient(
-                    &prepared_length_gradient,
+                    prepared_length_gradient.as_ref().unwrap(),
                     ray_length,
                     0.0,
                     distance,
                     gradient.repeating,
                 )
-            };
-            let coverage =
-                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
+            }
+        };
+
+        for x in x0..full_x0 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
             if coverage != 0 {
-                blend_gradient_sample_with_coverage(buffer, width, height, x, y, color, coverage);
+                let color = sample_pixel(x as f32 + 0.5);
+                blend_gradient_pixel_at_index_with_coverage(
+                    buffer,
+                    row_start + x as usize,
+                    color,
+                    coverage,
+                );
+            }
+        }
+
+        for x in full_x0..full_x1 {
+            let color = sample_pixel(x as f32 + 0.5);
+            blend_gradient_pixel_at_index_full_coverage(
+                buffer,
+                row_start + x as usize,
+                color,
+            );
+        }
+
+        for x in full_x1..x1 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            if coverage != 0 {
+                let color = sample_pixel(x as f32 + 0.5);
+                blend_gradient_pixel_at_index_with_coverage(
+                    buffer,
+                    row_start + x as usize,
+                    color,
+                    coverage,
+                );
             }
         }
     }
@@ -1155,46 +1336,72 @@ fn rasterize_radial_gradient(
         return;
     }
 
-    let prepared_length_gradient = prepare_length_gradient(&gradient.stops, gradient.interpolation);
+    let is_circle = (resolved_shape.radius_x - resolved_shape.radius_y).abs() <= f32::EPSILON;
     let fraction_only = length_stops_use_fraction_only(&gradient.stops);
-    let prepared_unit_gradient = fraction_only.then(|| {
-        let unit_stops = resolve_length_stops(&gradient.stops, 1.0, 0.0);
+    let prepared_unit_gradient = (fraction_only || is_circle).then(|| {
+        let span = if is_circle { resolved_shape.radius_x } else { 1.0 };
+        let unit_stops = resolve_length_stops(&gradient.stops, span, 0.0);
         prepare_resolved_gradient(&unit_stops, gradient.interpolation)
     });
+    let prepared_length_gradient = prepared_unit_gradient
+        .is_none()
+        .then(|| prepare_length_gradient(&gradient.stops, gradient.interpolation));
+
     let inverse_radius_x_squared = 1.0 / (resolved_shape.radius_x * resolved_shape.radius_x);
     let inverse_radius_y_squared = 1.0 / (resolved_shape.radius_y * resolved_shape.radius_y);
 
     for y in y0..y1 {
-        let full_coverage_span =
-            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
+        let (full_coverage_span_x0, full_coverage_span_x1) =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1)
+                .unwrap_or((x0, x0));
         let py = y as f32 + 0.5;
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
+        let dy = py - center_y;
+        let dy_sq = dy * dy;
+        let dy_scaled_sq = dy_sq * inverse_radius_y_squared;
+
+        let sample_pixel = |px: f32| -> LinearRgba {
             let dx = px - center_x;
-            let dy = py - center_y;
-            let color = if let Some(prepared_unit_gradient) = &prepared_unit_gradient {
-                let normalized_distance = ((dx * dx) * inverse_radius_x_squared
-                    + (dy * dy) * inverse_radius_y_squared)
-                    .sqrt();
+            if let Some(prepared_unit_gradient) = &prepared_unit_gradient {
+                let normalized_distance = if is_circle {
+                    (dx * dx + dy_sq).sqrt()
+                } else {
+                    ((dx * dx) * inverse_radius_x_squared + dy_scaled_sq).sqrt()
+                };
                 sample_prepared_gradient(
                     prepared_unit_gradient,
                     normalized_distance,
                     gradient.repeating,
                 )
             } else {
-                let distance = (dx * dx + dy * dy).sqrt();
+                let distance = (dx * dx + dy_sq).sqrt();
                 let ray_length = radial_ray_length(dx, dy, resolved_shape);
                 sample_prepared_length_gradient(
-                    &prepared_length_gradient,
+                    prepared_length_gradient.as_ref().unwrap(),
                     ray_length,
                     0.0,
                     distance,
                     gradient.repeating,
                 )
-            };
-            let coverage =
-                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
+            }
+        };
+
+        for x in x0..full_coverage_span_x0 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
             if coverage != 0 {
+                let color = sample_pixel(x as f32 + 0.5);
+                write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
+            }
+        }
+
+        for x in full_coverage_span_x0..full_coverage_span_x1 {
+            let color = sample_pixel(x as f32 + 0.5);
+            write_raster_pixel(pixels, width, x, y, color);
+        }
+
+        for x in full_coverage_span_x1..x1 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            if coverage != 0 {
+                let color = sample_pixel(x as f32 + 0.5);
                 write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
             }
         }
@@ -1222,25 +1429,65 @@ fn draw_conic_gradient(
     let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
     let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
 
-    for y in y0..y1 {
-        let full_coverage_span =
-            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
+    let rows = current_render_buffer_rows();
+    let draw_y0 = y0.max(rows.start.min(height) as i32);
+    let draw_y1 = y1.min(rows.end.min(height) as i32);
+    if x0 >= x1 || draw_y0 >= draw_y1 {
+        return;
+    }
+
+    for y in draw_y0..draw_y1 {
+        let (full_x0, full_x1) =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1)
+                .unwrap_or((x0, x0));
+        let py = y as f32 + 0.5;
+        let dy = py - center_y;
+        let neg_dy = center_y - py;
+        let row_start = (y as usize - rows.start) * width;
+
+        let sample_pixel = |px: f32| -> LinearRgba {
             let dx = px - center_x;
-            let dy = py - center_y;
             let angle = if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
                 0.0
             } else {
-                dx.atan2(-dy).to_degrees().rem_euclid(360.0)
+                dx.atan2(neg_dy).to_degrees().rem_euclid(360.0)
             };
             let position = (angle - gradient.angle).rem_euclid(360.0);
-            let color = sample_prepared_gradient(&prepared, position, gradient.repeating);
-            let coverage =
-                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
+            sample_prepared_gradient(&prepared, position, gradient.repeating)
+        };
+
+        for x in x0..full_x0 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
             if coverage != 0 {
-                blend_gradient_sample_with_coverage(buffer, width, height, x, y, color, coverage);
+                let color = sample_pixel(x as f32 + 0.5);
+                blend_gradient_pixel_at_index_with_coverage(
+                    buffer,
+                    row_start + x as usize,
+                    color,
+                    coverage,
+                );
+            }
+        }
+
+        for x in full_x0..full_x1 {
+            let color = sample_pixel(x as f32 + 0.5);
+            blend_gradient_pixel_at_index_full_coverage(
+                buffer,
+                row_start + x as usize,
+                color,
+            );
+        }
+
+        for x in full_x1..x1 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            if coverage != 0 {
+                let color = sample_pixel(x as f32 + 0.5);
+                blend_gradient_pixel_at_index_with_coverage(
+                    buffer,
+                    row_start + x as usize,
+                    color,
+                    coverage,
+                );
             }
         }
     }
@@ -1268,23 +1515,41 @@ fn rasterize_conic_gradient(
     let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
 
     for y in y0..y1 {
-        let full_coverage_span =
-            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
+        let (full_x0, full_x1) =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1)
+                .unwrap_or((x0, x0));
+        let py = y as f32 + 0.5;
+        let dy = py - center_y;
+        let neg_dy = center_y - py;
+
+        let sample_pixel = |px: f32| -> LinearRgba {
             let dx = px - center_x;
-            let dy = py - center_y;
             let angle = if dx.abs() <= f32::EPSILON && dy.abs() <= f32::EPSILON {
                 0.0
             } else {
-                dx.atan2(-dy).to_degrees().rem_euclid(360.0)
+                dx.atan2(neg_dy).to_degrees().rem_euclid(360.0)
             };
             let position = (angle - gradient.angle).rem_euclid(360.0);
-            let color = sample_prepared_gradient(&prepared, position, gradient.repeating);
-            let coverage =
-                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
+            sample_prepared_gradient(&prepared, position, gradient.repeating)
+        };
+
+        for x in x0..full_x0 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
             if coverage != 0 {
+                let color = sample_pixel(x as f32 + 0.5);
+                write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
+            }
+        }
+
+        for x in full_x0..full_x1 {
+            let color = sample_pixel(x as f32 + 0.5);
+            write_raster_pixel(pixels, width, x, y, color);
+        }
+
+        for x in full_x1..x1 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            if coverage != 0 {
+                let color = sample_pixel(x as f32 + 0.5);
                 write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
             }
         }
@@ -1303,14 +1568,45 @@ fn fill_gradient_rounded_rect(
     let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
         return;
     };
-    for y in y0..y1 {
-        let full_coverage_span =
-            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
-        for x in x0..x1 {
-            let coverage =
-                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
+    let rows = current_render_buffer_rows();
+    let draw_y0 = y0.max(rows.start.min(height) as i32);
+    let draw_y1 = y1.min(rows.end.min(height) as i32);
+    if x0 >= x1 || draw_y0 >= draw_y1 {
+        return;
+    }
+
+    for y in draw_y0..draw_y1 {
+        let (full_x0, full_x1) =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1)
+                .unwrap_or((x0, x0));
+        let row_start = (y as usize - rows.start) * width;
+        for x in x0..full_x0 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
             if coverage != 0 {
-                blend_gradient_sample_with_coverage(buffer, width, height, x, y, color, coverage);
+                blend_gradient_pixel_at_index_with_coverage(
+                    buffer,
+                    row_start + x as usize,
+                    color,
+                    coverage,
+                );
+            }
+        }
+        for x in full_x0..full_x1 {
+            blend_gradient_pixel_at_index_full_coverage(
+                buffer,
+                row_start + x as usize,
+                color,
+            );
+        }
+        for x in full_x1..x1 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            if coverage != 0 {
+                blend_gradient_pixel_at_index_with_coverage(
+                    buffer,
+                    row_start + x as usize,
+                    color,
+                    coverage,
+                );
             }
         }
     }
@@ -1329,11 +1625,20 @@ fn fill_rasterized_rounded_rect(
         return;
     };
     for y in y0..y1 {
-        let full_coverage_span =
-            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1);
-        for x in x0..x1 {
-            let coverage =
-                rounded_rect_row_coverage(layout, radius, clip, full_coverage_span, x, y);
+        let (full_x0, full_x1) =
+            rounded_rect_full_coverage_row_span(layout, radius, clip, y, x0, x1)
+                .unwrap_or((x0, x0));
+        for x in x0..full_x0 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
+            if coverage != 0 {
+                write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
+            }
+        }
+        for x in full_x0..full_x1 {
+            write_raster_pixel(pixels, width, x, y, color);
+        }
+        for x in full_x1..x1 {
+            let coverage = rounded_rect_coverage(layout, radius, clip, x, y);
             if coverage != 0 {
                 write_raster_pixel_with_coverage(pixels, width, x, y, color, coverage);
             }
@@ -1341,6 +1646,7 @@ fn fill_rasterized_rounded_rect(
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn rounded_rect_row_coverage(
     layout: LayoutBox,
@@ -2360,6 +2666,26 @@ mod tests {
     }
 
     #[test]
+    fn effect_tile_sized_gradient_layers_enter_cache_after_reuse() {
+        let _cache_guard = lock_gradient_cache_for_tests();
+        clear_gradient_layer_cache_for_tests();
+        let layer = linear_gradient_layer();
+        let layout = LayoutBox::new(0.0, 0.0, 308.0, 272.0);
+        let radius = CornerRadius::all(18.0);
+
+        assert!(cached_gradient_layer(layout, radius, &layer).is_none());
+        let (first, _, _) = cached_gradient_layer(layout, radius, &layer)
+            .expect("308x272 gradient layer should now fit in gradient cache");
+        let (second, _, _) = cached_gradient_layer(
+            LayoutBox::new(50.0, 50.0, 308.0, 272.0),
+            radius,
+            &layer,
+        )
+        .expect("translated 308x272 gradient layer should reuse cache");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn oversized_gradient_layers_skip_preraster_cache() {
         let _cache_guard = lock_gradient_cache_for_tests();
         clear_gradient_layer_cache_for_tests();
@@ -2368,7 +2694,7 @@ mod tests {
         for _ in 0..4 {
             assert!(
                 cached_gradient_layer(
-                    LayoutBox::new(0.0, 0.0, 308.0, 272.0),
+                    LayoutBox::new(0.0, 0.0, 1500.0, 1200.0),
                     CornerRadius::all(18.0),
                     &layer
                 )
@@ -2387,7 +2713,7 @@ mod tests {
         assert!(
             cached_static_gradient_layer(LayoutBox::new(12.5, 18.25, 512.0, 512.0), radius, &layer)
                 .is_none()
-        );
+            );
         let (first, first_offset_x, first_offset_y) =
             cached_static_gradient_layer(LayoutBox::new(12.5, 18.25, 512.0, 512.0), radius, &layer)
                 .expect("large gradient raster should enter the static cache");
@@ -2411,7 +2737,7 @@ mod tests {
         for _ in 0..4 {
             assert!(
                 cached_static_gradient_layer(
-                    LayoutBox::new(0.0, 0.0, 2048.0, 1024.0),
+                    LayoutBox::new(0.0, 0.0, 3000.0, 3000.0),
                     CornerRadius::all(24.0),
                     &layer
                 )
