@@ -14,7 +14,7 @@ use super::{
     transform::{AffineTransform, ClipState, transform_clip_rect},
 };
 
-const MAX_SHADOW_MASK_CACHE_ENTRIES: usize = 256;
+const MAX_SHADOW_MASK_CACHE_ENTRIES: usize = 1024;
 
 #[derive(Clone)]
 pub(crate) struct ShadowMask {

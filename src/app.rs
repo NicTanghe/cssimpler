@@ -498,7 +498,6 @@ where
 
     fn refresh_scene(&mut self, stats: &mut RuntimeStats) {
         let must_full_refresh = self.cached_scene.is_none()
-            || matches!(self.render_mode, RenderMode::EveryFrame)
             || matches!(self.pending_refresh.target, RefreshTarget::Full)
             || !matches!(self.pending_refresh.invalidation, Invalidation::Paint);
 

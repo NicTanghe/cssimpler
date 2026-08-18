@@ -33,3 +33,23 @@ cssimpler-core.workspace = true
 cssimpler-macro.workspace = true
 cssimpler-renderer.workspace = true
 cssimpler-style.workspace = true
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "debuginfo"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.bench]
+inherits = "release"
+debug = true
+strip = "none"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"

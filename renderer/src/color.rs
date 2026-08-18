@@ -1,7 +1,12 @@
+use std::sync::OnceLock;
+
 use cssimpler_core::{Color, LinearRgba};
 
 const TEN_BIT_MAX: u32 = 1023;
 const TWO_BIT_MAX: u32 = 3;
+
+const TEN_BIT_CHANNEL_COUNT: usize = 1024;
+const LINEAR_TO_TEN_BIT_BOUNDARY_COUNT: usize = 1023;
 
 const RED_SHIFT: u32 = 22;
 const GREEN_SHIFT: u32 = 12;
@@ -22,9 +27,9 @@ pub(crate) fn pack_rgb(color: Color) -> u32 {
 
 pub(crate) fn pack_linear_rgb(color: LinearRgba) -> u32 {
     pack_internal_rgb_u10(
-        srgb_unit_to_u10(linear_to_srgb_unit(color.r)),
-        srgb_unit_to_u10(linear_to_srgb_unit(color.g)),
-        srgb_unit_to_u10(linear_to_srgb_unit(color.b)),
+        linear_to_u10_channel(color.r),
+        linear_to_u10_channel(color.g),
+        linear_to_u10_channel(color.b),
         OPAQUE_ALPHA_2BIT as u16,
     )
 }
@@ -56,9 +61,9 @@ pub(crate) fn unpack_rgb(pixel: u32) -> Color {
 
 pub(crate) fn unpack_linear_rgb(pixel: u32) -> LinearRgba {
     LinearRgba {
-        r: srgb_unit_to_linear(extract_red(pixel) as f32 / TEN_BIT_MAX as f32),
-        g: srgb_unit_to_linear(extract_green(pixel) as f32 / TEN_BIT_MAX as f32),
-        b: srgb_unit_to_linear(extract_blue(pixel) as f32 / TEN_BIT_MAX as f32),
+        r: u10_channel_to_linear(extract_red(pixel)),
+        g: u10_channel_to_linear(extract_green(pixel)),
+        b: u10_channel_to_linear(extract_blue(pixel)),
         a: extract_alpha(pixel) as f32 / TWO_BIT_MAX as f32,
     }
 }
@@ -91,6 +96,47 @@ pub(crate) fn u10_to_u8_channel(channel: u16) -> u8 {
     ((u32::from(channel).min(TEN_BIT_MAX) * 255 + (TEN_BIT_MAX / 2)) / TEN_BIT_MAX) as u8
 }
 
+#[inline(always)]
+pub(crate) fn u10_channel_to_linear(channel: u16) -> f32 {
+    u10_to_linear_table()[(channel.min(TEN_BIT_MAX as u16)) as usize]
+}
+
+#[inline(always)]
+pub(crate) fn linear_to_u10_channel(value: f32) -> u16 {
+    let value = value.clamp(0.0, 1.0) as f64;
+    linear_to_u10_boundaries().partition_point(|boundary| *boundary <= value) as u16
+}
+
+fn u10_to_linear_table() -> &'static [f32; TEN_BIT_CHANNEL_COUNT] {
+    static TABLE: OnceLock<[f32; TEN_BIT_CHANNEL_COUNT]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [0.0; TEN_BIT_CHANNEL_COUNT];
+        let mut channel = 0;
+        while channel < TEN_BIT_CHANNEL_COUNT {
+            table[channel] = srgb_unit_to_linear(channel as f32 / TEN_BIT_MAX as f32);
+            channel += 1;
+        }
+        table
+    })
+}
+
+fn linear_to_srgb_boundaries() -> &'static [f64; LINEAR_TO_TEN_BIT_BOUNDARY_COUNT] {
+    static BOUNDARIES: OnceLock<[f64; LINEAR_TO_TEN_BIT_BOUNDARY_COUNT]> = OnceLock::new();
+    BOUNDARIES.get_or_init(|| {
+        let mut boundaries = [0.0; LINEAR_TO_TEN_BIT_BOUNDARY_COUNT];
+        let mut channel = 0;
+        while channel < LINEAR_TO_TEN_BIT_BOUNDARY_COUNT {
+            boundaries[channel] = srgb_unit_to_linear_f64((channel as f64 + 0.5) / TEN_BIT_MAX as f64);
+            channel += 1;
+        }
+        boundaries
+    })
+}
+
+fn linear_to_u10_boundaries() -> &'static [f64; LINEAR_TO_TEN_BIT_BOUNDARY_COUNT] {
+    linear_to_srgb_boundaries()
+}
+
 fn u8_to_u2_alpha(alpha: u8) -> u16 {
     ((u32::from(alpha) * TWO_BIT_MAX + 127) / 255) as u16
 }
@@ -118,10 +164,6 @@ fn extract_alpha(pixel: u32) -> u16 {
     ((pixel >> ALPHA_SHIFT) & TWO_BIT_MAX) as u16
 }
 
-fn srgb_unit_to_u10(value: f32) -> u16 {
-    (value.clamp(0.0, 1.0) * TEN_BIT_MAX as f32).round() as u16
-}
-
 fn srgb_unit_to_linear(value: f32) -> f32 {
     if value <= 0.04045 {
         value / 12.92
@@ -130,6 +172,15 @@ fn srgb_unit_to_linear(value: f32) -> f32 {
     }
 }
 
+fn srgb_unit_to_linear_f64(value: f64) -> f64 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[allow(dead_code)]
 fn linear_to_srgb_unit(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
     if value <= 0.003_130_8 {

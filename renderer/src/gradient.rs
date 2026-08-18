@@ -19,9 +19,9 @@ use super::{
     transform::{AffineTransform, ClipState, transform_layout_bounds},
 };
 
-const MAX_GRADIENT_LAYER_CACHE_ENTRIES: usize = 16;
-const MAX_GRADIENT_LAYER_CACHE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_SINGLE_GRADIENT_LAYER_CACHE_BYTES: usize = 256 * 1024;
+const MAX_GRADIENT_LAYER_CACHE_ENTRIES: usize = 128;
+const MAX_GRADIENT_LAYER_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SINGLE_GRADIENT_LAYER_CACHE_BYTES: usize = 512 * 1024;
 const MIN_GRADIENT_LAYER_CACHE_PIXELS: usize = 512;
 const MIN_GRADIENT_LAYER_CACHE_REUSES: u8 = 2;
 const MAX_STATIC_GRADIENT_LAYER_CACHE_ENTRIES: usize = 4;
@@ -165,6 +165,8 @@ pub(crate) struct ResolvedGradientStop {
     pub(crate) position: f32,
 }
 
+const GRADIENT_LUT_SIZE: usize = 2048;
+
 #[derive(Clone)]
 pub(crate) struct PreparedResolvedGradient {
     interpolation: GradientInterpolation,
@@ -172,6 +174,8 @@ pub(crate) struct PreparedResolvedGradient {
     start: f32,
     end: f32,
     segments: Vec<PreparedResolvedGradientSegment>,
+    lut: Option<Box<[LinearRgba; GRADIENT_LUT_SIZE]>>,
+    lut_inverse_span: f32,
 }
 
 #[derive(Clone)]
@@ -1484,7 +1488,7 @@ pub(crate) fn prepare_resolved_gradient(
 ) -> PreparedResolvedGradient {
     let first = stops.first().copied();
     let last = stops.last().copied();
-    let segments = stops
+    let segments: Vec<_> = stops
         .windows(2)
         .map(|pair| {
             let start = pair[0];
@@ -1504,12 +1508,37 @@ pub(crate) fn prepare_resolved_gradient(
         })
         .collect();
 
+    let start_pos = first.map(|stop| stop.position).unwrap_or(0.0);
+    let end_pos = last.map(|stop| stop.position).unwrap_or(0.0);
+    let span = end_pos - start_pos;
+    let (lut, lut_inverse_span) = if span > f32::EPSILON && !segments.is_empty() {
+        let inv_span = 1.0 / span;
+        let mut table = Box::new([LinearRgba::TRANSPARENT; GRADIENT_LUT_SIZE]);
+        for i in 0..GRADIENT_LUT_SIZE {
+            let t = start_pos + (i as f32 / (GRADIENT_LUT_SIZE - 1) as f32) * span;
+            let mut sampled = first.map(|stop| stop.color).unwrap_or(LinearRgba::TRANSPARENT);
+            for segment in &segments {
+                if t <= segment.end {
+                    sampled = segment.sample(t, interpolation);
+                    break;
+                }
+                sampled = segment.end_color.linear;
+            }
+            table[i] = sampled;
+        }
+        (Some(table), inv_span)
+    } else {
+        (None, 0.0)
+    };
+
     PreparedResolvedGradient {
         interpolation,
         first: first.map(|stop| PreparedColor::new(stop.color)),
-        start: first.map(|stop| stop.position).unwrap_or(0.0),
-        end: last.map(|stop| stop.position).unwrap_or(0.0),
+        start: start_pos,
+        end: end_pos,
         segments,
+        lut,
+        lut_inverse_span,
     }
 }
 
@@ -1524,6 +1553,23 @@ pub(crate) fn sample_prepared_gradient(
     let t = normalize_gradient_position(position, gradient.start, gradient.end, repeating);
     if t <= gradient.start {
         return first.linear;
+    }
+    if t >= gradient.end {
+        return gradient
+            .segments
+            .last()
+            .map(|segment| segment.end_color.linear)
+            .unwrap_or(first.linear);
+    }
+
+    if matches!(gradient.interpolation, GradientInterpolation::Oklab)
+        && let Some(lut) = &gradient.lut
+    {
+        let normalized = (t - gradient.start) * gradient.lut_inverse_span * (GRADIENT_LUT_SIZE - 1) as f32;
+        let i0 = (normalized.floor() as usize).min(GRADIENT_LUT_SIZE - 1);
+        let i1 = (i0 + 1).min(GRADIENT_LUT_SIZE - 1);
+        let fract = normalized - i0 as f32;
+        return lut[i0].lerp(lut[i1], fract);
     }
 
     for segment in &gradient.segments {
