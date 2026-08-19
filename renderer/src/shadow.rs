@@ -147,13 +147,28 @@ fn quantize_shadow_subpixel(v: f32) -> f32 {
     (v * 4.0).round() / 4.0
 }
 
+fn quantize_shadow_dimension(v: f32) -> f32 {
+    (v * 2.0).round() / 2.0
+}
+
+fn quantize_shadow_radius(r: CornerRadius) -> CornerRadius {
+    CornerRadius {
+        top_left: quantize_shadow_dimension(r.top_left),
+        top_right: quantize_shadow_dimension(r.top_right),
+        bottom_right: quantize_shadow_dimension(r.bottom_right),
+        bottom_left: quantize_shadow_dimension(r.bottom_left),
+    }
+}
+
 fn split_layout_for_shadow_cache(layout: LayoutBox) -> (LayoutBox, i32, i32) {
     let offset_x = layout.x.floor() as i32;
     let offset_y = layout.y.floor() as i32;
     let frac_x = quantize_shadow_subpixel((layout.x - offset_x as f32).clamp(0.0, 0.999));
     let frac_y = quantize_shadow_subpixel((layout.y - offset_y as f32).clamp(0.0, 0.999));
+    let width = quantize_shadow_dimension(layout.width);
+    let height = quantize_shadow_dimension(layout.height);
     (
-        LayoutBox::new(frac_x, frac_y, layout.width, layout.height),
+        LayoutBox::new(frac_x, frac_y, width, height),
         offset_x,
         offset_y,
     )
@@ -182,7 +197,8 @@ pub(crate) fn cached_shadow_mask(
     radius: CornerRadius,
     blur_radius: f32,
 ) -> (Arc<ShadowMask>, i32, i32) {
-    let blur_radius = blur_radius.max(0.0);
+    let blur_radius = quantize_shadow_dimension(blur_radius.max(0.0));
+    let radius = quantize_shadow_radius(radius);
     let (relative_layout, offset_x, offset_y) = split_layout_for_shadow_cache(layout);
     let key = shadow_mask_cache_key(relative_layout, radius, blur_radius);
 
@@ -684,9 +700,24 @@ fn draw_shadow_mask_transformed(
     };
     let prepared_color = PreparedBlendColor::new(color);
     let rows = current_render_buffer_rows();
-    let row_start = rows.start.min(height) as i32;
-    let row_end = rows.end.min(height) as i32;
-    for y in y0.max(row_start)..y1.min(row_end) {
+    let row_start = y0.max(rows.start.min(height) as i32);
+    let row_end = y1.min(rows.end.min(height) as i32);
+    if row_start >= row_end || x0 >= x1 {
+        return;
+    }
+
+    let mask_x0 = (mask.origin_x + offset_x) as f32;
+    let mask_y0 = (mask.origin_y + offset_y) as f32;
+    let mask_w = mask.width as i32;
+    let mask_h = mask.height as i32;
+    let mut row_alphas = vec![0_u8; (x1 - x0) as usize];
+
+    for y in row_start..row_end {
+        row_alphas.fill(0);
+        let mut row_has_alpha = false;
+        let mut min_active_x = (x1 - x0) as usize;
+        let mut max_active_x = 0_usize;
+
         for x in x0..x1 {
             let screen_x = x as f32 + 0.5;
             let screen_y = y as f32 + 0.5;
@@ -695,27 +726,28 @@ fn draw_shadow_mask_transformed(
             }
 
             let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
-            let local_x = (source_x - (mask.origin_x + offset_x) as f32).floor() as i32;
-            let local_y = (source_y - (mask.origin_y + offset_y) as f32).floor() as i32;
-            if local_x < 0
-                || local_y < 0
-                || local_x >= mask.width as i32
-                || local_y >= mask.height as i32
-            {
+            let local_x = (source_x - mask_x0).floor() as i32;
+            let local_y = (source_y - mask_y0).floor() as i32;
+            if local_x < 0 || local_y < 0 || local_x >= mask_w || local_y >= mask_h {
                 continue;
             }
 
             let alpha = mask.alpha[local_x as usize + local_y as usize * mask.width];
-            if alpha == 0 {
-                continue;
+            if alpha > 0 {
+                let idx = (x - x0) as usize;
+                row_alphas[idx] = alpha;
+                row_has_alpha = true;
+                min_active_x = min_active_x.min(idx);
+                max_active_x = max_active_x.max(idx + 1);
             }
+        }
 
-            let row_start = (y as usize - rows.start) * width;
-            let buffer_start = row_start + x as usize;
+        if row_has_alpha && min_active_x < max_active_x {
+            let row_start_idx = (y as usize - rows.start) * width + x0 as usize;
             blend_mask_row(
-                &mut buffer[buffer_start..buffer_start + 1],
-                buffer_start,
-                &[alpha],
+                &mut buffer[row_start_idx + min_active_x..row_start_idx + max_active_x],
+                row_start_idx + min_active_x,
+                &row_alphas[min_active_x..max_active_x],
                 prepared_color,
                 color.a,
             );

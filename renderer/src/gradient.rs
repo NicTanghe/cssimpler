@@ -318,6 +318,13 @@ pub(crate) fn draw_background_layer_transformed(
         return;
     };
 
+    let rows = current_render_buffer_rows();
+    let row_start = y0.max(rows.start.min(height) as i32);
+    let row_end = y1.min(rows.end.min(height) as i32);
+    if row_start >= row_end || x0 >= x1 {
+        return;
+    }
+
     match layer {
         BackgroundLayer::LinearGradient(gradient) => {
             let Some(first_stop) = gradient.stops.first() else {
@@ -334,7 +341,7 @@ pub(crate) fn draw_background_layer_transformed(
                 prepare_resolved_gradient(&stops, gradient.interpolation)
             });
 
-            for y in y0..y1 {
+            for y in row_start..row_end {
                 for x in x0..x1 {
                     let screen_x = x as f32 + 0.5;
                     let screen_y = y as f32 + 0.5;
@@ -384,7 +391,7 @@ pub(crate) fn draw_background_layer_transformed(
                 1.0 / (resolved_shape.radius_y * resolved_shape.radius_y)
             };
 
-            for y in y0..y1 {
+            for y in row_start..row_end {
                 for x in x0..x1 {
                     let screen_x = x as f32 + 0.5;
                     let screen_y = y as f32 + 0.5;
@@ -437,7 +444,7 @@ pub(crate) fn draw_background_layer_transformed(
             let stops = resolve_angle_stops(&gradient.stops);
             let prepared = prepare_resolved_gradient(&stops, gradient.interpolation);
             let (center_x, center_y) = resolve_gradient_point(gradient.center, layout);
-            for y in y0..y1 {
+            for y in row_start..row_end {
                 for x in x0..x1 {
                     let screen_x = x as f32 + 0.5;
                     let screen_y = y as f32 + 0.5;

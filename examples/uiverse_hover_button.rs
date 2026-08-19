@@ -1,47 +1,196 @@
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::Result;
-use cssimpler::app::{App, Invalidation};
+use cssimpler::app::{App, Invalidation, RuntimeStats, latest_runtime_stats};
 use cssimpler::core::Node;
-use cssimpler::renderer::{FrameInfo, WindowConfig};
+use cssimpler::renderer::{
+    FrameInfo, FramePaintMode, FramePaintReason, FrameTimingStats, WindowConfig,
+    latest_frame_timing_stats,
+};
 use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
 
 const BUTTON_TEXT: &str = "uiverse";
+const PERF_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HoverDemoState {
+    pub frame_index: u64,
+    pub last_frame_ms: u128,
+    pub log_elapsed: Duration,
+    pub renderer_stats: FrameTimingStats,
+    pub app_stats: RuntimeStats,
+}
 
 fn main() -> Result<()> {
-    let config =
-        WindowConfig::new("cssimpler / uiverse hover button", 1280, 720).with_decorations(false);
+    let config = WindowConfig::new("cssimpler / uiverse hover button", 1440, 920);
 
-    App::new((), stylesheet(), update, build_ui)
+    App::new(HoverDemoState::default(), stylesheet(), update, build_ui)
         .run(config)
         .map_err(Into::into)
 }
 
-fn update(_state: &mut (), _frame: FrameInfo) -> Invalidation {
+fn update(state: &mut HoverDemoState, frame: FrameInfo) -> Invalidation {
+    state.frame_index = frame.frame_index;
+    state.last_frame_ms = frame.delta.as_millis();
+    state.renderer_stats = latest_frame_timing_stats();
+    state.app_stats = latest_runtime_stats();
+    state.log_elapsed += frame.delta;
+
+    maybe_log_perf(state);
     Invalidation::Clean
 }
 
-fn build_ui(_state: &()) -> Node {
+pub fn maybe_log_perf(state: &mut HoverDemoState) {
+    if state.renderer_stats.paint_mode == FramePaintMode::Idle
+        && state.renderer_stats.painted_pixels == 0
+    {
+        return;
+    }
+
+    if state.log_elapsed < PERF_LOG_INTERVAL && state.last_frame_ms < 30 {
+        return;
+    }
+
+    while state.log_elapsed >= PERF_LOG_INTERVAL {
+        state.log_elapsed = state.log_elapsed.saturating_sub(PERF_LOG_INTERVAL);
+    }
+
+    eprintln!(
+        "[uiverse_hover] dt={}ms tree={} prep={} paint={} present={} total={} mode={} reason={} dirty={} jobs={} damage={} painted={} passes={} workers={}",
+        state.last_frame_ms,
+        format_us(state.app_stats.render_tree_us),
+        format_us(state.renderer_stats.scene_prep_us),
+        format_us(state.renderer_stats.paint_us),
+        format_us(state.renderer_stats.present_us),
+        format_us(state.renderer_stats.total_us),
+        paint_mode_label(state.renderer_stats),
+        paint_reason_label(state.renderer_stats.paint_reason),
+        state.renderer_stats.dirty_regions,
+        state.renderer_stats.dirty_jobs,
+        format_pixels(state.renderer_stats.damage_pixels),
+        format_pixels(state.renderer_stats.painted_pixels),
+        state.renderer_stats.scene_passes,
+        state.renderer_stats.render_workers,
+    );
+}
+
+fn build_ui(state: &HoverDemoState) -> Node {
     ui! {
         <div id="app">
-            <section class="spotlight">
-                <p class="kicker">
-                    Uiverse-inspired hover reveal
-                </p>
-                {build_button()}
-                <p class="note">
-                    The outlined label stays centered while the neon fill sweeps across on hover.
-                </p>
-                <p class="kicker">
-                    Uiverse-inspired glass card
-                </p>
-                {build_card()}
-                <p class="note">
-                    A frosted panel, floating badge stack, and compact social actions sit on top of a mint neon base.
-                </p>
-            </section>
+            {build_hud(state)}
+            <div class="demo-stage">
+                <section class="spotlight">
+                    <p class="kicker">
+                        Uiverse-inspired hover reveal
+                    </p>
+                    {build_button()}
+                    <p class="note">
+                        The outlined label stays centered while the neon fill sweeps across on hover.
+                    </p>
+                    <p class="kicker">
+                        Uiverse-inspired glass card
+                    </p>
+                    {build_card()}
+                    <p class="note">
+                        A frosted panel, floating badge stack, and compact social actions sit on top of a mint neon base.
+                    </p>
+                </section>
+            </div>
         </div>
+    }
+}
+
+fn build_hud(state: &HoverDemoState) -> Node {
+    ui! {
+        <section class="hud">
+            <div class="hud-header">
+                <p class="hud-title">Performance Metrics</p>
+            </div>
+            {build_metric_row(state)}
+        </section>
+    }
+}
+
+fn build_metric_row(state: &HoverDemoState) -> Node {
+    ui! {
+        <div class="metric-row">
+            {stat_chip("dt", format!("{} ms", state.last_frame_ms))}
+            {stat_chip("app view", format_us(state.app_stats.view_us))}
+            {stat_chip("tree build", format_us(state.app_stats.render_tree_us))}
+            {stat_chip("scene swap", format_us(state.app_stats.scene_swap_us))}
+            {stat_chip("transition", format_us(state.app_stats.transition_us))}
+            {stat_chip("scene prep", format_us(state.renderer_stats.scene_prep_us))}
+            {stat_chip("paint", format_us(state.renderer_stats.paint_us))}
+            {stat_chip("present", format_us(state.renderer_stats.present_us))}
+            {stat_chip("frame total", format_us(state.renderer_stats.total_us))}
+            {stat_chip("paint mode", paint_mode_label(state.renderer_stats))}
+            {stat_chip("paint reason", paint_reason_label(state.renderer_stats.paint_reason).to_string())}
+            {stat_chip("dirty regions", state.renderer_stats.dirty_regions.to_string())}
+            {stat_chip("dirty jobs", state.renderer_stats.dirty_jobs.to_string())}
+            {stat_chip("damage", format_pixels(state.renderer_stats.damage_pixels))}
+            {stat_chip("painted", format_pixels(state.renderer_stats.painted_pixels))}
+            {stat_chip("scene passes", state.renderer_stats.scene_passes.to_string())}
+            {stat_chip("workers", state.renderer_stats.render_workers.to_string())}
+        </div>
+    }
+}
+
+fn stat_chip(label: impl Into<String>, value: impl Into<String>) -> Node {
+    let label = label.into();
+    let value = value.into();
+
+    ui! {
+        <div class="stat-chip">
+            <p class="stat-label">
+                {label}
+            </p>
+            <p class="stat-value">
+                {value}
+            </p>
+        </div>
+    }
+}
+
+fn format_us(duration_us: u64) -> String {
+    format!("{:.2} ms", duration_us as f64 / 1000.0)
+}
+
+fn paint_mode_label(stats: FrameTimingStats) -> String {
+    match stats.paint_mode {
+        FramePaintMode::Idle => "idle".to_string(),
+        FramePaintMode::Full => {
+            if stats.render_workers > 1 {
+                format!("full x{}", stats.render_workers)
+            } else {
+                "full".to_string()
+            }
+        }
+        FramePaintMode::Incremental => {
+            format!("incremental {}r/{}j", stats.dirty_regions, stats.dirty_jobs)
+        }
+    }
+}
+
+fn paint_reason_label(reason: FramePaintReason) -> &'static str {
+    match reason {
+        FramePaintReason::Idle => "idle",
+        FramePaintReason::FullRedraw => "full redraw",
+        FramePaintReason::DirtyRegionLimit => "dirty-region limit",
+        FramePaintReason::DirtyAreaLimit => "dirty-area limit",
+        FramePaintReason::FragmentedDamage => "fragmented damage",
+        FramePaintReason::IncrementalDamage => "small damage",
+    }
+}
+
+fn format_pixels(pixels: usize) -> String {
+    if pixels >= 1_000_000 {
+        format!("{:.2}M px", pixels as f64 / 1_000_000.0)
+    } else if pixels >= 1_000 {
+        format!("{:.1}K px", pixels as f64 / 1_000.0)
+    } else {
+        format!("{pixels} px")
     }
 }
 
@@ -139,7 +288,7 @@ fn stylesheet() -> &'static Stylesheet {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUTTON_TEXT, build_card, build_ui, stylesheet};
+    use super::{BUTTON_TEXT, HoverDemoState, build_card, build_ui, stylesheet};
     use cssimpler::app::{App, Invalidation};
     use cssimpler::core::fonts::layout_text_block;
     use cssimpler::core::{ElementInteractionState, ElementPath, Node, RenderKind, RenderNode};
@@ -152,7 +301,7 @@ mod tests {
 
     #[test]
     fn hover_mask_expands_to_cover_the_button() {
-        let tree = build_ui(&());
+        let tree = build_ui(&HoverDemoState::default());
         let idle = build_render_tree_in_viewport_with_interaction(
             &tree,
             stylesheet(),
@@ -166,7 +315,7 @@ mod tests {
             1280,
             720,
             &ElementInteractionState {
-                hovered: Some(ElementPath::root(0).with_child(0).with_child(1)),
+                hovered: Some(ElementPath::root(0).with_child(1).with_child(0).with_child(1)),
                 active: None,
             },
         );
@@ -187,7 +336,7 @@ mod tests {
     }
 
     fn button(root: &RenderNode) -> &RenderNode {
-        &root.children[0].children[1]
+        &root.children[1].children[0].children[1]
     }
 
     fn hover_mask(root: &RenderNode) -> &RenderNode {
@@ -204,7 +353,7 @@ mod tests {
 
     #[test]
     fn hover_reveal_keeps_the_text_node_layouts_stable() {
-        let tree = build_ui(&());
+        let tree = build_ui(&HoverDemoState::default());
         let idle = build_render_tree_in_viewport_with_interaction(
             &tree,
             stylesheet(),
@@ -218,7 +367,7 @@ mod tests {
             1280,
             720,
             &ElementInteractionState {
-                hovered: Some(ElementPath::root(0).with_child(0).with_child(1)),
+                hovered: Some(ElementPath::root(0).with_child(1).with_child(0).with_child(1)),
                 active: None,
             },
         );

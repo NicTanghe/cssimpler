@@ -6254,6 +6254,11 @@ fn should_merge_dirty_regions(left: ClipRect, right: ClipRect) -> bool {
     // Check 2: Absolute and relative wasted area
     let intersection_area = left.intersect(right).map(|i| i.area()).unwrap_or(0.0);
     let wasted_area = (union_area - (combined_area - intersection_area)).max(0.0);
+
+    if intersection_area >= min_area * 0.75 && union_area <= MAX_MERGED_DIRTY_REGION_AREA {
+        return true;
+    }
+
     if wasted_area > MAX_MERGE_WASTED_PIXELS || wasted_area > min_area * MAX_WASTE_TO_MIN_AREA_RATIO
     {
         return false;

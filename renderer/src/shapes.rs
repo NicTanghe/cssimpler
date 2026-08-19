@@ -582,8 +582,34 @@ pub(crate) fn transformed_rounded_rect_coverage(
     x: i32,
     y: i32,
 ) -> u8 {
-    transformed_shape_coverage(inverse, clip_state, x, y, |source_x, source_y| {
-        point_in_rounded_rect(source_x, source_y, layout, radius)
+    let screen_x = x as f32 + 0.5;
+    let screen_y = y as f32 + 0.5;
+    if !clip_state.contains(screen_x, screen_y) {
+        return 0;
+    }
+    let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+    if !source_x.is_finite() || !source_y.is_finite() {
+        return 0;
+    }
+
+    let clamped_radius = clamp_corner_radius(radius, layout.width, layout.height);
+    let max_r = clamped_radius
+        .top_left
+        .max(clamped_radius.top_right)
+        .max(clamped_radius.bottom_left)
+        .max(clamped_radius.bottom_right);
+
+    let margin = (max_r + 1.5).min(layout.width * 0.5).min(layout.height * 0.5);
+    if source_x >= layout.x + margin
+        && source_x <= layout.x + layout.width - margin
+        && source_y >= layout.y + margin
+        && source_y <= layout.y + layout.height - margin
+    {
+        return u8::MAX;
+    }
+
+    transformed_shape_coverage(inverse, clip_state, x, y, |sx, sy| {
+        point_in_rounded_rect_with_radius(sx, sy, layout, clamped_radius)
     })
 }
 
