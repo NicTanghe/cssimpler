@@ -16,8 +16,8 @@ use crate::core::{
 use crate::renderer::{self, EngineEvent, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
 use crate::style::{
     Stylesheet, extract_render_tree, layout_resolved_render_tree_in_viewport,
-    rebuild_resolved_render_tree_with_cached_layout, resolve_render_tree_with_interaction_at_path,
-    resolve_render_tree_with_interaction_at_root,
+    rebuild_resolved_render_tree_with_cached_layout, resolve_render_tree_with_interaction_at_root,
+    resolve_render_tree_with_interaction_in_root,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -618,8 +618,8 @@ where
                 return false;
             }
             let style_start = Instant::now();
-            let resolved = resolve_render_tree_with_interaction_at_path(
-                node_match.node,
+            let resolved = resolve_render_tree_with_interaction_in_root(
+                &tree,
                 self.stylesheet,
                 self.runtime_world.interaction(),
                 &node_match.path,

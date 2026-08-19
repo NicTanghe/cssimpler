@@ -97,6 +97,108 @@ pub fn resolve_render_tree_with_interaction_at_path(
     }
 }
 
+pub fn resolve_render_tree_with_interaction_in_root(
+    root: &Node,
+    stylesheet: &Stylesheet,
+    interaction: &ElementInteractionState,
+    element_path: &ElementPath,
+) -> ResolvedRenderTree {
+    let Node::Element(root_element) = root else {
+        panic!("render tree roots must be elements");
+    };
+
+    if element_path.children.is_empty() {
+        return ResolvedRenderTree {
+            root: resolve_element_tree(
+                root_element,
+                stylesheet,
+                None,
+                None,
+                None,
+                &[],
+                interaction,
+                element_path,
+            ),
+        };
+    }
+
+    let mut current_element = root_element;
+    let mut current_path = ElementPath::root(element_path.root);
+    let mut style = crate::resolve_style_target(
+        current_element,
+        stylesheet,
+        seed_element_style(current_element),
+        None,
+        None,
+        None,
+        &[],
+        interaction,
+        &current_path,
+        None,
+    );
+    let mut inherited_text = style.visual.text;
+    let mut inherited_foreground = style.visual.foreground;
+    let mut inherited_custom_properties = style.custom_properties;
+    let mut ancestors = vec![ElementRef::from(current_element)];
+
+    for (step, &target_child_index) in element_path.children.iter().enumerate() {
+        let is_target = step + 1 == element_path.children.len();
+        let mut child_element_index = 0;
+        let mut matched = None;
+        for child in &current_element.children {
+            let Node::Element(child_element) = child else {
+                continue;
+            };
+            if child_element_index == target_child_index {
+                matched = Some(child_element);
+                break;
+            }
+            child_element_index += 1;
+        }
+
+        let Some(next_element) = matched else {
+            panic!("invalid element path {:?} in root", element_path);
+        };
+
+        current_path = current_path.with_child(target_child_index);
+        current_element = next_element;
+
+        if is_target {
+            break;
+        }
+
+        style = crate::resolve_style_target(
+            current_element,
+            stylesheet,
+            seed_element_style(current_element),
+            Some(&inherited_text),
+            Some(inherited_foreground),
+            Some(&inherited_custom_properties),
+            &ancestors,
+            interaction,
+            &current_path,
+            None,
+        );
+        inherited_text = style.visual.text;
+        inherited_foreground = style.visual.foreground;
+        inherited_custom_properties = style.custom_properties;
+        ancestors.insert(0, ElementRef::from(current_element));
+    }
+
+    ResolvedRenderTree {
+        root: resolve_element_tree(
+            current_element,
+            stylesheet,
+            Some(&inherited_text),
+            Some(inherited_foreground),
+            Some(&inherited_custom_properties),
+            &ancestors,
+            interaction,
+            element_path,
+        ),
+    }
+}
+
 pub fn layout_resolved_render_tree(
     resolved: &ResolvedRenderTree,
     available_space_override: Option<TaffySize<AvailableSpace>>,
