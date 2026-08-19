@@ -74,7 +74,7 @@ use self::{
     shapes::{expand_corner_radius, expand_layout},
 };
 
-const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 48;
+const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 256;
 const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.85;
 const SINGLE_REGION_MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.94;
 const DIRTY_BRANCH_COLLAPSE_THRESHOLD: usize = 3;
@@ -94,7 +94,7 @@ const MIN_INCREMENTAL_PIXELS_PER_WORKER: usize = 200 * 200;
 const MIN_INCREMENTAL_JOBS_PER_WORKER: usize = 3;
 const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 80;
 const MAX_RENDER_WORKERS: usize = 12;
-const SCENE_TRAVERSAL_COST_PER_NODE: usize = 96;
+const SCENE_TRAVERSAL_COST_PER_NODE: usize = 24;
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 const MAX_SUBTREE_SURFACE_CACHE_ENTRIES: usize = 64;
 const MAX_WORKER_BUFFER_POOL_BYTES: usize = 32 * 1024 * 1024;
@@ -2780,6 +2780,10 @@ impl ClipRect {
 
     fn contains(self, x: f32, y: f32) -> bool {
         x >= self.x0 && y >= self.y0 && x < self.x1 && y < self.y1
+    }
+
+    fn contains_rect(self, other: Self) -> bool {
+        self.x0 <= other.x0 && self.y0 <= other.y0 && self.x1 >= other.x1 && self.y1 >= other.y1
     }
 
     fn union(self, other: Self) -> Self {
@@ -6005,10 +6009,18 @@ fn collect_node_dirty_regions(
         &current_bounds.children,
         dirty_regions,
     );
-    push_dirty_region(
-        union_optional_bounds(previous_bounds.own_bounds, current_bounds.own_bounds),
-        dirty_regions,
-    );
+    let own_union = union_optional_bounds(previous_bounds.own_bounds, current_bounds.own_bounds);
+    if let Some(own_clip) = own_union {
+        let mut i = start_len;
+        while i < dirty_regions.len() {
+            if own_clip.contains_rect(dirty_regions[i]) {
+                dirty_regions.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    push_dirty_region(own_union, dirty_regions);
     if !children_match {
         maybe_collapse_branch_dirty_regions(
             previous_bounds.bounds,
@@ -6202,7 +6214,9 @@ fn coalesce_dirty_regions(dirty_regions: &mut Vec<ClipRect>) {
             }
         }
 
-        if !merged {
+        if merged {
+            index = 0;
+        } else {
             index += 1;
         }
     }
@@ -6222,13 +6236,14 @@ fn should_merge_dirty_regions(left: ClipRect, right: ClipRect) -> bool {
 
     let union = left.union(right);
     let union_area = union.area();
-    if union_area > MAX_MERGED_DIRTY_REGION_AREA {
-        return false;
-    }
     let combined_area = left_area + right_area;
 
     if union_area <= combined_area {
         return true;
+    }
+
+    if union_area > MAX_MERGED_DIRTY_REGION_AREA {
+        return false;
     }
 
     // Check 1: Relative expansion ratio
@@ -6279,30 +6294,31 @@ fn should_full_redraw(
         {
             return Some(FramePaintReason::DirtyAreaLimit);
         }
-    }
 
-    let traversal_cost = scene_node_count
-        .max(1)
-        .saturating_mul(SCENE_TRAVERSAL_COST_PER_NODE);
-    let incremental_cost = dirty_pixels
-        .saturating_mul(2)
-        .saturating_add(traversal_cost.saturating_mul(incremental_scene_passes.max(1)));
-    let full_cost = full_pixels.saturating_mul(2).saturating_add(
-        traversal_cost.saturating_mul(full_redraw_worker_count(width, height).max(1)),
-    );
-    if incremental_cost >= full_cost {
-        return Some(FramePaintReason::FragmentedDamage);
+        let traversal_cost = scene_node_count
+            .max(1)
+            .saturating_mul(SCENE_TRAVERSAL_COST_PER_NODE);
+        let incremental_cost = dirty_pixels
+            .saturating_mul(2)
+            .saturating_add(traversal_cost.saturating_mul(incremental_scene_passes.max(1)));
+        let full_cost = full_pixels.saturating_mul(2).saturating_add(
+            traversal_cost.saturating_mul(full_redraw_worker_count(width, height).max(1)),
+        );
+        if incremental_cost >= full_cost && dirty_ratio >= 0.50 {
+            return Some(FramePaintReason::FragmentedDamage);
+        }
     }
 
     None
 }
 
 fn clip_rects_pixel_count(clips: &[ClipRect], width: usize, height: usize) -> usize {
-    clips
+    let total: usize = clips
         .iter()
         .filter_map(|clip| clip_pixel_bounds(*clip, width, height))
         .map(|(x0, y0, x1, y1)| (x1 - x0).max(0).saturating_mul((y1 - y0).max(0)) as usize)
-        .sum()
+        .sum();
+    total.min(width.saturating_mul(height))
 }
 
 #[allow(dead_code)]
@@ -10974,7 +10990,7 @@ mod tests {
     #[test]
     fn fragmented_damage_fallback_uses_parallel_pass_estimate_instead_of_total_jobs() {
         let dirty_region_count = 24;
-        let dirty_pixels = 40_000;
+        let dirty_pixels = 280_000;
         let scene_node_count = 800;
         let width = 960;
         let height = 540;
@@ -11312,8 +11328,8 @@ mod tests {
             next.push(node);
         }
 
-        for index in 0..20 {
-            let x = 8.0 + index as f32 * 12.0;
+        for index in 0..42 {
+            let x = 8.0 + index as f32 * 11.0;
             previous.push(
                 RenderNode::container(LayoutBox::new(x, 0.0, 6.0, 640.0)).with_style(VisualStyle {
                     background: Some(Color::rgb(37, 99, 235)),
@@ -11345,7 +11361,7 @@ mod tests {
         assert_eq!(incremental, full);
         assert_eq!(stats.mode, FramePaintMode::Full);
         assert_eq!(stats.reason, FramePaintReason::FragmentedDamage);
-        assert_eq!(stats.dirty_regions, 20);
+        assert_eq!(stats.dirty_regions, 42);
         assert!(stats.dirty_jobs >= stats.dirty_regions);
         assert!(stats.damage_pixels < stats.painted_pixels);
         assert_eq!(stats.scene_passes, stats.workers);
@@ -11964,5 +11980,94 @@ mod tests {
             GlassRenderMode::Fallback,
         );
         assert!(inc_stats.scene_bounds.is_some());
+    }
+
+    #[test]
+    fn coalesce_merges_large_contained_and_overlapping_regions() {
+        let mut regions = vec![
+            ClipRect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 800.0,
+                y1: 600.0,
+            },
+            ClipRect {
+                x0: 50.0,
+                y0: 50.0,
+                x1: 200.0,
+                y1: 200.0,
+            },
+            ClipRect {
+                x0: 100.0,
+                y0: 100.0,
+                x1: 750.0,
+                y1: 550.0,
+            },
+        ];
+
+        coalesce_dirty_regions(&mut regions);
+
+        // All child regions are within or overlapping Region 0, so they merge with zero waste.
+        assert_eq!(regions.len(), 1);
+        assert_eq!(
+            regions[0],
+            ClipRect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 800.0,
+                y1: 600.0,
+            }
+        );
+    }
+
+    #[test]
+    fn collect_node_dirty_regions_prunes_child_regions_enclosed_by_own_bounds() {
+        let prev_child = RenderNode::container(LayoutBox::new(10.0, 10.0, 50.0, 50.0)).with_style(VisualStyle {
+            background: Some(Color::rgb(1, 2, 3)),
+            ..VisualStyle::default()
+        });
+        let curr_child = RenderNode::container(LayoutBox::new(10.0, 10.0, 50.0, 50.0)).with_style(VisualStyle {
+            background: Some(Color::rgb(4, 5, 6)),
+            ..VisualStyle::default()
+        });
+
+        let prev_parent = RenderNode::container(LayoutBox::new(0.0, 0.0, 200.0, 200.0))
+            .with_style(VisualStyle {
+                background: Some(Color::rgb(10, 20, 30)),
+                ..VisualStyle::default()
+            })
+            .with_children(vec![prev_child]);
+
+        let curr_parent = RenderNode::container(LayoutBox::new(0.0, 0.0, 200.0, 200.0))
+            .with_style(VisualStyle {
+                background: Some(Color::rgb(40, 50, 60)),
+                ..VisualStyle::default()
+            })
+            .with_children(vec![curr_child]);
+
+        let prev_bounds = super::cache_scene_subtree_bounds(std::slice::from_ref(&prev_parent)).roots.remove(0);
+        let curr_bounds = super::cache_scene_subtree_bounds(std::slice::from_ref(&curr_parent)).roots.remove(0);
+
+        let mut dirty_regions = Vec::new();
+        super::collect_node_dirty_regions(
+            &prev_parent,
+            &prev_bounds,
+            &curr_parent,
+            &curr_bounds,
+            &mut dirty_regions,
+        );
+
+        // Child dirty region (10, 10, 60, 60) is fully inside parent's own bounds (0, 0, 200, 200),
+        // so it is pruned and only the parent's own bounds region is emitted.
+        assert_eq!(dirty_regions.len(), 1);
+        assert_eq!(
+            dirty_regions[0],
+            ClipRect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 200.0,
+                y1: 200.0,
+            }
+        );
     }
 }
