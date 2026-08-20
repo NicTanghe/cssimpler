@@ -688,10 +688,56 @@ pub(crate) fn transformed_rounded_ring_coverage(
     x: i32,
     y: i32,
 ) -> u8 {
-    transformed_shape_coverage(inverse, clip_state, x, y, |source_x, source_y| {
-        point_in_rounded_rect(source_x, source_y, outer_layout, outer_radius)
-            && inner.is_none_or(|(inner_layout, inner_radius)| {
-                !point_in_rounded_rect(source_x, source_y, inner_layout, inner_radius)
+    let screen_x = x as f32 + 0.5;
+    let screen_y = y as f32 + 0.5;
+    if !clip_state.contains(screen_x, screen_y) {
+        return 0;
+    }
+    let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
+    if !source_x.is_finite() || !source_y.is_finite() {
+        return 0;
+    }
+
+    if source_x < outer_layout.x - 1.5
+        || source_x > outer_layout.x + outer_layout.width + 1.5
+        || source_y < outer_layout.y - 1.5
+        || source_y > outer_layout.y + outer_layout.height + 1.5
+    {
+        return 0;
+    }
+
+    if let Some((inner_layout, inner_radius)) = inner {
+        let clamped_inner =
+            clamp_corner_radius(inner_radius, inner_layout.width, inner_layout.height);
+        let max_inner_r = clamped_inner
+            .top_left
+            .max(clamped_inner.top_right)
+            .max(clamped_inner.bottom_left)
+            .max(clamped_inner.bottom_right);
+        let margin = (max_inner_r + 1.5)
+            .min(inner_layout.width * 0.5)
+            .min(inner_layout.height * 0.5);
+        if source_x >= inner_layout.x + margin
+            && source_x <= inner_layout.x + inner_layout.width - margin
+            && source_y >= inner_layout.y + margin
+            && source_y <= inner_layout.y + inner_layout.height - margin
+        {
+            return 0;
+        }
+    }
+
+    let clamped_outer = clamp_corner_radius(outer_radius, outer_layout.width, outer_layout.height);
+    let clamped_inner = inner.map(|(layout, radius)| {
+        (
+            layout,
+            clamp_corner_radius(radius, layout.width, layout.height),
+        )
+    });
+
+    transformed_shape_coverage(inverse, clip_state, x, y, |sx, sy| {
+        point_in_rounded_rect_with_radius(sx, sy, outer_layout, clamped_outer)
+            && clamped_inner.is_none_or(|(inner_layout, inner_r)| {
+                !point_in_rounded_rect_with_radius(sx, sy, inner_layout, inner_r)
             })
     })
 }

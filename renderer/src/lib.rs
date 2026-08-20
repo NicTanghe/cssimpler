@@ -84,7 +84,7 @@ const MAX_BRANCH_COLLAPSE_WASTED_PIXELS: f32 = 8192.0;
 const DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO: f32 = 1.35;
 const MAX_MERGE_WASTED_PIXELS: f32 = 16384.0;
 const MAX_WASTE_TO_MIN_AREA_RATIO: f32 = 0.60;
-const MAX_MERGED_DIRTY_REGION_AREA: f32 = 131072.0;
+const MAX_MERGED_DIRTY_REGION_AREA: f32 = 524288.0;
 const MAX_DIMENSION_MISMATCH_RATIO: f32 = 2.5;
 const MAX_SUBTREE_SURFACE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_BYTES: usize = 4 * 1024 * 1024;
@@ -5748,18 +5748,40 @@ fn draw_transformed_rounded_rect(
     };
     let prepared = PreparedBlendColor::new(color);
     let rows = current_render_buffer_rows();
-    let row_start = rows.start.min(height) as i32;
-    let row_end = rows.end.min(height) as i32;
-    for y in y0.max(row_start)..y1.min(row_end) {
-        for x in x0..x1 {
-            let coverage =
-                transformed_rounded_rect_coverage(layout, radius, inverse, clip_state, x, y);
-            if coverage == 0 {
-                continue;
+    let row_start = y0.max(rows.start.min(height) as i32);
+    let row_end = y1.min(rows.end.min(height) as i32);
+    if row_start >= row_end || x0 >= x1 {
+        return;
+    }
+
+    if color.a == 255 {
+        let packed = prepared.packed;
+        for y in row_start..row_end {
+            let row_offset = (y as usize - rows.start) * width;
+            for x in x0..x1 {
+                let coverage =
+                    transformed_rounded_rect_coverage(layout, radius, inverse, clip_state, x, y);
+                if coverage == 255 {
+                    buffer[row_offset + x as usize] = packed;
+                } else if coverage > 0 {
+                    blend_prepared_pixel_with_coverage(
+                        buffer, width, height, x, y, prepared, color.a, coverage,
+                    );
+                }
             }
-            blend_prepared_pixel_with_coverage(
-                buffer, width, height, x, y, prepared, color.a, coverage,
-            );
+        }
+    } else {
+        for y in row_start..row_end {
+            for x in x0..x1 {
+                let coverage =
+                    transformed_rounded_rect_coverage(layout, radius, inverse, clip_state, x, y);
+                if coverage == 0 {
+                    continue;
+                }
+                blend_prepared_pixel_with_coverage(
+                    buffer, width, height, x, y, prepared, color.a, coverage,
+                );
+            }
         }
     }
 }

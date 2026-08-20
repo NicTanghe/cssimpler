@@ -13,12 +13,18 @@ use cssimpler::ui;
 
 const BUTTON_TEXT: &str = "uiverse";
 const PERF_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const HUD_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HoverDemoState {
     pub frame_index: u64,
     pub last_frame_ms: u128,
     pub log_elapsed: Duration,
+    pub last_logged_frame: u64,
+    pub hud_elapsed: Duration,
+    pub hud_frame_ms: u128,
+    pub hud_renderer_stats: FrameTimingStats,
+    pub hud_app_stats: RuntimeStats,
     pub renderer_stats: FrameTimingStats,
     pub app_stats: RuntimeStats,
 }
@@ -37,6 +43,14 @@ fn update(state: &mut HoverDemoState, frame: FrameInfo) -> Invalidation {
     state.renderer_stats = latest_frame_timing_stats();
     state.app_stats = latest_runtime_stats();
     state.log_elapsed += frame.delta;
+    state.hud_elapsed += frame.delta;
+
+    if state.hud_elapsed >= HUD_UPDATE_INTERVAL || state.frame_index <= 1 {
+        state.hud_elapsed = Duration::ZERO;
+        state.hud_frame_ms = state.last_frame_ms;
+        state.hud_renderer_stats = state.renderer_stats;
+        state.hud_app_stats = state.app_stats.clone();
+    }
 
     maybe_log_perf(state);
     Invalidation::Clean
@@ -49,16 +63,28 @@ pub fn maybe_log_perf(state: &mut HoverDemoState) {
         return;
     }
 
-    if state.log_elapsed < PERF_LOG_INTERVAL && state.last_frame_ms < 30 {
+    if state.frame_index == state.last_logged_frame {
         return;
     }
 
+    if state.log_elapsed < PERF_LOG_INTERVAL {
+        return;
+    }
+
+    state.last_logged_frame = state.frame_index;
     while state.log_elapsed >= PERF_LOG_INTERVAL {
         state.log_elapsed = state.log_elapsed.saturating_sub(PERF_LOG_INTERVAL);
     }
 
+    let fps = if state.last_frame_ms > 0 {
+        (1000 / state.last_frame_ms).min(999)
+    } else {
+        60
+    };
+
     eprintln!(
-        "[uiverse_hover] dt={}ms tree={} prep={} paint={} present={} total={} mode={} reason={} dirty={} jobs={} damage={} painted={} passes={} workers={}",
+        "[uiverse_hover] fps={:<2} dt={:>3}ms tree={:>7} prep={:>7} paint={:>7} present={:>6} total={:>7} mode={} (reason={}, damage={})",
+        fps,
         state.last_frame_ms,
         format_us(state.app_stats.render_tree_us),
         format_us(state.renderer_stats.scene_prep_us),
@@ -67,12 +93,7 @@ pub fn maybe_log_perf(state: &mut HoverDemoState) {
         format_us(state.renderer_stats.total_us),
         paint_mode_label(state.renderer_stats),
         paint_reason_label(state.renderer_stats.paint_reason),
-        state.renderer_stats.dirty_regions,
-        state.renderer_stats.dirty_jobs,
         format_pixels(state.renderer_stats.damage_pixels),
-        format_pixels(state.renderer_stats.painted_pixels),
-        state.renderer_stats.scene_passes,
-        state.renderer_stats.render_workers,
     );
 }
 
@@ -114,25 +135,26 @@ fn build_hud(state: &HoverDemoState) -> Node {
 }
 
 fn build_metric_row(state: &HoverDemoState) -> Node {
+    let (paint_mode_main, paint_mode_sub) = paint_mode_lines(state.hud_renderer_stats);
     ui! {
         <div class="metric-row">
-            {stat_chip("dt", format!("{} ms", state.last_frame_ms))}
-            {stat_chip("app view", format_us(state.app_stats.view_us))}
-            {stat_chip("tree build", format_us(state.app_stats.render_tree_us))}
-            {stat_chip("scene swap", format_us(state.app_stats.scene_swap_us))}
-            {stat_chip("transition", format_us(state.app_stats.transition_us))}
-            {stat_chip("scene prep", format_us(state.renderer_stats.scene_prep_us))}
-            {stat_chip("paint", format_us(state.renderer_stats.paint_us))}
-            {stat_chip("present", format_us(state.renderer_stats.present_us))}
-            {stat_chip("frame total", format_us(state.renderer_stats.total_us))}
-            {stat_chip("paint mode", paint_mode_label(state.renderer_stats))}
-            {stat_chip("paint reason", paint_reason_label(state.renderer_stats.paint_reason).to_string())}
-            {stat_chip("dirty regions", state.renderer_stats.dirty_regions.to_string())}
-            {stat_chip("dirty jobs", state.renderer_stats.dirty_jobs.to_string())}
-            {stat_chip("damage", format_pixels(state.renderer_stats.damage_pixels))}
-            {stat_chip("painted", format_pixels(state.renderer_stats.painted_pixels))}
-            {stat_chip("scene passes", state.renderer_stats.scene_passes.to_string())}
-            {stat_chip("workers", state.renderer_stats.render_workers.to_string())}
+            {stat_chip("dt", format!("{} ms", state.hud_frame_ms))}
+            {stat_chip("app view", format_us(state.hud_app_stats.view_us))}
+            {stat_chip("tree build", format_us(state.hud_app_stats.render_tree_us))}
+            {stat_chip("scene swap", format_us(state.hud_app_stats.scene_swap_us))}
+            {stat_chip("transition", format_us(state.hud_app_stats.transition_us))}
+            {stat_chip("scene prep", format_us(state.hud_renderer_stats.scene_prep_us))}
+            {stat_chip("paint", format_us(state.hud_renderer_stats.paint_us))}
+            {stat_chip("present", format_us(state.hud_renderer_stats.present_us))}
+            {stat_chip("frame total", format_us(state.hud_renderer_stats.total_us))}
+            {two_line_stat_chip("paint mode", paint_mode_main, paint_mode_sub)}
+            {stat_chip("paint reason", paint_reason_label(state.hud_renderer_stats.paint_reason).to_string())}
+            {stat_chip("dirty regions", state.hud_renderer_stats.dirty_regions.to_string())}
+            {stat_chip("dirty jobs", state.hud_renderer_stats.dirty_jobs.to_string())}
+            {stat_chip("damage", format_pixels(state.hud_renderer_stats.damage_pixels))}
+            {stat_chip("painted", format_pixels(state.hud_renderer_stats.painted_pixels))}
+            {stat_chip("scene passes", state.hud_renderer_stats.scene_passes.to_string())}
+            {stat_chip("workers", state.hud_renderer_stats.render_workers.to_string())}
         </div>
     }
 }
@@ -153,8 +175,50 @@ fn stat_chip(label: impl Into<String>, value: impl Into<String>) -> Node {
     }
 }
 
+fn two_line_stat_chip(
+    label: impl Into<String>,
+    line1: impl Into<String>,
+    line2: impl Into<String>,
+) -> Node {
+    let label = label.into();
+    let line1 = line1.into();
+    let line2 = line2.into();
+
+    ui! {
+        <div class="stat-chip">
+            <p class="stat-label">
+                {label}
+            </p>
+            <p class="stat-value">
+                {line1}
+            </p>
+            <p class="stat-subvalue">
+                {line2}
+            </p>
+        </div>
+    }
+}
+
 fn format_us(duration_us: u64) -> String {
     format!("{:.2} ms", duration_us as f64 / 1000.0)
+}
+
+fn paint_mode_lines(stats: FrameTimingStats) -> (String, String) {
+    match stats.paint_mode {
+        FramePaintMode::Idle => ("idle".to_string(), "-".to_string()),
+        FramePaintMode::Full => {
+            let sub = if stats.render_workers > 1 {
+                format!("x{} workers", stats.render_workers)
+            } else {
+                "1 worker".to_string()
+            };
+            ("full".to_string(), sub)
+        }
+        FramePaintMode::Incremental => (
+            "incremental".to_string(),
+            format!("{}r / {}j", stats.dirty_regions, stats.dirty_jobs),
+        ),
+    }
 }
 
 fn paint_mode_label(stats: FrameTimingStats) -> String {

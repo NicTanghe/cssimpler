@@ -20,6 +20,8 @@ use crate::style::{
     resolve_render_tree_with_interaction_in_root,
 };
 
+const MAX_TRANSITION_STEP_DELTA: Duration = Duration::from_millis(50);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimePhase {
     StructuralUpdate,
@@ -712,9 +714,10 @@ where
         let Some(transition) = self.scene_transition.as_mut() else {
             return;
         };
+        let step_delta = delta.min(MAX_TRANSITION_STEP_DELTA);
         let sample_start = Instant::now();
         if let Some(scene) = self.cached_scene.as_mut() {
-            transition.advance(delta, scene);
+            transition.advance(step_delta, scene);
         }
         stats.record_phase(RuntimePhase::TransitionAdvance, sample_start.elapsed());
         if !transition.is_active() {
@@ -1102,9 +1105,10 @@ where
         let Some(transition) = self.scene_transition.as_mut() else {
             return;
         };
+        let step_delta = delta.min(MAX_TRANSITION_STEP_DELTA);
         let sample_start = Instant::now();
         if let Some(scene) = self.cached_scene.as_mut() {
-            transition.advance(delta, scene);
+            transition.advance(step_delta, scene);
         }
         stats.record_phase(RuntimePhase::TransitionAdvance, sample_start.elapsed());
         if !transition.is_active() {
