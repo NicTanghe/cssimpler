@@ -20,8 +20,6 @@ use crate::style::{
     resolve_render_tree_with_interaction_in_root,
 };
 
-const MAX_TRANSITION_STEP_DELTA: Duration = Duration::from_millis(50);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimePhase {
     StructuralUpdate,
@@ -43,6 +41,9 @@ pub struct RuntimeStats {
     pub style_resolution_us: u64,
     pub layout_sync_us: u64,
     pub render_extraction_us: u64,
+    pub transition_delta_us: u64,
+    pub transition_elapsed_us: u64,
+    pub transition_duration_us: u64,
     pub phase_order: Vec<RuntimePhase>,
     pub rerendered: bool,
     pub transition_active: bool,
@@ -714,12 +715,14 @@ where
         let Some(transition) = self.scene_transition.as_mut() else {
             return;
         };
-        let step_delta = delta.min(MAX_TRANSITION_STEP_DELTA);
+        stats.transition_delta_us = duration_to_us(delta);
         let sample_start = Instant::now();
         if let Some(scene) = self.cached_scene.as_mut() {
-            transition.advance(step_delta, scene);
+            transition.advance(delta, scene);
         }
         stats.record_phase(RuntimePhase::TransitionAdvance, sample_start.elapsed());
+        stats.transition_elapsed_us = duration_to_us(transition.elapsed());
+        stats.transition_duration_us = duration_to_us(transition.duration());
         if !transition.is_active() {
             self.scene_transition = None;
         }
@@ -1105,12 +1108,14 @@ where
         let Some(transition) = self.scene_transition.as_mut() else {
             return;
         };
-        let step_delta = delta.min(MAX_TRANSITION_STEP_DELTA);
+        stats.transition_delta_us = duration_to_us(delta);
         let sample_start = Instant::now();
         if let Some(scene) = self.cached_scene.as_mut() {
-            transition.advance(step_delta, scene);
+            transition.advance(delta, scene);
         }
         stats.record_phase(RuntimePhase::TransitionAdvance, sample_start.elapsed());
+        stats.transition_elapsed_us = duration_to_us(transition.elapsed());
+        stats.transition_duration_us = duration_to_us(transition.duration());
         if !transition.is_active() {
             self.scene_transition = None;
         }
@@ -2590,6 +2595,94 @@ mod tests {
         assert!((second[0].layout.width - 120.0).abs() < 0.01);
         assert_eq!(third[0].layout.width, 160.0);
         assert_eq!(fourth[0].layout.width, 160.0);
+    }
+
+    #[test]
+    fn app_samples_late_transition_frames_at_full_wall_clock_delta() {
+        let stylesheet = parse_stylesheet(
+            ".button { width: 80px; transition: width 500ms linear; }
+             .button.hot { width: 160px; }",
+        )
+        .expect("transition stylesheet should parse");
+        let mut app = App::new(
+            false,
+            &stylesheet,
+            |state, frame| {
+                if frame.frame_index == 1 {
+                    *state = true;
+                    Invalidation::Layout
+                } else {
+                    Invalidation::Clean
+                }
+            },
+            |state| {
+                let mut button = Node::element("button").with_class("button");
+                if *state {
+                    button = button.with_class("hot");
+                }
+                button.into()
+            },
+        );
+
+        let idle = app.frame(FrameInfo {
+            frame_index: 0,
+            delta: Duration::ZERO,
+        });
+        let midpoint = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::from_millis(250),
+        });
+
+        assert_eq!(idle[0].layout.width, 80.0);
+        assert!((midpoint[0].layout.width - 120.0).abs() < 0.01);
+        assert_eq!(app.latest_stats().transition_delta_us, 250_000);
+        assert_eq!(app.latest_stats().transition_elapsed_us, 250_000);
+        assert_eq!(app.latest_stats().transition_duration_us, 500_000);
+        assert!(app.latest_stats().transition_active);
+    }
+
+    #[test]
+    fn fragment_app_samples_late_transition_frames_at_full_wall_clock_delta() {
+        let stylesheet = parse_stylesheet(
+            ".button { width: 80px; transition: width 500ms linear; }
+             .button.hot { width: 160px; }",
+        )
+        .expect("transition stylesheet should parse");
+        let mut app = FragmentApp::new(
+            false,
+            &stylesheet,
+            |state, frame| {
+                if frame.frame_index == 1 {
+                    *state = true;
+                    Invalidation::Layout
+                } else {
+                    Invalidation::Clean
+                }
+            },
+            [Fragment::new("button", |state: &bool| {
+                let mut button = Node::element("button").with_class("button");
+                if *state {
+                    button = button.with_class("hot");
+                }
+                button.into()
+            })],
+        );
+
+        let idle = app.frame(FrameInfo {
+            frame_index: 0,
+            delta: Duration::ZERO,
+        });
+        let midpoint = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::from_millis(250),
+        });
+
+        assert_eq!(idle[0].layout.width, 80.0);
+        assert!((midpoint[0].layout.width - 120.0).abs() < 0.01);
+        assert_eq!(app.latest_stats().transition_delta_us, 250_000);
+        assert_eq!(app.latest_stats().transition_elapsed_us, 250_000);
+        assert_eq!(app.latest_stats().transition_duration_us, 500_000);
+        assert!(app.latest_stats().transition_active);
     }
 
     #[test]

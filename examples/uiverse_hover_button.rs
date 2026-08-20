@@ -39,9 +39,13 @@ fn main() -> Result<()> {
 
 fn update(state: &mut HoverDemoState, frame: FrameInfo) -> Invalidation {
     state.frame_index = frame.frame_index;
-    state.last_frame_ms = frame.delta.as_millis();
     state.renderer_stats = latest_frame_timing_stats();
     state.app_stats = latest_runtime_stats();
+    state.last_frame_ms = if state.renderer_stats.total_us > 0 {
+        u128::from(state.renderer_stats.frame_delta_us.div_ceil(1_000))
+    } else {
+        frame.delta.as_millis()
+    };
     state.log_elapsed += frame.delta;
     state.hud_elapsed += frame.delta;
 
@@ -76,24 +80,32 @@ pub fn maybe_log_perf(state: &mut HoverDemoState) {
         state.log_elapsed = state.log_elapsed.saturating_sub(PERF_LOG_INTERVAL);
     }
 
-    let fps = if state.last_frame_ms > 0 {
-        (1000 / state.last_frame_ms).min(999)
+    let fps = if state.renderer_stats.frame_delta_us > 0 {
+        (1_000_000 / state.renderer_stats.frame_delta_us).min(999)
     } else {
         60
     };
 
     eprintln!(
-        "[uiverse_hover] fps={:<2} dt={:>3}ms tree={:>7} prep={:>7} paint={:>7} present={:>6} total={:>7} mode={} (reason={}, damage={})",
+        "[uiverse_hover] frame={} fps={:<2} dt={:>3}ms update={:>7} tree={:>7} prep={:>7} paint={:>7} present={:>7} total={:>7} anim={} mode={} reason={} dirty={}r/{}j damage={} painted={} passes={} workers={}",
+        state.renderer_stats.frame_index,
         fps,
         state.last_frame_ms,
+        format_us(state.renderer_stats.update_us),
         format_us(state.app_stats.render_tree_us),
         format_us(state.renderer_stats.scene_prep_us),
         format_us(state.renderer_stats.paint_us),
         format_us(state.renderer_stats.present_us),
         format_us(state.renderer_stats.total_us),
+        format_animation_clock(&state.app_stats),
         paint_mode_label(state.renderer_stats),
         paint_reason_label(state.renderer_stats.paint_reason),
+        state.renderer_stats.dirty_regions,
+        state.renderer_stats.dirty_jobs,
         format_pixels(state.renderer_stats.damage_pixels),
+        format_pixels(state.renderer_stats.painted_pixels),
+        state.renderer_stats.scene_passes,
+        state.renderer_stats.render_workers,
     );
 }
 
@@ -143,6 +155,7 @@ fn build_metric_row(state: &HoverDemoState) -> Node {
             {stat_chip("tree build", format_us(state.hud_app_stats.render_tree_us))}
             {stat_chip("scene swap", format_us(state.hud_app_stats.scene_swap_us))}
             {stat_chip("transition", format_us(state.hud_app_stats.transition_us))}
+            {stat_chip("animation clock", format_animation_clock(&state.hud_app_stats))}
             {stat_chip("scene prep", format_us(state.hud_renderer_stats.scene_prep_us))}
             {stat_chip("paint", format_us(state.hud_renderer_stats.paint_us))}
             {stat_chip("present", format_us(state.hud_renderer_stats.present_us))}
@@ -201,6 +214,21 @@ fn two_line_stat_chip(
 
 fn format_us(duration_us: u64) -> String {
     format!("{:.2} ms", duration_us as f64 / 1000.0)
+}
+
+fn format_animation_clock(stats: &RuntimeStats) -> String {
+    if stats.transition_duration_us == 0 {
+        return "idle".to_string();
+    }
+
+    let progress = stats.transition_elapsed_us as f64 / stats.transition_duration_us as f64;
+    format!(
+        "{:.0}% {}/{}ms (+{}ms)",
+        progress.clamp(0.0, 1.0) * 100.0,
+        stats.transition_elapsed_us.div_ceil(1_000),
+        stats.transition_duration_us.div_ceil(1_000),
+        stats.transition_delta_us.div_ceil(1_000),
+    )
 }
 
 fn paint_mode_lines(stats: FrameTimingStats) -> (String, String) {
@@ -670,7 +698,7 @@ mod tests {
         );
         render_to_buffer(std::slice::from_ref(&hovered), &mut full, 480, 480, clear);
 
-        assert_eq!(incremental, full);
+        assert_render_buffers_match(&incremental, &full, 480);
     }
 
     #[test]
@@ -808,6 +836,49 @@ mod tests {
     }
 
     #[test]
+    fn hover_transition_zero_elapsed_sample_matches_idle_scene() {
+        let mut app = App::new(
+            (),
+            stylesheet(),
+            |_state, _frame| Invalidation::Clean,
+            |_state| {
+                ui! {
+                    <div>
+                        {build_card()}
+                    </div>
+                }
+            },
+        );
+        app.set_viewport(ViewportSize {
+            width: 480,
+            height: 480,
+        });
+
+        let idle = app.frame(FrameInfo {
+            frame_index: 0,
+            delta: Duration::ZERO,
+        });
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(ElementPath::root(0).with_child(0).with_child(0)),
+                active: None,
+            },
+        ));
+        let start = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::ZERO,
+        });
+
+        let clear = cssimpler::core::Color::rgb(255, 0, 255);
+        let mut idle_buffer = vec![0_u32; 480 * 480];
+        let mut start_buffer = vec![0_u32; 480 * 480];
+        render_to_buffer(&idle, &mut idle_buffer, 480, 480, clear);
+        render_to_buffer(&start, &mut start_buffer, 480, 480, clear);
+        assert_render_buffers_match(&start_buffer, &idle_buffer, 480);
+    }
+
+    #[test]
     fn hover_transition_midpoint_incremental_render_matches_full_redraw() {
         let mut app = App::new(
             (),
@@ -847,7 +918,7 @@ mod tests {
         render_scene_update(&idle, &mid, &mut incremental, 480, 480, clear);
         render_to_buffer(&mid, &mut full, 480, 480, clear);
 
-        assert_eq!(incremental, full);
+        assert_render_buffers_match(&incremental, &full, 480);
     }
 
     fn build_test_button(is_hot: bool) -> Node {
@@ -901,6 +972,28 @@ mod tests {
             frame_index,
             delta: Duration::from_millis(16),
         }
+    }
+
+    fn assert_render_buffers_match(actual: &[u32], expected: &[u32], width: usize) {
+        assert_eq!(actual.len(), expected.len());
+        let Some((index, (&actual_pixel, &expected_pixel))) = actual
+            .iter()
+            .zip(expected)
+            .enumerate()
+            .find(|(_, (actual_pixel, expected_pixel))| actual_pixel != expected_pixel)
+        else {
+            return;
+        };
+        let mismatch_count = actual
+            .iter()
+            .zip(expected)
+            .filter(|(actual_pixel, expected_pixel)| actual_pixel != expected_pixel)
+            .count();
+        panic!(
+            "render buffers differ at ({}, {}): actual={actual_pixel:#08x}, expected={expected_pixel:#08x}; mismatched pixels={mismatch_count}",
+            index % width,
+            index / width,
+        );
     }
 
     fn visible_bounds(

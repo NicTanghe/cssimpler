@@ -120,6 +120,8 @@ pub enum FramePaintReason {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameTimingStats {
+    pub frame_index: u64,
+    pub frame_delta_us: u64,
     pub update_us: u64,
     pub scene_prep_us: u64,
     pub paint_us: u64,
@@ -1010,10 +1012,20 @@ fn clear_shadow_mask_cache_for_tests() {
     shadow::clear_shadow_mask_cache_for_tests();
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameInfo {
     pub frame_index: u64,
     pub delta: Duration,
+}
+
+impl FrameInfo {
+    /// Returns the same logical frame without advancing elapsed-time consumers again.
+    pub(crate) const fn follow_up(self) -> Self {
+        Self {
+            frame_index: self.frame_index,
+            delta: Duration::ZERO,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1328,10 +1340,14 @@ where
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let frame_begin = Instant::now();
-        let mut frame_stats = FrameTimingStats::default();
         let now = Instant::now();
         let delta = now.saturating_duration_since(last_frame);
         last_frame = now;
+        let mut frame_stats = FrameTimingStats {
+            frame_index,
+            frame_delta_us: duration_to_us(delta),
+            ..FrameTimingStats::default()
+        };
 
         let left_down = window.get_mouse_down(MouseButton::Left);
         let right_down = window.get_mouse_down(MouseButton::Right);
@@ -1484,7 +1500,7 @@ where
 
         if event_triggered_rerender {
             let rerender_start = Instant::now();
-            scene_provider.update(frame);
+            scene_provider.update(frame.follow_up());
             frame_stats.update_us += duration_to_us(rerender_start.elapsed());
             scene = scene_provider.capture_scene();
             scrollbar_controller.apply_to_scene(&mut scene);
@@ -4312,7 +4328,7 @@ fn settle_element_interaction<P>(
             break;
         }
 
-        scene_provider.update(frame);
+        scene_provider.update(frame.follow_up());
         *scene = scene_provider.capture_scene();
         scrollbar_controller.apply_to_scene(scene);
         scrollbar_controller.handle_pointer(scene, mouse_position, interactive_left_down, false);
@@ -7138,6 +7154,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
+    use std::time::Duration;
 
     use cssimpler_core::fonts::{
         FontFamily, TextStyle, TextTransform, layout_text_block, register_font_file,
@@ -7153,7 +7170,7 @@ mod tests {
     };
 
     use crate::{
-        ClipRect, DirtyRenderJob, FramePaintMode, FramePaintReason, GlassRenderMode,
+        ClipRect, DirtyRenderJob, FrameInfo, FramePaintMode, FramePaintReason, GlassRenderMode,
         MouseEventKind, ViewportSize, WindowConfig, blend_pixel, build_incremental_render_jobs,
         coalesce_dirty_regions, deferred_hit_collection_visits, dirty_job_group_rows,
         dirty_regions_between_scenes, dispatch_click, dispatch_hover_transition_events,
@@ -7179,6 +7196,22 @@ mod tests {
     const FLAG_MOUSE_UP: usize = 1 << 8;
     const FLAG_CONTEXT_MENU: usize = 1 << 9;
     const FLAG_DBLCLICK: usize = 1 << 10;
+
+    #[test]
+    fn follow_up_frame_preserves_identity_without_reusing_elapsed_time() {
+        let frame = FrameInfo {
+            frame_index: 42,
+            delta: Duration::from_millis(57),
+        };
+
+        assert_eq!(
+            frame.follow_up(),
+            FrameInfo {
+                frame_index: 42,
+                delta: Duration::ZERO,
+            }
+        );
+    }
 
     #[test]
     fn window_config_opts_into_glass_capable_transparency() {

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::core::{
-    Color, LayoutBox, LengthPercentageValue, LinearRgba, RenderNode, Transform2D,
+    BoxShadow, Color, LayoutBox, LengthPercentageValue, LinearRgba, RenderNode, Transform2D,
     TransformMatrix3d, TransformOperation, TransformOrigin, TransitionPropertyName,
     TransitionStyle, TransitionTimingFunction,
 };
@@ -22,6 +22,7 @@ struct TransitionPlanNode {
     foreground: Option<TransitionTimingPlan>,
     background: Option<TransitionTimingPlan>,
     border_color: Option<TransitionTimingPlan>,
+    box_shadow: Option<TransitionTimingPlan>,
     has_sampling_work: bool,
     children: Vec<TransitionPlanNode>,
 }
@@ -78,6 +79,14 @@ impl SceneTransition {
 
     pub(crate) fn is_active(&self) -> bool {
         self.elapsed_seconds + f32::EPSILON < self.duration_seconds
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        Duration::from_secs_f32(self.elapsed_seconds)
+    }
+
+    pub(crate) fn duration(&self) -> Duration {
+        Duration::from_secs_f32(self.duration_seconds)
     }
 
     fn sample_into(&self, sampled: &mut [RenderNode]) {
@@ -195,6 +204,29 @@ fn sample_render_node_in_place(
         sampled.style.border.color = to.style.border.color;
     }
 
+    if let Some(entry) = plan.box_shadow
+        && let Some(progress) = transition_progress(entry, elapsed_seconds)
+    {
+        interpolate_box_shadow_list_into(
+            &mut sampled.style.shadows,
+            &from.style.shadows,
+            &to.style.shadows,
+            progress,
+        );
+        interpolate_box_shadow_list_into(
+            &mut sampled.style.inset_shadows,
+            &from.style.inset_shadows,
+            &to.style.inset_shadows,
+            progress,
+        );
+    } else {
+        sampled.style.shadows.clone_from(&to.style.shadows);
+        sampled
+            .style
+            .inset_shadows
+            .clone_from(&to.style.inset_shadows);
+    }
+
     sampled.text_edit = to.text_edit.clone();
 
     for (((sampled_child, from_child), to_child), child_plan) in sampled
@@ -255,11 +287,22 @@ fn build_transition_plan_node(from: &RenderNode, to: &RenderNode) -> (Transition
     let border_color = (from.style.border.color != to.style.border.color)
         .then(|| first_transition_plan_for_property(&to.transitions, "border-color"))
         .flatten();
+    let box_shadow = (from.style.shadows != to.style.shadows
+        || from.style.inset_shadows != to.style.inset_shadows)
+        .then(|| first_transition_plan_for_property(&to.transitions, "box-shadow"))
+        .flatten();
 
     let mut max_duration = 0.0_f32;
-    for plan in [layout, transform, foreground, background, border_color]
-        .into_iter()
-        .flatten()
+    for plan in [
+        layout,
+        transform,
+        foreground,
+        background,
+        border_color,
+        box_shadow,
+    ]
+    .into_iter()
+    .flatten()
     {
         max_duration = max_duration.max(plan.end_time());
     }
@@ -276,6 +319,7 @@ fn build_transition_plan_node(from: &RenderNode, to: &RenderNode) -> (Transition
         || foreground.is_some()
         || background.is_some()
         || border_color.is_some()
+        || box_shadow.is_some()
         || children.iter().any(|child| child.has_sampling_work);
 
     (
@@ -285,6 +329,7 @@ fn build_transition_plan_node(from: &RenderNode, to: &RenderNode) -> (Transition
             foreground,
             background,
             border_color,
+            box_shadow,
             has_sampling_work,
             children,
         },
@@ -457,6 +502,51 @@ fn interpolate_optional_color(from: Option<Color>, to: Option<Color>, progress: 
 
 fn interpolate_color(from: Color, to: Color, progress: f32) -> Color {
     Color::from_linear_rgba(from.to_linear_rgba().lerp(to.to_linear_rgba(), progress))
+}
+
+fn interpolate_box_shadow_list_into(
+    sampled: &mut Vec<BoxShadow>,
+    from: &[BoxShadow],
+    to: &[BoxShadow],
+    progress: f32,
+) {
+    sampled.clear();
+    if progress <= f32::EPSILON {
+        sampled.extend_from_slice(from);
+        return;
+    }
+    if progress >= 1.0 - f32::EPSILON {
+        sampled.extend_from_slice(to);
+        return;
+    }
+
+    let count = from.len().max(to.len());
+    sampled.reserve(count);
+    for index in 0..count {
+        let from_shadow = from.get(index).copied().unwrap_or_else(transparent_shadow);
+        let to_shadow = to.get(index).copied().unwrap_or_else(transparent_shadow);
+        sampled.push(interpolate_box_shadow(from_shadow, to_shadow, progress));
+    }
+}
+
+fn transparent_shadow() -> BoxShadow {
+    BoxShadow {
+        color: Color::rgba(0, 0, 0, 0),
+        offset_x: 0.0,
+        offset_y: 0.0,
+        blur_radius: 0.0,
+        spread: 0.0,
+    }
+}
+
+fn interpolate_box_shadow(from: BoxShadow, to: BoxShadow, progress: f32) -> BoxShadow {
+    BoxShadow {
+        color: interpolate_color(from.color, to.color, progress),
+        offset_x: lerp(from.offset_x, to.offset_x, progress),
+        offset_y: lerp(from.offset_y, to.offset_y, progress),
+        blur_radius: lerp(from.blur_radius, to.blur_radius, progress).max(0.0),
+        spread: lerp(from.spread, to.spread, progress),
+    }
 }
 
 fn interpolate_transform(
@@ -706,8 +796,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::core::{
-        Color, LayoutBox, LengthPercentageValue, RenderNode, Transform2D, TransformOperation,
-        TransitionPropertyName, TransitionStyle, TransitionTimingFunction, VisualStyle,
+        BoxShadow, Color, LayoutBox, LengthPercentageValue, RenderNode, Transform2D,
+        TransformOperation, TransitionPropertyName, TransitionStyle, TransitionTimingFunction,
+        VisualStyle,
     };
 
     use super::SceneTransition;
@@ -824,6 +915,57 @@ mod tests {
                 y: LengthPercentageValue::from_px(5.0),
             }]
         );
+    }
+
+    #[test]
+    fn box_shadow_transition_starts_at_previous_frame_and_uses_elapsed_time() {
+        let from_shadow = BoxShadow {
+            color: Color::rgba(5, 71, 17, 0),
+            offset_x: 40.0,
+            offset_y: 50.0,
+            blur_radius: 25.0,
+            spread: -40.0,
+        };
+        let to_shadow = BoxShadow {
+            color: Color::rgba(5, 71, 17, 31),
+            offset_x: 16.0,
+            offset_y: 30.0,
+            blur_radius: 26.0,
+            spread: -18.0,
+        };
+        let transition_style =
+            layout_transition("box-shadow", 0.5, TransitionTimingFunction::Linear);
+        let from = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 290.0, 300.0))
+                .with_style(VisualStyle {
+                    shadows: vec![from_shadow],
+                    ..VisualStyle::default()
+                })
+                .with_transitions(transition_style.clone()),
+        ];
+        let to = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 290.0, 300.0))
+                .with_style(VisualStyle {
+                    shadows: vec![to_shadow],
+                    ..VisualStyle::default()
+                })
+                .with_transitions(transition_style),
+        ];
+
+        let mut transition =
+            SceneTransition::new(from, to).expect("box-shadow transition should exist");
+        let mut sampled = transition.sample();
+        assert_eq!(sampled[0].style.shadows, vec![from_shadow]);
+
+        transition.advance(Duration::from_millis(250), &mut sampled);
+        let midpoint = sampled[0].style.shadows[0];
+        assert!((midpoint.offset_x - 28.0).abs() < 0.01);
+        assert!((midpoint.offset_y - 40.0).abs() < 0.01);
+        assert!((midpoint.blur_radius - 25.5).abs() < 0.01);
+        assert!((midpoint.spread - -29.0).abs() < 0.01);
+
+        transition.advance(Duration::from_millis(250), &mut sampled);
+        assert_eq!(sampled[0].style.shadows, vec![to_shadow]);
     }
 
     #[test]

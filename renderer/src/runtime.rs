@@ -493,7 +493,11 @@ where
             frame_index: self.frame_index,
             delta,
         };
-        let mut frame_stats = FrameTimingStats::default();
+        let mut frame_stats = FrameTimingStats {
+            frame_index: self.frame_index,
+            frame_delta_us: duration_to_us(delta),
+            ..FrameTimingStats::default()
+        };
 
         let suppress_pointer_for_system_drag = should_suspend_updates(
             self.left_down,
@@ -642,7 +646,7 @@ where
 
         if event_triggered_rerender {
             let rerender_start = Instant::now();
-            self.scene_provider.update(frame);
+            self.scene_provider.update(frame.follow_up());
             frame_stats.update_us += duration_to_us(rerender_start.elapsed());
             scene = self.scene_provider.capture_scene();
             self.scrollbar_controller.apply_to_scene(&mut scene);
