@@ -151,6 +151,13 @@ fn quantize_shadow_dimension(v: f32) -> f32 {
     (v * 2.0).round() / 2.0
 }
 
+// Blur masks are expensive to rasterize and adjacent blur values are visually
+// indistinguishable at the pixel scale. Keep the cache bounded during animated
+// box-shadow transitions instead of creating a new mask for every frame.
+fn quantize_shadow_blur(v: f32) -> f32 {
+    (v * 0.5).round() * 2.0
+}
+
 fn quantize_shadow_radius(r: CornerRadius) -> CornerRadius {
     CornerRadius {
         top_left: quantize_shadow_dimension(r.top_left),
@@ -197,7 +204,7 @@ pub(crate) fn cached_shadow_mask(
     radius: CornerRadius,
     blur_radius: f32,
 ) -> (Arc<ShadowMask>, i32, i32) {
-    let blur_radius = quantize_shadow_dimension(blur_radius.max(0.0));
+    let blur_radius = quantize_shadow_blur(blur_radius.max(0.0));
     let radius = quantize_shadow_radius(radius);
     let (relative_layout, offset_x, offset_y) = split_layout_for_shadow_cache(layout);
     let key = shadow_mask_cache_key(relative_layout, radius, blur_radius);
