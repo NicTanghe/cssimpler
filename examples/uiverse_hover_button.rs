@@ -21,6 +21,7 @@ pub struct HoverDemoState {
     pub last_frame_ms: u128,
     pub log_elapsed: Duration,
     pub last_logged_frame: u64,
+    pub last_spike_frame: u64,
     pub hud_elapsed: Duration,
     pub hud_frame_ms: u128,
     pub hud_renderer_stats: FrameTimingStats,
@@ -71,6 +72,28 @@ pub fn maybe_log_perf(state: &mut HoverDemoState) {
         return;
     }
 
+    // Keep rare tail-latency events even when the normal one-second sampling
+    // window would hide them.
+    if state.renderer_stats.total_us >= 45_000
+        && state.renderer_stats.frame_index != state.last_spike_frame
+    {
+        state.last_spike_frame = state.renderer_stats.frame_index;
+        eprintln!(
+            "[uiverse_hover][spike] frame={} dt={} total={} paint={} workers={} dirty={}r/{}j damage={} shadow_cache={} shadow_raster={} shadow_draw={}",
+            state.renderer_stats.frame_index,
+            format_us(state.renderer_stats.frame_delta_us),
+            format_us(state.renderer_stats.total_us),
+            format_us(state.renderer_stats.paint_us),
+            state.renderer_stats.render_workers,
+            state.renderer_stats.dirty_regions,
+            state.renderer_stats.dirty_jobs,
+            format_pixels(state.renderer_stats.damage_pixels),
+            state.renderer_stats.shadow_cache_misses,
+            format_us(state.renderer_stats.shadow_raster_us as u64),
+            format_us(state.renderer_stats.shadow_draw_us as u64),
+        );
+    }
+
     if state.log_elapsed < PERF_LOG_INTERVAL {
         return;
     }
@@ -87,7 +110,7 @@ pub fn maybe_log_perf(state: &mut HoverDemoState) {
     };
 
     eprintln!(
-        "[uiverse_hover] frame={} fps={:<2} dt={:>3}ms update={:>7} tree={:>7} prep={:>7} paint={:>7} present={:>7} total={:>7} anim={} mode={} reason={} dirty={}r/{}j damage={} painted={} passes={} workers={}",
+        "[uiverse_hover] frame={} fps={:<2} dt={:>3}ms update={:>7} tree={:>7} prep={:>7} paint={:>7} present={:>7} total={:>7} anim={} mode={} reason={} dirty={}r/{}j damage={} painted={} passes={} workers={} shadow_cache={} shadow_raster={:>7} shadow_draw={:>7}",
         state.renderer_stats.frame_index,
         fps,
         state.last_frame_ms,
@@ -106,6 +129,9 @@ pub fn maybe_log_perf(state: &mut HoverDemoState) {
         format_pixels(state.renderer_stats.painted_pixels),
         state.renderer_stats.scene_passes,
         state.renderer_stats.render_workers,
+        state.renderer_stats.shadow_cache_misses,
+        format_us(state.renderer_stats.shadow_raster_us as u64),
+        format_us(state.renderer_stats.shadow_draw_us as u64),
     );
 }
 

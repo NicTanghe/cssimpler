@@ -3,6 +3,8 @@ use std::hash::Hash;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use cssimpler_core::{Color, CornerRadius, LayoutBox, TextStrokeStyle};
 
@@ -17,6 +19,23 @@ use super::{
 };
 
 const MAX_SHADOW_MASK_CACHE_ENTRIES: usize = 1024;
+static SHADOW_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+static SHADOW_CACHE_RASTER_US: AtomicUsize = AtomicUsize::new(0);
+static SHADOW_DRAW_US: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn reset_frame_shadow_stats() {
+    SHADOW_CACHE_MISSES.store(0, Ordering::Relaxed);
+    SHADOW_CACHE_RASTER_US.store(0, Ordering::Relaxed);
+    SHADOW_DRAW_US.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn take_frame_shadow_stats() -> (usize, usize, usize) {
+    (
+        SHADOW_CACHE_MISSES.swap(0, Ordering::Relaxed),
+        SHADOW_CACHE_RASTER_US.swap(0, Ordering::Relaxed),
+        SHADOW_DRAW_US.swap(0, Ordering::Relaxed),
+    )
+}
 
 #[derive(Clone)]
 pub(crate) struct ShadowMask {
@@ -218,7 +237,13 @@ pub(crate) fn cached_shadow_mask(
         }
     }
 
+    SHADOW_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    let raster_start = Instant::now();
     let mask = Arc::new(rasterize_shadow_mask(relative_layout, radius, blur_radius));
+    SHADOW_CACHE_RASTER_US.fetch_add(
+        raster_start.elapsed().as_micros().min(usize::MAX as u128) as usize,
+        Ordering::Relaxed,
+    );
     let mut cache = shadow_mask_cache()
         .write()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -245,6 +270,7 @@ pub(crate) fn draw_shadow(
     shadow: cssimpler_core::BoxShadow,
     clip: ClipRect,
 ) {
+    let draw_start = Instant::now();
     if shadow.color.a == 0 {
         return;
     }
@@ -283,6 +309,10 @@ pub(crate) fn draw_shadow(
         offset_x,
         offset_y,
         clip,
+    );
+    SHADOW_DRAW_US.fetch_add(
+        draw_start.elapsed().as_micros().min(usize::MAX as u128) as usize,
+        Ordering::Relaxed,
     );
 }
 

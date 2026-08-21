@@ -699,6 +699,7 @@ where
             resized,
         ) {
             let paint_start = Instant::now();
+            crate::shadow::reset_frame_shadow_stats();
             let paint_stats = if use_alpha_buffer {
                 render_to_buffer_internal_from_roots_with_alpha(
                     &scene,
@@ -748,6 +749,11 @@ where
             frame_stats.scene_passes = paint_stats.scene_passes;
             frame_stats.paint_mode = paint_stats.mode;
             frame_stats.paint_reason = paint_stats.reason;
+            let (shadow_cache_misses, shadow_raster_us, shadow_draw_us) =
+                crate::shadow::take_frame_shadow_stats();
+            frame_stats.shadow_cache_misses = shadow_cache_misses;
+            frame_stats.shadow_raster_us = shadow_raster_us;
+            frame_stats.shadow_draw_us = shadow_draw_us;
 
             let present_start = Instant::now();
             redraw_auto_scroll_indicator_regions(

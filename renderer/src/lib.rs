@@ -91,9 +91,13 @@ const MAX_PROMOTED_SURFACE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_TEMP_BYTES: usize = 8 * 1024 * 1024;
 const MIN_PARALLEL_RENDER_PIXELS: usize = 640 * 480;
 const MIN_INCREMENTAL_PIXELS_PER_WORKER: usize = 200 * 200;
-const MIN_INCREMENTAL_JOBS_PER_WORKER: usize = 3;
+// Five medium-sized damage bands are common for animated controls. Let three
+// persistent workers participate instead of leaving the main thread waiting
+// on two long-running bands.
+const MIN_INCREMENTAL_JOBS_PER_WORKER: usize = 2;
 const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 80;
 const MAX_RENDER_WORKERS: usize = 12;
+const MAX_FULL_REDRAW_WORKERS: usize = 7;
 const SCENE_TRAVERSAL_COST_PER_NODE: usize = 24;
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 const MAX_SUBTREE_SURFACE_CACHE_ENTRIES: usize = 64;
@@ -135,6 +139,9 @@ pub struct FrameTimingStats {
     pub scene_passes: usize,
     pub paint_mode: FramePaintMode,
     pub paint_reason: FramePaintReason,
+    pub shadow_cache_misses: usize,
+    pub shadow_raster_us: usize,
+    pub shadow_draw_us: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -272,13 +279,36 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         }
 
         if background_count > 0 {
-            let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
-            while self.shared.active_tasks.load(AtomicOrdering::Acquire) > 0 {
-                state = self
+            loop {
+                let task = {
+                    let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+                    loop {
+                        if let Some(task) = state.tasks.pop() {
+                            break Some(task);
+                        }
+                        if self.shared.active_tasks.load(AtomicOrdering::Acquire) == 0 {
+                            break None;
+                        }
+                        state = self
+                            .shared
+                            .done
+                            .wait(state)
+                            .unwrap_or_else(|p| p.into_inner());
+                    }
+                };
+
+                let Some(task) = task else {
+                    break;
+                };
+                task();
+                if self
                     .shared
-                    .done
-                    .wait(state)
-                    .unwrap_or_else(|p| p.into_inner());
+                    .active_tasks
+                    .fetch_sub(1, AtomicOrdering::AcqRel)
+                    == 1
+                {
+                    self.shared.done.notify_all();
+                }
             }
         }
     }
@@ -6670,6 +6700,7 @@ fn full_redraw_worker_count(width: usize, height: usize) -> usize {
         .map(usize::from)
         .unwrap_or(1)
         .min(MAX_RENDER_WORKERS)
+        .min(MAX_FULL_REDRAW_WORKERS)
         .min(max_workers_from_rows)
         .max(1)
 }
@@ -7171,15 +7202,16 @@ mod tests {
 
     use crate::{
         ClipRect, DirtyRenderJob, FrameInfo, FramePaintMode, FramePaintReason, GlassRenderMode,
-        MouseEventKind, ViewportSize, WindowConfig, blend_pixel, build_incremental_render_jobs,
-        coalesce_dirty_regions, deferred_hit_collection_visits, dirty_job_group_rows,
-        dirty_regions_between_scenes, dispatch_click, dispatch_hover_transition_events,
-        dispatch_mouse_event, distribute_dirty_render_jobs, drawable_viewport_size,
-        hit_test_element_path, incremental_scene_passes_for_full_redraw_heuristic, is_transparent,
-        pack_rgb, pack_rgba, render_scene_update, render_scene_update_internal_from_roots,
-        render_to_buffer, reset_deferred_hit_collection_visits, resize_buffer,
-        scenes_match_visuals, should_full_redraw, should_present_frame, should_present_scene,
-        should_suspend_updates, unpack_alpha8, unpack_rgb,
+        MouseEventKind, ViewportSize, WindowConfig, WorkerPool, blend_pixel,
+        build_incremental_render_jobs, coalesce_dirty_regions, deferred_hit_collection_visits,
+        dirty_job_group_rows, dirty_regions_between_scenes, dispatch_click,
+        dispatch_hover_transition_events, dispatch_mouse_event, distribute_dirty_render_jobs,
+        drawable_viewport_size, hit_test_element_path,
+        incremental_scene_passes_for_full_redraw_heuristic, is_transparent, pack_rgb, pack_rgba,
+        render_scene_update, render_scene_update_internal_from_roots, render_to_buffer,
+        reset_deferred_hit_collection_visits, resize_buffer, scenes_match_visuals,
+        should_full_redraw, should_present_frame, should_present_scene, should_suspend_updates,
+        unpack_alpha8, unpack_rgb,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -7196,6 +7228,22 @@ mod tests {
     const FLAG_MOUSE_UP: usize = 1 << 8;
     const FLAG_CONTEXT_MENU: usize = 1 << 9;
     const FLAG_DBLCLICK: usize = 1 << 10;
+
+    #[test]
+    fn worker_pool_waiting_thread_executes_queued_tasks() {
+        let pool = WorkerPool::new(0);
+        let completed = AtomicUsize::new(0);
+
+        pool.scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    completed.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+        });
+
+        assert_eq!(completed.load(Ordering::Relaxed), 4);
+    }
 
     #[test]
     fn follow_up_frame_preserves_identity_without_reusing_elapsed_time() {
