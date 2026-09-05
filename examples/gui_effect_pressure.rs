@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use cssimpler::app::{App, Invalidation, Refresh, RenderMode, RuntimeStats, latest_runtime_stats};
+use cssimpler::app::{App, Invalidation, Refresh, RuntimeStats, latest_runtime_stats};
 use cssimpler::core::Node;
 use cssimpler::renderer::{
     FrameInfo, FramePaintMode, FramePaintReason, FrameTimingStats, WindowConfig,
@@ -35,6 +35,7 @@ const MANUAL_ACTION_MASK: u64 = ACTION_ADD_TILES
 const PHASE_COUNT: usize = 3;
 const PHASE_STEP_INTERVAL: Duration = Duration::from_millis(120);
 const PERF_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const HUD_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 pub const MAX_TILE_COUNT: usize = 48;
 const ACTIVE_PODS_PER_ANIMATED_TILE: usize = 2;
 const DEFAULT_ANIMATED_TILE_WINDOW: usize = 2;
@@ -66,6 +67,10 @@ pub struct EffectStressState {
     phase_elapsed: Duration,
     animation_band_start: usize,
     log_elapsed: Duration,
+    hud_elapsed: Duration,
+    hud_frame_ms: u128,
+    hud_renderer_stats: FrameTimingStats,
+    hud_app_stats: RuntimeStats,
     renderer_stats: FrameTimingStats,
     app_stats: RuntimeStats,
     baseline_harness: Option<BaselineHarness>,
@@ -86,6 +91,10 @@ impl Default for EffectStressState {
             phase_elapsed: Duration::ZERO,
             animation_band_start: 0,
             log_elapsed: Duration::ZERO,
+            hud_elapsed: Duration::ZERO,
+            hud_frame_ms: 0,
+            hud_renderer_stats: FrameTimingStats::default(),
+            hud_app_stats: RuntimeStats::default(),
             renderer_stats: FrameTimingStats::default(),
             app_stats: RuntimeStats::default(),
             baseline_harness: None,
@@ -253,7 +262,7 @@ fn main() -> Result<()> {
     }
 
     App::new(EffectStressState::default(), stylesheet(), update, build_ui)
-        .with_render_mode(RenderMode::EveryFrame)
+        .with_continuous_updates(true)
         .run(config)
         .map_err(Into::into)
 }
@@ -272,6 +281,15 @@ pub fn apply_frame(state: &mut EffectStressState, frame: FrameInfo, actions: u64
     state.renderer_stats = latest_frame_timing_stats();
     state.app_stats = latest_runtime_stats();
     state.log_elapsed += frame.delta;
+    state.hud_elapsed += frame.delta;
+
+    let refresh_hud = state.hud_elapsed >= HUD_UPDATE_INTERVAL || state.frame_index <= 1;
+    if refresh_hud && state.baseline_harness.is_none() {
+        state.hud_elapsed = Duration::ZERO;
+        state.hud_frame_ms = state.last_frame_ms;
+        state.hud_renderer_stats = state.renderer_stats;
+        state.hud_app_stats = state.app_stats.clone();
+    }
 
     if actions & ACTION_RESET != 0 {
         *state = EffectStressState {
@@ -369,14 +387,14 @@ pub fn apply_frame(state: &mut EffectStressState, frame: FrameInfo, actions: u64
     invalidation.max(animation_invalidation(state))
 }
 
-fn baseline_autostart_requested() -> bool {
+pub fn baseline_autostart_requested() -> bool {
     matches!(
         std::env::var("CSSIMPLER_PRESSURE_BASELINE").ok().as_deref(),
         Some("1" | "true" | "TRUE" | "yes" | "YES")
     )
 }
 
-fn start_baseline_harness(state: &mut EffectStressState) -> Invalidation {
+pub fn start_baseline_harness(state: &mut EffectStressState) -> Invalidation {
     let harness = BaselineHarness::new();
     let invalidation = apply_baseline_scenario(state, harness.scenario);
     eprintln!(
@@ -580,23 +598,23 @@ fn build_metric_row(state: &EffectStressState) -> Node {
             {stat_chip("animation", animation_label(state).to_string())}
             {stat_chip("phase", phase_label(state.phase).to_string())}
             {stat_chip("step", format!("{} ms", PHASE_STEP_INTERVAL.as_millis()))}
-            {stat_chip("dt", format!("{} ms", state.last_frame_ms))}
-            {stat_chip("app view", format_us(state.app_stats.view_us))}
-            {stat_chip("tree build", format_us(state.app_stats.render_tree_us))}
-            {stat_chip("scene swap", format_us(state.app_stats.scene_swap_us))}
-            {stat_chip("transition", format_us(state.app_stats.transition_us))}
-            {stat_chip("scene prep", format_us(state.renderer_stats.scene_prep_us))}
-            {stat_chip("paint", format_us(state.renderer_stats.paint_us))}
-            {stat_chip("present", format_us(state.renderer_stats.present_us))}
-            {stat_chip("frame total", format_us(state.renderer_stats.total_us))}
-            {stat_chip("paint mode", paint_mode_label(state.renderer_stats))}
-            {stat_chip("paint reason", paint_reason_label(state.renderer_stats.paint_reason).to_string())}
-            {stat_chip("dirty regions", state.renderer_stats.dirty_regions.to_string())}
-            {stat_chip("dirty jobs", state.renderer_stats.dirty_jobs.to_string())}
-            {stat_chip("damage", format_pixels(state.renderer_stats.damage_pixels))}
-            {stat_chip("painted", format_pixels(state.renderer_stats.painted_pixels))}
-            {stat_chip("scene passes", state.renderer_stats.scene_passes.to_string())}
-            {stat_chip("workers", state.renderer_stats.render_workers.to_string())}
+            {stat_chip("dt", format!("{} ms", state.hud_frame_ms))}
+            {stat_chip("app view", format_us(state.hud_app_stats.view_us))}
+            {stat_chip("tree build", format_us(state.hud_app_stats.render_tree_us))}
+            {stat_chip("scene swap", format_us(state.hud_app_stats.scene_swap_us))}
+            {stat_chip("transition", format_us(state.hud_app_stats.transition_us))}
+            {stat_chip("scene prep", format_us(state.hud_renderer_stats.scene_prep_us))}
+            {stat_chip("paint", format_us(state.hud_renderer_stats.paint_us))}
+            {stat_chip("present", format_us(state.hud_renderer_stats.present_us))}
+            {stat_chip("frame total", format_us(state.hud_renderer_stats.total_us))}
+            {stat_chip("paint mode", paint_mode_label(state.hud_renderer_stats))}
+            {stat_chip("paint reason", paint_reason_label(state.hud_renderer_stats.paint_reason).to_string())}
+            {stat_chip("dirty regions", state.hud_renderer_stats.dirty_regions.to_string())}
+            {stat_chip("dirty jobs", state.hud_renderer_stats.dirty_jobs.to_string())}
+            {stat_chip("damage", format_pixels(state.hud_renderer_stats.damage_pixels))}
+            {stat_chip("painted", format_pixels(state.hud_renderer_stats.painted_pixels))}
+            {stat_chip("scene passes", state.hud_renderer_stats.scene_passes.to_string())}
+            {stat_chip("workers", state.hud_renderer_stats.render_workers.to_string())}
             {stat_chip("baseline", baseline_status_label(state))}
         </div>
     }
@@ -877,24 +895,7 @@ fn format_pixels(pixels: usize) -> String {
 
 fn baseline_status_label(state: &EffectStressState) -> String {
     if let Some(harness) = &state.baseline_harness {
-        if harness.warmup_frames_remaining > 0 {
-            let warmed = harness
-                .warmup_frames
-                .saturating_sub(harness.warmup_frames_remaining);
-            format!(
-                "{} warm {}/{}",
-                harness.scenario.label(),
-                warmed,
-                harness.warmup_frames
-            )
-        } else {
-            format!(
-                "{} sample {}/{}",
-                harness.scenario.label(),
-                harness.sample_frames_collected,
-                harness.sample_frames
-            )
-        }
+        format!("{} (benchmarking)", harness.scenario.label())
     } else if let Some(summary) = &state.last_baseline_summary {
         let avg_paint_us = summary
             .scenarios
@@ -1158,6 +1159,12 @@ pub fn tile_fragment_id(tile_index: usize) -> String {
     format!("tile-{tile_index:02}")
 }
 
+fn hud_timing_changed(previous: &EffectStressState, next: &EffectStressState) -> bool {
+    previous.hud_frame_ms != next.hud_frame_ms
+        || previous.hud_renderer_stats != next.hud_renderer_stats
+        || previous.hud_app_stats != next.hud_app_stats
+}
+
 pub fn normal_app_refresh(
     previous: &EffectStressState,
     next: &EffectStressState,
@@ -1190,7 +1197,12 @@ pub fn fragment_refresh(
     match invalidation {
         Invalidation::Clean => Refresh::clean(),
         Invalidation::Paint => {
-            let mut ids = vec!["hero".to_string()];
+            let hero_changed = hud_timing_changed(previous, next);
+            let mut ids = if hero_changed {
+                vec!["hero".to_string()]
+            } else {
+                Vec::new()
+            };
             for tile_index in active_tile_indices(previous)
                 .into_iter()
                 .chain(active_tile_indices(next))

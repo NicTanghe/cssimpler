@@ -510,7 +510,16 @@ where
     }
 
     fn refresh_scene(&mut self, stats: &mut RuntimeStats) {
+        if self.cached_scene.is_some()
+            && !matches!(self.render_mode, RenderMode::EveryFrame)
+            && !self.pending_refresh.needs_rerender()
+        {
+            self.pending_refresh = Refresh::clean();
+            return;
+        }
+
         let must_full_refresh = self.cached_scene.is_none()
+            || matches!(self.render_mode, RenderMode::EveryFrame)
             || matches!(self.pending_refresh.target, RefreshTarget::Full)
             || !matches!(self.pending_refresh.invalidation, Invalidation::Paint);
 
@@ -866,6 +875,7 @@ pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     runtime_world: RuntimeWorld,
     text_inputs: NativeTextInputs,
     render_mode: RenderMode,
+    continuous_updates: bool,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
     scene_transition: Option<SceneTransition>,
@@ -892,6 +902,7 @@ where
             runtime_world: RuntimeWorld::default(),
             text_inputs: NativeTextInputs::default(),
             render_mode: RenderMode::OnInvalidation,
+            continuous_updates: false,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
             scene_transition: None,
@@ -902,6 +913,13 @@ where
 
     pub fn with_render_mode(mut self, render_mode: RenderMode) -> Self {
         self.render_mode = render_mode;
+        self
+    }
+
+    /// Keep invoking the update callback at the configured frame cadence while
+    /// still reusing clean scenes in [`RenderMode::OnInvalidation`].
+    pub fn with_continuous_updates(mut self, enabled: bool) -> Self {
+        self.continuous_updates = enabled;
         self
     }
 
@@ -1240,9 +1258,10 @@ where
     }
 
     fn redraw_schedule(&self) -> renderer::RedrawSchedule {
-        match self.render_mode {
-            RenderMode::EveryFrame => renderer::RedrawSchedule::EveryFrame,
-            RenderMode::OnInvalidation => renderer::RedrawSchedule::OnInvalidation,
+        if self.continuous_updates || matches!(self.render_mode, RenderMode::EveryFrame) {
+            renderer::RedrawSchedule::EveryFrame
+        } else {
+            renderer::RedrawSchedule::OnInvalidation
         }
     }
 

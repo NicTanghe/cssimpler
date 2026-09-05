@@ -91,7 +91,7 @@ const MAX_SUBTREE_SURFACE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_TEMP_BYTES: usize = 8 * 1024 * 1024;
 const MIN_PARALLEL_RENDER_PIXELS: usize = 640 * 480;
-const MIN_PARALLEL_INCREMENTAL_PIXELS: usize = 200 * 200;
+const MIN_PARALLEL_INCREMENTAL_PIXELS: usize = 128 * 128;
 const TARGET_INCREMENTAL_PIXELS_PER_WORKER: usize = 128 * 128;
 // Full-redraw selection models traversal work, not the number of tasks used to
 // smooth scheduling tails. Keep that estimate conservative and stable when
@@ -11561,7 +11561,7 @@ mod tests {
                     x1: 120.0,
                     y1: 80.0,
                 },
-                pixel_count: 9_600,
+                pixel_count: 2_400,
             };
             4
         ];

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use cssimpler_core::{Color, CornerRadius, LayoutBox, TextStrokeStyle};
@@ -75,7 +75,6 @@ struct ShadowMaskCacheKey {
 struct ShadowMaskCache {
     next_use: u64,
     masks: HashMap<ShadowMaskCacheKey, CacheEntry<Arc<ShadowMask>>>,
-    in_flight: HashSet<ShadowMaskCacheKey>,
 }
 
 #[derive(Clone)]
@@ -88,19 +87,6 @@ fn next_cache_use(next_use: &mut u64) -> u64 {
     let last_used = *next_use;
     *next_use = next_use.saturating_add(1);
     last_used
-}
-
-fn cached_cache_entry<K, V>(
-    entries: &mut HashMap<K, CacheEntry<Arc<V>>>,
-    key: &K,
-    last_used: u64,
-) -> Option<Arc<V>>
-where
-    K: Eq + Hash,
-{
-    let entry = entries.get_mut(key)?;
-    entry.last_used = last_used;
-    Some(entry.value.clone())
 }
 
 fn insert_lru_cache_entry<K, V>(
@@ -140,27 +126,34 @@ where
 }
 
 struct ShadowMaskCacheState {
-    cache: Mutex<ShadowMaskCache>,
+    cache: RwLock<ShadowMaskCache>,
+    in_flight: Mutex<HashSet<ShadowMaskCacheKey>>,
     condvar: Condvar,
 }
 
 fn shadow_mask_cache() -> &'static ShadowMaskCacheState {
     static CACHE: OnceLock<ShadowMaskCacheState> = OnceLock::new();
     CACHE.get_or_init(|| ShadowMaskCacheState {
-        cache: Mutex::new(ShadowMaskCache::default()),
+        cache: RwLock::new(ShadowMaskCache::default()),
+        in_flight: Mutex::new(HashSet::new()),
         condvar: Condvar::new(),
     })
 }
 
 #[cfg(test)]
 pub(crate) fn clear_shadow_mask_cache_for_tests() {
-    let mut cache = shadow_mask_cache()
+    let state = shadow_mask_cache();
+    let mut cache = state
         .cache
-        .lock()
+        .write()
         .unwrap_or_else(|poison| poison.into_inner());
     cache.next_use = 0;
     cache.masks.clear();
-    cache.in_flight.clear();
+    let mut in_flight = state
+        .in_flight
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    in_flight.clear();
 }
 
 #[cfg(test)]
@@ -238,21 +231,34 @@ pub(crate) fn cached_shadow_mask(
     let key = shadow_mask_cache_key(relative_layout, radius, blur_radius);
 
     let state = shadow_mask_cache();
-    let mut cache = state.cache.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Fast-path: read lock for cache hits (eliminates mutex contention across worker threads)
+    {
+        let cache = state.cache.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = cache.masks.get(&key) {
+            return (entry.value.clone(), offset_x, offset_y);
+        }
+    }
+
+    // Slow-path: coordinate in-flight rasterization on cache miss
+    let mut in_flight = state.in_flight.lock().unwrap_or_else(|p| p.into_inner());
     loop {
-        let last_used = next_cache_use(&mut cache.next_use);
-        if let Some(existing) = cached_cache_entry(&mut cache.masks, &key, last_used) {
-            return (existing, offset_x, offset_y);
+        // Re-check under read lock in case another worker just finished rasterizing
+        {
+            let cache = state.cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = cache.masks.get(&key) {
+                return (entry.value.clone(), offset_x, offset_y);
+            }
         }
 
-        if !cache.in_flight.contains(&key) {
-            cache.in_flight.insert(key.clone());
+        if !in_flight.contains(&key) {
+            in_flight.insert(key.clone());
             break;
         }
 
-        cache = state.condvar.wait(cache).unwrap_or_else(|p| p.into_inner());
+        in_flight = state.condvar.wait(in_flight).unwrap_or_else(|p| p.into_inner());
     }
-    drop(cache);
+    drop(in_flight);
 
     SHADOW_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
     let raster_start = Instant::now();
@@ -262,17 +268,22 @@ pub(crate) fn cached_shadow_mask(
         Ordering::Relaxed,
     );
 
-    let mut cache = state.cache.lock().unwrap_or_else(|p| p.into_inner());
-    cache.in_flight.remove(&key);
+    let mut cache = state.cache.write().unwrap_or_else(|p| p.into_inner());
     let last_used = next_cache_use(&mut cache.next_use);
     insert_lru_cache_entry(
         &mut cache.masks,
-        key,
+        key.clone(),
         mask.clone(),
         last_used,
         MAX_SHADOW_MASK_CACHE_ENTRIES,
     );
+    drop(cache);
+
+    let mut in_flight = state.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+    in_flight.remove(&key);
     state.condvar.notify_all();
+    drop(in_flight);
+
     (mask, offset_x, offset_y)
 }
 
