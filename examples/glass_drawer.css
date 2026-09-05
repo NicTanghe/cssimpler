@@ -3,7 +3,8 @@
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: rgb(12, 15, 20);
+  native-material: glass;
+  glass-tint: rgba(12, 15, 20, 0.60);
   color: rgb(222, 231, 238);
 }
 

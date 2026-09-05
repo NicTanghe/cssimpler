@@ -427,6 +427,7 @@ fn worker_loop(shared: Arc<WorkerPoolShared>) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum GlassRenderMode {
     Native,
     NativeWithTint,

@@ -17,6 +17,10 @@ pub(crate) fn uses_custom_presenter() -> bool {
     platform::uses_custom_presenter()
 }
 
+pub(crate) fn glass_render_mode() -> crate::GlassRenderMode {
+    platform::glass_render_mode()
+}
+
 pub(crate) fn present(
     window: &Window,
     buffer: &[u32],
@@ -48,6 +52,10 @@ mod platform {
 
     pub(super) fn uses_custom_presenter() -> bool {
         false
+    }
+
+    pub(super) fn glass_render_mode() -> crate::GlassRenderMode {
+        crate::GlassRenderMode::Native
     }
 
     pub(super) fn present(
@@ -230,6 +238,10 @@ mod platform {
 
     pub(super) fn uses_custom_presenter() -> bool {
         true
+    }
+
+    pub(super) fn glass_render_mode() -> crate::GlassRenderMode {
+        crate::GlassRenderMode::NativeWithTint
     }
 
     pub(super) fn present(
@@ -567,10 +579,55 @@ mod platform {
     }
 }
 
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "macos")))]
 mod platform {
     use cssimpler_core::Color;
     use winit::window::Window;
+
+    use crate::GlassRenderMode;
+
+    pub(super) fn apply(_window: &Window, _tint: Color) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    pub(super) fn clear(_window: &Window) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub(super) fn requires_initial_transparency() -> bool {
+        true
+    }
+
+    pub(super) fn uses_custom_presenter() -> bool {
+        false
+    }
+
+    pub(super) fn glass_render_mode() -> GlassRenderMode {
+        GlassRenderMode::NativeWithTint
+    }
+
+    pub(super) fn present(
+        _window: &Window,
+        _buffer: &[u32],
+        _alpha: Option<&[u8]>,
+        _width: usize,
+        _height: usize,
+        _scale_factor: f64,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
+#[cfg(all(
+    not(target_os = "windows"),
+    not(target_os = "macos"),
+    not(all(unix, not(target_os = "macos")))
+))]
+mod platform {
+    use cssimpler_core::Color;
+    use winit::window::Window;
+
+    use crate::GlassRenderMode;
 
     pub(super) fn apply(_window: &Window, _tint: Color) -> Result<bool, String> {
         Ok(false)
@@ -588,6 +645,10 @@ mod platform {
         false
     }
 
+    pub(super) fn glass_render_mode() -> GlassRenderMode {
+        GlassRenderMode::Native
+    }
+
     pub(super) fn present(
         _window: &Window,
         _buffer: &[u32],
@@ -599,3 +660,33 @@ mod platform {
         Ok(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_glass_configuration() {
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+        assert!(requires_initial_transparency());
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(glass_render_mode(), crate::GlassRenderMode::NativeWithTint);
+            assert!(!uses_custom_presenter());
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(glass_render_mode(), crate::GlassRenderMode::Native);
+            assert!(!uses_custom_presenter());
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(glass_render_mode(), crate::GlassRenderMode::NativeWithTint);
+            assert!(uses_custom_presenter());
+        }
+    }
+}
+

@@ -941,11 +941,7 @@ where
 
     fn glass_render_mode(&self) -> GlassRenderMode {
         if self.native_glass_active {
-            if native_glass::uses_custom_presenter() {
-                GlassRenderMode::NativeWithTint
-            } else {
-                GlassRenderMode::Native
-            }
+            native_glass::glass_render_mode()
         } else {
             GlassRenderMode::Fallback
         }
@@ -1836,13 +1832,21 @@ mod tests {
     }
 
     #[test]
-    fn glass_capable_windows_and_macos_start_transparent_when_required_by_native_backend() {
+    fn glass_capable_platforms_start_transparent_when_required_by_native_backend() {
         let config = WindowConfig::new("glass", 320, 180).with_glass_capable(true);
 
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            all(unix, not(target_os = "macos"))
+        ))]
         assert!(window_uses_native_glass(&config));
 
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            all(unix, not(target_os = "macos"))
+        )))]
         assert!(!window_uses_native_glass(&config));
     }
 
