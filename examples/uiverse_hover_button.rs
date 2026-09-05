@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Result;
-use cssimpler::app::{App, Invalidation, RuntimeStats, latest_runtime_stats};
+use cssimpler::app::{App, Invalidation, Refresh, RuntimeStats, latest_runtime_stats};
 use cssimpler::core::Node;
 use cssimpler::renderer::{
     FrameInfo, FramePaintMode, FramePaintReason, FrameTimingStats, WindowConfig,
@@ -22,6 +22,8 @@ pub struct HoverDemoState {
     pub log_elapsed: Duration,
     pub last_logged_frame: u64,
     pub last_spike_frame: u64,
+    pub last_animation_stall_frame: u64,
+    pub last_deferred_frame: u64,
     pub hud_elapsed: Duration,
     pub hud_frame_ms: u128,
     pub hud_renderer_stats: FrameTimingStats,
@@ -34,11 +36,12 @@ fn main() -> Result<()> {
     let config = WindowConfig::new("cssimpler / uiverse hover button", 1440, 920);
 
     App::new(HoverDemoState::default(), stylesheet(), update, build_ui)
+        .with_continuous_updates(true)
         .run(config)
         .map_err(Into::into)
 }
 
-fn update(state: &mut HoverDemoState, frame: FrameInfo) -> Invalidation {
+fn update(state: &mut HoverDemoState, frame: FrameInfo) -> Refresh {
     state.frame_index = frame.frame_index;
     state.renderer_stats = latest_frame_timing_stats();
     state.app_stats = latest_runtime_stats();
@@ -50,7 +53,9 @@ fn update(state: &mut HoverDemoState, frame: FrameInfo) -> Invalidation {
     state.log_elapsed += frame.delta;
     state.hud_elapsed += frame.delta;
 
-    if state.hud_elapsed >= HUD_UPDATE_INTERVAL || state.frame_index <= 1 {
+    let refresh_hud = (state.hud_elapsed >= HUD_UPDATE_INTERVAL || state.frame_index <= 1)
+        && !state.app_stats.transition_active;
+    if refresh_hud {
         state.hud_elapsed = Duration::ZERO;
         state.hud_frame_ms = state.last_frame_ms;
         state.hud_renderer_stats = state.renderer_stats;
@@ -58,12 +63,31 @@ fn update(state: &mut HoverDemoState, frame: FrameInfo) -> Invalidation {
     }
 
     maybe_log_perf(state);
-    Invalidation::Clean
+    if refresh_hud {
+        Refresh::fragment("hud", Invalidation::Paint)
+    } else {
+        Refresh::clean()
+    }
 }
 
 pub fn maybe_log_perf(state: &mut HoverDemoState) {
+    if state.renderer_stats.transition_deferred
+        && state.renderer_stats.frame_index != state.last_deferred_frame
+    {
+        state.last_deferred_frame = state.renderer_stats.frame_index;
+        eprintln!(
+            "[uiverse_hover][deferred] frame={} dt={} anim_delta={} elapsed={} duration={} reason=zero_progress_transition",
+            state.renderer_stats.frame_index,
+            format_us(state.renderer_stats.frame_delta_us),
+            format_us(state.app_stats.transition_delta_us),
+            format_us(state.app_stats.transition_elapsed_us),
+            format_us(state.app_stats.transition_duration_us),
+        );
+    }
+
     if state.renderer_stats.paint_mode == FramePaintMode::Idle
         && state.renderer_stats.painted_pixels == 0
+        && !state.app_stats.transition_active
     {
         return;
     }
@@ -79,18 +103,49 @@ pub fn maybe_log_perf(state: &mut HoverDemoState) {
     {
         state.last_spike_frame = state.renderer_stats.frame_index;
         eprintln!(
-            "[uiverse_hover][spike] frame={} dt={} total={} paint={} workers={} dirty={}r/{}j damage={} shadow_cache={} shadow_raster={} shadow_draw={}",
+            "[uiverse_hover][spike] frame={} dt={} total={} paint={} mode={} reason={} viewport={}x{} resized={} workers={} passes={} helped={} wait={} main_task={} slowest_task={} dirty={}r/{}j damage={} shadow_cache={} shadow_raster={} shadow_draw={} text_raster={}/{} text_effect={}/{}",
             state.renderer_stats.frame_index,
             format_us(state.renderer_stats.frame_delta_us),
             format_us(state.renderer_stats.total_us),
             format_us(state.renderer_stats.paint_us),
+            paint_mode_label(state.renderer_stats),
+            paint_reason_label(state.renderer_stats.paint_reason),
+            state.renderer_stats.viewport_width,
+            state.renderer_stats.viewport_height,
+            state.renderer_stats.buffer_resized,
             state.renderer_stats.render_workers,
+            state.renderer_stats.scene_passes,
+            state.renderer_stats.worker_main_helped,
+            format_us(state.renderer_stats.worker_wait_us as u64),
+            format_us(state.renderer_stats.worker_main_task_us as u64),
+            format_us(state.renderer_stats.worker_slowest_task_us as u64),
             state.renderer_stats.dirty_regions,
             state.renderer_stats.dirty_jobs,
             format_pixels(state.renderer_stats.damage_pixels),
             state.renderer_stats.shadow_cache_misses,
             format_us(state.renderer_stats.shadow_raster_us as u64),
             format_us(state.renderer_stats.shadow_draw_us as u64),
+            state.renderer_stats.text_raster_cache_misses,
+            format_us(state.renderer_stats.text_raster_build_us as u64),
+            state.renderer_stats.text_effect_cache_misses,
+            format_us(state.renderer_stats.text_effect_build_us as u64),
+        );
+    }
+
+    if state.app_stats.transition_active
+        && state.app_stats.transition_delta_us >= 45_000
+        && state.app_stats.transition_elapsed_us >= state.app_stats.transition_delta_us
+        && state.renderer_stats.frame_index != state.last_animation_stall_frame
+    {
+        state.last_animation_stall_frame = state.renderer_stats.frame_index;
+        eprintln!(
+            "[uiverse_hover][animation-stall] frame={} anim_delta={} elapsed={} duration={} previous_paint={} previous_total={}",
+            state.renderer_stats.frame_index,
+            format_us(state.app_stats.transition_delta_us),
+            format_us(state.app_stats.transition_elapsed_us),
+            format_us(state.app_stats.transition_duration_us),
+            format_us(state.renderer_stats.paint_us),
+            format_us(state.renderer_stats.total_us),
         );
     }
 
@@ -110,7 +165,7 @@ pub fn maybe_log_perf(state: &mut HoverDemoState) {
     };
 
     eprintln!(
-        "[uiverse_hover] frame={} fps={:<2} dt={:>3}ms update={:>7} tree={:>7} prep={:>7} paint={:>7} present={:>7} total={:>7} anim={} mode={} reason={} dirty={}r/{}j damage={} painted={} passes={} workers={} shadow_cache={} shadow_raster={:>7} shadow_draw={:>7}",
+        "[uiverse_hover] frame={} fps={:<2} dt={:>3}ms update={:>7} tree={:>7} prep={:>7} paint={:>7} present={:>7} total={:>7} anim={} mode={} reason={} dirty={}r/{}j damage={} painted={} passes={} workers={} main_task={:>7} slowest_task={:>7} wait={:>7} shadow_cache={} shadow_raster={:>7} shadow_draw={:>7}",
         state.renderer_stats.frame_index,
         fps,
         state.last_frame_ms,
@@ -129,6 +184,9 @@ pub fn maybe_log_perf(state: &mut HoverDemoState) {
         format_pixels(state.renderer_stats.painted_pixels),
         state.renderer_stats.scene_passes,
         state.renderer_stats.render_workers,
+        format_us(state.renderer_stats.worker_main_task_us as u64),
+        format_us(state.renderer_stats.worker_slowest_task_us as u64),
+        format_us(state.renderer_stats.worker_wait_us as u64),
         state.renderer_stats.shadow_cache_misses,
         format_us(state.renderer_stats.shadow_raster_us as u64),
         format_us(state.renderer_stats.shadow_draw_us as u64),
@@ -163,7 +221,7 @@ fn build_ui(state: &HoverDemoState) -> Node {
 
 fn build_hud(state: &HoverDemoState) -> Node {
     ui! {
-        <section class="hud">
+        <section id="hud" class="hud">
             <div class="hud-header">
                 <p class="hud-title">Performance Metrics</p>
             </div>
@@ -194,6 +252,16 @@ fn build_metric_row(state: &HoverDemoState) -> Node {
             {stat_chip("painted", format_pixels(state.hud_renderer_stats.painted_pixels))}
             {stat_chip("scene passes", state.hud_renderer_stats.scene_passes.to_string())}
             {stat_chip("workers", state.hud_renderer_stats.render_workers.to_string())}
+            {two_line_stat_chip(
+                "worker timing",
+                format!("main {}", format_us(state.hud_renderer_stats.worker_main_task_us as u64)),
+                format!("slow {}", format_us(state.hud_renderer_stats.worker_slowest_task_us as u64)),
+            )}
+            {two_line_stat_chip(
+                "text cache",
+                format!("raster {}", state.hud_renderer_stats.text_raster_cache_misses),
+                format!("effect {}", state.hud_renderer_stats.text_effect_cache_misses),
+            )}
         </div>
     }
 }
@@ -314,7 +382,7 @@ fn format_pixels(pixels: usize) -> String {
 
 fn build_button() -> Node {
     ui! {
-        <button class="button" type="button">
+        <button id="reveal-button" class="button" type="button">
             <span class="actual-text">
                 <span class="actual-label">
                     <span class="actual-label-text">
@@ -338,7 +406,7 @@ fn build_button() -> Node {
 fn build_card() -> Node {
     ui! {
         <div class="uiverse-card-demo">
-            <div class="parent">
+            <div id="card-demo" class="parent">
                 <div class="card">
                     <div class="logo">
                         <span class="circle circle1"></span>
@@ -407,7 +475,7 @@ fn stylesheet() -> &'static Stylesheet {
 #[cfg(test)]
 mod tests {
     use super::{BUTTON_TEXT, HoverDemoState, build_card, build_ui, stylesheet};
-    use cssimpler::app::{App, Invalidation};
+    use cssimpler::app::{App, Invalidation, latest_runtime_stats};
     use cssimpler::core::fonts::layout_text_block;
     use cssimpler::core::{ElementInteractionState, ElementPath, Node, RenderKind, RenderNode};
     use cssimpler::renderer::{
@@ -433,7 +501,12 @@ mod tests {
             1280,
             720,
             &ElementInteractionState {
-                hovered: Some(ElementPath::root(0).with_child(1).with_child(0).with_child(1)),
+                hovered: Some(
+                    ElementPath::root(0)
+                        .with_child(1)
+                        .with_child(0)
+                        .with_child(1),
+                ),
                 active: None,
             },
         );
@@ -485,7 +558,12 @@ mod tests {
             1280,
             720,
             &ElementInteractionState {
-                hovered: Some(ElementPath::root(0).with_child(1).with_child(0).with_child(1)),
+                hovered: Some(
+                    ElementPath::root(0)
+                        .with_child(1)
+                        .with_child(0)
+                        .with_child(1),
+                ),
                 active: None,
             },
         );
@@ -945,6 +1023,176 @@ mod tests {
         render_to_buffer(&mid, &mut full, 480, 480, clear);
 
         assert_render_buffers_match(&incremental, &full, 480);
+    }
+
+    #[test]
+    fn hover_cursor_sweep_across_children_advances_transition_continuously() {
+        let mut app = App::new(
+            (),
+            stylesheet(),
+            |_state, _frame| Invalidation::Clean,
+            |_state| {
+                ui! {
+                    <div>
+                        {build_card()}
+                    </div>
+                }
+            },
+        );
+        app.set_viewport(ViewportSize {
+            width: 480,
+            height: 480,
+        });
+
+        // Frame 0: idle baseline
+        let _idle = app.frame(FrameInfo {
+            frame_index: 0,
+            delta: Duration::ZERO,
+        });
+
+        let parent_path = ElementPath::root(0).with_child(0).with_child(0);
+        let card_path = parent_path.clone().with_child(0);
+        let glass_path = card_path.clone().with_child(1);
+        let content_path = card_path.clone().with_child(2);
+        let title_path = content_path.clone().with_child(0);
+
+        // Hover enters .parent
+        assert!(SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(parent_path),
+                active: None,
+            },
+        ));
+        // Settle interaction with follow_up (delta = 0)
+        SceneProvider::update(
+            &mut app,
+            FrameInfo {
+                frame_index: 0,
+                delta: Duration::ZERO,
+            },
+        );
+        // Initial transition created at t = 0 is zero-progress
+        assert!(SceneProvider::transition_is_zero_progress(&app));
+
+        // Frame 1: 16ms elapses
+        let _f1 = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::from_millis(16),
+        });
+        let stats1 = latest_runtime_stats();
+        assert!(stats1.transition_active);
+        assert!(stats1.transition_elapsed_us >= 16_000);
+        assert!(!SceneProvider::transition_is_zero_progress(&app));
+
+        // Frame 2: cursor sweeps into .card child
+        SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(card_path),
+                active: None,
+            },
+        );
+        SceneProvider::update(
+            &mut app,
+            FrameInfo {
+                frame_index: 1,
+                delta: Duration::ZERO,
+            },
+        );
+        // Active transition must NOT be reset to zero progress!
+        assert!(!SceneProvider::transition_is_zero_progress(&app));
+
+        let _f2 = app.frame(FrameInfo {
+            frame_index: 2,
+            delta: Duration::from_millis(16),
+        });
+        let stats2 = latest_runtime_stats();
+        assert!(stats2.transition_active);
+        assert!(stats2.transition_elapsed_us > stats1.transition_elapsed_us);
+        assert!(stats2.transition_elapsed_us >= 32_000);
+        assert!(!SceneProvider::transition_is_zero_progress(&app));
+
+        // Frame 3: cursor sweeps into .glass child
+        SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(glass_path),
+                active: None,
+            },
+        );
+        SceneProvider::update(
+            &mut app,
+            FrameInfo {
+                frame_index: 2,
+                delta: Duration::ZERO,
+            },
+        );
+        assert!(!SceneProvider::transition_is_zero_progress(&app));
+
+        let _f3 = app.frame(FrameInfo {
+            frame_index: 3,
+            delta: Duration::from_millis(16),
+        });
+        let stats3 = latest_runtime_stats();
+        assert!(stats3.transition_active);
+        assert!(stats3.transition_elapsed_us > stats2.transition_elapsed_us);
+        assert!(stats3.transition_elapsed_us >= 48_000);
+        assert!(!SceneProvider::transition_is_zero_progress(&app));
+
+        // Frame 4: cursor sweeps into .content child
+        SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(content_path),
+                active: None,
+            },
+        );
+        SceneProvider::update(
+            &mut app,
+            FrameInfo {
+                frame_index: 3,
+                delta: Duration::ZERO,
+            },
+        );
+        assert!(!SceneProvider::transition_is_zero_progress(&app));
+
+        let _f4 = app.frame(FrameInfo {
+            frame_index: 4,
+            delta: Duration::from_millis(16),
+        });
+        let stats4 = latest_runtime_stats();
+        assert!(stats4.transition_active);
+        assert!(stats4.transition_elapsed_us > stats3.transition_elapsed_us);
+        assert!(stats4.transition_elapsed_us >= 64_000);
+        assert!(!SceneProvider::transition_is_zero_progress(&app));
+
+        // Frame 5: cursor sweeps into .title child
+        SceneProvider::set_element_interaction(
+            &mut app,
+            ElementInteractionState {
+                hovered: Some(title_path),
+                active: None,
+            },
+        );
+        SceneProvider::update(
+            &mut app,
+            FrameInfo {
+                frame_index: 4,
+                delta: Duration::ZERO,
+            },
+        );
+        assert!(!SceneProvider::transition_is_zero_progress(&app));
+
+        let _f5 = app.frame(FrameInfo {
+            frame_index: 5,
+            delta: Duration::from_millis(16),
+        });
+        let stats5 = latest_runtime_stats();
+        assert!(stats5.transition_active);
+        assert!(stats5.transition_elapsed_us > stats4.transition_elapsed_us);
+        assert!(stats5.transition_elapsed_us >= 80_000);
+        assert!(!SceneProvider::transition_is_zero_progress(&app));
     }
 
     fn build_test_button(is_hot: bool) -> Node {

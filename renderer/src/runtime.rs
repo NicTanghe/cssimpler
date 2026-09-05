@@ -496,6 +496,8 @@ where
         let mut frame_stats = FrameTimingStats {
             frame_index: self.frame_index,
             frame_delta_us: duration_to_us(delta),
+            viewport_width: viewport.width,
+            viewport_height: viewport.height,
             ..FrameTimingStats::default()
         };
 
@@ -558,7 +560,7 @@ where
         let normal_click_started =
             click_started && !auto_scroll_canceled_click && !scrollbar_consumed_click;
 
-        settle_element_interaction(
+        let mut interaction_rerendered = settle_element_interaction(
             &mut self.scene_provider,
             frame,
             &mut scene,
@@ -656,7 +658,7 @@ where
                 interactive_left_down,
                 false,
             );
-            settle_element_interaction(
+            interaction_rerendered |= settle_element_interaction(
                 &mut self.scene_provider,
                 frame,
                 &mut scene,
@@ -671,6 +673,13 @@ where
         frame_stats.scene_prep_us = duration_to_us(scene_prep_start.elapsed());
         let auto_scroll_indicator = self.scrollbar_controller.auto_scroll_indicator();
         let resized = self.buffer_width != viewport.width || self.buffer_height != viewport.height;
+        let defer_zero_progress_transition = should_defer_zero_progress_transition_paint(
+            interaction_rerendered,
+            self.scene_provider.transition_is_zero_progress(),
+            resized,
+        );
+        frame_stats.buffer_resized = resized;
+        frame_stats.transition_deferred = defer_zero_progress_transition;
         resize_buffer(
             &mut self.buffer,
             &mut self.buffer_width,
@@ -691,15 +700,19 @@ where
             );
         }
 
-        if should_present_frame_from_roots(
-            self.previous_presented_scene.as_deref(),
-            &scene,
-            self.previous_presented_indicator,
-            auto_scroll_indicator,
-            resized,
-        ) {
+        if !defer_zero_progress_transition
+            && should_present_frame_from_roots(
+                self.previous_presented_scene.as_deref(),
+                &scene,
+                self.previous_presented_indicator,
+                auto_scroll_indicator,
+                resized,
+            )
+        {
             let paint_start = Instant::now();
             crate::shadow::reset_frame_shadow_stats();
+            crate::fonts::reset_frame_text_stats();
+            crate::global_worker_pool().reset_frame_stats();
             let paint_stats = if use_alpha_buffer {
                 render_to_buffer_internal_from_roots_with_alpha(
                     &scene,
@@ -754,6 +767,22 @@ where
             frame_stats.shadow_cache_misses = shadow_cache_misses;
             frame_stats.shadow_raster_us = shadow_raster_us;
             frame_stats.shadow_draw_us = shadow_draw_us;
+            let (
+                text_raster_cache_misses,
+                text_raster_build_us,
+                text_effect_cache_misses,
+                text_effect_build_us,
+            ) = crate::fonts::take_frame_text_stats();
+            frame_stats.text_raster_cache_misses = text_raster_cache_misses;
+            frame_stats.text_raster_build_us = text_raster_build_us;
+            frame_stats.text_effect_cache_misses = text_effect_cache_misses;
+            frame_stats.text_effect_build_us = text_effect_build_us;
+            let (worker_main_helped, worker_wait_us, worker_main_task_us, worker_slowest_task_us) =
+                crate::global_worker_pool().take_frame_stats();
+            frame_stats.worker_main_helped = worker_main_helped;
+            frame_stats.worker_wait_us = worker_wait_us;
+            frame_stats.worker_main_task_us = worker_main_task_us;
+            frame_stats.worker_slowest_task_us = worker_slowest_task_us;
 
             let present_start = Instant::now();
             redraw_auto_scroll_indicator_regions(
@@ -1403,6 +1432,14 @@ fn normalize_physical_key(key: PhysicalKey) -> Option<String> {
     })
 }
 
+fn should_defer_zero_progress_transition_paint(
+    interaction_rerendered: bool,
+    transition_zero_progress: bool,
+    resized: bool,
+) -> bool {
+    interaction_rerendered && transition_zero_progress && !resized
+}
+
 #[cfg(test)]
 mod tests {
     use cssimpler_core::{
@@ -1425,7 +1462,8 @@ mod tests {
     use super::{
         copy_render_buffer_into_surface, non_transparent_damage_rects, normalize_button_state,
         normalize_key_location, normalize_logical_key, normalize_modifiers, normalize_physical_key,
-        normalize_pointer_button, normalize_scroll_delta, summarize_native_glass,
+        normalize_pointer_button, normalize_scroll_delta,
+        should_defer_zero_progress_transition_paint, summarize_native_glass,
         window_uses_native_glass,
     };
     use crate::WindowConfig;
@@ -1436,6 +1474,22 @@ mod tests {
             glass_tint: tint,
             ..VisualStyle::default()
         })
+    }
+
+    #[test]
+    fn interaction_transition_defers_only_its_zero_progress_paint() {
+        assert!(should_defer_zero_progress_transition_paint(
+            true, true, false
+        ));
+        assert!(!should_defer_zero_progress_transition_paint(
+            false, true, false
+        ));
+        assert!(!should_defer_zero_progress_transition_paint(
+            true, false, false
+        ));
+        assert!(!should_defer_zero_progress_transition_paint(
+            true, true, true
+        ));
     }
 
     fn stacking_glass_node(level: i32, tint: Option<Color>) -> RenderNode {

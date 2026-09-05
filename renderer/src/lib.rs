@@ -8,7 +8,7 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod backdrop;
 mod color;
@@ -82,6 +82,7 @@ const DIRTY_BRANCH_COLLAPSE_MAX_AREA_RATIO: f32 = 1.5;
 const MAX_BRANCH_COLLAPSE_AREA: f32 = 65536.0;
 const MAX_BRANCH_COLLAPSE_WASTED_PIXELS: f32 = 8192.0;
 const DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO: f32 = 1.35;
+const DIRTY_REGION_NEARBY_GAP: f32 = 12.0;
 const MAX_MERGE_WASTED_PIXELS: f32 = 16384.0;
 const MAX_WASTE_TO_MIN_AREA_RATIO: f32 = 0.60;
 const MAX_MERGED_DIRTY_REGION_AREA: f32 = 524288.0;
@@ -90,14 +91,20 @@ const MAX_SUBTREE_SURFACE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROMOTED_SURFACE_TEMP_BYTES: usize = 8 * 1024 * 1024;
 const MIN_PARALLEL_RENDER_PIXELS: usize = 640 * 480;
-const MIN_INCREMENTAL_PIXELS_PER_WORKER: usize = 200 * 200;
-// Five medium-sized damage bands are common for animated controls. Let three
-// persistent workers participate instead of leaving the main thread waiting
-// on two long-running bands.
-const MIN_INCREMENTAL_JOBS_PER_WORKER: usize = 2;
-const MIN_PARALLEL_RENDER_ROWS_PER_WORKER: usize = 80;
+const MIN_PARALLEL_INCREMENTAL_PIXELS: usize = 200 * 200;
+const TARGET_INCREMENTAL_PIXELS_PER_WORKER: usize = 128 * 128;
+// Full-redraw selection models traversal work, not the number of tasks used to
+// smooth scheduling tails. Keep that estimate conservative and stable when
+// task granularity changes.
+const INCREMENTAL_COST_PIXELS_PER_WORKER: usize = 200 * 200;
+const INCREMENTAL_COST_JOBS_PER_WORKER: usize = 2;
+// Keep damage bands small enough that a transform-heavy strip cannot become a
+// 60-80 ms tail after every other worker has gone idle.
+const INCREMENTAL_RENDER_ROWS_PER_JOB: usize = 32;
+const FULL_REDRAW_TASKS_PER_WORKER: usize = 3;
+const MIN_FULL_REDRAW_ROWS_PER_WORKER: usize = 80;
+const MIN_FULL_REDRAW_ROWS_PER_TASK: usize = 32;
 const MAX_RENDER_WORKERS: usize = 12;
-const MAX_FULL_REDRAW_WORKERS: usize = 7;
 const SCENE_TRAVERSAL_COST_PER_NODE: usize = 24;
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 const MAX_SUBTREE_SURFACE_CACHE_ENTRIES: usize = 64;
@@ -142,6 +149,18 @@ pub struct FrameTimingStats {
     pub shadow_cache_misses: usize,
     pub shadow_raster_us: usize,
     pub shadow_draw_us: usize,
+    pub text_raster_cache_misses: usize,
+    pub text_raster_build_us: usize,
+    pub text_effect_cache_misses: usize,
+    pub text_effect_build_us: usize,
+    pub worker_main_helped: usize,
+    pub worker_wait_us: usize,
+    pub worker_main_task_us: usize,
+    pub worker_slowest_task_us: usize,
+    pub viewport_width: usize,
+    pub viewport_height: usize,
+    pub buffer_resized: bool,
+    pub transition_deferred: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -166,6 +185,10 @@ struct WorkerPoolShared {
     done: Condvar,
     shutdown: AtomicBool,
     active_tasks: AtomicUsize,
+    main_helped_tasks: AtomicUsize,
+    main_wait_us: AtomicUsize,
+    main_task_us: AtomicUsize,
+    slowest_task_us: AtomicUsize,
 }
 
 struct WorkerPoolState {
@@ -175,6 +198,7 @@ struct WorkerPoolState {
 pub(crate) struct WorkerPool {
     _threads: Vec<thread::JoinHandle<()>>,
     shared: Arc<WorkerPoolShared>,
+    scope_lock: Mutex<()>,
 }
 
 static WORKER_POOL: OnceLock<WorkerPool> = OnceLock::new();
@@ -199,6 +223,10 @@ impl WorkerPool {
             done: Condvar::new(),
             shutdown: AtomicBool::new(false),
             active_tasks: AtomicUsize::new(0),
+            main_helped_tasks: AtomicUsize::new(0),
+            main_wait_us: AtomicUsize::new(0),
+            main_task_us: AtomicUsize::new(0),
+            slowest_task_us: AtomicUsize::new(0),
         });
 
         let mut threads = Vec::with_capacity(num_workers);
@@ -215,6 +243,7 @@ impl WorkerPool {
         Self {
             _threads: threads,
             shared,
+            scope_lock: Mutex::new(()),
         }
     }
 
@@ -222,6 +251,13 @@ impl WorkerPool {
     where
         F: for<'scope> FnOnce(&Scope<'scope, 'env>) -> R,
     {
+        // The queue and active-task counter describe one borrowed task scope.
+        // Serialize callers so concurrent renders cannot replace each other's
+        // queue while workers still hold lifetime-erased task closures.
+        let _scope_guard = self
+            .scope_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let scope = Scope {
             shared: Arc::clone(&self.shared),
             tasks: Mutex::new(Vec::new()),
@@ -231,6 +267,58 @@ impl WorkerPool {
         scope.join();
         result
     }
+
+    pub(crate) fn reset_frame_stats(&self) {
+        self.shared
+            .main_helped_tasks
+            .store(0, AtomicOrdering::Relaxed);
+        self.shared.main_wait_us.store(0, AtomicOrdering::Relaxed);
+        self.shared.main_task_us.store(0, AtomicOrdering::Relaxed);
+        self.shared
+            .slowest_task_us
+            .store(0, AtomicOrdering::Relaxed);
+    }
+
+    pub(crate) fn take_frame_stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.shared
+                .main_helped_tasks
+                .swap(0, AtomicOrdering::Relaxed),
+            self.shared.main_wait_us.swap(0, AtomicOrdering::Relaxed),
+            self.shared.main_task_us.swap(0, AtomicOrdering::Relaxed),
+            self.shared.slowest_task_us.swap(0, AtomicOrdering::Relaxed),
+        )
+    }
+}
+
+fn run_worker_task(
+    shared: &WorkerPoolShared,
+    task: BoxedRenderTask<'static>,
+    on_main_thread: bool,
+) {
+    let task_start = Instant::now();
+    task();
+    let task_us = task_start.elapsed().as_micros().min(usize::MAX as u128) as usize;
+    shared
+        .slowest_task_us
+        .fetch_max(task_us, AtomicOrdering::Relaxed);
+    if on_main_thread {
+        shared
+            .main_task_us
+            .fetch_add(task_us, AtomicOrdering::Relaxed);
+    }
+}
+
+fn finish_queued_worker_task(shared: &WorkerPoolShared) {
+    if shared.active_tasks.fetch_sub(1, AtomicOrdering::AcqRel) != 1 {
+        return;
+    }
+
+    // Pair the final completion with the same mutex used by the waiter. This
+    // prevents completion from landing between its active-count check and the
+    // condvar wait, which would otherwise lose the only wakeup for the scope.
+    let _state = shared.state.lock().unwrap_or_else(|p| p.into_inner());
+    shared.done.notify_all();
 }
 
 pub(crate) struct Scope<'scope, 'env: 'scope> {
@@ -275,7 +363,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         drop(tasks);
 
         if let Some(task) = master_task {
-            task();
+            run_worker_task(&self.shared, task, true);
         }
 
         if background_count > 0 {
@@ -289,26 +377,27 @@ impl<'scope, 'env> Scope<'scope, 'env> {
                         if self.shared.active_tasks.load(AtomicOrdering::Acquire) == 0 {
                             break None;
                         }
+                        let wait_start = Instant::now();
                         state = self
                             .shared
                             .done
                             .wait(state)
                             .unwrap_or_else(|p| p.into_inner());
+                        self.shared.main_wait_us.fetch_add(
+                            wait_start.elapsed().as_micros().min(usize::MAX as u128) as usize,
+                            AtomicOrdering::Relaxed,
+                        );
                     }
                 };
 
                 let Some(task) = task else {
                     break;
                 };
-                task();
-                if self
-                    .shared
-                    .active_tasks
-                    .fetch_sub(1, AtomicOrdering::AcqRel)
-                    == 1
-                {
-                    self.shared.done.notify_all();
-                }
+                self.shared
+                    .main_helped_tasks
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                run_worker_task(&self.shared, task, true);
+                finish_queued_worker_task(&self.shared);
             }
         }
     }
@@ -331,10 +420,8 @@ fn worker_loop(shared: Arc<WorkerPoolShared>) {
         };
 
         if let Some(task) = task {
-            task();
-            if shared.active_tasks.fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
-                shared.done.notify_all();
-            }
+            run_worker_task(&shared, task, false);
+            finish_queued_worker_task(&shared);
         }
     }
 }
@@ -1029,6 +1116,7 @@ fn dirty_job_group_rows(jobs: &[DirtyRenderJob]) -> Option<BufferRows> {
     (start < end).then_some(BufferRows::new(start, end))
 }
 
+#[cfg(test)]
 fn dirty_job_group_clip(jobs: &[DirtyRenderJob]) -> Option<ClipRect> {
     let mut clip = jobs.first()?.clip;
     for job in jobs.iter().skip(1) {
@@ -1198,6 +1286,14 @@ pub trait SceneProvider {
     }
 
     fn needs_redraw(&self) -> bool {
+        false
+    }
+
+    fn transition_active(&self) -> bool {
+        false
+    }
+
+    fn transition_is_zero_progress(&self) -> bool {
         false
     }
 }
@@ -1774,7 +1870,7 @@ fn render_to_buffer_internal_with_cached_bounds(
     } else {
         full_redraw_worker_count(width, height)
     };
-    if worker_count <= 1 {
+    let scene_passes = if worker_count <= 1 {
         render_to_buffer_serial(
             scene,
             &cached_bounds.roots,
@@ -1785,6 +1881,7 @@ fn render_to_buffer_internal_with_cached_bounds(
             glass_mode,
             alpha_buffer.as_deref_mut(),
         );
+        1
     } else {
         render_to_buffer_parallel(
             scene,
@@ -1796,8 +1893,8 @@ fn render_to_buffer_internal_with_cached_bounds(
             worker_count,
             glass_mode,
             alpha_buffer.as_deref_mut(),
-        );
-    }
+        )
+    };
 
     PaintStats {
         workers: worker_count.max(1),
@@ -1805,7 +1902,7 @@ fn render_to_buffer_internal_with_cached_bounds(
         dirty_jobs: 0,
         damage_pixels: width.saturating_mul(height),
         painted_pixels: width.saturating_mul(height),
-        scene_passes: worker_count.max(1),
+        scene_passes,
         mode: FramePaintMode::Full,
         reason: FramePaintReason::FullRedraw,
         damage_rects: None,
@@ -1855,7 +1952,7 @@ fn render_to_buffer_parallel(
     worker_count: usize,
     glass_mode: GlassRenderMode,
     mut alpha_buffer: Option<&mut [u8]>,
-) {
+) -> usize {
     let expected_pixel_count = width
         .checked_mul(height)
         .expect("parallel render dimensions should fit in usize");
@@ -1873,12 +1970,15 @@ fn render_to_buffer_parallel(
     }
 
     let clear = pack_rgb(clear_color);
-    let band_count = worker_count.max(1).min(height.max(1));
-    let rows_per_worker = height.div_ceil(band_count);
-    let pixels_per_band = rows_per_worker.saturating_mul(width).max(1);
+    // More tasks than execution threads keep a single effect-heavy row band
+    // from becoming the tail of the whole frame. This also leaves queued work
+    // for the calling thread to steal after it finishes its first band.
+    let band_count = full_redraw_task_count(height, worker_count);
+    let rows_per_task = height.div_ceil(band_count);
+    let pixels_per_band = rows_per_task.saturating_mul(width).max(1);
     let bands = (0..height)
-        .step_by(rows_per_worker)
-        .map(|row_start| BufferRows::new(row_start, (row_start + rows_per_worker).min(height)))
+        .step_by(rows_per_task)
+        .map(|row_start| BufferRows::new(row_start, (row_start + rows_per_task).min(height)))
         .collect::<Vec<_>>();
     let band_root_indices = bands
         .iter()
@@ -1963,6 +2063,8 @@ fn render_to_buffer_parallel(
             }
         });
     }
+
+    bands.len()
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2074,6 +2176,7 @@ fn render_scene_update_roots(
     }
 
     coalesce_dirty_regions(&mut snapped_dirty_regions);
+    coalesce_nearby_dirty_regions(&mut snapped_dirty_regions);
     let dirty_region_count = snapped_dirty_regions.len();
     let dirty_pixels = clip_rects_pixel_count(&snapped_dirty_regions, width, height);
     let planned_dirty_jobs = build_incremental_render_jobs(&snapped_dirty_regions, width, height);
@@ -2087,10 +2190,15 @@ fn render_scene_update_roots(
         planned_dirty_jobs.len(),
         incremental_worker_count,
     );
+    let incremental_cost_worker_count = if max_backdrop_blur_radius > 0.0 {
+        1
+    } else {
+        incremental_render_cost_worker_count(&planned_dirty_jobs)
+    };
     let incremental_fallback_scene_passes = incremental_scene_passes_for_full_redraw_heuristic(
         dirty_region_count,
         planned_dirty_jobs.len(),
-        incremental_worker_count,
+        incremental_cost_worker_count,
     );
     if let Some(reason) = should_full_redraw(
         dirty_region_count,
@@ -2176,27 +2284,6 @@ fn render_scene_update_roots(
     }
 }
 
-fn coalesce_contiguous_dirty_jobs(jobs: &[DirtyRenderJob]) -> Vec<DirtyRenderJob> {
-    if jobs.len() <= 1 {
-        return jobs.to_vec();
-    }
-    let mut merged: Vec<DirtyRenderJob> = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        if let Some(last) = merged.last_mut() {
-            if (last.clip.x0 - job.clip.x0).abs() <= f32::EPSILON
-                && (last.clip.x1 - job.clip.x1).abs() <= f32::EPSILON
-                && (last.clip.y1 - job.clip.y0).abs() <= f32::EPSILON
-            {
-                last.clip.y1 = job.clip.y1;
-                last.pixel_count = last.pixel_count.saturating_add(job.pixel_count);
-                continue;
-            }
-        }
-        merged.push(job.clone());
-    }
-    merged
-}
-
 fn render_scene_update_parallel(
     scene: &[RenderNode],
     cached_bounds: &[CachedSubtreeBounds],
@@ -2209,48 +2296,52 @@ fn render_scene_update_parallel(
     glass_mode: GlassRenderMode,
 ) {
     let worker_count = worker_count.max(1).min(dirty_jobs.len().max(1));
-    let job_groups = distribute_dirty_render_jobs(dirty_jobs, worker_count);
-    let coalesced_job_groups = job_groups
+    let job_rows = dirty_jobs
         .iter()
-        .map(|jobs| coalesce_contiguous_dirty_jobs(jobs))
-        .collect::<Vec<_>>();
-    let group_rows = job_groups
-        .iter()
-        .map(|jobs| {
-            dirty_job_group_rows(jobs)
-                .expect("dirty render groups should only contain non-empty row spans")
+        .map(|job| {
+            dirty_job_group_rows(std::slice::from_ref(job))
+                .expect("dirty render jobs should contain a non-empty row span")
         })
         .collect::<Vec<_>>();
-    let group_root_indices = job_groups
+    let job_root_indices = dirty_jobs
         .iter()
-        .map(|jobs| {
-            let clip = dirty_job_group_clip(jobs)
-                .expect("dirty render groups should only contain at least one clip");
-            root_indices_intersecting_clip(scene, cached_bounds, clip)
-        })
+        .map(|job| root_indices_intersecting_clip(scene, cached_bounds, job.clip))
         .collect::<Vec<_>>();
-    let clear = pack_rgb(clear_color);
-    let worker_buffer_lengths = group_rows
+    let worker_buffer_len = job_rows
         .iter()
         .map(|rows| rows.pixel_len(width))
-        .collect::<Vec<_>>();
+        .max()
+        .unwrap_or_default();
+    let clear = pack_rgb(clear_color);
+    let worker_buffer_lengths = vec![worker_buffer_len; worker_count];
     let mut worker_buffers = acquire_worker_buffers(&worker_buffer_lengths);
+    let next_job = AtomicUsize::new(0);
+    let output = Mutex::new(buffer);
 
+    // Each executor owns one reusable strip buffer and pulls another strip as
+    // soon as it finishes. Static row grouping made the transform-heavy strip
+    // at the bottom of the card the tail of otherwise-complete frames. Copying
+    // the narrow completed clips under a short lock keeps scratch storage
+    // bounded by worker_count * one strip rather than one buffer per job.
     global_worker_pool().scope(|scope| {
-        for (((worker_buffer, jobs), rows), root_indices) in worker_buffers
-            .iter_mut()
-            .zip(coalesced_job_groups.iter())
-            .zip(group_rows.iter().copied())
-            .zip(group_root_indices.iter())
-        {
+        for worker_buffer in &mut worker_buffers {
+            let next_job = &next_job;
+            let output = &output;
+            let job_rows = &job_rows;
+            let job_root_indices = &job_root_indices;
             scope.spawn(move || {
-                with_render_buffer_rows(rows, || {
-                    for job in jobs {
+                loop {
+                    let job_index = next_job.fetch_add(1, AtomicOrdering::Relaxed);
+                    let Some(job) = dirty_jobs.get(job_index) else {
+                        break;
+                    };
+                    let rows = job_rows[job_index];
+                    with_render_buffer_rows(rows, || {
                         clear_clip_packed(worker_buffer, width, height, job.clip, clear);
                         draw_cached_root_indices(
                             scene,
                             cached_bounds,
-                            root_indices,
+                            &job_root_indices[job_index],
                             worker_buffer,
                             width,
                             height,
@@ -2258,35 +2349,28 @@ fn render_scene_update_parallel(
                             clear_color,
                             glass_mode,
                         );
+                    });
+
+                    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(job.clip, width, height) else {
+                        continue;
+                    };
+                    let mut output = output.lock().unwrap_or_else(|poison| poison.into_inner());
+                    for y in y0..y1 {
+                        let destination_row_start = y as usize * width;
+                        let source_row_start = (y as usize - rows.start) * width;
+                        let destination_start = destination_row_start + x0 as usize;
+                        let destination_end = destination_row_start + x1 as usize;
+                        let source_start = source_row_start + x0 as usize;
+                        let source_end = source_row_start + x1 as usize;
+                        output[destination_start..destination_end]
+                            .copy_from_slice(&worker_buffer[source_start..source_end]);
                     }
-                });
+                }
             });
         }
     });
 
-    for ((worker_buffer, jobs), rows) in worker_buffers
-        .iter()
-        .zip(coalesced_job_groups.iter())
-        .zip(group_rows.iter().copied())
-    {
-        for job in jobs {
-            let Some((x0, y0, x1, y1)) = clip_pixel_bounds(job.clip, width, height) else {
-                continue;
-            };
-
-            for y in y0..y1 {
-                let destination_row_start = y as usize * width;
-                let source_row_start = (y as usize - rows.start) * width;
-                let destination_start = destination_row_start + x0 as usize;
-                let destination_end = destination_row_start + x1 as usize;
-                let source_start = source_row_start + x0 as usize;
-                let source_end = source_row_start + x1 as usize;
-                buffer[destination_start..destination_end]
-                    .copy_from_slice(&worker_buffer[source_start..source_end]);
-            }
-        }
-    }
-
+    drop(output);
     release_worker_buffers(worker_buffers);
 }
 
@@ -2302,7 +2386,7 @@ fn build_incremental_render_jobs(
             continue;
         };
 
-        let band_height = MIN_PARALLEL_RENDER_ROWS_PER_WORKER.max(1);
+        let band_height = INCREMENTAL_RENDER_ROWS_PER_JOB.max(1);
         let region_width = (x1 - x0).max(0) as usize;
         for band_y0 in (y0 as usize..y1 as usize).step_by(band_height) {
             let band_y1 = (band_y0 + band_height).min(y1 as usize);
@@ -2325,6 +2409,7 @@ fn build_incremental_render_jobs(
     jobs
 }
 
+#[cfg(test)]
 fn distribute_dirty_render_jobs(
     dirty_jobs: &[DirtyRenderJob],
     worker_count: usize,
@@ -2386,21 +2471,53 @@ fn distribute_dirty_render_jobs(
 }
 
 fn incremental_render_worker_count(dirty_jobs: &[DirtyRenderJob]) -> usize {
+    let available_workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_RENDER_WORKERS);
+    incremental_render_worker_count_with_available(dirty_jobs, available_workers)
+}
+
+fn incremental_render_worker_count_with_available(
+    dirty_jobs: &[DirtyRenderJob],
+    available_workers: usize,
+) -> usize {
     if dirty_jobs.len() <= 1 {
         return 1;
     }
 
     let total_dirty_pixels = dirty_jobs.iter().map(|job| job.pixel_count).sum::<usize>();
-    if total_dirty_pixels < MIN_INCREMENTAL_PIXELS_PER_WORKER {
+    if total_dirty_pixels < MIN_PARALLEL_INCREMENTAL_PIXELS {
         return 1;
     }
 
     let max_workers_from_pixels = total_dirty_pixels
-        .div_ceil(MIN_INCREMENTAL_PIXELS_PER_WORKER)
+        .div_ceil(TARGET_INCREMENTAL_PIXELS_PER_WORKER)
+        .max(1);
+    available_workers
+        .max(1)
+        .min(MAX_RENDER_WORKERS)
+        .min(dirty_jobs.len())
+        .min(max_workers_from_pixels)
+        .max(1)
+}
+
+fn incremental_render_cost_worker_count(dirty_jobs: &[DirtyRenderJob]) -> usize {
+    if dirty_jobs.len() <= 1 {
+        return 1;
+    }
+
+    let total_dirty_pixels = dirty_jobs.iter().map(|job| job.pixel_count).sum::<usize>();
+    if total_dirty_pixels < MIN_PARALLEL_INCREMENTAL_PIXELS {
+        return 1;
+    }
+
+    let max_workers_from_pixels = total_dirty_pixels
+        .div_ceil(INCREMENTAL_COST_PIXELS_PER_WORKER)
         .max(1);
     let max_workers_from_jobs = dirty_jobs
         .len()
-        .div_ceil(MIN_INCREMENTAL_JOBS_PER_WORKER)
+        .div_ceil(INCREMENTAL_COST_JOBS_PER_WORKER)
         .max(1);
     thread::available_parallelism()
         .map(usize::from)
@@ -3313,6 +3430,15 @@ fn draw_node_contents_internal_impl(
     allow_surface_promotion: bool,
     draw_deferred_stacking_contexts: bool,
 ) {
+    if clip.is_empty()
+        || cached_bounds
+            .bounds
+            .and_then(|bounds| bounds.intersect(clip))
+            .is_none()
+    {
+        return;
+    }
+
     if node_requires_projected_path(node) {
         draw_node_transformed_internal(
             node,
@@ -4333,10 +4459,12 @@ fn settle_element_interaction<P>(
     interactive_left_down: bool,
     press_started: bool,
     interaction: &mut ElementInteractionState,
-) where
+) -> bool
+where
     P: SceneProvider,
 {
     let mut press_started = press_started;
+    let mut rerendered = false;
 
     for _ in 0..4 {
         let hovered = mouse_position
@@ -4358,11 +4486,14 @@ fn settle_element_interaction<P>(
             break;
         }
 
+        rerendered = true;
         scene_provider.update(frame.follow_up());
         *scene = scene_provider.capture_scene();
         scrollbar_controller.apply_to_scene(scene);
         scrollbar_controller.handle_pointer(scene, mouse_position, interactive_left_down, false);
     }
+
+    rerendered
 }
 
 fn next_element_interaction_state(
@@ -4492,6 +4623,15 @@ fn draw_node_transformed_internal_impl(
     allow_surface_promotion: bool,
     draw_deferred_stacking_contexts: bool,
 ) {
+    if clip_state.coarse.is_empty()
+        || cached_bounds
+            .bounds
+            .and_then(|bounds| bounds.intersect(clip_state.coarse))
+            .is_none()
+    {
+        return;
+    }
+
     let world_matrix = parent_world_matrix.multiply(node_local_transform_matrix(
         node.layout,
         &node.style.transform,
@@ -6268,12 +6408,23 @@ fn maybe_collapse_branch_dirty_regions(
 }
 
 fn coalesce_dirty_regions(dirty_regions: &mut Vec<ClipRect>) {
+    coalesce_dirty_regions_where(dirty_regions, should_merge_dirty_regions);
+}
+
+fn coalesce_nearby_dirty_regions(dirty_regions: &mut Vec<ClipRect>) {
+    coalesce_dirty_regions_where(dirty_regions, should_merge_nearby_dirty_regions);
+}
+
+fn coalesce_dirty_regions_where(
+    dirty_regions: &mut Vec<ClipRect>,
+    should_merge: impl Fn(ClipRect, ClipRect) -> bool,
+) {
     let mut index = 0;
     while index < dirty_regions.len() {
         let mut merged = false;
         let mut other_index = index + 1;
         while other_index < dirty_regions.len() {
-            if should_merge_dirty_regions(dirty_regions[index], dirty_regions[other_index]) {
+            if should_merge(dirty_regions[index], dirty_regions[other_index]) {
                 dirty_regions[index] = dirty_regions[index].union(dirty_regions[other_index]);
                 dirty_regions.swap_remove(other_index);
                 merged = true;
@@ -6288,6 +6439,31 @@ fn coalesce_dirty_regions(dirty_regions: &mut Vec<ClipRect>) {
             index += 1;
         }
     }
+}
+
+fn should_merge_nearby_dirty_regions(left: ClipRect, right: ClipRect) -> bool {
+    if left.overlaps_or_touches(right) {
+        return should_merge_dirty_regions(left, right);
+    }
+
+    let horizontal_gap = if left.x1 < right.x0 {
+        right.x0 - left.x1
+    } else if right.x1 < left.x0 {
+        left.x0 - right.x1
+    } else {
+        0.0
+    };
+    let overlaps_vertically = left.y0 < right.y1 && right.y0 < left.y1;
+    if !overlaps_vertically || horizontal_gap > DIRTY_REGION_NEARBY_GAP {
+        return false;
+    }
+
+    let union = left.union(right);
+    let combined_area = left.area() + right.area();
+    let wasted_area = (union.area() - combined_area).max(0.0);
+    union.area() <= MAX_MERGED_DIRTY_REGION_AREA
+        && union.area() <= combined_area * DIRTY_REGION_COALESCE_MAX_EXPANSION_RATIO
+        && wasted_area <= MAX_MERGE_WASTED_PIXELS
 }
 
 fn should_merge_dirty_regions(left: ClipRect, right: ClipRect) -> bool {
@@ -6695,14 +6871,23 @@ fn full_redraw_worker_count(width: usize, height: usize) -> usize {
         return 1;
     }
 
-    let max_workers_from_rows = height.div_ceil(MIN_PARALLEL_RENDER_ROWS_PER_WORKER).max(1);
+    let max_workers_from_rows = height.div_ceil(MIN_FULL_REDRAW_ROWS_PER_WORKER).max(1);
     thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
         .min(MAX_RENDER_WORKERS)
-        .min(MAX_FULL_REDRAW_WORKERS)
         .min(max_workers_from_rows)
         .max(1)
+}
+
+fn full_redraw_task_count(height: usize, worker_count: usize) -> usize {
+    if worker_count <= 1 || height <= 1 {
+        return 1;
+    }
+
+    let desired_tasks = worker_count.saturating_mul(FULL_REDRAW_TASKS_PER_WORKER);
+    let max_tasks_from_rows = height.div_ceil(MIN_FULL_REDRAW_ROWS_PER_TASK).max(1);
+    desired_tasks.min(max_tasks_from_rows).min(height).max(1)
 }
 
 fn duration_to_us(duration: Duration) -> u64 {
@@ -7203,15 +7388,15 @@ mod tests {
     use crate::{
         ClipRect, DirtyRenderJob, FrameInfo, FramePaintMode, FramePaintReason, GlassRenderMode,
         MouseEventKind, ViewportSize, WindowConfig, WorkerPool, blend_pixel,
-        build_incremental_render_jobs, coalesce_dirty_regions, deferred_hit_collection_visits,
-        dirty_job_group_rows, dirty_regions_between_scenes, dispatch_click,
-        dispatch_hover_transition_events, dispatch_mouse_event, distribute_dirty_render_jobs,
-        drawable_viewport_size, hit_test_element_path,
-        incremental_scene_passes_for_full_redraw_heuristic, is_transparent, pack_rgb, pack_rgba,
-        render_scene_update, render_scene_update_internal_from_roots, render_to_buffer,
-        reset_deferred_hit_collection_visits, resize_buffer, scenes_match_visuals,
-        should_full_redraw, should_present_frame, should_present_scene, should_suspend_updates,
-        unpack_alpha8, unpack_rgb,
+        build_incremental_render_jobs, coalesce_dirty_regions, coalesce_nearby_dirty_regions,
+        deferred_hit_collection_visits, dirty_job_group_rows, dirty_regions_between_scenes,
+        dispatch_click, dispatch_hover_transition_events, dispatch_mouse_event,
+        distribute_dirty_render_jobs, drawable_viewport_size, full_redraw_task_count,
+        hit_test_element_path, incremental_scene_passes_for_full_redraw_heuristic, is_transparent,
+        pack_rgb, pack_rgba, render_scene_update, render_scene_update_internal_from_roots,
+        render_to_buffer, reset_deferred_hit_collection_visits, resize_buffer,
+        scenes_match_visuals, should_full_redraw, should_present_frame, should_present_scene,
+        should_suspend_updates, unpack_alpha8, unpack_rgb,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -7243,6 +7428,39 @@ mod tests {
         });
 
         assert_eq!(completed.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn worker_pool_serializes_concurrent_borrowed_scopes() {
+        let pool = WorkerPool::new(2);
+        let completed = AtomicUsize::new(0);
+
+        for _ in 0..64 {
+            thread::scope(|threads| {
+                for _ in 0..2 {
+                    let pool = &pool;
+                    let completed = &completed;
+                    threads.spawn(move || {
+                        pool.scope(|scope| {
+                            for _ in 0..8 {
+                                scope.spawn(|| {
+                                    completed.fetch_add(1, Ordering::Relaxed);
+                                });
+                            }
+                        });
+                    });
+                }
+            });
+        }
+
+        assert_eq!(completed.load(Ordering::Relaxed), 64 * 16);
+    }
+
+    #[test]
+    fn full_redraw_uses_multiple_tasks_per_worker() {
+        assert_eq!(full_redraw_task_count(1_150, 12), 36);
+        assert_eq!(full_redraw_task_count(640, 8), 20);
+        assert_eq!(full_redraw_task_count(80, 1), 1);
     }
 
     #[test]
@@ -11065,6 +11283,58 @@ mod tests {
     }
 
     #[test]
+    fn nearby_horizontal_damage_merges_across_small_ui_gaps() {
+        let mut dirty_regions = vec![
+            ClipRect {
+                x0: 10.0,
+                y0: 20.0,
+                x1: 134.0,
+                y1: 84.0,
+            },
+            ClipRect {
+                x0: 142.0,
+                y0: 20.0,
+                x1: 266.0,
+                y1: 84.0,
+            },
+            ClipRect {
+                x0: 274.0,
+                y0: 20.0,
+                x1: 398.0,
+                y1: 84.0,
+            },
+        ];
+
+        coalesce_nearby_dirty_regions(&mut dirty_regions);
+
+        assert_eq!(dirty_regions.len(), 1);
+        assert_eq!(dirty_regions[0].x0, 10.0);
+        assert_eq!(dirty_regions[0].x1, 398.0);
+    }
+
+    #[test]
+    fn nearby_damage_keeps_separate_rows_independent() {
+        let mut dirty_regions = vec![
+            ClipRect {
+                x0: 10.0,
+                y0: 20.0,
+                x1: 134.0,
+                y1: 84.0,
+            },
+            ClipRect {
+                x0: 10.0,
+                y0: 92.0,
+                x1: 134.0,
+                y1: 156.0,
+            },
+        ];
+
+        coalesce_nearby_dirty_regions(&mut dirty_regions);
+
+        assert_eq!(dirty_regions.len(), 2);
+    }
+
+    #[test]
     fn incremental_render_jobs_split_a_tall_dirty_region_into_bands() {
         let jobs = build_incremental_render_jobs(
             &[ClipRect {
@@ -11077,10 +11347,9 @@ mod tests {
             320,
         );
 
-        assert_eq!(jobs.len(), 3);
-        assert_eq!(jobs[0].pixel_count, 100 * 80);
-        assert_eq!(jobs[1].pixel_count, 100 * 80);
-        assert_eq!(jobs[2].pixel_count, 100 * 80);
+        assert_eq!(jobs.len(), 8);
+        assert!(jobs[..7].iter().all(|job| job.pixel_count == 100 * 32));
+        assert_eq!(jobs[7].pixel_count, 100 * 16);
     }
 
     #[test]
@@ -11263,7 +11532,27 @@ mod tests {
     }
 
     #[test]
-    fn incremental_worker_count_keeps_multiple_jobs_per_worker() {
+    fn incremental_worker_count_keeps_animation_bands_independent() {
+        let jobs = vec![
+            DirtyRenderJob {
+                clip: ClipRect {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 306.0,
+                    y1: 80.0,
+                },
+                pixel_count: 24_480,
+            };
+            4
+        ];
+
+        let workers = super::incremental_render_worker_count_with_available(&jobs, 12);
+
+        assert_eq!(workers, 4);
+    }
+
+    #[test]
+    fn incremental_worker_count_keeps_small_damage_on_one_thread() {
         let jobs = vec![
             DirtyRenderJob {
                 clip: ClipRect {
@@ -11272,14 +11561,14 @@ mod tests {
                     x1: 120.0,
                     y1: 80.0,
                 },
-                pixel_count: 9600,
+                pixel_count: 9_600,
             };
-            14
+            4
         ];
 
-        let workers = super::incremental_render_worker_count(&jobs);
+        let workers = super::incremental_render_worker_count_with_available(&jobs, 12);
 
-        assert!(workers <= 5);
+        assert_eq!(workers, 1);
     }
 
     #[test]
@@ -11472,7 +11761,10 @@ mod tests {
         assert_eq!(stats.dirty_regions, 42);
         assert!(stats.dirty_jobs >= stats.dirty_regions);
         assert!(stats.damage_pixels < stats.painted_pixels);
-        assert_eq!(stats.scene_passes, stats.workers);
+        assert_eq!(
+            stats.scene_passes,
+            full_redraw_task_count(640, stats.workers)
+        );
     }
 
     #[test]
@@ -12130,14 +12422,16 @@ mod tests {
 
     #[test]
     fn collect_node_dirty_regions_prunes_child_regions_enclosed_by_own_bounds() {
-        let prev_child = RenderNode::container(LayoutBox::new(10.0, 10.0, 50.0, 50.0)).with_style(VisualStyle {
-            background: Some(Color::rgb(1, 2, 3)),
-            ..VisualStyle::default()
-        });
-        let curr_child = RenderNode::container(LayoutBox::new(10.0, 10.0, 50.0, 50.0)).with_style(VisualStyle {
-            background: Some(Color::rgb(4, 5, 6)),
-            ..VisualStyle::default()
-        });
+        let prev_child =
+            RenderNode::container(LayoutBox::new(10.0, 10.0, 50.0, 50.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(1, 2, 3)),
+                ..VisualStyle::default()
+            });
+        let curr_child =
+            RenderNode::container(LayoutBox::new(10.0, 10.0, 50.0, 50.0)).with_style(VisualStyle {
+                background: Some(Color::rgb(4, 5, 6)),
+                ..VisualStyle::default()
+            });
 
         let prev_parent = RenderNode::container(LayoutBox::new(0.0, 0.0, 200.0, 200.0))
             .with_style(VisualStyle {
@@ -12153,8 +12447,12 @@ mod tests {
             })
             .with_children(vec![curr_child]);
 
-        let prev_bounds = super::cache_scene_subtree_bounds(std::slice::from_ref(&prev_parent)).roots.remove(0);
-        let curr_bounds = super::cache_scene_subtree_bounds(std::slice::from_ref(&curr_parent)).roots.remove(0);
+        let prev_bounds = super::cache_scene_subtree_bounds(std::slice::from_ref(&prev_parent))
+            .roots
+            .remove(0);
+        let curr_bounds = super::cache_scene_subtree_bounds(std::slice::from_ref(&curr_parent))
+            .roots
+            .remove(0);
 
         let mut dirty_regions = Vec::new();
         super::collect_node_dirty_regions(

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 use ab_glyph::{Font, ScaleFont, point};
 use cssimpler_core::fonts::{
@@ -19,9 +21,35 @@ use crate::{
 
 const MAX_TEXT_RASTER_CACHE_ENTRIES: usize = 256;
 const MAX_TEXT_EFFECT_CACHE_ENTRIES: usize = 512;
-const MAX_TEXT_EFFECT_WORKERS: usize = 8;
-const MIN_PARALLEL_BLUR_PIXELS: usize = 24_576;
 const TEXT_BLUR_PASS_COUNT: usize = 3;
+
+static TEXT_RASTER_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+static TEXT_RASTER_BUILD_US: AtomicUsize = AtomicUsize::new(0);
+static TEXT_EFFECT_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+static TEXT_EFFECT_BUILD_US: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn reset_frame_text_stats() {
+    TEXT_RASTER_CACHE_MISSES.store(0, Ordering::Relaxed);
+    TEXT_RASTER_BUILD_US.store(0, Ordering::Relaxed);
+    TEXT_EFFECT_CACHE_MISSES.store(0, Ordering::Relaxed);
+    TEXT_EFFECT_BUILD_US.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn take_frame_text_stats() -> (usize, usize, usize, usize) {
+    (
+        TEXT_RASTER_CACHE_MISSES.swap(0, Ordering::Relaxed),
+        TEXT_RASTER_BUILD_US.swap(0, Ordering::Relaxed),
+        TEXT_EFFECT_CACHE_MISSES.swap(0, Ordering::Relaxed),
+        TEXT_EFFECT_BUILD_US.swap(0, Ordering::Relaxed),
+    )
+}
+
+fn record_build_time(counter: &AtomicUsize, started_at: Instant) {
+    counter.fetch_add(
+        started_at.elapsed().as_micros().min(usize::MAX as u128) as usize,
+        Ordering::Relaxed,
+    );
+}
 
 pub(crate) fn draw_text(
     buffer: &mut [u32],
@@ -426,6 +454,7 @@ fn cached_text_mask(
     }
 
     let wrap_width = Some(relative_layout.width.max(1.0));
+    let build_start = Instant::now();
     let wrapped = prepared_text_layout
         .filter(|prepared| prepared.matches_wrap_width(wrap_width))
         .map(|prepared| prepared.layout.clone())
@@ -440,7 +469,10 @@ fn cached_text_mask(
         )
     } else {
         rasterize_bitmap_text(relative_layout, &wrapped, text_style)
-    }?;
+    };
+    TEXT_RASTER_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    record_build_time(&TEXT_RASTER_BUILD_US, build_start);
+    let mask = mask?;
     let mask = Arc::new(mask);
 
     insert_cached_raster_mask(key.as_ref().clone(), mask.clone());
@@ -485,24 +517,20 @@ fn cached_text_effect_mask(
         kind,
     };
 
-    {
-        let mut cache = text_mask_cache()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let last_used = next_cache_use(&mut cache.next_use);
-        if let Some(mask) = cached_cache_entry(&mut cache.effects, &key, last_used) {
-            return mask;
-        }
-    }
-
-    let mask = Arc::new(build(raster.mask.as_ref()));
     let mut cache = text_mask_cache()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let last_used = next_cache_use(&mut cache.next_use);
-    if let Some(existing) = cached_cache_entry(&mut cache.effects, &key, last_used) {
-        return existing;
+    if let Some(mask) = cached_cache_entry(&mut cache.effects, &key, last_used) {
+        return mask;
     }
+
+    // Build while holding the cache lock so concurrent damage bands cannot all
+    // rasterize the same expensive glow before racing to insert it.
+    let build_start = Instant::now();
+    let mask = Arc::new(build(raster.mask.as_ref()));
+    TEXT_EFFECT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    record_build_time(&TEXT_EFFECT_BUILD_US, build_start);
     insert_lru_cache_entry(
         &mut cache.effects,
         key,
@@ -808,16 +836,11 @@ fn blur_mask_with_workers(mask: &AlphaMask, radius: usize, worker_count: usize) 
 }
 
 fn blur_worker_count(mask: &AlphaMask) -> usize {
-    let total_pixels = mask.width.saturating_mul(mask.height);
-    if total_pixels < MIN_PARALLEL_BLUR_PIXELS {
-        return 1;
-    }
-
-    thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(MAX_TEXT_EFFECT_WORKERS)
-        .max(1)
+    let _ = mask;
+    // Text effects are commonly built from an already-parallel paint task.
+    // Spawning fresh scoped OS threads for every horizontal and vertical pass
+    // creates severe oversubscription and tail latency on hover cache misses.
+    1
 }
 
 fn blur_pass_radii(radius: usize) -> Vec<usize> {
@@ -1321,7 +1344,11 @@ pub(crate) fn lock_text_mask_cache_for_tests() -> std::sync::MutexGuard<'static,
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::thread;
 
     use cssimpler_core::fonts::{
         BitmapFontMetrics, FontFamily, LineHeight, TextAlign, TextStyle, layout_text_block,
@@ -1473,6 +1500,52 @@ mod tests {
         );
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn concurrent_shadow_requests_build_the_effect_once() {
+        let _cache_guard = lock_text_mask_cache_for_tests();
+        clear_text_mask_cache_for_tests();
+        let raster = cached_text_mask(
+            LayoutBox::new(12.0, 16.0, 160.0, 40.0),
+            "Concurrent glow",
+            &TextStyle::default(),
+            None,
+        )
+        .expect("text mask should rasterize");
+        let shadow = ShadowEffect {
+            color: None,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            blur_radius: 6.0,
+            spread: 0.0,
+        };
+        let kind = TextEffectCacheKind::Shadow {
+            spread_bits: shadow.spread.to_bits(),
+            blur_bits: shadow.blur_radius.to_bits(),
+        };
+        let builds = AtomicUsize::new(0);
+
+        let masks = thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let kind = kind.clone();
+                    scope.spawn(|| {
+                        cached_text_effect_mask(&raster, kind, |base| {
+                            builds.fetch_add(1, Ordering::Relaxed);
+                            shadow_mask_from_raster(base, shadow)
+                        })
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("effect worker should finish"))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        assert!(masks.iter().all(|mask| Arc::ptr_eq(mask, &masks[0])));
     }
 
     #[test]

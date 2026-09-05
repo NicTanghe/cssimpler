@@ -81,6 +81,14 @@ impl SceneTransition {
         self.elapsed_seconds + f32::EPSILON < self.duration_seconds
     }
 
+    pub(crate) fn is_zero_progress(&self) -> bool {
+        self.elapsed_seconds <= f32::EPSILON
+    }
+
+    pub(crate) fn targets_match(&self, candidate: &[RenderNode]) -> bool {
+        scene_targets_match(&self.to, candidate)
+    }
+
     pub(crate) fn elapsed(&self) -> Duration {
         Duration::from_secs_f32(self.elapsed_seconds)
     }
@@ -117,6 +125,27 @@ fn render_node_structure_matches(left: &RenderNode, right: &RenderNode) -> bool 
             .iter()
             .zip(&right.children)
             .all(|(left, right)| render_node_structure_matches(left, right))
+}
+
+fn scene_targets_match(left: &[RenderNode], right: &[RenderNode]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| render_node_target_matches(left, right))
+}
+
+fn render_node_target_matches(left: &RenderNode, right: &RenderNode) -> bool {
+    left.kind == right.kind
+        && left.layout == right.layout
+        && left.style == right.style
+        && left.transitions == right.transitions
+        && left.children.len() == right.children.len()
+        && left
+            .children
+            .iter()
+            .zip(&right.children)
+            .all(|(left, right)| render_node_target_matches(left, right))
 }
 
 fn max_scene_transition_duration(from: &[RenderNode], to: &[RenderNode]) -> f32 {

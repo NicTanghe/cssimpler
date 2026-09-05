@@ -1,9 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-#[cfg(test)]
-use std::sync::Mutex;
-use std::sync::{Arc, OnceLock, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 use cssimpler_core::{Color, CornerRadius, LayoutBox, TextStrokeStyle};
@@ -77,6 +75,7 @@ struct ShadowMaskCacheKey {
 struct ShadowMaskCache {
     next_use: u64,
     masks: HashMap<ShadowMaskCacheKey, CacheEntry<Arc<ShadowMask>>>,
+    in_flight: HashSet<ShadowMaskCacheKey>,
 }
 
 #[derive(Clone)]
@@ -140,18 +139,28 @@ where
     }
 }
 
-fn shadow_mask_cache() -> &'static RwLock<ShadowMaskCache> {
-    static CACHE: OnceLock<RwLock<ShadowMaskCache>> = OnceLock::new();
-    CACHE.get_or_init(|| RwLock::new(ShadowMaskCache::default()))
+struct ShadowMaskCacheState {
+    cache: Mutex<ShadowMaskCache>,
+    condvar: Condvar,
+}
+
+fn shadow_mask_cache() -> &'static ShadowMaskCacheState {
+    static CACHE: OnceLock<ShadowMaskCacheState> = OnceLock::new();
+    CACHE.get_or_init(|| ShadowMaskCacheState {
+        cache: Mutex::new(ShadowMaskCache::default()),
+        condvar: Condvar::new(),
+    })
 }
 
 #[cfg(test)]
 pub(crate) fn clear_shadow_mask_cache_for_tests() {
     let mut cache = shadow_mask_cache()
-        .write()
+        .cache
+        .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     cache.next_use = 0;
     cache.masks.clear();
+    cache.in_flight.clear();
 }
 
 #[cfg(test)]
@@ -228,14 +237,22 @@ pub(crate) fn cached_shadow_mask(
     let (relative_layout, offset_x, offset_y) = split_layout_for_shadow_cache(layout);
     let key = shadow_mask_cache_key(relative_layout, radius, blur_radius);
 
-    {
-        let cache = shadow_mask_cache()
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(entry) = cache.masks.get(&key) {
-            return (entry.value.clone(), offset_x, offset_y);
+    let state = shadow_mask_cache();
+    let mut cache = state.cache.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        let last_used = next_cache_use(&mut cache.next_use);
+        if let Some(existing) = cached_cache_entry(&mut cache.masks, &key, last_used) {
+            return (existing, offset_x, offset_y);
         }
+
+        if !cache.in_flight.contains(&key) {
+            cache.in_flight.insert(key.clone());
+            break;
+        }
+
+        cache = state.condvar.wait(cache).unwrap_or_else(|p| p.into_inner());
     }
+    drop(cache);
 
     SHADOW_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
     let raster_start = Instant::now();
@@ -244,13 +261,10 @@ pub(crate) fn cached_shadow_mask(
         raster_start.elapsed().as_micros().min(usize::MAX as u128) as usize,
         Ordering::Relaxed,
     );
-    let mut cache = shadow_mask_cache()
-        .write()
-        .unwrap_or_else(|poison| poison.into_inner());
+
+    let mut cache = state.cache.lock().unwrap_or_else(|p| p.into_inner());
+    cache.in_flight.remove(&key);
     let last_used = next_cache_use(&mut cache.next_use);
-    if let Some(existing) = cached_cache_entry(&mut cache.masks, &key, last_used) {
-        return (existing, offset_x, offset_y);
-    }
     insert_lru_cache_entry(
         &mut cache.masks,
         key,
@@ -258,6 +272,7 @@ pub(crate) fn cached_shadow_mask(
         last_used,
         MAX_SHADOW_MASK_CACHE_ENTRIES,
     );
+    state.condvar.notify_all();
     (mask, offset_x, offset_y)
 }
 
@@ -988,5 +1003,29 @@ mod tests {
 
         assert!(Arc::ptr_eq(&retained, &retained_again));
         assert!(!Arc::ptr_eq(&first, &first_after));
+    }
+
+    #[test]
+    fn concurrent_shadow_requests_build_the_mask_once() {
+        let _cache_guard = lock_shadow_mask_cache_for_tests();
+        clear_shadow_mask_cache_for_tests();
+        super::reset_frame_shadow_stats();
+
+        let radius = CornerRadius::all(16.0);
+        let layout = LayoutBox::new(10.25, 20.0, 96.0, 72.0);
+
+        let masks = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(move || cached_shadow_mask(layout, radius, 12.0).0))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("shadow worker should finish"))
+                .collect::<Vec<_>>()
+        });
+
+        let (misses, _, _) = super::take_frame_shadow_stats();
+        assert_eq!(misses, 1);
+        assert!(masks.iter().all(|mask| Arc::ptr_eq(mask, &masks[0])));
     }
 }

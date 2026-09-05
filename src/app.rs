@@ -273,6 +273,7 @@ enum UniqueMatch<T> {
 }
 
 struct NodeBoundaryMatch<'a> {
+    #[allow(dead_code)]
     node: &'a Node,
     path: ElementPath,
 }
@@ -398,6 +399,7 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     runtime_world: RuntimeWorld,
     text_inputs: NativeTextInputs,
     render_mode: RenderMode,
+    continuous_updates: bool,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
     scene_transition: Option<SceneTransition>,
@@ -420,6 +422,7 @@ where
             runtime_world: RuntimeWorld::default(),
             text_inputs: NativeTextInputs::default(),
             render_mode: RenderMode::OnInvalidation,
+            continuous_updates: false,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
             scene_transition: None,
@@ -435,6 +438,13 @@ where
 
     pub fn render_mode(&self) -> RenderMode {
         self.render_mode
+    }
+
+    /// Keep invoking the update callback at the configured frame cadence while
+    /// still reusing clean scenes in [`RenderMode::OnInvalidation`].
+    pub fn with_continuous_updates(mut self, enabled: bool) -> Self {
+        self.continuous_updates = enabled;
+        self
     }
 
     pub fn needs_redraw(&self) -> bool {
@@ -694,6 +704,15 @@ where
     }
 
     fn replace_scene(&mut self, scene: Vec<RenderNode>) {
+        if let Some(active) = self.scene_transition.take() {
+            if active.targets_match(&scene) {
+                self.cached_scene =
+                    Some(self.cached_scene.take().unwrap_or_else(|| active.sample()));
+                self.scene_transition = Some(active);
+                return;
+            }
+        }
+
         let previous = self.cached_scene.take();
 
         match previous {
@@ -816,14 +835,25 @@ where
     }
 
     fn redraw_schedule(&self) -> renderer::RedrawSchedule {
-        match self.render_mode {
-            RenderMode::EveryFrame => renderer::RedrawSchedule::EveryFrame,
-            RenderMode::OnInvalidation => renderer::RedrawSchedule::OnInvalidation,
+        if self.continuous_updates || matches!(self.render_mode, RenderMode::EveryFrame) {
+            renderer::RedrawSchedule::EveryFrame
+        } else {
+            renderer::RedrawSchedule::OnInvalidation
         }
     }
 
     fn needs_redraw(&self) -> bool {
         App::needs_redraw(self)
+    }
+
+    fn transition_active(&self) -> bool {
+        self.scene_transition.is_some()
+    }
+
+    fn transition_is_zero_progress(&self) -> bool {
+        self.scene_transition
+            .as_ref()
+            .is_some_and(|transition| transition.is_zero_progress())
     }
 }
 
@@ -1090,6 +1120,15 @@ where
     }
 
     fn replace_scene(&mut self, scene: Vec<RenderNode>) {
+        if let Some(active) = self.scene_transition.take() {
+            if active.targets_match(&scene) {
+                self.cached_scene =
+                    Some(self.cached_scene.take().unwrap_or_else(|| active.sample()));
+                self.scene_transition = Some(active);
+                return;
+            }
+        }
+
         if let Some(previous) = self.cached_scene.take() {
             if SceneTransition::should_create(&previous, &scene) {
                 let transition = SceneTransition::new(previous, scene)
@@ -1209,6 +1248,16 @@ where
 
     fn needs_redraw(&self) -> bool {
         FragmentApp::needs_redraw(self)
+    }
+
+    fn transition_active(&self) -> bool {
+        self.scene_transition.is_some()
+    }
+
+    fn transition_is_zero_progress(&self) -> bool {
+        self.scene_transition
+            .as_ref()
+            .is_some_and(|transition| transition.is_zero_progress())
     }
 }
 
@@ -1423,8 +1472,8 @@ mod tests {
     };
     use crate::renderer::{
         ButtonState, EngineEvent, FrameInfo, KeyIdentity, KeyboardEvent, PointerButton,
-        PointerPosition, SceneProvider, TextInputEvent, ViewportSize, render_scene_update,
-        render_to_buffer,
+        PointerPosition, RedrawSchedule, SceneProvider, TextInputEvent, ViewportSize,
+        render_scene_update, render_to_buffer,
     };
     use crate::style::{Stylesheet, parse_stylesheet};
 
@@ -1868,6 +1917,36 @@ mod tests {
         assert_eq!(render_calls.get(), 2);
         assert_eq!(app.render_mode(), RenderMode::EveryFrame);
         assert_eq!(*app.state(), 1);
+    }
+
+    #[test]
+    fn continuous_updates_tick_without_rebuilding_clean_scenes() {
+        let stylesheet = Stylesheet::default();
+        let update_calls = Cell::new(0_u32);
+        let render_calls = Cell::new(0_u32);
+        let mut app = App::new(
+            (),
+            &stylesheet,
+            |_state, _frame| {
+                update_calls.set(update_calls.get() + 1);
+                Invalidation::Clean
+            },
+            |_state| {
+                render_calls.set(render_calls.get() + 1);
+                ui! { <div id="app"></div> }
+            },
+        )
+        .with_continuous_updates(true);
+
+        app.frame(frame(0));
+        app.frame(frame(1));
+
+        assert_eq!(update_calls.get(), 2);
+        assert_eq!(render_calls.get(), 1);
+        assert_eq!(
+            SceneProvider::redraw_schedule(&app),
+            RedrawSchedule::EveryFrame
+        );
     }
 
     #[test]

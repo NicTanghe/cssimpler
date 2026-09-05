@@ -599,7 +599,9 @@ pub(crate) fn transformed_rounded_rect_coverage(
         .max(clamped_radius.bottom_left)
         .max(clamped_radius.bottom_right);
 
-    let margin = (max_r + 1.5).min(layout.width * 0.5).min(layout.height * 0.5);
+    let margin = (max_r + 1.5)
+        .min(layout.width * 0.5)
+        .min(layout.height * 0.5);
     if source_x >= layout.x + margin
         && source_x <= layout.x + layout.width - margin
         && source_y >= layout.y + margin
