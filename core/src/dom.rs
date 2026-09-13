@@ -76,8 +76,11 @@ impl ElementNode {
         self
     }
 
-    pub fn with_class(mut self, class_name: impl Into<String>) -> Self {
-        self.classes.push(class_name.into());
+    /// Append a whitespace-separated class list, preserving existing classes.
+    /// This also handles class values supplied by dynamic `ui!` expressions.
+    pub fn with_class(mut self, class_names: impl Into<String>) -> Self {
+        self.classes
+            .extend(class_names.into().split_whitespace().map(str::to_owned));
         self.sync_class_attribute();
         self
     }
@@ -277,6 +280,28 @@ mod tests {
             }
             Node::Text(_) => panic!("expected an element node"),
         }
+    }
+
+    #[test]
+    fn class_builders_and_attributes_share_tokenization() {
+        for input in [
+            "card",
+            "card selected",
+            "  card\tselected\nactive  ",
+            "",
+            " \t\n",
+        ] {
+            let appended = Node::element("button").with_class(input);
+            let assigned = Node::element("button").with_attribute("class", input);
+            assert_eq!(appended.classes, assigned.classes, "{input:?}");
+            assert_eq!(appended.attribute("class"), assigned.attribute("class"));
+        }
+        let node = Node::element("button")
+            .with_class("base")
+            .with_class("card selected")
+            .with_class(" ");
+        assert_eq!(node.classes, ["base", "card", "selected"]);
+        assert_eq!(node.attribute("class"), Some("base card selected"));
     }
 
     #[test]

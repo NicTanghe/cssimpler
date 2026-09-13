@@ -154,3 +154,18 @@ fn ui_macro_accepts_html_void_input_without_self_closing_slash() {
         Node::Text(_) => panic!("expected form element"),
     }
 }
+
+#[test]
+fn ui_macro_dynamic_class_lists_match_literal_lists() {
+    let classes = String::from("card\tselected\nactive");
+    let empty = "  ";
+    let dynamic =
+        ui! { <button class="base" class={classes} class={empty} onclick={increment}></button> };
+    let literal = ui! { <button class="base card selected active" onclick={increment}></button> };
+    let (Node::Element(dynamic), Node::Element(literal)) = (dynamic, literal) else {
+        panic!("expected buttons");
+    };
+    assert_eq!(dynamic.classes, literal.classes);
+    assert_eq!(dynamic.attribute("class"), literal.attribute("class"));
+    assert!(dynamic.handlers.click.is_some());
+}
