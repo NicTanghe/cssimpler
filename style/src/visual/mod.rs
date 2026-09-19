@@ -3,6 +3,7 @@ mod border;
 mod color;
 mod glass;
 mod gradient;
+mod image;
 mod scrollbar;
 mod shadow;
 mod svg;
@@ -22,6 +23,9 @@ use crate::{Declaration, StyleError};
 pub(crate) fn extract_property(
     property: &Property<'_>,
 ) -> Option<Result<Vec<Declaration>, StyleError>> {
+    if let Some(declarations) = image::extract(property) {
+        return Some(declarations);
+    }
     if let Some(declarations) = glass::custom_property_declarations(property) {
         return Some(declarations);
     }
@@ -49,10 +53,18 @@ pub(crate) fn extract_property(
 
     match property {
         Property::BackgroundColor(color) => Some(color::background_color_declaration(color)),
-        Property::Background(backgrounds) => Some(gradient::background_declarations(backgrounds)),
-        Property::BackgroundImage(images) => {
-            Some(gradient::background_image_declarations(images.as_slice()))
-        }
+        Property::Background(backgrounds) => Some(
+            gradient::background_declarations(backgrounds).map(|mut declarations| {
+                declarations.extend(image::backgrounds(backgrounds));
+                declarations
+            }),
+        ),
+        Property::BackgroundImage(images) => Some(
+            gradient::background_image_declarations(images.as_slice()).map(|mut declarations| {
+                declarations.push(Declaration::RasterSource(image::source(images)));
+                declarations
+            }),
+        ),
         Property::Color(color) => Some(color::foreground_color_declaration(color)),
         Property::Fill(paint) => Some(svg::fill_declaration(paint)),
         Property::Stroke(paint) => Some(svg::stroke_declaration(paint)),
@@ -112,6 +124,26 @@ pub(crate) fn extract_property(
 
 pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) -> bool {
     match declaration {
+        Declaration::RasterSource(source) => {
+            style.visual.raster_background.source = source.clone();
+            true
+        }
+        Declaration::RasterSize(fit) => {
+            style.visual.raster_background.fit = *fit;
+            true
+        }
+        Declaration::RasterPosition(position) => {
+            style.visual.raster_background.position = *position;
+            true
+        }
+        Declaration::RasterRepeat(repeat) => {
+            style.visual.raster_background.repeat = *repeat;
+            true
+        }
+        Declaration::RasterOpacity(opacity) => {
+            style.visual.raster_background.opacity = *opacity;
+            true
+        }
         Declaration::Background(color) => {
             color::apply_background(style, *color);
             true

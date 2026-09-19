@@ -87,7 +87,16 @@ fn svg_paint_server_data_kind(data: &SvgPaintServerData) -> SvgPaintServerKind {
 pub(crate) fn is_supported_svg_tag(tag: &str) -> bool {
     matches!(
         tag,
-        "svg" | "defs" | "g" | "path" | "circle" | "linearGradient" | "stop"
+        "svg"
+            | "defs"
+            | "g"
+            | "path"
+            | "circle"
+            | "polygon"
+            | "polyline"
+            | "rect"
+            | "linearGradient"
+            | "stop"
     )
 }
 
@@ -133,7 +142,7 @@ pub(crate) fn seed_element_style(element: &ElementNode) -> Style {
                     &normalize_svg_length_attribute(value),
                 );
             }
-            _ => panic!("unsupported SVG attribute `{}` on <{}>", name, element.tag),
+            _ => {}
         }
     }
 
@@ -163,7 +172,7 @@ pub(crate) fn resolve_svg_root(
     for child in &element.children {
         match child {
             Node::Text(text) if text.trim().is_empty() => {}
-            Node::Text(_) => panic!("text nodes are not supported inside <svg>"),
+            Node::Text(_) => {}
             Node::Element(child) => {
                 let child_path = element_path.with_child(child_index);
                 child_index += 1;
@@ -233,9 +242,7 @@ fn normalize_svg_length_attribute(value: &str) -> String {
 fn parse_svg_root_metadata(element: &ElementNode) -> SvgRootMetadata {
     let view_box = element
         .attribute("viewBox")
-        .map(parse_view_box)
-        .transpose()
-        .unwrap_or_else(|error| panic!("unsupported SVG `viewBox` on <svg>: {error}"));
+        .and_then(|v| parse_view_box(v).ok());
     let fallback_width = numeric_svg_length_attribute(element.attribute("width"))
         .or_else(|| view_box.map(|view_box| view_box.width))
         .unwrap_or(300.0);
@@ -295,9 +302,7 @@ fn collect_svg_paint_servers(element: &ElementNode, registry: &mut SvgPaintServe
             Node::Element(child) => match child.tag.as_str() {
                 "defs" => collect_svg_defs(child, registry),
                 "g" => collect_svg_paint_servers(child, registry),
-                "linearGradient" => {
-                    panic!("SVG paint-server <linearGradient> must be declared inside <defs>")
-                }
+                "linearGradient" => {}
                 _ => {}
             },
         }
@@ -305,17 +310,10 @@ fn collect_svg_paint_servers(element: &ElementNode, registry: &mut SvgPaintServe
 }
 
 fn collect_svg_defs(element: &ElementNode, registry: &mut SvgPaintServerRegistry) {
-    for (name, _) in element.attributes() {
-        if name == "id" || name == "class" {
-            continue;
-        }
-        panic!("unsupported SVG attribute `{}` on <defs>", name);
-    }
-
     for child in &element.children {
         match child {
             Node::Text(text) if text.trim().is_empty() => {}
-            Node::Text(_) => panic!("text nodes are not supported inside <defs>"),
+            Node::Text(_) => {}
             Node::Element(child) => collect_svg_paint_server_definition(child, registry),
         }
     }
@@ -580,9 +578,8 @@ fn collect_svg_paths(
 ) {
     match element.tag.as_str() {
         "defs" => return,
-        "g" | "path" | "circle" => {}
-        "svg" => panic!("nested <svg> elements are not supported inside SVG subtrees"),
-        _ => panic!("unsupported SVG tag <{}>", element.tag),
+        "g" | "path" | "circle" | "polygon" | "polyline" | "rect" => {}
+        _ => return,
     }
 
     let style = crate::resolve_style_target(
@@ -611,8 +608,7 @@ fn collect_svg_paths(
             let mut child_index = 0;
             for child in &element.children {
                 match child {
-                    Node::Text(text) if text.trim().is_empty() => {}
-                    Node::Text(_) => panic!("text nodes are not supported inside <g>"),
+                    Node::Text(_) => {}
                     Node::Element(child) => {
                         let child_path = element_path.with_child(child_index);
                         child_index += 1;
@@ -634,39 +630,10 @@ fn collect_svg_paths(
             }
         }
         "path" => {
-            for child in &element.children {
-                match child {
-                    Node::Text(text) if text.trim().is_empty() => {}
-                    _ => panic!("<path> does not support child nodes"),
-                }
-            }
-
-            let data = element
-                .attribute("d")
-                .unwrap_or_else(|| panic!("supported <path> elements require a `d` attribute"));
-            let geometry = parse_svg_path_data(data)
-                .unwrap_or_else(|error| panic!("unsupported SVG path data on <path>: {error}"));
-            paths.push(SvgPathInstance {
-                geometry: translate_svg_geometry(
-                    geometry,
-                    svg_state.translate_x,
-                    svg_state.translate_y,
-                ),
-                paint: svg_path_paint(&svg_state, style.visual.foreground, paint_servers),
-            });
-        }
-        "circle" => {
-            for child in &element.children {
-                match child {
-                    Node::Text(text) if text.trim().is_empty() => {}
-                    _ => panic!("<circle> does not support child nodes"),
-                }
-            }
-
-            let geometry = parse_svg_circle_geometry(element).unwrap_or_else(|error| {
-                panic!("unsupported SVG circle geometry on <circle>: {error}")
-            });
-            let Some(geometry) = geometry else {
+            let Some(data) = element.attribute("d") else {
+                return;
+            };
+            let Ok(geometry) = parse_svg_path_data(data) else {
                 return;
             };
             paths.push(SvgPathInstance {
@@ -678,7 +645,68 @@ fn collect_svg_paths(
                 paint: svg_path_paint(&svg_state, style.visual.foreground, paint_servers),
             });
         }
-        _ => unreachable!("unsupported SVG tags are rejected before matching"),
+        "circle" => {
+            let Ok(Some(geometry)) = parse_svg_circle_geometry(element) else {
+                return;
+            };
+            paths.push(SvgPathInstance {
+                geometry: translate_svg_geometry(
+                    geometry,
+                    svg_state.translate_x,
+                    svg_state.translate_y,
+                ),
+                paint: svg_path_paint(&svg_state, style.visual.foreground, paint_servers),
+            });
+        }
+        "polygon" | "polyline" => {
+            let closed = element.tag.as_str() == "polygon";
+            let Some(points_str) = element.attribute("points") else {
+                return;
+            };
+            let Some(points) = parse_svg_points(points_str) else {
+                return;
+            };
+            let geometry = SvgPathGeometry::new(vec![SvgContour {
+                points,
+                closed,
+            }]);
+            paths.push(SvgPathInstance {
+                geometry: translate_svg_geometry(
+                    geometry,
+                    svg_state.translate_x,
+                    svg_state.translate_y,
+                ),
+                paint: svg_path_paint(&svg_state, style.visual.foreground, paint_servers),
+            });
+        }
+        "rect" => {
+            let x = numeric_svg_length_attribute(element.attribute("x")).unwrap_or(0.0);
+            let y = numeric_svg_length_attribute(element.attribute("y")).unwrap_or(0.0);
+            let width = numeric_svg_length_attribute(element.attribute("width")).unwrap_or(0.0);
+            let height = numeric_svg_length_attribute(element.attribute("height")).unwrap_or(0.0);
+            if width <= 0.0 || height <= 0.0 {
+                return;
+            }
+            let points = vec![
+                SvgPoint::new(x, y),
+                SvgPoint::new(x + width, y),
+                SvgPoint::new(x + width, y + height),
+                SvgPoint::new(x, y + height),
+            ];
+            let geometry = SvgPathGeometry::new(vec![SvgContour {
+                points,
+                closed: true,
+            }]);
+            paths.push(SvgPathInstance {
+                geometry: translate_svg_geometry(
+                    geometry,
+                    svg_state.translate_x,
+                    svg_state.translate_y,
+                ),
+                paint: svg_path_paint(&svg_state, style.visual.foreground, paint_servers),
+            });
+        }
+        _ => {}
     }
 }
 
@@ -858,6 +886,22 @@ fn resolve_svg_paint(
         }
         SvgPaint::None => None,
     }
+}
+
+fn parse_svg_points(value: &str) -> Option<Vec<SvgPoint>> {
+    let mut numbers = Vec::new();
+    for token in value.replace(',', " ").split_whitespace() {
+        let num = token.parse::<f32>().ok()?;
+        numbers.push(num);
+    }
+    if numbers.len() < 2 || numbers.len() % 2 != 0 {
+        return None;
+    }
+    let points = numbers
+        .chunks_exact(2)
+        .map(|chunk| SvgPoint::new(chunk[0], chunk[1]))
+        .collect();
+    Some(points)
 }
 
 fn parse_svg_path_data(data: &str) -> Result<SvgPathGeometry, String> {
@@ -1907,6 +1951,49 @@ mod tests {
                     .into(),
             )
             .into()
+    }
+
+    #[test]
+    fn svg_ignores_arbitrary_data_and_control_attributes() {
+        let tree = Node::element("svg")
+            .with_attribute("viewBox", "0 0 24 24")
+            .with_attribute("data-control", "select")
+            .with_attribute("preserveAspectRatio", "none")
+            .with_attribute("version", "1.1")
+            .with_child(
+                Node::element("path")
+                    .with_attribute("d", "M4 12 L20 12")
+                    .with_attribute("data-control", "select")
+                    .into(),
+            )
+            .into();
+
+        let scene = build_render_tree(&tree, &Stylesheet::default());
+        let RenderKind::Svg(svg) = scene.kind else {
+            panic!("expected an SVG render node");
+        };
+        assert_eq!(svg.paths.len(), 1);
+    }
+
+    #[test]
+    fn svg_polygon_elements_render_as_closed_paths() {
+        let tree = Node::element("svg")
+            .with_attribute("viewBox", "0 0 2560 100")
+            .with_child(
+                Node::element("polygon")
+                    .with_attribute("points", "2560 0 2560 300 0 100")
+                    .into(),
+            )
+            .into();
+
+        let scene = build_render_tree(&tree, &Stylesheet::default());
+        let RenderKind::Svg(svg) = scene.kind else {
+            panic!("expected an SVG render node");
+        };
+        assert_eq!(svg.paths.len(), 1);
+        let contour = &svg.paths[0].geometry.contours[0];
+        assert_eq!(contour.points.len(), 3);
+        assert!(contour.closed);
     }
 
     fn panic_message(error: Box<dyn std::any::Any + Send>) -> String {

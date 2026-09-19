@@ -221,9 +221,8 @@ fn background_layer_from_image(
     match image {
         Image::None => Ok(None),
         Image::Gradient(gradient) => gradient_from_css(gradient).map(Some),
-        Image::Url(_) | Image::ImageSet(_) => {
-            Err(StyleError::UnsupportedValue(format!("{image:?}")))
-        }
+        Image::Url(_) => Ok(None),
+        Image::ImageSet(_) => Err(StyleError::UnsupportedValue(format!("{image:?}"))),
     }
 }
 

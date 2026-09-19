@@ -362,7 +362,7 @@ pub(crate) fn resolve_element_tree(
     interaction: &ElementInteractionState,
     element_path: &ElementPath,
 ) -> ResolvedElement {
-    let style = crate::resolve_style_target(
+    let mut style = crate::resolve_style_target(
         element,
         stylesheet,
         seed_element_style(element),
@@ -374,6 +374,40 @@ pub(crate) fn resolve_element_tree(
         element_path,
         None,
     );
+    if element.tag == "img" {
+        if let Some(source) = element.attribute("src") {
+            style.visual.raster_background.source = Some(source.to_owned());
+            style.visual.raster_background.repeat = (false, false);
+            style.visual.raster_background.position = (0.5, 0.5);
+            if style.visual.raster_background.fit == cssimpler_core::images::ImageFit::Auto {
+                style.visual.raster_background.fit = cssimpler_core::images::ImageFit::Fill;
+            }
+            if let Some(image) = cssimpler_core::images::image(source) {
+                use taffy::style::Dimension;
+                style.layout.taffy.aspect_ratio = Some(image.width as f32 / image.height as f32);
+                let ratio = image.width as f32 / image.height as f32;
+                match (
+                    style.layout.taffy.size.width,
+                    style.layout.taffy.size.height,
+                ) {
+                    (Dimension::Auto, Dimension::Length(height)) => {
+                        style.layout.taffy.size.width = Dimension::Length(height * ratio)
+                    }
+                    (Dimension::Length(width), Dimension::Auto) => {
+                        style.layout.taffy.size.height = Dimension::Length(width / ratio)
+                    }
+                    (Dimension::Auto, Dimension::Auto) => {
+                        style.layout.taffy.size.width = Dimension::Length(image.width as f32)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(source) = &style.visual.raster_background.source {
+        style.visual.raster_background.generation =
+            cssimpler_core::images::image(source).map_or(0, |image| image.generation);
+    }
     if element.tag == "svg" {
         let resolved_svg = resolve_svg_root(
             element,
@@ -398,6 +432,17 @@ pub(crate) fn resolve_element_tree(
             "supported SVG elements must appear inside <svg>, found <{}> at {:?}",
             element.tag, element_path
         );
+    }
+    if style.layout.taffy.display == TaffyDisplay::None {
+        return ResolvedElement {
+            element_id: element.id.clone(),
+            style,
+            text: String::new(),
+            svg_scene: None,
+            element_path: element_path.clone(),
+            handlers: cssimpler_core::EventHandlers::default(),
+            children: Vec::new(),
+        };
     }
     let mut child_ancestors = Vec::with_capacity(ancestors.len() + 1);
     child_ancestors.push(ElementRef::from(element));
@@ -808,6 +853,9 @@ fn render_node_from_layout(
     parent_x: f32,
     parent_y: f32,
 ) -> RenderNode {
+    if tree.style.layout.taffy.display == TaffyDisplay::None {
+        return RenderNode::container(LayoutBox::new(parent_x, parent_y, 0.0, 0.0));
+    }
     let layout = *taffy
         .layout(tree.node_id)
         .expect("computed layouts should be readable");
@@ -817,6 +865,7 @@ fn render_node_from_layout(
     let child_nodes: Vec<_> = tree
         .children
         .iter()
+        .filter(|child| child.style.layout.taffy.display != TaffyDisplay::None)
         .map(|child| render_node_from_layout(child, taffy, x, y))
         .collect();
     let content_inset = content_inset_from_taffy(&tree.style.layout.taffy);
@@ -839,13 +888,15 @@ fn render_node_from_layout(
 
     if child_nodes.is_empty() && !tree.text.is_empty() {
         let wrap_width = text_layout_wrap_width(layout_box, content_inset, scrollbars);
+        // Taffy can assign a different final width after measuring flex/grid
+        // content. Refresh the prepared text before validating that final width.
+        let text_layout = text_layout_from_measure_context(taffy, tree.node_id, wrap_width);
         debug_assert_final_text_measurement_is_consistent(
             tree,
             taffy,
             wrap_width,
             scrollbars.is_none(),
         );
-        let text_layout = text_layout_from_measure_context(taffy, tree.node_id, wrap_width);
         let mut node = RenderNode::text(layout_box, tree.text.clone())
             .with_style(tree.style.visual.clone())
             .with_transitions(tree.style.transitions.clone())
@@ -1043,13 +1094,15 @@ fn render_node_with_cached_layout(
     if !matches!(template.kind, cssimpler_core::RenderKind::Container) {
         return None;
     }
-    if resolved.children.len() != template.children.len() {
+    let visible_children = resolved
+        .children
+        .iter()
+        .filter(|child| child.style.layout.taffy.display != TaffyDisplay::None);
+    if visible_children.clone().count() != template.children.len() {
         return None;
     }
 
-    let children = resolved
-        .children
-        .iter()
+    let children = visible_children
         .zip(&template.children)
         .map(|(child, child_template)| render_node_with_cached_layout(child, child_template))
         .collect::<Option<Vec<_>>>()?;

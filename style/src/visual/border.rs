@@ -5,7 +5,7 @@ use lightningcss::properties::border::{
 };
 use lightningcss::properties::border_radius::BorderRadius;
 use lightningcss::values::color::CssColor;
-use lightningcss::values::length::LengthPercentage;
+use lightningcss::values::length::{Length, LengthPercentage, LengthValue};
 use lightningcss::values::size::Size2D;
 use taffy::prelude::LengthPercentage as TaffyLengthPercentage;
 
@@ -295,6 +295,11 @@ fn length_percentage_to_px(value: &LengthPercentage) -> Result<f32, StyleError> 
         LengthPercentage::Dimension(length) => length
             .to_px()
             .map(|value| value as f32)
+            .or_else(|| match length {
+                LengthValue::Rem(rem) => Some(*rem * 16.0),
+                LengthValue::Em(em) => Some(*em * 16.0),
+                _ => None,
+            })
             .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}"))),
         // Encode percentages as negative fractions so the renderer can resolve
         // them against the final layout size once width and height are known.
@@ -311,6 +316,11 @@ fn border_width_to_px(value: &CssBorderSideWidth) -> Result<f32, StyleError> {
         CssBorderSideWidth::Length(length) => length
             .to_px()
             .map(|value| value as f32)
+            .or_else(|| match length {
+                Length::Value(LengthValue::Rem(rem)) => Some(*rem * 16.0),
+                Length::Value(LengthValue::Em(em)) => Some(*em * 16.0),
+                _ => None,
+            })
             .ok_or_else(|| StyleError::UnsupportedValue(format!("{value:?}"))),
     }
 }

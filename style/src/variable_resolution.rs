@@ -8,21 +8,68 @@ use lightningcss::stylesheet::ParserOptions;
 
 use crate::{Declaration, StyleError};
 
+fn is_supported_property(name: &str) -> bool {
+    match name {
+        "content"
+        | "overflow" | "overflow-x" | "overflow-y"
+        | "display" | "position" | "z-index"
+        | "top" | "right" | "bottom" | "left" | "inset"
+        | "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height"
+        | "margin" | "margin-top" | "margin-right" | "margin-bottom" | "margin-left"
+        | "padding" | "padding-top" | "padding-right" | "padding-bottom" | "padding-left"
+        | "flex-direction" | "flex-wrap" | "justify-content" | "align-content"
+        | "align-items" | "align-self" | "flex-grow" | "flex-shrink" | "flex-basis" | "flex"
+        | "gap" | "row-gap" | "column-gap"
+        | "grid-template-columns" | "grid-template-rows" | "grid-column" | "grid-row"
+        | "grid-column-start" | "grid-column-end" | "grid-row-start" | "grid-row-end"
+        | "background-color" | "background" | "background-image"
+        | "color" | "fill" | "stroke" | "stroke-width"
+        | "border-radius" | "border-top-left-radius" | "border-top-right-radius"
+        | "border-bottom-right-radius" | "border-bottom-left-radius"
+        | "border" | "border-top" | "border-right" | "border-bottom" | "border-left"
+        | "border-width" | "border-top-width" | "border-right-width"
+        | "border-bottom-width" | "border-left-width"
+        | "border-color" | "border-top-color" | "border-right-color"
+        | "border-bottom-color" | "border-left-color"
+        | "border-style" | "border-top-style" | "border-right-style"
+        | "border-bottom-style" | "border-left-style"
+        | "box-shadow" | "filter" | "backdrop-filter" | "opacity"
+        | "transform" | "transform-origin" | "transform-style" | "perspective"
+        | "font-family" | "font-size" | "font-weight" | "font-style" | "line-height"
+        | "letter-spacing" | "text-align" | "text-transform" | "text-decoration"
+        | "transition" | "transition-property" | "transition-duration"
+        | "transition-timing-function" | "transition-delay"
+        | "native-material" | "glass-tint"
+        | "scrollbar-width" | "scrollbar-color"
+        | "-webkit-text-stroke" | "-webkit-text-stroke-width" | "-webkit-text-stroke-color"
+        | "-webkit-backdrop-filter" => true,
+        _ => name.starts_with("--"),
+    }
+}
+
 pub(crate) fn extract_property(
     property: &Property<'_>,
 ) -> Option<Result<Vec<Declaration>, StyleError>> {
     match property {
         Property::Unparsed(unparsed) if contains_var_reference(&unparsed.value) => {
+            let name = unparsed.property_id.name();
+            if !is_supported_property(name) {
+                return None;
+            }
             Some(variable_dependent_property_declaration(
-                unparsed.property_id.name(),
+                name,
                 property_value_to_css(property),
             ))
         }
         Property::Custom(custom)
             if !custom.name.as_ref().starts_with("--") && contains_var_reference(&custom.value) =>
         {
+            let name = custom.name.as_ref();
+            if !is_supported_property(name) {
+                return None;
+            }
             Some(variable_dependent_property_declaration(
-                custom.name.as_ref(),
+                name,
                 property_value_to_css(property),
             ))
         }
@@ -83,11 +130,7 @@ fn resolve_variable_dependent_property(
     })?;
 
     if property_contains_var_reference(&resolved_property) {
-        return Err(unresolved_property_error(
-            property_name,
-            value_css,
-            "a referenced custom property was missing or invalid",
-        ));
+        return Ok(Vec::new());
     }
 
     let declarations = super::extract_property(&resolved_property)

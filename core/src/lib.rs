@@ -4,6 +4,7 @@ pub mod dom;
 pub mod extracted_scene;
 pub mod fonts;
 pub mod generated_content;
+pub mod images;
 pub mod interaction;
 pub mod runtime_ecs;
 pub mod scrollbar;
@@ -743,6 +744,7 @@ impl ZIndex {
 pub struct VisualStyle {
     pub background: Option<Color>,
     pub background_layers: Vec<BackgroundLayer>,
+    pub raster_background: images::RasterBackground,
     pub foreground: Color,
     pub svg: SvgStyle,
     pub text: TextStyle,
@@ -771,6 +773,7 @@ impl Default for VisualStyle {
         Self {
             background: None,
             background_layers: Vec::new(),
+            raster_background: images::RasterBackground::default(),
             foreground: Color::BLACK,
             svg: SvgStyle::default(),
             text: TextStyle::default(),

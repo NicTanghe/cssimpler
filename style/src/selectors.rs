@@ -451,7 +451,7 @@ fn extract_compound_selector(
         .flatten()
         .collect::<Vec<_>>();
 
-    let simple_selectors = if simple_selectors.is_empty() && pseudo_element.is_some() {
+    let simple_selectors = if simple_selectors.is_empty() {
         vec![SimpleSelector::Universal]
     } else {
         simple_selectors
@@ -970,4 +970,16 @@ mod tests {
 
         assert!(matches!(error, StyleError::UnsupportedSelector(_)));
     }
+
+    #[test]
+    fn parser_supports_universal_selector() {
+        let sheet = parse_stylesheet("* { margin: 0; }")
+            .expect("universal selector should parse");
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(
+            sheet.rules[0].selector.rightmost.simple_selectors,
+            vec![SimpleSelector::Universal]
+        );
+    }
 }
+

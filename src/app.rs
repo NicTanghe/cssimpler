@@ -322,27 +322,28 @@ fn render_root_with_schedule(
     );
     stats.record_phase(RuntimePhase::StyleResolution, style_start.elapsed());
 
-    match mode {
-        RootRenderMode::FullLayout => {
-            let layout_start = Instant::now();
-            let mut layout = layout_resolved_render_tree_in_viewport(
-                &resolved,
-                viewport.map(|viewport| (viewport.width, viewport.height)),
-            );
-            stats.record_phase(RuntimePhase::LayoutSync, layout_start.elapsed());
-
-            let extract_start = Instant::now();
-            let node = extract_render_tree(&mut layout);
-            stats.record_phase(RuntimePhase::RenderExtraction, extract_start.elapsed());
-            Some(node)
+    if let RootRenderMode::CachedLayout(template) = mode {
+        let extract_start = Instant::now();
+        let node = rebuild_resolved_render_tree_with_cached_layout(&resolved, template);
+        stats.record_phase(RuntimePhase::RenderExtraction, extract_start.elapsed());
+        if node.is_some() {
+            return node;
         }
-        RootRenderMode::CachedLayout(template) => {
-            let extract_start = Instant::now();
-            let node = rebuild_resolved_render_tree_with_cached_layout(&resolved, template)?;
-            stats.record_phase(RuntimePhase::RenderExtraction, extract_start.elapsed());
-            Some(node)
-        }
+        // Cached render structure can be incompatible after visibility or
+        // scrollbar changes. The root still exists; recompute its layout.
     }
+
+    let layout_start = Instant::now();
+    let mut layout = layout_resolved_render_tree_in_viewport(
+        &resolved,
+        viewport.map(|viewport| (viewport.width, viewport.height)),
+    );
+    stats.record_phase(RuntimePhase::LayoutSync, layout_start.elapsed());
+
+    let extract_start = Instant::now();
+    let node = extract_render_tree(&mut layout);
+    stats.record_phase(RuntimePhase::RenderExtraction, extract_start.elapsed());
+    Some(node)
 }
 
 fn render_boundary_with_schedule(

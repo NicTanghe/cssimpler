@@ -128,15 +128,14 @@ impl Stylesheet {
         interaction: &'a ElementInteractionState,
         pseudo_element: Option<PseudoElementKind>,
     ) -> impl Iterator<Item = &'a StyleRule> {
-        self.rules.iter().filter(move |rule| {
-            rule.selector.matches_with_ancestors_interaction_and_pseudo(
-                element,
-                ancestors,
-                element_path,
-                interaction,
-                pseudo_element,
-            )
-        })
+        let indices = self.matching_rule_indices_with_context_and_pseudo(
+            element,
+            ancestors,
+            element_path,
+            interaction,
+            pseudo_element,
+        );
+        indices.into_iter().map(move |i| &self.rules[i])
     }
 
     fn matching_rule_indices_with_context_and_pseudo<'a>(
@@ -379,6 +378,11 @@ pub enum Declaration {
     TransitionTimingFunctions(Vec<TransitionTimingFunction>),
     Background(Color),
     BackgroundLayers(Vec<BackgroundLayerDeclaration>),
+    RasterSource(Option<String>),
+    RasterSize(cssimpler_core::images::ImageFit),
+    RasterPosition((f32, f32)),
+    RasterRepeat((bool, bool)),
+    RasterOpacity(f32),
     Foreground(Color),
     NativeMaterial(NativeMaterial),
     GlassTint(Option<Color>),
@@ -527,6 +531,88 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
     collect_style_rules(&parsed.rules, &mut stylesheet)?;
 
     Ok(stylesheet)
+}
+
+pub fn parse_stylesheet_lossy(source: &str) -> Result<Stylesheet, StyleError> {
+    let parsed = match StyleSheet::parse(source, ParserOptions::default()) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(Stylesheet::default()),
+    };
+    let normalized = match parsed.to_css(PrinterOptions {
+        targets: CssTargets {
+            include: CssFeatures::Nesting,
+            ..CssTargets::default()
+        },
+        ..PrinterOptions::default()
+    }) {
+        Ok(normalized) => normalized,
+        Err(_) => return Ok(Stylesheet::default()),
+    };
+    let parsed = match StyleSheet::parse(&normalized.code, ParserOptions::default()) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(Stylesheet::default()),
+    };
+    let mut stylesheet = Stylesheet::default();
+    collect_style_rules_lossy(&parsed.rules, &mut stylesheet);
+
+    Ok(stylesheet)
+}
+
+fn collect_style_rules_lossy(rule_list: &CssRuleList<'_, impl Clone>, stylesheet: &mut Stylesheet) {
+    for rule in &rule_list.0 {
+        match rule {
+            CssRule::Style(style_rule) => {
+                collect_style_rule_lossy(style_rule, stylesheet);
+                collect_style_rules_lossy(&style_rule.rules, stylesheet);
+            }
+            CssRule::Nesting(nesting_rule) => {
+                collect_style_rule_lossy(&nesting_rule.style, stylesheet);
+                collect_style_rules_lossy(&nesting_rule.style.rules, stylesheet);
+            }
+            CssRule::Media(media_rule) => {
+                collect_style_rules_lossy(&media_rule.rules, stylesheet);
+            }
+            CssRule::Supports(supports_rule) => {
+                collect_style_rules_lossy(&supports_rule.rules, stylesheet);
+            }
+            CssRule::LayerBlock(layer_rule) => {
+                collect_style_rules_lossy(&layer_rule.rules, stylesheet);
+            }
+            CssRule::Container(container_rule) => {
+                collect_style_rules_lossy(&container_rule.rules, stylesheet);
+            }
+            CssRule::Scope(scope_rule) => {
+                collect_style_rules_lossy(&scope_rule.rules, stylesheet);
+            }
+            CssRule::StartingStyle(starting_style_rule) => {
+                collect_style_rules_lossy(&starting_style_rule.rules, stylesheet);
+            }
+            CssRule::MozDocument(document_rule) => {
+                collect_style_rules_lossy(&document_rule.rules, stylesheet);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_style_rule_lossy(
+    style_rule: &LightningStyleRule<'_, impl Clone>,
+    stylesheet: &mut Stylesheet,
+) {
+    let mut declarations = Vec::new();
+    for (property, _important) in style_rule.declarations.iter() {
+        if let Ok(decls) = extract_property(property) {
+            declarations.extend(decls);
+        }
+    }
+    if declarations.is_empty() {
+        return;
+    }
+    for selector in &style_rule.selectors.0 {
+        if let Ok(sel) = extract_selector(selector) {
+            stylesheet.push(StyleRule::new(sel, declarations.clone()));
+        }
+    }
 }
 
 fn collect_style_rules(
@@ -822,10 +908,19 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
         Property::Display(display) => Ok(vec![Declaration::Display(display_from_css(display)?)]),
         Property::Position(position) => Ok(vec![position_declaration_from_css(position)]),
         Property::ZIndex(value) => Ok(vec![Declaration::ZIndex(z_index_from_css(value))]),
-        Property::Top(value) => Ok(vec![inset_top_declaration(value)?]),
+        Property::Top(value) | Property::InsetBlockStart(value) => {
+            Ok(vec![inset_top_declaration(value)?])
+        }
         Property::Right(value) => Ok(vec![inset_right_declaration(value)?]),
-        Property::Bottom(value) => Ok(vec![inset_bottom_declaration(value)?]),
+        Property::Bottom(value) | Property::InsetBlockEnd(value) => {
+            Ok(vec![inset_bottom_declaration(value)?])
+        }
         Property::Left(value) => Ok(vec![inset_left_declaration(value)?]),
+        // Layout currently uses horizontal block flow.
+        Property::InsetBlock(inset) => Ok(vec![
+            inset_top_declaration(&inset.block_start)?,
+            inset_bottom_declaration(&inset.block_end)?,
+        ]),
         Property::Inset(inset) => Ok(vec![
             inset_top_declaration(&inset.top)?,
             inset_right_declaration(&inset.right)?,
@@ -856,15 +951,23 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
             DimensionValue::Dimension(value) => Declaration::MaxHeight(value),
             DimensionValue::Calc(value) => Declaration::MaxHeightCalc(value),
         }]),
+        Property::MarginBlock(margin) => Ok(vec![
+            margin_top_declaration(&margin.block_start)?,
+            margin_bottom_declaration(&margin.block_end)?,
+        ]),
         Property::Margin(margin) => Ok(vec![
             margin_top_declaration(&margin.top)?,
             margin_right_declaration(&margin.right)?,
             margin_bottom_declaration(&margin.bottom)?,
             margin_left_declaration(&margin.left)?,
         ]),
-        Property::MarginTop(value) => Ok(vec![margin_top_declaration(value)?]),
+        Property::MarginTop(value) | Property::MarginBlockStart(value) => {
+            Ok(vec![margin_top_declaration(value)?])
+        }
         Property::MarginRight(value) => Ok(vec![margin_right_declaration(value)?]),
-        Property::MarginBottom(value) => Ok(vec![margin_bottom_declaration(value)?]),
+        Property::MarginBottom(value) | Property::MarginBlockEnd(value) => {
+            Ok(vec![margin_bottom_declaration(value)?])
+        }
         Property::MarginLeft(value) => Ok(vec![margin_left_declaration(value)?]),
         Property::Padding(padding) => Ok(vec![
             padding_top_declaration(&padding.top)?,
@@ -1161,6 +1264,10 @@ fn length_percentage_calc_from_css(value: &LengthPercentage) -> Option<LengthPer
         LengthPercentage::Dimension(length) => {
             if let Some(px) = length.to_px() {
                 Some(LengthPercentageCalc::new(0.0, px as f32))
+            } else if let LengthValue::Rem(rem) = length {
+                Some(LengthPercentageCalc::new(0.0, *rem * 16.0))
+            } else if let LengthValue::Em(em) = length {
+                Some(LengthPercentageCalc::new(0.0, *em * 16.0))
             } else {
                 viewport_length_to_percent(length)
                     .map(|percent| LengthPercentageCalc::new(percent, 0.0))
@@ -1203,6 +1310,49 @@ fn length_percentage_calc_from_math_function(
 ) -> Option<LengthPercentageCalc> {
     match value {
         CssMathFunction::Calc(value) => length_percentage_calc_from_calc(value),
+        CssMathFunction::Min(items) => {
+            let mut result: Option<LengthPercentageCalc> = None;
+            for item in items {
+                let calc = length_percentage_calc_from_calc(item)?;
+                result = Some(match result {
+                    None => calc,
+                    Some(prev) => {
+                        if prev.percent == 0.0 && calc.percent == 0.0 {
+                            LengthPercentageCalc::new(0.0, prev.px.min(calc.px))
+                        } else if prev.px == 0.0 && calc.px == 0.0 {
+                            LengthPercentageCalc::new(prev.percent.min(calc.percent), 0.0)
+                        } else if calc.px > 0.0 {
+                            calc
+                        } else {
+                            prev
+                        }
+                    }
+                });
+            }
+            result
+        }
+        CssMathFunction::Max(items) => {
+            let mut result: Option<LengthPercentageCalc> = None;
+            for item in items {
+                let calc = length_percentage_calc_from_calc(item)?;
+                result = Some(match result {
+                    None => calc,
+                    Some(prev) => {
+                        if prev.percent == 0.0 && calc.percent == 0.0 {
+                            LengthPercentageCalc::new(0.0, prev.px.max(calc.px))
+                        } else if prev.px == 0.0 && calc.px == 0.0 {
+                            LengthPercentageCalc::new(prev.percent.max(calc.percent), 0.0)
+                        } else if calc.px > 0.0 {
+                            calc
+                        } else {
+                            prev
+                        }
+                    }
+                });
+            }
+            result
+        }
+        CssMathFunction::Clamp(_min, val, _max) => length_percentage_calc_from_calc(val),
         _ => None,
     }
 }
@@ -1579,7 +1729,11 @@ fn apply_declaration(
     if let Some(declarations) =
         variable_resolution::resolve_declaration(declaration, &style.custom_properties)
     {
-        let declarations = declarations.unwrap_or_else(|error| panic!("{error}"));
+        let declarations = match declarations {
+            Ok(decls) => decls,
+            Err(error) if error.to_string().contains("missing or invalid") => return,
+            Err(error) => panic!("{error}"),
+        };
         for declaration in declarations {
             apply_declaration(style, position_explicit, font_state, &declaration);
         }

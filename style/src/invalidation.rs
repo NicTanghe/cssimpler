@@ -82,6 +82,11 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         }
         Declaration::Background(_)
         | Declaration::BackgroundLayers(_)
+        | Declaration::RasterSource(_)
+        | Declaration::RasterSize(_)
+        | Declaration::RasterPosition(_)
+        | Declaration::RasterRepeat(_)
+        | Declaration::RasterOpacity(_)
         | Declaration::Foreground(_)
         | Declaration::NativeMaterial(_)
         | Declaration::GlassTint(_)

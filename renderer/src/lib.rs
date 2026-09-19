@@ -14,6 +14,7 @@ mod backdrop;
 mod color;
 mod fonts;
 mod gradient;
+mod image;
 mod input;
 mod native_glass;
 mod runtime;
@@ -2736,6 +2737,7 @@ fn render_nodes_match_own_visuals_ignoring_projection(
 fn visual_styles_match_ignoring_projection(left: &VisualStyle, right: &VisualStyle) -> bool {
     left.background == right.background
         && left.background_layers == right.background_layers
+        && left.raster_background == right.raster_background
         && left.foreground == right.foreground
         && left.svg == right.svg
         && left.text == right.text
@@ -5315,6 +5317,16 @@ fn draw_background_and_border(
             }
         }
 
+        image::draw(
+            buffer,
+            width,
+            height,
+            node.layout,
+            node.style.corner_radius,
+            &node.style.raster_background,
+            transform::AffineTransform::IDENTITY,
+            &transform::ClipState::new(clip),
+        );
         for layer in node.style.background_layers.iter().rev() {
             draw_background_layer(
                 buffer,
@@ -5404,6 +5416,16 @@ fn draw_background_and_border_transformed(
             );
         }
 
+        image::draw(
+            buffer,
+            width,
+            height,
+            node.layout,
+            node.style.corner_radius,
+            &node.style.raster_background,
+            matrix,
+            clip_state,
+        );
         for layer in node.style.background_layers.iter().rev() {
             gradient::draw_background_layer_transformed(
                 buffer,
@@ -8441,6 +8463,33 @@ mod tests {
     }
 
     #[test]
+    fn image_draw_respects_local_worker_row_offsets() {
+        let source = "test-worker-band-image";
+        let rgba = [255, 0, 0, 255];
+        cssimpler_core::images::register_image(source.into(), 1, 1, &rgba);
+
+        let mut style = cssimpler_core::images::RasterBackground::default();
+        style.source = Some(source.into());
+        let layout = LayoutBox::new(0.0, 4.0, 3.0, 2.0);
+        let mut buffer = vec![0_u32; 3 * 2];
+
+        super::with_render_buffer_rows(super::BufferRows::new(4, 6), || {
+            super::image::draw(
+                &mut buffer,
+                3,
+                8,
+                layout,
+                CornerRadius::ZERO,
+                &style,
+                super::transform::AffineTransform::IDENTITY,
+                &super::transform::ClipState::new(ClipRect::full(3.0, 8.0)),
+            );
+        });
+
+        assert_ne!(buffer[1], 0);
+    }
+
+    #[test]
     fn blend_mask_row_matches_scalar_reference() {
         let mut accelerated = vec![
             pack_rgb(Color::rgb(15, 23, 42)),
@@ -9474,7 +9523,14 @@ mod tests {
             .count();
 
         assert!(different_pixels > 0);
-        assert!(stroked_buffer.contains(&pack_rgb(Color::rgb(245, 158, 11))));
+        // Glyph coverage depends on the system's generic font. A thin outline
+        // can be antialiased everywhere; require orange-tinted pixels without
+        // requiring a fully opaque sample. Both the fill and background have
+        // increasing RGB channels, so neither can satisfy this ordering.
+        assert!(stroked_buffer.iter().any(|pixel| {
+            let color = unpack_rgb(*pixel);
+            color.r > color.g && color.g > color.b
+        }));
     }
 
     #[test]

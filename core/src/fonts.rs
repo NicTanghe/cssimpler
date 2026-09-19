@@ -309,6 +309,8 @@ impl FontRegistry {
             .map_err(|_| FontError::RegistryPoisoned)?;
         if !self.system_fonts_loaded.load(Ordering::Relaxed) {
             database.load_system_fonts();
+            #[cfg(target_os = "linux")]
+            configure_linux_generic_families(&mut database);
             self.system_fonts_loaded.store(true, Ordering::Release);
         }
         Ok(())
@@ -400,6 +402,42 @@ impl FontRegistry {
             .clone();
 
         Some(Self::build_resolved_font(font, style))
+    }
+}
+
+// fontdb's XML alias fallback can select the last installed condensed face.
+// Ask Fontconfig for the desktop's actual generic choices once during loading.
+#[cfg(target_os = "linux")]
+fn configure_linux_generic_families(database: &mut fontdb::Database) {
+    for generic in ["sans-serif", "serif", "monospace"] {
+        let Ok(output) = std::process::Command::new("fc-match")
+            .args(["--format=%{family[0]}", generic])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(name) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || database
+                .query(&fontdb::Query {
+                    families: &[fontdb::Family::Name(name)],
+                    ..Default::default()
+                })
+                .is_none()
+        {
+            continue;
+        }
+        match generic {
+            "sans-serif" => database.set_sans_serif_family(name),
+            "serif" => database.set_serif_family(name),
+            _ => database.set_monospace_family(name),
+        }
     }
 }
 
