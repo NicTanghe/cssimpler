@@ -100,15 +100,34 @@ pub(crate) fn u10_channel_to_linear(channel: u16) -> f32 {
     u10_to_linear_table()[(channel.min(TEN_BIT_MAX as u16)) as usize]
 }
 
+const TEN_BIT_BOUNDARY_COUNT: usize = 1023;
+
 #[inline(always)]
 pub(crate) fn linear_to_u10_channel(value: f32) -> u16 {
-    let clamped = value.clamp(0.0, 1.0) as f64;
-    let srgb = if clamped <= 0.0031308 {
-        clamped * 12.92
+    let value = value.clamp(0.0, 1.0) as f64;
+    linear_to_u10_boundaries().partition_point(|boundary| *boundary <= value) as u16
+}
+
+fn linear_to_u10_boundaries() -> &'static [f64; TEN_BIT_BOUNDARY_COUNT] {
+    static BOUNDARIES: OnceLock<[f64; TEN_BIT_BOUNDARY_COUNT]> = OnceLock::new();
+    BOUNDARIES.get_or_init(|| {
+        let mut boundaries = [0.0; TEN_BIT_BOUNDARY_COUNT];
+        let mut channel = 0;
+        while channel < TEN_BIT_BOUNDARY_COUNT {
+            boundaries[channel] =
+                srgb_unit_to_linear_f64((channel as f64 + 0.5) / TEN_BIT_MAX as f64);
+            channel += 1;
+        }
+        boundaries
+    })
+}
+
+fn srgb_unit_to_linear_f64(value: f64) -> f64 {
+    if value <= 0.04045 {
+        value / 12.92
     } else {
-        1.055 * clamped.powf(1.0 / 2.4) - 0.055
-    };
-    ((srgb * TEN_BIT_MAX as f64 + 0.5) as u32).min(TEN_BIT_MAX) as u16
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 fn u10_to_linear_table() -> &'static [f32; TEN_BIT_CHANNEL_COUNT] {
@@ -250,6 +269,45 @@ mod tests {
             let current = linear_to_u10_channel(v);
             assert!(current >= prev);
             prev = current;
+        }
+    }
+
+    #[test]
+    fn linear_to_u10_matches_reference_oracle() {
+        use super::linear_to_u10_channel;
+
+        fn reference_linear_to_u10(value: f32) -> u16 {
+            let clamped = value.clamp(0.0, 1.0) as f64;
+            let srgb = if clamped <= 0.0031308 {
+                clamped * 12.92
+            } else {
+                1.055 * clamped.powf(1.0 / 2.4) - 0.055
+            };
+            ((srgb * 1023.0 + 0.5) as u32).min(1023) as u16
+        }
+
+        for channel in 0..=1023_u16 {
+            let base = super::u10_channel_to_linear(channel);
+            for offset in [-1e-6_f32, -1e-7, 0.0, 1e-7, 1e-6] {
+                let v = base + offset;
+                assert_eq!(
+                    linear_to_u10_channel(v),
+                    reference_linear_to_u10(v),
+                    "mismatch at v = {} (base channel {})",
+                    v,
+                    channel
+                );
+            }
+        }
+
+        for i in 0..=100_000 {
+            let v = i as f32 / 100_000.0;
+            assert_eq!(
+                linear_to_u10_channel(v),
+                reference_linear_to_u10(v),
+                "mismatch at v = {}",
+                v
+            );
         }
     }
 }

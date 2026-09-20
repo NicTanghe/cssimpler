@@ -475,9 +475,9 @@ struct SubtreeSurfaceCache {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BufferRows {
-    start: usize,
-    end: usize,
+pub(crate) struct BufferRows {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 impl BufferRows {
@@ -1023,7 +1023,7 @@ pub(crate) fn lock_subtree_surface_cache_for_tests() -> std::sync::MutexGuard<'s
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
-fn with_render_buffer_rows<T>(rows: BufferRows, render: impl FnOnce() -> T) -> T {
+pub(crate) fn with_render_buffer_rows<T>(rows: BufferRows, render: impl FnOnce() -> T) -> T {
     struct RenderBufferRowsReset<'a> {
         cell: &'a Cell<BufferRows>,
         previous: BufferRows,

@@ -229,6 +229,37 @@ struct ResolvedRadialShape {
     radius_y: f32,
 }
 
+fn cached_gradient_layer_covers_bounds(
+    layout: LayoutBox,
+    clip: ClipRect,
+    width: usize,
+    height: usize,
+    cached: &CachedGradientLayer,
+    offset_x: i32,
+    offset_y: i32,
+) -> bool {
+    if cached.width == 0 || cached.height == 0 {
+        return false;
+    }
+    let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
+        return true;
+    };
+    let Ok(cached_w) = i32::try_from(cached.width) else {
+        return false;
+    };
+    let Ok(cached_h) = i32::try_from(cached.height) else {
+        return false;
+    };
+    let Some(max_x) = offset_x.checked_add(cached_w) else {
+        return false;
+    };
+    let Some(max_y) = offset_y.checked_add(cached_h) else {
+        return false;
+    };
+
+    x0 >= offset_x && x1 <= max_x && y0 >= offset_y && y1 <= max_y
+}
+
 pub(crate) fn draw_background_layer(
     buffer: &mut [u32],
     width: usize,
@@ -241,31 +272,51 @@ pub(crate) fn draw_background_layer(
     if let Some((cached_layer, offset_x, offset_y)) =
         cached_static_gradient_layer(layout, radius, layer)
     {
-        draw_cached_gradient_layer(
-            buffer,
-            width,
-            height,
+        if cached_gradient_layer_covers_bounds(
             layout,
             clip,
+            width,
+            height,
             cached_layer.as_ref(),
             offset_x,
             offset_y,
-        );
-        return;
+        ) {
+            draw_cached_gradient_layer(
+                buffer,
+                width,
+                height,
+                layout,
+                clip,
+                cached_layer.as_ref(),
+                offset_x,
+                offset_y,
+            );
+            return;
+        }
     }
 
     if let Some((cached_layer, offset_x, offset_y)) = cached_gradient_layer(layout, radius, layer) {
-        draw_cached_gradient_layer(
-            buffer,
-            width,
-            height,
+        if cached_gradient_layer_covers_bounds(
             layout,
             clip,
+            width,
+            height,
             cached_layer.as_ref(),
             offset_x,
             offset_y,
-        );
-        return;
+        ) {
+            draw_cached_gradient_layer(
+                buffer,
+                width,
+                height,
+                layout,
+                clip,
+                cached_layer.as_ref(),
+                offset_x,
+                offset_y,
+            );
+            return;
+        }
     }
 
     match layer {
@@ -661,15 +712,20 @@ fn should_prerasterize_static_gradient_layer(layout: LayoutBox) -> bool {
 }
 
 fn split_layout_for_gradient_cache(layout: LayoutBox) -> (LayoutBox, i32, i32) {
-    let offset_x = layout.x.floor() as i32;
-    let offset_y = layout.y.floor() as i32;
+    let mut offset_x = layout.x.floor() as i32;
+    let mut rel_x = (layout.x - offset_x as f32).max(0.0);
+    if rel_x >= 1.0 {
+        offset_x += 1;
+        rel_x = (layout.x - offset_x as f32).max(0.0);
+    }
+    let mut offset_y = layout.y.floor() as i32;
+    let mut rel_y = (layout.y - offset_y as f32).max(0.0);
+    if rel_y >= 1.0 {
+        offset_y += 1;
+        rel_y = (layout.y - offset_y as f32).max(0.0);
+    }
     (
-        LayoutBox::new(
-            layout.x - offset_x as f32,
-            layout.y - offset_y as f32,
-            layout.width,
-            layout.height,
-        ),
+        LayoutBox::new(rel_x, rel_y, layout.width, layout.height),
         offset_x,
         offset_y,
     )
@@ -936,10 +992,26 @@ fn draw_cached_gradient_layer(
     let Some((x0, y0, x1, y1)) = pixel_bounds(layout, clip, width, height) else {
         return;
     };
+    if cached.width == 0 || cached.height == 0 {
+        return;
+    }
+
+    let min_x = offset_x.max(0);
+    let max_x = (offset_x.saturating_add(cached.width as i32))
+        .max(min_x)
+        .min(width as i32);
+    let x0 = x0.max(min_x);
+    let x1 = x1.min(max_x);
+    if x0 >= x1 {
+        return;
+    }
+
     let rows = current_render_buffer_rows();
-    let draw_y0 = rows.start.max(y0 as usize);
-    let draw_y1 = rows.end.min(y1 as usize);
-    if x0 >= x1 || draw_y0 >= draw_y1 {
+    let min_y = (offset_y.max(0) as usize).max(rows.start);
+    let max_y = (offset_y.saturating_add(cached.height as i32)).max(0) as usize;
+    let draw_y0 = (y0 as usize).max(min_y);
+    let draw_y1 = (y1 as usize).min(max_y).min(rows.end);
+    if draw_y0 >= draw_y1 {
         return;
     }
 
@@ -2364,18 +2436,19 @@ mod tests {
     use cssimpler_core::{
         AnglePercentageValue, BackgroundLayer, CircleRadius, Color, ConicGradient, CornerRadius,
         GradientDirection, GradientHorizontal, GradientInterpolation, GradientPoint, GradientStop,
-        LayoutBox, LengthPercentageValue, LinearGradient, RadialGradient, RadialShape,
+        LayoutBox, LengthPercentageValue, LinearGradient, LinearRgba, RadialGradient, RadialShape,
     };
 
     use super::{
-        PreparedLengthGradient, ResolvedGradientStop, cached_gradient_layer,
-        cached_static_gradient_layer, clear_gradient_layer_cache_for_tests,
-        length_stops_use_fraction_only, lock_gradient_cache_for_tests, prepare_length_gradient,
-        prepare_resolved_gradient, resolve_length_stops, rounded_rect_row_coverage,
-        sample_gradient, sample_prepared_gradient, sample_prepared_length_gradient,
+        CachedGradientLayer, PreparedLengthGradient, ResolvedGradientStop, cached_gradient_layer,
+        cached_static_gradient_layer, clear_gradient_layer_cache_for_tests, draw_background_layer,
+        draw_cached_gradient_layer, length_stops_use_fraction_only, lock_gradient_cache_for_tests,
+        prepare_length_gradient, prepare_resolved_gradient, resolve_length_stops,
+        rounded_rect_row_coverage, sample_gradient, sample_prepared_gradient,
+        sample_prepared_length_gradient,
     };
-    use crate::ClipRect;
     use crate::shapes::{rounded_rect_coverage, rounded_rect_full_coverage_row_span};
+    use crate::{BufferRows, ClipRect, with_render_buffer_rows};
 
     fn assert_close(left: cssimpler_core::LinearRgba, right: cssimpler_core::LinearRgba) {
         let epsilon = 0.0005;
@@ -2756,6 +2829,167 @@ mod tests {
                 )
                 .is_none()
             );
+        }
+    }
+
+    #[test]
+    fn draw_cached_gradient_layer_with_fractional_or_negative_offsets_does_not_panic() {
+        let width = 320;
+        let height = 240;
+        let mut buffer = vec![0u32; width * height];
+        let layer_w = 64;
+        let layer_h = 48;
+        let cached = CachedGradientLayer::new(
+            layer_w,
+            layer_h,
+            vec![LinearRgba::TRANSPARENT; layer_w * layer_h],
+        );
+
+        for offset_y in [
+            -10,
+            0,
+            10,
+            (height - layer_h) as i32,
+            (height - layer_h + 1) as i32,
+        ] {
+            for offset_x in [
+                -10,
+                0,
+                10,
+                (width - layer_w) as i32,
+                (width - layer_w + 1) as i32,
+            ] {
+                let layout = LayoutBox::new(
+                    offset_x as f32 - 0.5,
+                    offset_y as f32 - 0.5,
+                    layer_w as f32 + 2.0,
+                    layer_h as f32 + 2.0,
+                );
+                let clip = ClipRect::full(width as f32, height as f32);
+                draw_cached_gradient_layer(
+                    &mut buffer,
+                    width,
+                    height,
+                    layout,
+                    clip,
+                    &cached,
+                    offset_x,
+                    offset_y,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_negative_and_fractional_gradient_cache_matches_uncached_output() {
+        let _cache_guard = lock_gradient_cache_for_tests();
+        clear_gradient_layer_cache_for_tests();
+
+        let width = 768;
+        let height = 140;
+
+        let gradients = [
+            LinearGradient {
+                direction: GradientDirection::Angle(90.0),
+                interpolation: GradientInterpolation::Oklab,
+                repeating: false,
+                stops: vec![
+                    GradientStop {
+                        color: Color::rgb(240, 50, 60),
+                        position: LengthPercentageValue::from_fraction(0.0),
+                    },
+                    GradientStop {
+                        color: Color::rgb(30, 120, 240),
+                        position: LengthPercentageValue::from_fraction(1.0),
+                    },
+                ],
+            },
+            LinearGradient {
+                direction: GradientDirection::Angle(0.0),
+                interpolation: GradientInterpolation::Oklab,
+                repeating: false,
+                stops: vec![
+                    GradientStop {
+                        color: Color::rgba(255, 100, 50, 200),
+                        position: LengthPercentageValue::from_fraction(0.0),
+                    },
+                    GradientStop {
+                        color: Color::rgba(50, 200, 100, 100),
+                        position: LengthPercentageValue::from_fraction(1.0),
+                    },
+                ],
+            },
+        ];
+
+        let test_layouts = [
+            LayoutBox::new(0.0, -1e-8_f32, 768.0, 140.0),
+            LayoutBox::new(-1e-8_f32, 0.0, 768.0, 140.0),
+            LayoutBox::new(-1e-8_f32, -1e-8_f32, 768.0, 140.0),
+            LayoutBox::new(10.5, 20.25, 768.0, 140.0),
+        ];
+
+        let clip = ClipRect::full(width as f32, height as f32);
+        let radius = CornerRadius::default();
+
+        for gradient in gradients {
+            let layer = BackgroundLayer::LinearGradient(gradient);
+            for layout in test_layouts {
+                clear_gradient_layer_cache_for_tests();
+
+                let mut uncached_buf = vec![0u32; width * height];
+                draw_background_layer(
+                    &mut uncached_buf,
+                    width,
+                    height,
+                    layout,
+                    radius,
+                    &layer,
+                    clip,
+                );
+
+                let mut warm_buf = vec![0u32; width * height];
+                for _ in 0..3 {
+                    warm_buf.fill(0);
+                    draw_background_layer(
+                        &mut warm_buf,
+                        width,
+                        height,
+                        layout,
+                        radius,
+                        &layer,
+                        clip,
+                    );
+                }
+
+                assert_eq!(
+                    warm_buf, uncached_buf,
+                    "warm cached draw did not match uncached draw for layout {:?}",
+                    layout
+                );
+
+                let worker_rows = BufferRows::new(20, 120);
+                let mut worker_buf = vec![0u32; (worker_rows.end - worker_rows.start) * width];
+                with_render_buffer_rows(worker_rows, || {
+                    draw_background_layer(
+                        &mut worker_buf,
+                        width,
+                        height,
+                        layout,
+                        radius,
+                        &layer,
+                        clip,
+                    );
+                });
+
+                let expected_slice =
+                    &uncached_buf[worker_rows.start * width..worker_rows.end * width];
+                assert_eq!(
+                    worker_buf.as_slice(),
+                    expected_slice,
+                    "worker row span draw did not match reference for layout {:?}",
+                    layout
+                );
+            }
         }
     }
 }
