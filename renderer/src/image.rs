@@ -68,22 +68,50 @@ pub(crate) fn draw(
     let row_start_y = y0.max(rows.start.min(height) as i32);
     let row_end_y = y1.min(rows.end.min(height) as i32);
     let simple = matrix.is_identity() && clip.is_simple();
+    let has_zero_radius = radius == CornerRadius::ZERO;
+    let inv_w = 1.0 / image_width;
+    let inv_h = 1.0 / image_height;
     for y in row_start_y..row_end_y {
         let row_offset = (y as usize - rows.start) * width;
-        for x in x0..x1 {
-            let (sx, sy) = inverse.transform_point(x as f32 + 0.5, y as f32 + 0.5);
-            let mut u = (sx - origin.0) / image_width;
-            let mut v = (sy - origin.1) / image_height;
-            if style.repeat.0 {
-                u = u.rem_euclid(1.0);
-            }
+        let v_simple = if simple {
+            let sy = y as f32 + 0.5;
+            let mut v = (sy - origin.1) * inv_h;
             if style.repeat.1 {
                 v = v.rem_euclid(1.0);
             }
+            v
+        } else {
+            0.0
+        };
+        if simple && !style.repeat.1 && !(0.0..1.0).contains(&v_simple) {
+            continue;
+        }
+        for x in x0..x1 {
+            let (u, v) = if simple {
+                let sx = x as f32 + 0.5;
+                let mut u = (sx - origin.0) * inv_w;
+                if style.repeat.0 {
+                    u = u.rem_euclid(1.0);
+                }
+                (u, v_simple)
+            } else {
+                let (sx, sy) = inverse.transform_point(x as f32 + 0.5, y as f32 + 0.5);
+                let mut u = (sx - origin.0) * inv_w;
+                let mut v = (sy - origin.1) * inv_h;
+                if style.repeat.0 {
+                    u = u.rem_euclid(1.0);
+                }
+                if style.repeat.1 {
+                    v = v.rem_euclid(1.0);
+                }
+                (u, v)
+            };
             if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                 continue;
             }
-            let coverage = if simple {
+            let coverage = if simple && has_zero_radius {
+                255
+            } else if simple {
                 rounded_rect_coverage(layout, radius, clip.coarse, x, y)
             } else {
                 transformed_rounded_rect_coverage(layout, radius, inverse, clip, x, y)
@@ -92,14 +120,16 @@ pub(crate) fn draw(
                 continue;
             }
             let mut color = sample(&image, u, v);
-            color.a *= style.opacity * coverage as f32 / 255.0;
+            if coverage < 255 || style.opacity < 0.999 {
+                color.a *= style.opacity * coverage as f32 / 255.0;
+            }
             blend_linear_over(buffer, row_offset + x as usize, color);
         }
     }
 }
 
 fn sample(image: &RasterImage, u: f32, v: f32) -> LinearRgba {
-    if image.width == 0 || image.height == 0 || image.pixels.is_empty() {
+    if image.width == 0 || image.height == 0 || image.linear_pixels.is_empty() {
         return LinearRgba::TRANSPARENT;
     }
     let x = (u * image.width as f32 - 0.5).clamp(0.0, (image.width - 1) as f32);
@@ -116,16 +146,18 @@ fn sample(image: &RasterImage, u: f32, v: f32) -> LinearRgba {
         b: 0.0,
         a: 0.0,
     };
-    for (x, y, weight) in [
-        (x0, y0, (1.0 - fx) * (1.0 - fy)),
-        (x1, y0, fx * (1.0 - fy)),
-        (x0, y1, (1.0 - fx) * fy),
-        (x1, y1, fx * fy),
+    let row0 = y0 * image.width;
+    let row1 = y1 * image.width;
+    for (idx, weight) in [
+        (row0 + x0, (1.0 - fx) * (1.0 - fy)),
+        (row0 + x1, fx * (1.0 - fy)),
+        (row1 + x0, (1.0 - fx) * fy),
+        (row1 + x1, fx * fy),
     ] {
         let color = image
-            .pixels
-            .get(y * image.width + x)
-            .map(|c| c.to_linear_rgba())
+            .linear_pixels
+            .get(idx)
+            .copied()
             .unwrap_or(LinearRgba::TRANSPARENT);
         let alpha = color.a * weight;
         out.r += color.r * alpha;
@@ -140,4 +172,3 @@ fn sample(image: &RasterImage, u: f32, v: f32) -> LinearRgba {
     }
     out
 }
-

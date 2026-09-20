@@ -1863,15 +1863,13 @@ fn render_to_buffer_internal_with_cached_bounds(
         owned_bounds = cache_scene_subtree_bounds(scene);
         &owned_bounds
     };
-    let worker_count = if cached_bounds
-        .roots
-        .iter()
-        .any(|root| root.subtree_uses_backdrop_blur)
-    {
-        1
-    } else {
-        full_redraw_worker_count(width, height)
-    };
+    let full_clip = ClipRect::full(width as f32, height as f32);
+    let worker_count =
+        if cached_bounds_have_visible_backdrop_blur(scene, &cached_bounds.roots, full_clip) {
+            1
+        } else {
+            full_redraw_worker_count(width, height)
+        };
     let scene_passes = if worker_count <= 1 {
         render_to_buffer_serial(
             scene,
@@ -2152,8 +2150,23 @@ fn render_scene_update_roots(
             ..PaintStats::default()
         };
     }
+    let full_clip = ClipRect::full(width as f32, height as f32);
+    let computed_previous_bounds;
+    let prev_roots = match previous_bounds {
+        Some(b) => &b.roots,
+        None => {
+            computed_previous_bounds = cache_scene_subtree_bounds(previous_scene);
+            &computed_previous_bounds.roots
+        }
+    };
     let max_backdrop_blur_radius =
-        scene_max_backdrop_blur_radius(previous_scene).max(scene_max_backdrop_blur_radius(scene));
+        visible_scene_max_backdrop_blur_radius(previous_scene, prev_roots, full_clip).max(
+            visible_scene_max_backdrop_blur_radius(
+                scene,
+                &scene_diff.current_bounds.roots,
+                full_clip,
+            ),
+        );
     if max_backdrop_blur_radius > 0.0 {
         dirty_regions.iter_mut().for_each(|region| {
             *region = region.expand(max_backdrop_blur_radius);
@@ -2161,7 +2174,6 @@ fn render_scene_update_roots(
     }
 
     coalesce_dirty_regions(&mut dirty_regions);
-    let full_clip = ClipRect::full(width as f32, height as f32);
     let mut snapped_dirty_regions = dirty_regions
         .into_iter()
         .filter_map(|dirty_region| {
@@ -6770,6 +6782,7 @@ fn cache_subtree_bounds(
     }
 }
 
+#[allow(dead_code)]
 fn scene_max_backdrop_blur_radius(scene: &[RenderNode]) -> f32 {
     scene
         .iter()
@@ -6777,11 +6790,101 @@ fn scene_max_backdrop_blur_radius(scene: &[RenderNode]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+#[allow(dead_code)]
 fn node_max_backdrop_blur_radius(node: &RenderNode) -> f32 {
     node.children
         .iter()
         .map(node_max_backdrop_blur_radius)
         .fold(node.style.backdrop_blur_radius, f32::max)
+}
+
+fn cached_bounds_have_visible_backdrop_blur(
+    scene: &[RenderNode],
+    cached_bounds: &[CachedSubtreeBounds],
+    viewport_clip: ClipRect,
+) -> bool {
+    scene
+        .iter()
+        .zip(cached_bounds)
+        .any(|(node, bounds)| node_has_visible_backdrop_blur(node, bounds, viewport_clip))
+}
+
+fn node_has_visible_backdrop_blur(
+    node: &RenderNode,
+    bounds: &CachedSubtreeBounds,
+    viewport_clip: ClipRect,
+) -> bool {
+    if !bounds.subtree_uses_backdrop_blur {
+        return false;
+    }
+    if bounds
+        .bounds
+        .and_then(|b| b.intersect(viewport_clip))
+        .is_none()
+    {
+        return false;
+    }
+    if node.style.backdrop_blur_radius > 0.0 {
+        if bounds
+            .own_bounds
+            .and_then(|b| b.intersect(viewport_clip))
+            .is_some()
+        {
+            return true;
+        }
+    }
+    node.children
+        .iter()
+        .zip(&bounds.children)
+        .any(|(child_node, child_bounds)| {
+            node_has_visible_backdrop_blur(child_node, child_bounds, viewport_clip)
+        })
+}
+
+fn visible_scene_max_backdrop_blur_radius(
+    scene: &[RenderNode],
+    cached_bounds: &[CachedSubtreeBounds],
+    viewport_clip: ClipRect,
+) -> f32 {
+    scene
+        .iter()
+        .zip(cached_bounds)
+        .map(|(node, bounds)| visible_node_max_backdrop_blur_radius(node, bounds, viewport_clip))
+        .fold(0.0, f32::max)
+}
+
+fn visible_node_max_backdrop_blur_radius(
+    node: &RenderNode,
+    bounds: &CachedSubtreeBounds,
+    viewport_clip: ClipRect,
+) -> f32 {
+    if !bounds.subtree_uses_backdrop_blur {
+        return 0.0;
+    }
+    if bounds
+        .bounds
+        .and_then(|b| b.intersect(viewport_clip))
+        .is_none()
+    {
+        return 0.0;
+    }
+    let own = if node.style.backdrop_blur_radius > 0.0
+        && bounds
+            .own_bounds
+            .and_then(|b| b.intersect(viewport_clip))
+            .is_some()
+    {
+        node.style.backdrop_blur_radius
+    } else {
+        0.0
+    };
+    node.children
+        .iter()
+        .zip(&bounds.children)
+        .map(|(child_node, child_bounds)| {
+            visible_node_max_backdrop_blur_radius(child_node, child_bounds, viewport_clip)
+        })
+        .fold(own, f32::max)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

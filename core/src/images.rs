@@ -41,6 +41,7 @@ pub struct RasterImage {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<Color>,
+    pub linear_pixels: Vec<crate::color::LinearRgba>,
     pub generation: u64,
 }
 type Registry = VecDeque<(String, Arc<RasterImage>)>;
@@ -56,10 +57,14 @@ pub fn register_image(source: String, width: usize, height: usize, rgba: &[u8]) 
     if size == 0 || size != rgba.len() || size > 64 * 1024 * 1024 {
         return false;
     }
-    let pixels = rgba
-        .chunks_exact(4)
-        .map(|p| Color::rgba(p[0], p[1], p[2], p[3]))
-        .collect();
+    let pixel_count = rgba.len() / 4;
+    let mut pixels = Vec::with_capacity(pixel_count);
+    let mut linear_pixels = Vec::with_capacity(pixel_count);
+    for p in rgba.chunks_exact(4) {
+        let color = Color::rgba(p[0], p[1], p[2], p[3]);
+        pixels.push(color);
+        linear_pixels.push(color.to_linear_rgba());
+    }
     let mut cache = registry().lock().unwrap_or_else(|e| e.into_inner());
     cache.retain(|(key, _)| key != &source);
     static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -70,6 +75,7 @@ pub fn register_image(source: String, width: usize, height: usize, rgba: &[u8]) 
             width,
             height,
             pixels,
+            linear_pixels,
             generation,
         }),
     ));

@@ -707,10 +707,14 @@ where
             .map(|viewport| ViewportSize::new(viewport.width, viewport.height))
     }
 
-    fn scene(&self) -> &[RenderNode] {
+    pub fn scene(&self) -> &[RenderNode] {
         self.cached_scene
             .as_deref()
             .expect("app scene should be cached after the first frame")
+    }
+
+    pub fn scene_mut(&mut self) -> Option<&mut [RenderNode]> {
+        self.cached_scene.as_deref_mut()
     }
 
     fn replace_scene(&mut self, scene: Vec<RenderNode>) {
