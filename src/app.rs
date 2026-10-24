@@ -396,6 +396,7 @@ fn root_render_mode<'a>(
 
 pub struct App<'a, State, Update, View, Signal = Invalidation> {
     state: State,
+    event_handler: Option<fn(&mut State, &EngineEvent) -> bool>,
     close_handler: Option<fn(&mut State) -> bool>,
     exit_when: Option<fn(&State) -> bool>,
     stylesheet: &'a Stylesheet,
@@ -421,6 +422,7 @@ where
     pub fn new(state: State, stylesheet: &'a Stylesheet, update: Update, view: View) -> Self {
         Self {
             state,
+            event_handler: None,
             close_handler: None,
             exit_when: None,
             stylesheet,
@@ -436,6 +438,13 @@ where
             last_stats: RuntimeStats::default(),
             signal: PhantomData,
         }
+    }
+
+    /// Handle application shortcuts before native text editing. Return true to
+    /// consume the event and invalidate the view; false preserves default input.
+    pub fn with_event_handler(mut self, handler: fn(&mut State, &EngineEvent) -> bool) -> Self {
+        self.event_handler = Some(handler);
+        self
     }
 
     pub fn with_close_handler(mut self, handler: fn(&mut State) -> bool) -> Self {
@@ -866,6 +875,13 @@ where
     }
 
     fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        if self
+            .event_handler
+            .is_some_and(|handler| handler(&mut self.state, event))
+        {
+            self.invalidate(Invalidation::Structure);
+            return true;
+        }
         if self.text_inputs.handle_engine_event(
             event,
             self.cached_scene.as_deref(),
@@ -903,6 +919,7 @@ where
 
 pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     state: State,
+    event_handler: Option<fn(&mut State, &EngineEvent) -> bool>,
     close_handler: Option<fn(&mut State) -> bool>,
     exit_when: Option<fn(&State) -> bool>,
     stylesheet: &'a Stylesheet,
@@ -932,6 +949,7 @@ where
         let fragments = fragments.into_iter().collect::<Vec<_>>();
         Self {
             state,
+            event_handler: None,
             close_handler: None,
             exit_when: None,
             stylesheet,
@@ -948,6 +966,13 @@ where
             last_stats: RuntimeStats::default(),
             signal: PhantomData,
         }
+    }
+
+    /// Handle application shortcuts before native text editing. Return true to
+    /// consume the event and invalidate the view; false preserves default input.
+    pub fn with_event_handler(mut self, handler: fn(&mut State, &EngineEvent) -> bool) -> Self {
+        self.event_handler = Some(handler);
+        self
     }
 
     pub fn with_close_handler(mut self, handler: fn(&mut State) -> bool) -> Self {
@@ -1305,6 +1330,13 @@ where
     }
 
     fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        if self
+            .event_handler
+            .is_some_and(|handler| handler(&mut self.state, event))
+        {
+            self.invalidate(Invalidation::Structure);
+            return true;
+        }
         if self.text_inputs.handle_engine_event(
             event,
             self.cached_scene.as_deref(),
@@ -3170,5 +3202,39 @@ mod viewport_and_lifecycle_tests {
         assert!(!SceneProvider::wants_close(&app));
         assert!(!SceneProvider::can_close(&mut app));
         assert!(SceneProvider::wants_close(&app));
+    }
+    #[test]
+    fn custom_event_handler_consumes_shortcuts_and_invalidates_the_view() {
+        use crate::renderer::{ButtonState, EngineEvent, KeyIdentity, KeyboardEvent};
+        let stylesheet = parse_stylesheet("").unwrap();
+        let mut app = App::new(false, &stylesheet, |_, _| Invalidation::Clean,
+            |open| Node::element("p").with_child(Node::text(if *open { "open" } else { "closed" })).into())
+            .with_event_handler(|open, event| {
+                if matches!(event, EngineEvent::Key(k) if k.state == ButtonState::Pressed && k.logical_key == KeyIdentity::Named("Escape".into())) {
+                    *open = !*open;
+                    true
+                } else { false }
+            });
+        app.frame(FrameInfo {
+            frame_index: 0,
+            delta: Duration::ZERO,
+        });
+        assert!(!SceneProvider::handle_engine_event(
+            &mut app,
+            &EngineEvent::Resumed
+        ));
+        assert!(SceneProvider::handle_engine_event(
+            &mut app,
+            &EngineEvent::Key(KeyboardEvent {
+                logical_key: KeyIdentity::Named("Escape".into()),
+                physical_key: None,
+                location: Default::default(),
+                state: ButtonState::Pressed,
+                repeat: false,
+                modifiers: Default::default(),
+            })
+        ));
+        assert!(*app.state());
+        assert!(SceneProvider::needs_redraw(&app));
     }
 }
