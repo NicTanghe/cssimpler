@@ -1,3 +1,6 @@
+mod shaping;
+pub use shaping::{ShapedGlyph, ShapedText, requires_shaping};
+
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -200,6 +203,7 @@ impl PreparedTextLayout {
 #[derive(Clone)]
 pub struct ResolvedFont {
     font: FontArc,
+    face_index: u32,
     size_px: f32,
     line_height_px: f32,
 }
@@ -247,6 +251,11 @@ impl ResolvedFont {
             return 0.0;
         }
 
+        if requires_shaping(text)
+            && let Some(shaped) = self.shape_text(text, 0.0)
+        {
+            return shaped.width;
+        }
         let scaled_font = self.font.as_scaled(self.size_px);
         let mut width = 0.0;
         let mut previous = None;
@@ -294,7 +303,7 @@ impl From<std::io::Error> for FontError {
 struct FontRegistry {
     database: RwLock<fontdb::Database>,
     system_fonts_loaded: AtomicBool,
-    cache: RwLock<HashMap<fontdb::ID, FontArc>>,
+    cache: RwLock<HashMap<fontdb::ID, (FontArc, u32)>>,
 }
 
 impl FontRegistry {
@@ -366,9 +375,10 @@ impl FontRegistry {
         database.query(&query)
     }
 
-    fn build_resolved_font(font: FontArc, style: &TextStyle) -> ResolvedFont {
+    fn build_resolved_font((font, face_index): (FontArc, u32), style: &TextStyle) -> ResolvedFont {
         ResolvedFont {
             font,
+            face_index,
             size_px: style.size_px.max(1.0),
             line_height_px: style.resolved_line_height_px().max(0.0),
         }
@@ -390,7 +400,7 @@ impl FontRegistry {
         let database = self.database.read().ok()?;
         let loaded = database.with_face_data(font_id, |data, face_index| {
             FontVec::try_from_vec_and_index(data.to_vec(), face_index)
-                .map(FontArc::new)
+                .map(|font| (FontArc::new(font), face_index))
                 .ok()
         })??;
         drop(database);
@@ -567,12 +577,16 @@ pub fn layout_text_block(text: &str, style: &TextStyle, wrap_width: Option<f32>)
     }
 }
 
-/// Measures every UTF-8 character caret position in one glyph-metrics pass.
+/// Measures UTF-8 caret positions. Simple text uses a single glyph-metrics pass;
+/// complex scripts expose grapheme boundaries mapped to full shaped clusters.
 ///
 /// The byte indices refer to `text`, while offsets reflect the rendered text after applying the
 /// style's text transform and whitespace rules. This makes transform expansions such as `ß` to
 /// `SS` safe to use for editing without losing the source UTF-8 position.
 pub fn layout_text_caret_stops(text: &str, style: &TextStyle) -> Vec<TextCaretStop> {
+    if let Some(stops) = shaping::complex_caret_stops(text, style) {
+        return stops;
+    }
     let mut stops = Vec::with_capacity(text.chars().count().saturating_add(1));
     stops.push(TextCaretStop {
         byte_index: 0,
@@ -765,6 +779,12 @@ impl MeasurementBackend {
     }
 
     fn measure_text_width(&self, text: &str, letter_spacing_px: f32) -> f32 {
+        if let Self::Real(font) = self
+            && requires_shaping(text)
+            && let Some(run) = font.shape_text(text, letter_spacing_px)
+        {
+            return run.width;
+        }
         let base_width = match self {
             Self::Real(font) => font.measure_text_width(text),
             Self::Bitmap(metrics) => metrics.measure_text_width(text),

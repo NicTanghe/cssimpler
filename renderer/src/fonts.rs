@@ -592,6 +592,22 @@ fn positioned_glyphs(
     let mut glyphs = Vec::new();
 
     for (line_index, line) in wrapped.lines.iter().enumerate() {
+        if cssimpler_core::fonts::requires_shaping(&line.text)
+            && let Some(run) = font.shape_text(&line.text, letter_spacing_px)
+        {
+            let mut x = aligned_line_start_x(layout, run.width, text_align);
+            let mut y =
+                start_y + font.baseline_offset_px() + line_index as f32 * font.line_height_px();
+            for glyph in run.glyphs {
+                glyphs.push(ab_glyph::GlyphId(glyph.id).with_scale_and_position(
+                    font.size_px(),
+                    point(x + glyph.x_offset, y - glyph.y_offset),
+                ));
+                x += glyph.x_advance;
+                y -= glyph.y_advance;
+            }
+            continue;
+        }
         let mut caret_x = aligned_line_start_x(layout, line.width, text_align);
         let baseline_y =
             start_y + font.baseline_offset_px() + line_index as f32 * font.line_height_px();
@@ -1403,6 +1419,29 @@ mod tests {
         assert!(Arc::ptr_eq(&first.mask, &second.mask));
         assert_eq!(first.offset_x, 10);
         assert_eq!(second.offset_x, 90);
+    }
+
+    #[test]
+    fn devanagari_is_rasterized_as_shaped_glyphs() {
+        let _guard = lock_text_mask_cache_for_tests();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/assets/NotoSansDevanagari.ttf");
+        let family = register_font_file(path).unwrap().remove(0);
+        clear_text_mask_cache_for_tests();
+        let style = TextStyle {
+            families: vec![FontFamily::Named(family)],
+            size_px: 32.0,
+            ..TextStyle::default()
+        };
+        let font = resolve_font(&style).unwrap();
+        let wrapped = layout_text_block("क्ष", &style, None);
+        let layout = LayoutBox::new(0.0, 0.0, 120.0, 60.0);
+        let glyphs = positioned_glyphs(layout, &wrapped, &font, 0.0, TextAlign::Left);
+        assert!(glyphs.len() < "क्ष".chars().count());
+        assert!(glyphs.iter().all(|g| g.id.0 != 0));
+        let mask =
+            super::rasterize_resolved_text(layout, &wrapped, &font, 0.0, TextAlign::Left).unwrap();
+        assert!(mask.alpha.iter().any(|a| *a > 0));
     }
 
     #[test]
