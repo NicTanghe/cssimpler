@@ -1292,6 +1292,14 @@ fn copy_render_buffer_into_surface(
     debug_assert_eq!(source.len(), source_width.saturating_mul(source_height));
     debug_assert!(source_alpha.is_none_or(|alpha| alpha.len() == source.len()));
 
+    if target.is_empty() {
+        return;
+    }
+    if source.is_empty() {
+        target.fill(clear);
+        return;
+    }
+
     if target_width == source_width && target_height == source_height {
         if let Some(rects) = damage_rects {
             for &rect in rects {
@@ -1354,24 +1362,34 @@ fn copy_render_buffer_into_surface(
         return;
     }
 
-    target.fill(clear);
-    let copy_width = source_width.min(target_width);
-    let copy_height = source_height.min(target_height);
-    for row in 0..copy_height {
-        let src_row = row * source_width;
-        let dst_row = row * target_width;
-        for column in 0..copy_width {
-            let source_index = src_row + column;
-            target[dst_row + column] = surface_pixel(
-                source[source_index],
-                source_alpha.map(|alpha| alpha[source_index]),
-                column,
-                row,
-                clear,
-                preserve_transparency,
-            );
+    // Layout and hit testing use logical pixels; the native surface uses physical
+    // pixels. Fill the whole surface with the logical frame so visible controls
+    // and pointer coordinates agree on Retina and fractional-DPI displays.
+    // Repaint fully when scaled: incoming damage rectangles use logical pixels.
+    let rows_per_chunk = target_height.div_ceil(12).max(1);
+    crate::global_worker_pool().scope(|scope| {
+        for (chunk_index, chunk) in target.chunks_mut(rows_per_chunk * target_width).enumerate() {
+            let first_row = chunk_index * rows_per_chunk;
+            scope.spawn(move || {
+                for (row_offset, target_row) in chunk.chunks_mut(target_width).enumerate() {
+                    let row = first_row + row_offset;
+                    let source_row = row * source_height / target_height;
+                    for (column, target_pixel) in target_row.iter_mut().enumerate() {
+                        let source_column = column * source_width / target_width;
+                        let index = source_row * source_width + source_column;
+                        *target_pixel = surface_pixel(
+                            source[index],
+                            source_alpha.map(|alpha| alpha[index]),
+                            column,
+                            row,
+                            clear,
+                            preserve_transparency,
+                        );
+                    }
+                }
+            });
         }
-    }
+    });
 }
 
 fn surface_pixel(
@@ -1775,7 +1793,35 @@ mod tests {
     }
 
     #[test]
-    fn blit_to_surface_copies_rows_when_target_is_wider() {
+    fn retina_surface_scales_the_logical_frame_to_physical_pixels() {
+        let source = [
+            pack_rgb(Color::rgb(255, 0, 0)),
+            pack_rgb(Color::rgb(0, 255, 0)),
+            pack_rgb(Color::rgb(0, 0, 255)),
+            pack_rgb(Color::WHITE),
+        ];
+        let mut target = vec![0; 16];
+        copy_render_buffer_into_surface(&mut target, 4, 4, &source, 2, 2, None, 0, false, None);
+        for row in 0..4 {
+            for column in 0..4 {
+                assert_eq!(
+                    target[row * 4 + column],
+                    super::surface_pixel(
+                        source[(row / 2) * 2 + column / 2],
+                        None,
+                        column,
+                        row,
+                        0,
+                        false
+                    ),
+                    "visible pixel and logical hit target disagree at ({column}, {row})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blit_to_surface_scales_rows_when_target_is_wider() {
         let source = vec![
             pack_rgb(Color::rgb(1, 2, 3)),
             pack_rgb(Color::rgb(4, 5, 6)),
@@ -1786,25 +1832,18 @@ mod tests {
         ];
         let mut target = vec![9; 10];
         copy_render_buffer_into_surface(&mut target, 5, 2, &source, 3, 2, None, 0, false, None);
-        assert_eq!(
-            target,
-            vec![
-                to_softbuffer_rgb_blue_noise(source[0], 0, 0),
-                to_softbuffer_rgb_blue_noise(source[1], 1, 0),
-                to_softbuffer_rgb_blue_noise(source[2], 2, 0),
-                0,
-                0,
-                to_softbuffer_rgb_blue_noise(source[3], 0, 1),
-                to_softbuffer_rgb_blue_noise(source[4], 1, 1),
-                to_softbuffer_rgb_blue_noise(source[5], 2, 1),
-                0,
-                0,
-            ]
-        );
+        for row in 0..2 {
+            for (column, source_column) in [0, 0, 1, 1, 2].into_iter().enumerate() {
+                assert_eq!(
+                    target[row * 5 + column],
+                    to_softbuffer_rgb_blue_noise(source[row * 3 + source_column], column, row)
+                );
+            }
+        }
     }
 
     #[test]
-    fn blit_to_surface_copies_rows_when_target_is_narrower() {
+    fn blit_to_surface_scales_rows_when_target_is_narrower() {
         let source = vec![
             pack_rgb(Color::rgb(1, 2, 3)),
             pack_rgb(Color::rgb(4, 5, 6)),
@@ -1828,6 +1867,103 @@ mod tests {
                 to_softbuffer_rgb_blue_noise(source[6], 2, 1),
             ]
         );
+    }
+
+    #[test]
+    fn scaled_surface_preserves_alpha_at_fractional_dpi_and_after_damage() {
+        let source: Vec<_> = (0..16)
+            .map(|i| pack_rgb(Color::rgb(i * 10, 80, 120)))
+            .collect();
+        let alpha: Vec<_> = (0..16).map(|i| (i % 4) * 85).collect();
+        let damage = [ClipRect {
+            x0: 1.0,
+            y0: 1.0,
+            x1: 2.0,
+            y1: 2.0,
+        }];
+        for size in [5, 6, 8] {
+            for preserve in [false, true] {
+                let clear = 0x123456;
+                let mut target = vec![0; size * size];
+                copy_render_buffer_into_surface(
+                    &mut target,
+                    size,
+                    size,
+                    &source,
+                    4,
+                    4,
+                    Some(&alpha),
+                    clear,
+                    preserve,
+                    Some(&damage),
+                );
+                for row in 0..size {
+                    for column in 0..size {
+                        let index = (row * 4 / size) * 4 + column * 4 / size;
+                        assert_eq!(
+                            target[row * size + column],
+                            super::surface_pixel(
+                                source[index],
+                                Some(alpha[index]),
+                                column,
+                                row,
+                                clear,
+                                preserve
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_native_presentation_and_pointer_hit_testing_agree() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CLICKS: AtomicUsize = AtomicUsize::new(0);
+        fn click() {
+            CLICKS.fetch_add(1, Ordering::SeqCst);
+        }
+        let color = Color::rgb(255, 0, 0);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(80.0, 40.0, 48.0, 48.0))
+                .with_style(VisualStyle {
+                    background: Some(color),
+                    ..VisualStyle::default()
+                })
+                .on_click(click),
+        ];
+        let mut source = vec![0; 200 * 120];
+        crate::render_to_buffer(&scene, &mut source, 200, 120, Color::WHITE);
+        for (index, scale) in [1.0, 1.25, 1.5, 2.0, 3.0].into_iter().enumerate() {
+            let width = (200.0 * scale) as usize;
+            let height = (120.0 * scale) as usize;
+            let mut target = vec![0; width * height];
+            copy_render_buffer_into_surface(
+                &mut target,
+                width,
+                height,
+                &source,
+                200,
+                120,
+                None,
+                0,
+                false,
+                None,
+            );
+            let x = (104.0 * scale) as usize;
+            let y = (64.0 * scale) as usize;
+            assert_eq!(
+                target[y * width + x],
+                super::surface_pixel(pack_rgb(color), None, x, y, 0, false)
+            );
+            assert!(crate::dispatch_click(
+                &scene,
+                x as f32 / scale as f32,
+                y as f32 / scale as f32
+            ));
+            assert_eq!(CLICKS.load(Ordering::SeqCst), index + 1);
+        }
     }
 
     #[test]

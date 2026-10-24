@@ -1,4 +1,5 @@
-[build]
+# SSE is an x86 feature; keep ARM/macOS builds on their native instruction set.
+[target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))']
 rustflags = [
     "-C", "target-feature=+sse4.1,+sse4.2",
 ]
