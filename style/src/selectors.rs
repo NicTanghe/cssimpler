@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use cssimpler_core::{ElementInteractionState, ElementNode, ElementPath};
 use cssparser::ToCss;
 use lightningcss::selector::{
-    Combinator as LightningCombinator, Component, PseudoClass,
-    PseudoElement as LightningPseudoElement, Selector as LightningSelector,
+    Component, PseudoClass, PseudoElement as LightningPseudoElement, Selector as LightningSelector,
 };
+use parcel_selectors::parser::Combinator as LightningCombinator;
 
 use crate::StyleError;
 
@@ -973,8 +973,7 @@ mod tests {
 
     #[test]
     fn parser_supports_universal_selector() {
-        let sheet = parse_stylesheet("* { margin: 0; }")
-            .expect("universal selector should parse");
+        let sheet = parse_stylesheet("* { margin: 0; }").expect("universal selector should parse");
         assert_eq!(sheet.rules.len(), 1);
         assert_eq!(
             sheet.rules[0].selector.rightmost.simple_selectors,
@@ -982,4 +981,3 @@ mod tests {
         );
     }
 }
-

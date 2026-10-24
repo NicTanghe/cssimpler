@@ -554,6 +554,16 @@ fn build_render_tree_with_available_space(
     interaction: &ElementInteractionState,
     root_index: usize,
 ) -> RenderNode {
+    let viewport_stylesheet = available_space_override.and_then(|size| {
+        if let (AvailableSpace::Definite(width), AvailableSpace::Definite(height)) =
+            (size.width, size.height)
+        {
+            Some(stylesheet.for_viewport(width as usize, height as usize))
+        } else {
+            None
+        }
+    });
+    let stylesheet = viewport_stylesheet.as_deref().unwrap_or(stylesheet);
     let mut resolved =
         resolve_render_tree_with_interaction_at_root(root, stylesheet, interaction, root_index);
     if available_space_override.is_some() {

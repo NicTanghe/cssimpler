@@ -1,3 +1,5 @@
+extern crate self as cssimpler;
+
 pub mod app;
 
 pub use cssimpler_core as core;

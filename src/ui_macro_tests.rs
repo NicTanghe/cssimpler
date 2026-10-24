@@ -169,3 +169,19 @@ fn ui_macro_dynamic_class_lists_match_literal_lists() {
     assert_eq!(dynamic.attribute("class"), literal.attribute("class"));
     assert!(dynamic.handlers.click.is_some());
 }
+
+#[test]
+fn dynamic_lists_and_optional_children_are_flattened_without_wrapper_nodes() {
+    let rows = vec![crate::ui! {<p>One</p>}, crate::ui! {<p>Two</p>}];
+    let tree = crate::ui! {<section>{rows}{Some(crate::ui!{<button>Save</button>})}{None::<crate::core::Node>}</section>};
+    let crate::core::Node::Element(root) = tree else {
+        panic!("section expected")
+    };
+    assert_eq!(root.children.len(), 3);
+    for (child, tag) in root.children.iter().zip(["p", "p", "button"]) {
+        let crate::core::Node::Element(element) = child else {
+            panic!("element expected")
+        };
+        assert_eq!(element.tag, tag);
+    }
+}

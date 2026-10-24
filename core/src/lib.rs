@@ -18,7 +18,8 @@ use taffy::Style as TaffyStyle;
 pub use color::{Color, GradientInterpolation, LinearRgba};
 pub use custom_properties::CustomProperties;
 pub use dom::{
-    ElementNode, EventHandler, EventHandlers, InputEventHandler, IntoNode, Node, into_node,
+    ElementNode, EventHandler, EventHandlers, InputEventHandler, IntoNode, IntoNodes, Node,
+    into_node,
 };
 pub use extracted_scene::{ExtractedPaintItem, ExtractedPaintKind, ExtractedScene};
 pub use generated_content::GeneratedTextSource;
@@ -959,6 +960,11 @@ impl RenderNode {
 
     pub fn on_dblclick(mut self, handler: EventHandler) -> Self {
         self.handlers.dblclick = Some(handler);
+        self
+    }
+
+    pub fn on_enter(mut self, handler: EventHandler) -> Self {
+        self.handlers.enter = Some(handler);
         self
     }
 

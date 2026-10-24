@@ -8,3 +8,4 @@ cssimpler-core.workspace = true
 lightningcss.workspace = true
 taffy.workspace = true
 cssparser.workspace = true
+parcel_selectors.workspace = true

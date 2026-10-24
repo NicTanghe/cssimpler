@@ -12,6 +12,7 @@ pub struct EventHandlers {
     pub contextmenu: Option<EventHandler>,
     pub dblclick: Option<EventHandler>,
     pub input: Option<InputEventHandler>,
+    pub enter: Option<EventHandler>,
     pub mousedown: Option<EventHandler>,
     pub mouseenter: Option<EventHandler>,
     pub mouseleave: Option<EventHandler>,
@@ -19,6 +20,26 @@ pub struct EventHandlers {
     pub mouseout: Option<EventHandler>,
     pub mouseover: Option<EventHandler>,
     pub mouseup: Option<EventHandler>,
+}
+
+/// Values accepted in a dynamic HTML child slot, including lists and optional nodes.
+pub trait IntoNodes {
+    fn into_nodes(self) -> Vec<Node>;
+}
+impl<T: IntoNode> IntoNodes for T {
+    fn into_nodes(self) -> Vec<Node> {
+        vec![self.into_node()]
+    }
+}
+impl<T: IntoNode> IntoNodes for Vec<T> {
+    fn into_nodes(self) -> Vec<Node> {
+        self.into_iter().map(IntoNode::into_node).collect()
+    }
+}
+impl<T: IntoNode> IntoNodes for Option<T> {
+    fn into_nodes(self) -> Vec<Node> {
+        self.into_iter().map(IntoNode::into_node).collect()
+    }
 }
 
 pub trait IntoNode {
@@ -105,6 +126,11 @@ impl ElementNode {
         self
     }
 
+    pub fn with_nodes(mut self, nodes: impl IntoNodes) -> Self {
+        self.children.extend(nodes.into_nodes());
+        self
+    }
+
     pub fn on_click(mut self, handler: EventHandler) -> Self {
         self.handlers.click = Some(handler);
         self
@@ -117,6 +143,12 @@ impl ElementNode {
 
     pub fn on_dblclick(mut self, handler: EventHandler) -> Self {
         self.handlers.dblclick = Some(handler);
+        self
+    }
+
+    /// Run when Enter is pressed in this input.
+    pub fn on_enter(mut self, handler: EventHandler) -> Self {
+        self.handlers.enter = Some(handler);
         self
     }
 

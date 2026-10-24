@@ -200,6 +200,7 @@ struct RuntimeApp<P> {
     scale_factor: f64,
     modifiers: KeyboardModifiers,
     mouse_position: Option<(f32, f32)>,
+    touch: super::touch::TouchController,
     pending_wheel: Option<(f32, f32)>,
     left_down: bool,
     right_down: bool,
@@ -248,6 +249,7 @@ where
             scale_factor: 1.0,
             modifiers: KeyboardModifiers::default(),
             mouse_position: None,
+            touch: super::touch::TouchController::default(),
             pending_wheel: None,
             left_down: false,
             right_down: false,
@@ -388,15 +390,15 @@ where
         };
         let size = window.inner_size();
         self.scale_factor = window.scale_factor();
-        if let Some(viewport) = drawable_viewport_size(size.width as usize, size.height as usize) {
+        if let Some(viewport) = logical_viewport(size.width, size.height, self.scale_factor) {
             self.scene_provider.set_viewport(viewport);
             self.resize_surface(event_loop);
         }
         self.handle_engine_event(
             event_loop,
             EngineEvent::ViewportChanged(ViewportEvent {
-                width: size.width as usize,
-                height: size.height as usize,
+                width: (size.width as f64 / self.scale_factor).round() as usize,
+                height: (size.height as f64 / self.scale_factor).round() as usize,
                 scale_factor: self.scale_factor,
             }),
         );
@@ -404,6 +406,7 @@ where
     }
 
     fn clear_pointer_state(&mut self) {
+        self.touch.cancel();
         self.mouse_position = None;
         self.pending_wheel = None;
         self.left_down = false;
@@ -477,8 +480,7 @@ where
             return;
         };
         let size = window.inner_size();
-        let Some(viewport) = drawable_viewport_size(size.width as usize, size.height as usize)
-        else {
+        let Some(viewport) = logical_viewport(size.width, size.height, self.scale_factor) else {
             return;
         };
 
@@ -1019,6 +1021,10 @@ where
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.scene_provider.wants_close() {
+            event_loop.exit();
+            return;
+        }
         if self.window.is_none() {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
@@ -1063,8 +1069,69 @@ where
         }
 
         match event {
-            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
-                event_loop.exit();
+            WindowEvent::CloseRequested => {
+                if self.scene_provider.can_close() {
+                    event_loop.exit();
+                } else {
+                    self.request_immediate_redraw();
+                }
+            }
+            WindowEvent::Destroyed => event_loop.exit(),
+            WindowEvent::Touch(touch) => {
+                let position = (
+                    (touch.location.x / self.scale_factor) as f32,
+                    (touch.location.y / self.scale_factor) as f32,
+                );
+                if let Some(update) =
+                    self.touch
+                        .update(touch.id, touch.phase, position, Instant::now())
+                {
+                    self.mouse_position = Some(update.position);
+                    self.handle_engine_event(
+                        event_loop,
+                        EngineEvent::PointerMoved {
+                            position: PointerPosition {
+                                x: position.0,
+                                y: position.1,
+                            },
+                            modifiers: self.modifiers,
+                        },
+                    );
+                    if update.cancel_click {
+                        self.left_press_target = None;
+                    }
+                    if update.press {
+                        self.left_down = true;
+                        self.handle_engine_event(
+                            event_loop,
+                            EngineEvent::PointerButton {
+                                button: PointerButton::Primary,
+                                state: ButtonState::Pressed,
+                                modifiers: self.modifiers,
+                            },
+                        );
+                    }
+                    if update.release {
+                        self.left_down = false;
+                        self.handle_engine_event(
+                            event_loop,
+                            EngineEvent::PointerButton {
+                                button: PointerButton::Primary,
+                                state: ButtonState::Released,
+                                modifiers: self.modifiers,
+                            },
+                        );
+                    }
+                    if let Some((x, y)) = update.scroll {
+                        self.accumulate_wheel(ScrollDelta::Pixels { x, y });
+                    }
+                    self.request_immediate_redraw();
+                    // Observe both edges even when a quick tap starts and ends
+                    // before the platform delivers the next redraw notification.
+                    if update.press || update.release {
+                        self.draw_frame(event_loop);
+                    }
+                }
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.handle_viewport_change(event_loop);
@@ -1082,26 +1149,33 @@ where
                 self.modifiers = normalize_modifiers(modifiers.state());
                 self.handle_engine_event(event_loop, EngineEvent::ModifiersChanged(self.modifiers));
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_position = Some((position.x as f32, position.y as f32));
+            WindowEvent::CursorMoved { position, .. }
+                if !self.touch.ignore_mouse(Instant::now()) =>
+            {
+                self.mouse_position = Some((
+                    (position.x / self.scale_factor) as f32,
+                    (position.y / self.scale_factor) as f32,
+                ));
                 self.handle_engine_event(
                     event_loop,
                     EngineEvent::PointerMoved {
                         position: PointerPosition {
-                            x: position.x as f32,
-                            y: position.y as f32,
+                            x: (position.x / self.scale_factor) as f32,
+                            y: (position.y / self.scale_factor) as f32,
                         },
                         modifiers: self.modifiers,
                     },
                 );
                 self.request_immediate_redraw();
             }
-            WindowEvent::CursorLeft { .. } => {
+            WindowEvent::CursorLeft { .. } if !self.touch.ignore_mouse(Instant::now()) => {
                 self.mouse_position = None;
                 self.handle_engine_event(event_loop, EngineEvent::PointerLeft);
                 self.request_immediate_redraw();
             }
-            WindowEvent::MouseInput { state, button, .. } => {
+            WindowEvent::MouseInput { state, button, .. }
+                if !self.touch.ignore_mouse(Instant::now()) =>
+            {
                 let normalized_state = normalize_button_state(state);
                 match button {
                     WinitMouseButton::Left => {
@@ -1123,10 +1197,17 @@ where
                         modifiers: self.modifiers,
                     },
                 );
-                self.request_immediate_redraw();
+                // Preserve button edges even when press/release arrive before a redraw.
+                self.draw_frame(event_loop);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let delta = normalize_scroll_delta(delta);
+                let delta = match normalize_scroll_delta(delta) {
+                    ScrollDelta::Pixels { x, y } => ScrollDelta::Pixels {
+                        x: x / self.scale_factor as f32,
+                        y: y / self.scale_factor as f32,
+                    },
+                    other => other,
+                };
                 self.accumulate_wheel(delta);
                 self.handle_engine_event(
                     event_loop,
@@ -1150,7 +1231,11 @@ where
                     repeat: event.repeat,
                     modifiers: self.modifiers,
                 };
-                if let Some(text) = event.text.as_deref() {
+                if event.state == ElementState::Pressed
+                    && !self.modifiers.control
+                    && !self.modifiers.super_key
+                    && let Some(text) = event.text.as_deref()
+                {
                     self.maybe_emit_text_commit(event_loop, text);
                 }
                 self.handle_engine_event(event_loop, EngineEvent::Key(normalized));
@@ -1174,6 +1259,21 @@ where
             _ => {}
         }
     }
+}
+
+fn logical_viewport(width: u32, height: u32, scale: f64) -> Option<super::ViewportSize> {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    if width == 0 || height == 0 {
+        return None;
+    }
+    drawable_viewport_size(
+        (width as f64 / scale).round().max(1.0) as usize,
+        (height as f64 / scale).round().max(1.0) as usize,
+    )
 }
 
 fn copy_render_buffer_into_surface(
@@ -1868,5 +1968,18 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(simplified, vec![(0, 0, 2, 2)]);
+    }
+}
+
+#[cfg(test)]
+mod logical_pixel_tests {
+    use super::logical_viewport;
+    #[test]
+    fn dpi_scales_css_viewport_and_ignores_minimized_windows() {
+        let viewport = logical_viewport(1920, 1080, 1.5).unwrap();
+        assert_eq!((viewport.width, viewport.height), (1280, 720));
+        assert_eq!(logical_viewport(0, 1080, 1.5), None);
+        assert_eq!(logical_viewport(1920, 0, 1.5), None);
+        assert_eq!(logical_viewport(1920, 1080, f64::NAN).unwrap().width, 1920);
     }
 }

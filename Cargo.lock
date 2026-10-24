@@ -423,6 +423,7 @@ dependencies = [
  "cssimpler-core",
  "cssparser",
  "lightningcss",
+ "parcel_selectors",
  "taffy",
 ]
 

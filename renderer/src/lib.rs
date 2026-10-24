@@ -23,6 +23,7 @@ mod shadow;
 mod shapes;
 mod softbuffer_dither;
 mod svg;
+mod touch;
 mod transform;
 
 use self::{
@@ -1261,6 +1262,15 @@ pub enum RedrawSchedule {
 }
 
 pub trait SceneProvider {
+    /// Return false to defer a window close (for example, while confirming a draft).
+    fn can_close(&mut self) -> bool {
+        true
+    }
+    /// Allows a deferred close to complete after an application update.
+    fn wants_close(&self) -> bool {
+        false
+    }
+
     fn update(&mut self, frame: FrameInfo);
 
     fn scene(&self) -> &[RenderNode];
@@ -3759,8 +3769,9 @@ enum MouseEventKind {
     MouseUp,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn dispatch_click(scene: &[RenderNode], x: f32, y: f32) -> bool {
+/// Dispatch a primary click through the normal scene hit testing.
+/// Useful for embedded hosts and headless input tests; returns whether a handler ran.
+pub fn dispatch_click(scene: &[RenderNode], x: f32, y: f32) -> bool {
     dispatch_mouse_event(scene, x, y, MouseEventKind::Click)
 }
 
