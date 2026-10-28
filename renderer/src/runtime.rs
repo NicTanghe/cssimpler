@@ -673,8 +673,20 @@ where
         }
 
         frame_stats.scene_prep_us = duration_to_us(scene_prep_start.elapsed());
-        let auto_scroll_indicator = self.scrollbar_controller.auto_scroll_indicator();
-        let resized = self.buffer_width != viewport.width || self.buffer_height != viewport.height;
+        let scale = self.scale_factor as f32;
+        let scene = crate::dpi::device_scene(scene, scale);
+        let auto_scroll_indicator =
+            self.scrollbar_controller
+                .auto_scroll_indicator()
+                .map(|mut indicator| {
+                    indicator.x *= scale;
+                    indicator.y *= scale;
+                    indicator.scale = scale;
+                    indicator
+                });
+        let physical_width = size.width as usize;
+        let physical_height = size.height as usize;
+        let resized = self.buffer_width != physical_width || self.buffer_height != physical_height;
         let defer_zero_progress_transition = should_defer_zero_progress_transition_paint(
             interaction_rerendered,
             self.scene_provider.transition_is_zero_progress(),
@@ -686,8 +698,8 @@ where
             &mut self.buffer,
             &mut self.buffer_width,
             &mut self.buffer_height,
-            viewport.width,
-            viewport.height,
+            physical_width,
+            physical_height,
             self.config.clear_color,
         );
 
@@ -1933,19 +1945,26 @@ mod tests {
                 })
                 .on_click(click),
         ];
-        let mut source = vec![0; 200 * 120];
-        crate::render_to_buffer(&scene, &mut source, 200, 120, Color::WHITE);
-        for (index, scale) in [1.0, 1.25, 1.5, 2.0, 3.0].into_iter().enumerate() {
+        for (index, scale) in [1.0, 1.2, 1.25, 1.5, 2.0, 3.0].into_iter().enumerate() {
             let width = (200.0 * scale) as usize;
             let height = (120.0 * scale) as usize;
             let mut target = vec![0; width * height];
+            let mut source = target.clone();
+            crate::render_to_buffer_at_scale(
+                &scene,
+                &mut source,
+                width,
+                height,
+                Color::WHITE,
+                scale as f32,
+            );
             copy_render_buffer_into_surface(
                 &mut target,
                 width,
                 height,
                 &source,
-                200,
-                120,
+                width,
+                height,
                 None,
                 0,
                 false,

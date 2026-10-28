@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 mod backdrop;
 mod color;
+mod dpi;
 mod fonts;
 mod gradient;
 mod image;
@@ -1769,6 +1770,20 @@ pub fn render_to_buffer(
         GlassRenderMode::Fallback,
         None,
     );
+}
+
+/// Render a logical scene into a physical-pixel buffer at `scale_factor`.
+/// Layout and hit testing remain in logical CSS pixels.
+pub fn render_to_buffer_at_scale(
+    scene: &[RenderNode],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+    scale_factor: f32,
+) {
+    let scene = dpi::device_scene(scene.to_vec(), scale_factor);
+    render_to_buffer(&scene, buffer, width, height, clear_color);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4691,7 +4706,10 @@ fn draw_node_transformed_internal_impl(
         return;
     }
 
-    if allow_surface_promotion && node_can_use_promoted_surface(node, cached_bounds) {
+    if allow_surface_promotion
+        && !matrix.magnifies()
+        && node_can_use_promoted_surface(node, cached_bounds)
+    {
         if let Some(surface) = cached_promoted_surface(node, width, height) {
             draw_cached_surface_transformed(
                 buffer,
@@ -4913,9 +4931,7 @@ fn draw_node_transformed_internal_impl(
         }
     }
 
-    if matrix.is_identity() {
-        scrollbar::draw_scrollbars(node, buffer, width, height, clip_state.coarse);
-    }
+    scrollbar::draw_scrollbars_transformed(node, buffer, width, height, matrix, clip_state);
 
     for entry in deferred.iter().filter(|entry| entry.level >= 0) {
         draw_deferred_transformed_render_context(
@@ -5967,6 +5983,33 @@ fn draw_transformed_rounded_rect(
         return;
     }
 
+    if clip_state.is_simple()
+        && let Some(scale) = matrix.uniform_scale()
+    {
+        let layout = matrix.scaled_layout(layout);
+        let radius = dpi::scaled_radius(radius, scale);
+        if !draw_axis_aligned_opaque_rect(
+            buffer,
+            width,
+            height,
+            layout,
+            radius,
+            color,
+            clip_state.coarse,
+        ) {
+            draw_rounded_rect(
+                buffer,
+                width,
+                height,
+                layout,
+                radius,
+                color,
+                clip_state.coarse,
+            );
+        }
+        return;
+    }
+
     let Some(inverse) = matrix.invert() else {
         return;
     };
@@ -6030,6 +6073,41 @@ fn draw_transformed_rounded_ring(
     clip_state: &ClipState,
 ) {
     if color.a == 0 {
+        return;
+    }
+
+    if clip_state.is_simple()
+        && let Some(scale) = matrix.uniform_scale()
+    {
+        let outer_layout = matrix.scaled_layout(outer_layout);
+        let outer_radius = dpi::scaled_radius(outer_radius, scale);
+        let inner = inner.map(|(layout, radius)| {
+            (
+                matrix.scaled_layout(layout),
+                dpi::scaled_radius(radius, scale),
+            )
+        });
+        if !draw_axis_aligned_opaque_ring(
+            buffer,
+            width,
+            height,
+            outer_layout,
+            outer_radius,
+            inner,
+            color,
+            clip_state.coarse,
+        ) {
+            draw_rounded_ring(
+                buffer,
+                width,
+                height,
+                outer_layout,
+                outer_radius,
+                inner,
+                color,
+                clip_state.coarse,
+            );
+        }
         return;
     }
 
@@ -10861,7 +10939,11 @@ mod tests {
             Some(&extracted),
             &extracted,
             None,
-            Some(crate::scrollbar::AutoScrollIndicator { x: 24.0, y: 18.0 }),
+            Some(crate::scrollbar::AutoScrollIndicator {
+                x: 24.0,
+                y: 18.0,
+                scale: 1.0
+            }),
             false,
         ));
     }

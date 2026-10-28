@@ -116,6 +116,28 @@ pub(crate) fn draw_text_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
+    // Rasterize axis-aligned text directly in device pixels, including its
+    // fractional origin. Scaling an 8-bit glyph mask loses outline detail.
+    let device_text = device_text(layout, text, style, prepared_text_layout, matrix);
+    let (layout, style, prepared_text_layout, matrix) = match &device_text {
+        Some((layout, style, prepared)) => {
+            (*layout, style, Some(prepared), AffineTransform::IDENTITY)
+        }
+        None => (layout, style, prepared_text_layout, matrix),
+    };
+    if matrix.is_identity() && clip_state.is_simple() {
+        draw_text(
+            buffer,
+            width,
+            height,
+            layout,
+            text,
+            prepared_text_layout,
+            style,
+            clip_state.coarse,
+        );
+        return;
+    }
     let Some(raster) = cached_text_mask(layout, text, &style.text, prepared_text_layout) else {
         return;
     };
@@ -182,6 +204,54 @@ pub(crate) fn draw_text_transformed(
         matrix,
         clip_state,
     );
+}
+
+/// Keep the logical line breaks, alignment widths and line spacing while
+/// rasterizing the outlines at the actual display density.
+fn device_text(
+    layout: LayoutBox,
+    text: &str,
+    style: &VisualStyle,
+    prepared: Option<&PreparedTextLayout>,
+    matrix: AffineTransform,
+) -> Option<(LayoutBox, VisualStyle, PreparedTextLayout)> {
+    let scale = matrix.uniform_scale()?;
+    if matrix.is_identity() {
+        return None;
+    }
+    let wrap_width = Some(layout.width.max(1.0));
+    let mut prepared = prepared
+        .filter(|p| p.matches_wrap_width(wrap_width))
+        .cloned()
+        .unwrap_or_else(|| {
+            PreparedTextLayout::new(wrap_width, layout_text_block(text, &style.text, wrap_width))
+        });
+    let layout = matrix.scaled_layout(layout);
+    let mut style = style.clone();
+    style.text.size_px *= scale;
+    style.text.letter_spacing_px *= scale;
+    if let LineHeight::Px(px) = &mut style.text.line_height {
+        *px *= scale;
+    }
+    style.text_stroke.width *= scale;
+    for shadow in style
+        .text_shadows
+        .iter_mut()
+        .chain(style.filter_drop_shadows.iter_mut())
+    {
+        shadow.offset_x *= scale;
+        shadow.offset_y *= scale;
+        shadow.blur_radius *= scale;
+        shadow.spread *= scale;
+    }
+    prepared.wrap_width = Some(layout.width.max(1.0));
+    prepared.layout.width *= scale;
+    prepared.layout.height *= scale;
+    prepared.layout.line_height *= scale;
+    for line in &mut prepared.layout.lines {
+        line.width *= scale;
+    }
+    Some((layout, style, prepared))
 }
 
 fn draw_shadow_mask(

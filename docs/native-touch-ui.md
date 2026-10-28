@@ -19,7 +19,7 @@ Dynamic expression slots accept individual nodes, text, vectors, and optional no
 
 The first touch contact becomes the primary pointer. A tap produces one click; a swipe scrolls the nearest scrollable ancestor and cancels the pending click. Cancelled contacts and extra fingers do not trigger clicks. Mouse events synthesized after touch are briefly suppressed to prevent duplicate actions. Quick taps preserve both press and release even between redraw notifications.
 
-Layout, pointer coordinates, and pixel-based wheel deltas use logical CSS pixels. The native surface remains at physical resolution; presentation scales the logical render buffer to fill that surface, including Retina and fractional scaling. Scaled presentation currently repaints the full surface; equal-size presentation retains damage-region updates. Minimizing a window suspends drawing.
+Layout, pointer coordinates, and pixel-based wheel deltas use logical CSS pixels. The renderer rasterizes the scene and text outlines at the native surface’s physical resolution, including Retina and fractional scaling, without enlarging a lower-resolution frame. Damage tracking also uses physical pixels. Direct/headless callers can use `render_to_buffer_at_scale` with a logical scene and a physical-size buffer. Minimizing a window suspends drawing.
 
 ## Responsive CSS
 
