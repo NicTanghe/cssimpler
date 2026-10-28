@@ -839,6 +839,10 @@ where
                         Ok(mut target) => {
                             let target_width = target.width().get() as usize;
                             let target_height = target.height().get() as usize;
+                            let damage_rects = surface_damage_rects(
+                                target.age(),
+                                paint_stats.damage_rects.as_deref(),
+                            );
                             copy_render_buffer_into_surface(
                                 &mut target,
                                 target_width,
@@ -853,7 +857,7 @@ where
                                 },
                                 pack_softbuffer_rgb(self.config.clear_color),
                                 self.native_glass_active,
-                                paint_stats.damage_rects.as_deref(),
+                                damage_rects,
                             );
                             // Transparent pixels reveal native glass on Windows. Present the full
                             // surface so cleared transparent regions also replace stale pixels
@@ -1288,6 +1292,12 @@ fn logical_viewport(width: u32, height: u32, scale: f64) -> Option<super::Viewpo
     )
 }
 
+// A partial copy is valid only when the buffer contains the last presented
+// frame. Some backends return fresh or older buffers that need the whole frame.
+fn surface_damage_rects(age: u8, damage_rects: Option<&[ClipRect]>) -> Option<&[ClipRect]> {
+    if age == 1 { damage_rects } else { None }
+}
+
 fn copy_render_buffer_into_surface(
     target: &mut [u32],
     target_width: usize,
@@ -1589,7 +1599,7 @@ mod tests {
         copy_render_buffer_into_surface, non_transparent_damage_rects, normalize_button_state,
         normalize_key_location, normalize_logical_key, normalize_modifiers, normalize_physical_key,
         normalize_pointer_button, normalize_scroll_delta,
-        should_defer_zero_progress_transition_paint, summarize_native_glass,
+        should_defer_zero_progress_transition_paint, summarize_native_glass, surface_damage_rects,
         window_uses_native_glass,
     };
     use crate::WindowConfig;
@@ -2043,6 +2053,39 @@ mod tests {
                 to_softbuffer_rgb_blue_noise_with_alpha(source[2], alpha[2], 2, 0),
             ]
         );
+    }
+
+    #[test]
+    fn fresh_or_old_surface_receives_the_complete_frame() {
+        let source = vec![pack_rgb(Color::rgb(10, 20, 30)); 4];
+        let damage = [ClipRect {
+            x0: 1.0,
+            y0: 0.0,
+            x1: 2.0,
+            y1: 2.0,
+        }];
+        for age in [0, 2] {
+            let mut target = vec![0; 4];
+            copy_render_buffer_into_surface(
+                &mut target,
+                2,
+                2,
+                &source,
+                2,
+                2,
+                None,
+                0,
+                false,
+                surface_damage_rects(age, Some(&damage)),
+            );
+            for (index, pixel) in target.iter().enumerate() {
+                assert_eq!(
+                    *pixel,
+                    to_softbuffer_rgb_blue_noise(source[index], index % 2, index / 2)
+                );
+            }
+        }
+        assert!(surface_damage_rects(1, Some(&damage)).is_some());
     }
 
     #[test]
