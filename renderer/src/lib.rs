@@ -28,6 +28,8 @@ mod svg;
 mod text_edit;
 pub use selection_geometry::prepare_text_selection_backgrounds;
 mod touch;
+#[cfg(any(windows, test))]
+mod touch_window;
 pub use text_edit::text_index_at_position;
 mod transform;
 

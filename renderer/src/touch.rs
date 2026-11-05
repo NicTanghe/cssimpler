@@ -24,6 +24,11 @@ pub(crate) struct TouchUpdate {
     pub scroll: Option<(f32, f32)>,
 }
 impl TouchController {
+    #[cfg(windows)]
+    pub fn is_active(&self) -> bool {
+        self.contact.is_some()
+    }
+
     pub fn ignore_mouse(&self, now: Instant) -> bool {
         self.contact.is_some() || self.suppress_until.is_some_and(|until| now < until)
     }

@@ -237,6 +237,8 @@ struct RuntimeApp<P> {
     mouse_position: Option<(f32, f32)>,
     native_resize_started: bool,
     touch: super::touch::TouchController,
+    #[cfg(windows)]
+    touch_window: Option<super::touch_window::Gesture>,
     pending_wheel: Option<(f32, f32)>,
     left_down: bool,
     right_down: bool,
@@ -287,6 +289,8 @@ where
             mouse_position: None,
             native_resize_started: false,
             touch: super::touch::TouchController::default(),
+            #[cfg(windows)]
+            touch_window: None,
             pending_wheel: None,
             left_down: false,
             right_down: false,
@@ -465,6 +469,124 @@ where
         )
     }
 
+    /// Windows' winit drag helpers post a mouse non-client press. Real touch
+    /// contacts do not reliably supply that mouse button state, so track their
+    /// physical screen positions directly instead of relying on mouse promotion.
+    #[cfg(windows)]
+    fn handle_touch_window_gesture(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        touch: &winit::event::Touch,
+    ) -> bool {
+        use super::touch_window::{Action, Geometry, Gesture};
+        use winit::{dpi::PhysicalPosition, event::TouchPhase};
+        let Some(window) = self.window.as_ref().cloned() else {
+            return false;
+        };
+        let logical = (
+            (touch.location.x / self.scale_factor) as f32,
+            (touch.location.y / self.scale_factor) as f32,
+        );
+        if self.touch_window.is_none() {
+            if touch.phase != TouchPhase::Started
+                || self.touch.is_active()
+                || self.config.decorations
+                || window.is_maximized()
+                || window.fullscreen().is_some()
+            {
+                return false;
+            }
+            let size = window.inner_size();
+            let direction = window
+                .is_resizable()
+                .then(|| {
+                    resize_direction_at(
+                        logical,
+                        (
+                            (size.width as f64 / self.scale_factor) as f32,
+                            (size.height as f64 / self.scale_factor) as f32,
+                        ),
+                        // Keep the existing border opt-in, but give fingers a larger target.
+                        if self.config.resize_border_width > 0.0 {
+                            self.config.resize_border_width.max(16.0)
+                        } else {
+                            0.0
+                        },
+                    )
+                })
+                .flatten();
+            let scene = self
+                .previous_presented_scene
+                .as_deref()
+                .unwrap_or_else(|| self.scene_provider.scene());
+            let action = if let Some(direction) = direction {
+                Action::Resize(direction)
+            } else if drag_region_contains(
+                scene,
+                logical.0,
+                logical.1,
+                self.config.drag_region_height,
+            ) {
+                Action::Move
+            } else {
+                return false;
+            };
+            let (Ok(position), Ok(client_origin)) =
+                (window.outer_position(), window.inner_position())
+            else {
+                return false;
+            };
+            let screen = PhysicalPosition::new(
+                f64::from(client_origin.x) + touch.location.x,
+                f64::from(client_origin.y) + touch.location.y,
+            );
+            self.touch_window = Some(Gesture::new(
+                touch.id,
+                action,
+                screen,
+                Geometry { position, size },
+            ));
+            self.left_press_target = None;
+            self.left_down = false;
+            self.previous_left_down = false;
+            self.pending_wheel = None;
+        }
+        // Reserve this contact in the ordinary controller as well. Its updates
+        // are consumed here, so a window gesture cannot click or scroll content,
+        // and synthesized mouse input stays suppressed through the release.
+        let _ = self
+            .touch
+            .update(touch.id, touch.phase, logical, Instant::now());
+        let gesture = self.touch_window.as_ref().unwrap();
+        if gesture.id != touch.id {
+            return true;
+        }
+        match touch.phase {
+            TouchPhase::Moved => {
+                if let Ok(origin) = window.inner_position() {
+                    let geometry = gesture.geometry_at(PhysicalPosition::new(
+                        f64::from(origin.x) + touch.location.x,
+                        f64::from(origin.y) + touch.location.y,
+                    ));
+                    let resizing = matches!(gesture.action, Action::Resize(_));
+                    window.set_outer_position(geometry.position);
+                    if resizing {
+                        let _ = window.request_inner_size(geometry.size);
+                        self.handle_viewport_change(event_loop);
+                    }
+                    self.request_immediate_redraw();
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                self.touch_window = None;
+                self.mouse_position = None;
+                self.request_immediate_redraw();
+            }
+            TouchPhase::Started => {}
+        }
+        true
+    }
+
     fn update_resize_cursor(&self) {
         // Preserve content-drag cursors. Hover updates must still work if the
         // native resize loop consumed the release event.
@@ -482,6 +604,10 @@ where
 
     fn clear_pointer_state(&mut self) {
         self.touch.cancel();
+        #[cfg(windows)]
+        {
+            self.touch_window = None;
+        }
         self.mouse_position = None;
         self.native_resize_started = false;
         self.pending_wheel = None;
@@ -1171,6 +1297,10 @@ where
             }
             WindowEvent::Destroyed => event_loop.exit(),
             WindowEvent::Touch(touch) => {
+                #[cfg(windows)]
+                if self.handle_touch_window_gesture(event_loop, &touch) {
+                    return;
+                }
                 let position = (
                     (touch.location.x / self.scale_factor) as f32,
                     (touch.location.y / self.scale_factor) as f32,
