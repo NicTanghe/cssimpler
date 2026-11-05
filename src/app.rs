@@ -312,6 +312,8 @@ fn render_root_with_schedule(
     stats: &mut RuntimeStats,
 ) -> Option<RenderNode> {
     let root = runtime_world.root_as_node(root_index)?;
+    let viewport_stylesheet = viewport.map(|v| stylesheet.for_viewport(v.width, v.height));
+    let stylesheet = viewport_stylesheet.as_deref().unwrap_or(stylesheet);
 
     let style_start = Instant::now();
     let resolved = resolve_render_tree_with_interaction_at_root(
@@ -394,6 +396,9 @@ fn root_render_mode<'a>(
 
 pub struct App<'a, State, Update, View, Signal = Invalidation> {
     state: State,
+    event_handler: Option<fn(&mut State, &EngineEvent) -> bool>,
+    close_handler: Option<fn(&mut State) -> bool>,
+    exit_when: Option<fn(&State) -> bool>,
     stylesheet: &'a Stylesheet,
     update: Update,
     view: View,
@@ -417,6 +422,9 @@ where
     pub fn new(state: State, stylesheet: &'a Stylesheet, update: Update, view: View) -> Self {
         Self {
             state,
+            event_handler: None,
+            close_handler: None,
+            exit_when: None,
             stylesheet,
             update,
             view,
@@ -430,6 +438,22 @@ where
             last_stats: RuntimeStats::default(),
             signal: PhantomData,
         }
+    }
+
+    /// Handle application shortcuts before native text editing. Return true to
+    /// consume the event and invalidate the view; false preserves default input.
+    pub fn with_event_handler(mut self, handler: fn(&mut State, &EngineEvent) -> bool) -> Self {
+        self.event_handler = Some(handler);
+        self
+    }
+
+    pub fn with_close_handler(mut self, handler: fn(&mut State) -> bool) -> Self {
+        self.close_handler = Some(handler);
+        self
+    }
+    pub fn with_exit_when(mut self, predicate: fn(&State) -> bool) -> Self {
+        self.exit_when = Some(predicate);
+        self
     }
 
     pub fn with_render_mode(mut self, render_mode: RenderMode) -> Self {
@@ -641,9 +665,12 @@ where
                 return false;
             }
             let style_start = Instant::now();
+            let viewport_stylesheet = self
+                .viewport()
+                .map(|v| self.stylesheet.for_viewport(v.width, v.height));
             let resolved = resolve_render_tree_with_interaction_in_root(
                 &tree,
-                self.stylesheet,
+                viewport_stylesheet.as_deref().unwrap_or(self.stylesheet),
                 self.runtime_world.interaction(),
                 &node_match.path,
             );
@@ -819,6 +846,18 @@ where
     View: FnMut(&State) -> Node,
     Signal: Into<Refresh>,
 {
+    fn can_close(&mut self) -> bool {
+        let result = self
+            .close_handler
+            .is_none_or(|handler| handler(&mut self.state));
+        self.invalidate(Invalidation::Structure);
+        result
+    }
+    fn wants_close(&self) -> bool {
+        self.exit_when
+            .is_some_and(|predicate| predicate(&self.state))
+    }
+
     fn set_viewport(&mut self, viewport: ViewportSize) {
         App::set_viewport(self, viewport);
     }
@@ -836,6 +875,13 @@ where
     }
 
     fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        if self
+            .event_handler
+            .is_some_and(|handler| handler(&mut self.state, event))
+        {
+            self.invalidate(Invalidation::Structure);
+            return true;
+        }
         if self.text_inputs.handle_engine_event(
             event,
             self.cached_scene.as_deref(),
@@ -873,6 +919,9 @@ where
 
 pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     state: State,
+    event_handler: Option<fn(&mut State, &EngineEvent) -> bool>,
+    close_handler: Option<fn(&mut State) -> bool>,
+    exit_when: Option<fn(&State) -> bool>,
     stylesheet: &'a Stylesheet,
     update: Update,
     fragments: Vec<Fragment<'a, State>>,
@@ -900,6 +949,9 @@ where
         let fragments = fragments.into_iter().collect::<Vec<_>>();
         Self {
             state,
+            event_handler: None,
+            close_handler: None,
+            exit_when: None,
             stylesheet,
             update,
             fragment_indices: build_fragment_indices(&fragments),
@@ -914,6 +966,22 @@ where
             last_stats: RuntimeStats::default(),
             signal: PhantomData,
         }
+    }
+
+    /// Handle application shortcuts before native text editing. Return true to
+    /// consume the event and invalidate the view; false preserves default input.
+    pub fn with_event_handler(mut self, handler: fn(&mut State, &EngineEvent) -> bool) -> Self {
+        self.event_handler = Some(handler);
+        self
+    }
+
+    pub fn with_close_handler(mut self, handler: fn(&mut State) -> bool) -> Self {
+        self.close_handler = Some(handler);
+        self
+    }
+    pub fn with_exit_when(mut self, predicate: fn(&State) -> bool) -> Self {
+        self.exit_when = Some(predicate);
+        self
     }
 
     pub fn with_render_mode(mut self, render_mode: RenderMode) -> Self {
@@ -1233,6 +1301,18 @@ where
     Update: FnMut(&mut State, FrameInfo) -> Signal,
     Signal: Into<Refresh>,
 {
+    fn can_close(&mut self) -> bool {
+        let result = self
+            .close_handler
+            .is_none_or(|handler| handler(&mut self.state));
+        self.invalidate(Invalidation::Structure);
+        result
+    }
+    fn wants_close(&self) -> bool {
+        self.exit_when
+            .is_some_and(|predicate| predicate(&self.state))
+    }
+
     fn set_viewport(&mut self, viewport: ViewportSize) {
         FragmentApp::set_viewport(self, viewport);
     }
@@ -1250,6 +1330,13 @@ where
     }
 
     fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        if self
+            .event_handler
+            .is_some_and(|handler| handler(&mut self.state, event))
+        {
+            self.invalidate(Invalidation::Structure);
+            return true;
+        }
         if self.text_inputs.handle_engine_event(
             event,
             self.cached_scene.as_deref(),
@@ -3061,5 +3148,93 @@ mod tests {
         for child in &node.children {
             collect_text(child, text);
         }
+    }
+}
+
+#[cfg(test)]
+mod viewport_and_lifecycle_tests {
+    use super::{App, Invalidation};
+    use crate::{
+        core::Node,
+        renderer::{FrameInfo, SceneProvider, ViewportSize},
+        style::parse_stylesheet,
+    };
+    use std::time::Duration;
+    #[test]
+    fn css_media_rules_recompute_when_window_is_resized() {
+        let stylesheet = parse_stylesheet(
+            "#card {width:200px;height:20px} @media (max-width:600px) {#card {width:100px}}",
+        )
+        .unwrap();
+        let mut app = App::new(
+            (),
+            &stylesheet,
+            |_, _| Invalidation::Clean,
+            |_| Node::element("div").with_id("card").into(),
+        );
+        app.set_viewport(ViewportSize::new(500, 800));
+        let small = app.frame(FrameInfo {
+            frame_index: 0,
+            delta: Duration::ZERO,
+        });
+        assert_eq!(small[0].layout.width, 100.0);
+        app.set_viewport(ViewportSize::new(900, 800));
+        let wide = app.frame(FrameInfo {
+            frame_index: 1,
+            delta: Duration::ZERO,
+        });
+        assert_eq!(wide[0].layout.width, 200.0);
+    }
+    #[test]
+    fn application_can_defer_and_complete_a_native_close_request() {
+        let stylesheet = parse_stylesheet("").unwrap();
+        let mut app = App::new(
+            false,
+            &stylesheet,
+            |_, _| Invalidation::Clean,
+            |_| Node::element("div").into(),
+        )
+        .with_close_handler(|confirmed| {
+            *confirmed = true;
+            false
+        })
+        .with_exit_when(|confirmed| *confirmed);
+        assert!(!SceneProvider::wants_close(&app));
+        assert!(!SceneProvider::can_close(&mut app));
+        assert!(SceneProvider::wants_close(&app));
+    }
+    #[test]
+    fn custom_event_handler_consumes_shortcuts_and_invalidates_the_view() {
+        use crate::renderer::{ButtonState, EngineEvent, KeyIdentity, KeyboardEvent};
+        let stylesheet = parse_stylesheet("").unwrap();
+        let mut app = App::new(false, &stylesheet, |_, _| Invalidation::Clean,
+            |open| Node::element("p").with_child(Node::text(if *open { "open" } else { "closed" })).into())
+            .with_event_handler(|open, event| {
+                if matches!(event, EngineEvent::Key(k) if k.state == ButtonState::Pressed && k.logical_key == KeyIdentity::Named("Escape".into())) {
+                    *open = !*open;
+                    true
+                } else { false }
+            });
+        app.frame(FrameInfo {
+            frame_index: 0,
+            delta: Duration::ZERO,
+        });
+        assert!(!SceneProvider::handle_engine_event(
+            &mut app,
+            &EngineEvent::Resumed
+        ));
+        assert!(SceneProvider::handle_engine_event(
+            &mut app,
+            &EngineEvent::Key(KeyboardEvent {
+                logical_key: KeyIdentity::Named("Escape".into()),
+                physical_key: None,
+                location: Default::default(),
+                state: ButtonState::Pressed,
+                repeat: false,
+                modifiers: Default::default(),
+            })
+        ));
+        assert!(*app.state());
+        assert!(SceneProvider::needs_redraw(&app));
     }
 }

@@ -50,6 +50,7 @@ struct AutoScrollSession {
 pub(crate) struct AutoScrollIndicator {
     pub x: f32,
     pub y: f32,
+    pub scale: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -151,6 +152,7 @@ impl ScrollbarController {
             .map(|auto_scroll| AutoScrollIndicator {
                 x: auto_scroll.anchor_x,
                 y: auto_scroll.anchor_y,
+                scale: 1.0,
             })
     }
 
@@ -599,6 +601,30 @@ pub(crate) fn draw_scrollbars(
     height: usize,
     clip: ClipRect,
 ) {
+    draw_scrollbars_with(node, |layout, radius, color| {
+        draw_rounded_rect(buffer, width, height, layout, radius, color, clip);
+    });
+}
+
+pub(crate) fn draw_scrollbars_transformed(
+    node: &RenderNode,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    matrix: crate::transform::AffineTransform,
+    clip_state: &crate::transform::ClipState,
+) {
+    draw_scrollbars_with(node, |layout, radius, color| {
+        crate::draw_transformed_rounded_rect(
+            buffer, width, height, layout, radius, color, matrix, clip_state,
+        );
+    });
+}
+
+fn draw_scrollbars_with(
+    node: &RenderNode,
+    mut draw_rect: impl FnMut(LayoutBox, CornerRadius, Color),
+) {
     let Some(scrollbars) = node.scrollbars else {
         return;
     };
@@ -617,24 +643,8 @@ pub(crate) fn draw_scrollbars(
             scrollbars.interaction.vertical.thumb_hovered,
             scrollbars.interaction.vertical.thumb_active,
         );
-        draw_rounded_rect(
-            buffer,
-            width,
-            height,
-            rects.track,
-            radius,
-            track_color,
-            clip,
-        );
-        draw_rounded_rect(
-            buffer,
-            width,
-            height,
-            rects.thumb,
-            radius,
-            thumb_color,
-            clip,
-        );
+        draw_rect(rects.track, radius, track_color);
+        draw_rect(rects.thumb, radius, thumb_color);
     }
 
     if let Some(rects) = scrollbar_rects(node, ScrollbarAxis::Horizontal) {
@@ -648,31 +658,15 @@ pub(crate) fn draw_scrollbars(
             scrollbars.interaction.horizontal.thumb_hovered,
             scrollbars.interaction.horizontal.thumb_active,
         );
-        draw_rounded_rect(
-            buffer,
-            width,
-            height,
-            rects.track,
-            radius,
-            track_color,
-            clip,
-        );
-        draw_rounded_rect(
-            buffer,
-            width,
-            height,
-            rects.thumb,
-            radius,
-            thumb_color,
-            clip,
-        );
+        draw_rect(rects.track, radius, track_color);
+        draw_rect(rects.thumb, radius, thumb_color);
     }
 
     if scrollbars.shows_horizontal()
         && scrollbars.shows_vertical()
         && let Some(corner) = scrollbar_corner(node, scrollbars.resolved_width())
     {
-        draw_rounded_rect(buffer, width, height, corner, radius, resolved.track, clip);
+        draw_rect(corner, radius, resolved.track);
     }
 }
 
@@ -682,19 +676,27 @@ pub(crate) fn draw_auto_scroll_indicator(
     width: usize,
     height: usize,
 ) {
+    let scale = indicator.scale;
     let clip = ClipRect::full(width as f32, height as f32);
-    let outer_layout = centered_layout(indicator.x, indicator.y, AUTO_SCROLL_INDICATOR_RADIUS);
-    let inner_layout =
-        centered_layout(indicator.x, indicator.y, AUTO_SCROLL_INDICATOR_RADIUS - 1.5);
-    let center_dot = centered_layout(indicator.x, indicator.y, 2.5);
-    let radius = CornerRadius::all(AUTO_SCROLL_INDICATOR_RADIUS);
-    let inner_radius = CornerRadius::all((AUTO_SCROLL_INDICATOR_RADIUS - 1.5).max(0.0));
+    let outer_layout = centered_layout(
+        indicator.x,
+        indicator.y,
+        AUTO_SCROLL_INDICATOR_RADIUS * scale,
+    );
+    let inner_layout = centered_layout(
+        indicator.x,
+        indicator.y,
+        (AUTO_SCROLL_INDICATOR_RADIUS - 1.5) * scale,
+    );
+    let center_dot = centered_layout(indicator.x, indicator.y, 2.5 * scale);
+    let radius = CornerRadius::all(AUTO_SCROLL_INDICATOR_RADIUS * scale);
+    let inner_radius = CornerRadius::all(((AUTO_SCROLL_INDICATOR_RADIUS - 1.5) * scale).max(0.0));
 
     draw_rounded_rect(
         buffer,
         width,
         height,
-        offset_layout(outer_layout, 0.0, 1.0),
+        offset_layout(outer_layout, 0.0, scale),
         radius,
         Color::rgba(15, 23, 42, 56),
         clip,
@@ -722,7 +724,7 @@ pub(crate) fn draw_auto_scroll_indicator(
         width,
         height,
         center_dot,
-        CornerRadius::all(2.5),
+        CornerRadius::all(2.5 * scale),
         Color::rgba(30, 41, 59, 216),
         clip,
     );
@@ -733,41 +735,49 @@ pub(crate) fn draw_auto_scroll_indicator(
         width,
         height,
         indicator.x,
-        indicator.y - 8.5,
+        indicator.y - 8.5 * scale,
         AutoScrollDirection::Up,
         icon_color,
+        scale,
     );
     draw_indicator_arrow(
         buffer,
         width,
         height,
         indicator.x,
-        indicator.y + 8.5,
+        indicator.y + 8.5 * scale,
         AutoScrollDirection::Down,
         icon_color,
+        scale,
     );
     draw_indicator_arrow(
         buffer,
         width,
         height,
-        indicator.x - 8.5,
+        indicator.x - 8.5 * scale,
         indicator.y,
         AutoScrollDirection::Left,
         icon_color,
+        scale,
     );
     draw_indicator_arrow(
         buffer,
         width,
         height,
-        indicator.x + 8.5,
+        indicator.x + 8.5 * scale,
         indicator.y,
         AutoScrollDirection::Right,
         icon_color,
+        scale,
     );
 }
 
 pub(crate) fn auto_scroll_indicator_bounds(indicator: AutoScrollIndicator) -> LayoutBox {
-    centered_layout(indicator.x, indicator.y, AUTO_SCROLL_INDICATOR_RADIUS + 6.0)
+    centered_layout(
+        indicator.x,
+        indicator.y,
+        (AUTO_SCROLL_INDICATOR_RADIUS + 6.0) * indicator.scale,
+    )
 }
 
 fn sorted_stacking_indices(nodes: &[RenderNode]) -> Vec<usize> {
@@ -1347,27 +1357,28 @@ fn draw_indicator_arrow(
     center_y: f32,
     direction: AutoScrollDirection,
     color: Color,
+    scale: f32,
 ) {
     let ((tip_x, tip_y), (left_x, left_y), (right_x, right_y)) = match direction {
         AutoScrollDirection::Up => (
-            (center_x, center_y - 2.5),
-            (center_x - 3.5, center_y + 1.0),
-            (center_x + 3.5, center_y + 1.0),
+            (center_x, center_y - 2.5 * scale),
+            (center_x - 3.5 * scale, center_y + scale),
+            (center_x + 3.5 * scale, center_y + scale),
         ),
         AutoScrollDirection::Down => (
-            (center_x, center_y + 2.5),
-            (center_x - 3.5, center_y - 1.0),
-            (center_x + 3.5, center_y - 1.0),
+            (center_x, center_y + 2.5 * scale),
+            (center_x - 3.5 * scale, center_y - scale),
+            (center_x + 3.5 * scale, center_y - scale),
         ),
         AutoScrollDirection::Left => (
-            (center_x - 2.5, center_y),
-            (center_x + 1.0, center_y - 3.5),
-            (center_x + 1.0, center_y + 3.5),
+            (center_x - 2.5 * scale, center_y),
+            (center_x + scale, center_y - 3.5 * scale),
+            (center_x + scale, center_y + 3.5 * scale),
         ),
         AutoScrollDirection::Right => (
-            (center_x + 2.5, center_y),
-            (center_x - 1.0, center_y - 3.5),
-            (center_x - 1.0, center_y + 3.5),
+            (center_x + 2.5 * scale, center_y),
+            (center_x - scale, center_y - 3.5 * scale),
+            (center_x - scale, center_y + 3.5 * scale),
         ),
     };
 
@@ -1827,7 +1838,11 @@ mod tests {
         assert!(controller.toggle_middle_button_auto_scroll(&scene, Some((44.0, 28.0))));
         assert_eq!(
             controller.auto_scroll_indicator(),
-            Some(AutoScrollIndicator { x: 44.0, y: 28.0 })
+            Some(AutoScrollIndicator {
+                x: 44.0,
+                y: 28.0,
+                scale: 1.0
+            })
         );
         assert!(controller.cancel_middle_button_auto_scroll());
         assert_eq!(controller.auto_scroll_indicator(), None);

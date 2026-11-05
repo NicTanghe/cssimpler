@@ -49,6 +49,7 @@ mod attributes;
 mod custom_properties;
 mod fonts;
 mod invalidation;
+mod media;
 mod render_tree;
 mod selectors;
 mod svg;
@@ -90,6 +91,28 @@ pub struct Stylesheet {
 }
 
 impl Stylesheet {
+    /// Resolve viewport-dependent rules without mutating the source stylesheet.
+    pub fn for_viewport(&self, width: usize, height: usize) -> std::borrow::Cow<'_, Self> {
+        if self
+            .rules
+            .iter()
+            .all(|rule| rule.media_conditions.is_empty())
+        {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut filtered = Self::default();
+        for rule in &self.rules {
+            if rule
+                .media_conditions
+                .iter()
+                .all(|condition| condition.matches(width, height))
+            {
+                filtered.push(rule.clone());
+            }
+        }
+        std::borrow::Cow::Owned(filtered)
+    }
+
     pub fn push(&mut self, rule: StyleRule) {
         self.index.insert(self.rules.len(), &rule);
         self.rules.push(rule);
@@ -292,6 +315,7 @@ pub struct StyleRule {
     custom_declaration_indices: Vec<usize>,
     other_declaration_indices: Vec<usize>,
     interaction_dependencies: InteractionDependencies,
+    media_conditions: Vec<media::Condition>,
 }
 
 impl StyleRule {
@@ -306,6 +330,7 @@ impl StyleRule {
             }
         }
         Self {
+            media_conditions: Vec::new(),
             interaction_dependencies: selector.interaction_dependencies(),
             selector,
             declarations,
@@ -570,7 +595,12 @@ fn collect_style_rules_lossy(rule_list: &CssRuleList<'_, impl Clone>, stylesheet
                 collect_style_rules_lossy(&nesting_rule.style.rules, stylesheet);
             }
             CssRule::Media(media_rule) => {
+                let start = stylesheet.rules.len();
                 collect_style_rules_lossy(&media_rule.rules, stylesheet);
+                let condition = media::Condition::from_list(&media_rule.query);
+                for rule in &mut stylesheet.rules[start..] {
+                    rule.media_conditions.push(condition.clone());
+                }
             }
             CssRule::Supports(supports_rule) => {
                 collect_style_rules_lossy(&supports_rule.rules, stylesheet);
@@ -630,7 +660,12 @@ fn collect_style_rules(
                 collect_style_rules(&nesting_rule.style.rules, stylesheet)?;
             }
             CssRule::Media(media_rule) => {
+                let start = stylesheet.rules.len();
                 collect_style_rules(&media_rule.rules, stylesheet)?;
+                let condition = media::Condition::from_list(&media_rule.query);
+                for rule in &mut stylesheet.rules[start..] {
+                    rule.media_conditions.push(condition.clone());
+                }
             }
             CssRule::Supports(supports_rule) => {
                 collect_style_rules(&supports_rule.rules, stylesheet)?;

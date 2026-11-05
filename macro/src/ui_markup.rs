@@ -277,32 +277,32 @@ fn is_no_space_after(ch: char) -> bool {
 
 fn expand_element(element: &Element) -> Result<TokenStream2> {
     let tag = element.tag.to_string();
-    let mut builder = quote!(::cssimpler_core::Node::element(#tag));
+    let mut builder = quote!(::cssimpler::core::Node::element(#tag));
 
     for attribute in &element.attributes {
         builder = expand_attribute(builder, attribute)?;
     }
 
     if !element.children.is_empty() {
-        let children = element
-            .children
-            .iter()
-            .map(expand_child)
-            .collect::<Result<Vec<_>>>()?;
-        builder = quote! {
-            #builder
-            #( .with_child(#children) )*
-        };
+        for child in &element.children {
+            builder = match child {
+                Child::Expression(expression) => quote!(#builder.with_nodes(#expression)),
+                _ => {
+                    let child = expand_child(child)?;
+                    quote!(#builder.with_child(#child))
+                }
+            };
+        }
     }
 
-    Ok(quote!(::cssimpler_core::Node::from(#builder)))
+    Ok(quote!(::cssimpler::core::Node::from(#builder)))
 }
 
 fn expand_child(child: &Child) -> Result<TokenStream2> {
     match child {
         Child::Element(element) => expand_element(element),
-        Child::Expression(expression) => Ok(quote!(::cssimpler_core::into_node(#expression))),
-        Child::Text(text) => Ok(quote!(::cssimpler_core::Node::text(#text))),
+        Child::Expression(expression) => Ok(quote!(::cssimpler::core::into_node(#expression))),
+        Child::Text(text) => Ok(quote!(::cssimpler::core::Node::text(#text))),
     }
 }
 

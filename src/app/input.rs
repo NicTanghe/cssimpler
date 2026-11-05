@@ -1,3 +1,8 @@
+mod clipboard;
+mod selection;
+
+use clipboard::TextClipboard;
+use selection::DocumentSelection;
 use std::collections::HashMap;
 
 use crate::core::{
@@ -23,6 +28,7 @@ struct ActiveInputDrag {
     key: String,
     path: ElementPath,
     anchor: usize,
+    password: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -31,16 +37,40 @@ struct FocusedInput {
     path: ElementPath,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub(super) struct NativeTextInputs {
     states: HashMap<String, NativeTextInputState>,
     focused: Option<FocusedInput>,
     pointer_position: Option<PointerPosition>,
     active_drag: Option<ActiveInputDrag>,
+    autofocus_keys: HashMap<usize, String>,
+    clipboard: TextClipboard,
+    document_selection: DocumentSelection,
 }
 
 impl NativeTextInputs {
     pub(super) fn materialize_root(&mut self, root_index: usize, root: Node) -> Node {
+        let mut inputs = Vec::new();
+        collect_inputs(&root, &ElementPath::root(root_index), &mut inputs);
+        if self.focused.as_ref().is_some_and(|focused| {
+            focused.path.root == root_index && !inputs.iter().any(|(key, _, _)| key == &focused.key)
+        }) {
+            self.clear_focus();
+        }
+        let autofocus = inputs.iter().rev().find(|(_, _, autofocus)| *autofocus);
+        if let Some((key, path, _)) = autofocus {
+            if self.autofocus_keys.get(&root_index) != Some(key) {
+                self.focused = Some(FocusedInput {
+                    key: key.clone(),
+                    path: path.clone(),
+                });
+            }
+        }
+        if let Some((key, _, _)) = autofocus {
+            self.autofocus_keys.insert(root_index, key.clone());
+        } else {
+            self.autofocus_keys.remove(&root_index);
+        }
         self.materialize_node(root, Some(ElementPath::root(root_index)))
     }
 
@@ -50,30 +80,72 @@ impl NativeTextInputs {
         scene: Option<&[RenderNode]>,
         runtime_world: &RuntimeWorld,
     ) -> bool {
+        let selection_cleared = self.document_selection.reconcile(scene, runtime_world);
         let before = self.focused_value();
         let changed = match event {
             EngineEvent::PointerMoved { position, .. } => {
                 self.pointer_position = Some(*position);
-                self.update_drag_selection(scene)
+                let input = self.update_drag_selection(scene);
+                let document = self.document_selection.update(scene, *position);
+                input || document
             }
             EngineEvent::PointerLeft => {
                 self.pointer_position = None;
                 self.active_drag = None;
+                self.document_selection.finish();
                 false
             }
             EngineEvent::PointerButton {
                 button: PointerButton::Primary,
                 state: ButtonState::Pressed,
-                ..
-            } => self.focus_input_at_pointer(scene, runtime_world),
+                modifiers,
+            } => {
+                let cleared = self.document_selection.clear();
+                let input = self.focus_input_at_pointer(scene, runtime_world, modifiers.shift);
+                let document = if self.focused.is_none() {
+                    self.document_selection
+                        .begin(scene, runtime_world, self.pointer_position)
+                } else {
+                    false
+                };
+                cleared || input || document
+            }
             EngineEvent::PointerButton {
                 button: PointerButton::Primary,
                 state: ButtonState::Released,
                 ..
-            } => self.finish_drag_selection(),
+            } => {
+                self.document_selection.finish();
+                self.finish_drag_selection()
+            }
             EngineEvent::TextInput(TextInputEvent::Commit(text)) => self.insert_focused_text(text),
             EngineEvent::TextInput(TextInputEvent::Preedit { .. }) => false,
-            EngineEvent::Key(event) => self.handle_key_event(event),
+            EngineEvent::Key(event)
+                if event.state == ButtonState::Pressed
+                    && event.logical_key == KeyIdentity::Named("Tab".into()) =>
+            {
+                let changed = self.focus_next_input(scene, runtime_world, event.modifiers.shift);
+                if changed {
+                    self.document_selection.clear();
+                }
+                changed
+            }
+            EngineEvent::Key(event)
+                if event.state == ButtonState::Pressed
+                    && event.logical_key == KeyIdentity::Named("Enter".into()) =>
+            {
+                if !event.repeat {
+                    self.dispatch_enter(runtime_world)
+                } else {
+                    false
+                }
+            }
+            EngineEvent::Key(event) => self.handle_key_event(event, scene, runtime_world),
+            EngineEvent::FocusChanged(false) | EngineEvent::Suspended => {
+                self.active_drag = None;
+                self.document_selection.finish();
+                false
+            }
             _ => false,
         };
 
@@ -81,7 +153,7 @@ impl NativeTextInputs {
             self.dispatch_input_if_value_changed(before, runtime_world);
         }
 
-        changed
+        changed || selection_cleared
     }
 
     fn materialize_node(&mut self, node: Node, element_path: Option<ElementPath>) -> Node {
@@ -124,7 +196,10 @@ impl NativeTextInputs {
                     element.set_attribute("value", state.value.clone());
                     element.children.clear();
                     if !state.value.is_empty() {
-                        element.children.push(Node::Text(state.value.clone()));
+                        element.children.push(Node::Text(display_value(
+                            &state.value,
+                            is_password_input(&element),
+                        )));
                     }
                     return Node::Element(element);
                 }
@@ -157,10 +232,14 @@ impl NativeTextInputs {
         stylesheet: &Stylesheet,
         runtime_world: &RuntimeWorld,
     ) {
+        self.document_selection
+            .decorate(scene, stylesheet, runtime_world);
         let Some(focused) = self.focused.as_ref() else {
+            renderer::prepare_text_selection_backgrounds(scene);
             return;
         };
         let Some(state) = self.states.get(&focused.key) else {
+            renderer::prepare_text_selection_backgrounds(scene);
             return;
         };
 
@@ -169,7 +248,7 @@ impl NativeTextInputs {
             cache_authored_roots(node, runtime_world, &mut authored_roots);
         }
 
-        for node in scene {
+        for node in scene.iter_mut() {
             Self::decorate_node(
                 node,
                 stylesheet,
@@ -179,6 +258,7 @@ impl NativeTextInputs {
                 state,
             );
         }
+        renderer::prepare_text_selection_backgrounds(scene);
     }
 
     fn decorate_node(
@@ -197,6 +277,7 @@ impl NativeTextInputs {
         {
             node.text_edit = Some(text_edit_decoration(
                 state,
+                is_password_input(element),
                 resolve_selection_style_at_path(
                     root,
                     stylesheet,
@@ -223,6 +304,7 @@ impl NativeTextInputs {
         &mut self,
         scene: Option<&[RenderNode]>,
         runtime_world: &RuntimeWorld,
+        extend: bool,
     ) -> bool {
         let Some(scene) = scene else {
             return self.clear_focus();
@@ -239,7 +321,10 @@ impl NativeTextInputs {
         let Some(element) = element_at_path(&root, &path) else {
             return self.clear_focus();
         };
-        if !is_native_text_input(element) {
+        if !is_editable_text_input(element) {
+            if element.attribute("data-preserve-input-focus").is_some() {
+                return false;
+            }
             return self.clear_focus();
         }
 
@@ -254,9 +339,14 @@ impl NativeTextInputs {
                 value: initial_value,
                 selection_anchor: None,
             });
-        let cursor =
-            caret_index_from_pointer_or_value(Some(scene), &path, &state.value, position.x)
-                .unwrap_or_else(|| clamp_to_char_boundary(&state.value, fallback_cursor));
+        let cursor = caret_index_from_pointer_or_value(
+            Some(scene),
+            &path,
+            &state.value,
+            position.x,
+            is_password_input(element),
+        )
+        .unwrap_or_else(|| clamp_to_char_boundary(&state.value, fallback_cursor));
         let changed = !self
             .focused
             .as_ref()
@@ -264,7 +354,12 @@ impl NativeTextInputs {
             || state.cursor != cursor
             || state.selection_anchor.is_some();
 
-        state.set_cursor(cursor);
+        let anchor = if extend && self.focused.as_ref().is_some_and(|f| f.key == key) {
+            state.selection_anchor.unwrap_or(state.cursor)
+        } else {
+            cursor
+        };
+        state.set_selection(anchor, cursor);
         self.focused = Some(FocusedInput {
             key: key.clone(),
             path: path.clone(),
@@ -272,7 +367,8 @@ impl NativeTextInputs {
         self.active_drag = Some(ActiveInputDrag {
             key,
             path,
-            anchor: cursor,
+            anchor,
+            password: is_password_input(element),
         });
 
         changed
@@ -288,9 +384,13 @@ impl NativeTextInputs {
         let Some(state) = self.states.get_mut(&drag.key) else {
             return false;
         };
-        let Some(cursor) =
-            caret_index_from_pointer_or_value(scene, &drag.path, &state.value, position.x)
-        else {
+        let Some(cursor) = caret_index_from_pointer_or_value(
+            scene,
+            &drag.path,
+            &state.value,
+            position.x,
+            drag.password,
+        ) else {
             return false;
         };
 
@@ -352,21 +452,150 @@ impl NativeTextInputs {
         true
     }
 
-    fn handle_key_event(&mut self, event: &KeyboardEvent) -> bool {
+    fn dispatch_enter(&self, world: &RuntimeWorld) -> bool {
+        let Some(focused) = &self.focused else {
+            return false;
+        };
+        let Some(root) = world.root_as_node(focused.path.root) else {
+            return false;
+        };
+        let Some(element) = element_at_path(&root, &focused.path) else {
+            return false;
+        };
+        if text_input_key(element, &focused.path) != focused.key {
+            return false;
+        }
+        if let Some(handler) = element.handlers.enter {
+            handler();
+            return true;
+        }
+        false
+    }
+
+    fn focus_next_input(
+        &mut self,
+        scene: Option<&[RenderNode]>,
+        world: &RuntimeWorld,
+        reverse: bool,
+    ) -> bool {
+        let Some(scene) = scene else {
+            return false;
+        };
+        let mut roots = HashMap::new();
+        for node in scene {
+            cache_authored_roots(node, world, &mut roots);
+        }
+        let mut root_indices: Vec<_> = roots.keys().copied().collect();
+        root_indices.sort_unstable();
+        let mut inputs = Vec::new();
+        for index in root_indices {
+            if let Some(root) = roots.get(&index).and_then(Option::as_ref) {
+                collect_inputs(root, &ElementPath::root(index), &mut inputs);
+            }
+        }
+        if inputs.is_empty() {
+            return false;
+        }
+        let current = self
+            .focused
+            .as_ref()
+            .and_then(|f| inputs.iter().position(|(key, _, _)| key == &f.key));
+        let next = match (current, reverse) {
+            (Some(i), true) => (i + inputs.len() - 1) % inputs.len(),
+            (Some(i), false) => (i + 1) % inputs.len(),
+            (None, true) => inputs.len() - 1,
+            (None, false) => 0,
+        };
+        let (key, path, _) = &inputs[next];
+        self.active_drag = None;
+        self.focused = Some(FocusedInput {
+            key: key.clone(),
+            path: path.clone(),
+        });
+        true
+    }
+
+    fn handle_key_event(
+        &mut self,
+        event: &KeyboardEvent,
+        scene: Option<&[RenderNode]>,
+        world: &RuntimeWorld,
+    ) -> bool {
         if event.state != ButtonState::Pressed {
             return false;
         }
-        let KeyIdentity::Named(name) = &event.logical_key else {
+        let command =
+            (event.modifiers.control || event.modifiers.super_key) && !event.modifiers.alt;
+        let character = match &event.logical_key {
+            KeyIdentity::Character(c) => c.to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        let name = match &event.logical_key {
+            KeyIdentity::Named(n) => n.as_str(),
+            _ => "",
+        };
+        let copy = command && character == "c" || event.modifiers.control && name == "Insert";
+        let cut = command && character == "x" || event.modifiers.shift && name == "Delete";
+        let paste = command && character == "v" || event.modifiers.shift && name == "Insert";
+        if self.focused.is_none() {
+            if copy {
+                return self
+                    .document_selection
+                    .selected_text()
+                    .is_some_and(|text| self.clipboard.set_text(text));
+            }
+            if command && character == "a" {
+                return self.document_selection.select_all(scene, world);
+            }
+            if name == "Escape" {
+                return self.document_selection.clear();
+            }
+            return false;
+        }
+        // Resolve the current authored input: its type or editability may have changed.
+        let focused = self.focused.as_ref().unwrap();
+        let Some(root) = world.root_as_node(focused.path.root) else {
             return false;
         };
-
-        match name.as_str() {
+        let Some(element) = element_at_path(&root, &focused.path) else {
+            return false;
+        };
+        if !is_editable_text_input(element) {
+            return false;
+        }
+        if copy || cut {
+            if is_password_input(element) {
+                return false;
+            }
+            let Some(state) = self.states.get(&focused.key) else {
+                return false;
+            };
+            let Some((start, end)) = state.selection_range() else {
+                return false;
+            };
+            if !self.clipboard.set_text(state.value[start..end].to_owned()) {
+                return false;
+            }
+            return if cut { self.delete_focused() } else { true };
+        }
+        if paste {
+            return self
+                .clipboard
+                .get_text()
+                .is_some_and(|text| self.insert_focused_text(&text));
+        }
+        if command && character == "a" {
+            return self.with_focused_state_mut(|state| {
+                state.set_selection(0, state.value.len());
+                true
+            });
+        }
+        match name {
             "Backspace" => self.backspace_focused(),
             "Delete" => self.delete_focused(),
-            "ArrowLeft" => self.move_focused_cursor_left(),
-            "ArrowRight" => self.move_focused_cursor_right(),
-            "Home" => self.move_focused_cursor_home(),
-            "End" => self.move_focused_cursor_end(),
+            "ArrowLeft" | "ArrowRight" | "Home" | "End" => {
+                self.move_focused_cursor(name, event.modifiers.shift)
+            }
             "Escape" => self.clear_focus(),
             _ => false,
         }
@@ -459,55 +688,34 @@ impl NativeTextInputs {
         })
     }
 
-    fn move_focused_cursor_left(&mut self) -> bool {
+    fn move_focused_cursor(&mut self, direction: &str, extend: bool) -> bool {
         self.with_focused_state_mut(|state| {
-            if let Some((start, _)) = state.selection_range() {
-                state.cursor = start;
-                state.selection_anchor = None;
-                return true;
-            }
-            let Some(previous) = previous_char_boundary(&state.value, state.cursor) else {
-                return false;
+            let before = (state.cursor, state.selection_anchor);
+            let anchor = state.selection_anchor.unwrap_or(state.cursor);
+            let cursor = match direction {
+                "Home" => 0,
+                "End" => state.value.len(),
+                "ArrowLeft" => {
+                    if !extend && let Some((start, _)) = state.selection_range() {
+                        start
+                    } else {
+                        previous_char_boundary(&state.value, state.cursor).unwrap_or(0)
+                    }
+                }
+                _ => {
+                    if !extend && let Some((_, end)) = state.selection_range() {
+                        end
+                    } else {
+                        next_char_boundary(&state.value, state.cursor).unwrap_or(state.value.len())
+                    }
+                }
             };
-            state.cursor = previous;
-            true
-        })
-    }
-
-    fn move_focused_cursor_right(&mut self) -> bool {
-        self.with_focused_state_mut(|state| {
-            if let Some((_, end)) = state.selection_range() {
-                state.cursor = end;
-                state.selection_anchor = None;
-                return true;
+            if extend {
+                state.set_selection(anchor, cursor);
+            } else {
+                state.set_cursor(cursor);
             }
-            let Some(next) = next_char_boundary(&state.value, state.cursor) else {
-                return false;
-            };
-            state.cursor = next;
-            true
-        })
-    }
-
-    fn move_focused_cursor_home(&mut self) -> bool {
-        self.with_focused_state_mut(|state| {
-            if state.cursor == 0 && state.selection_anchor.is_none() {
-                return false;
-            }
-            state.cursor = 0;
-            state.selection_anchor = None;
-            true
-        })
-    }
-
-    fn move_focused_cursor_end(&mut self) -> bool {
-        self.with_focused_state_mut(|state| {
-            if state.cursor == state.value.len() && state.selection_anchor.is_none() {
-                return false;
-            }
-            state.cursor = state.value.len();
-            state.selection_anchor = None;
-            true
+            before != (state.cursor, state.selection_anchor)
         })
     }
 }
@@ -565,7 +773,76 @@ fn is_native_text_input(element: &ElementNode) -> bool {
     element.tag.eq_ignore_ascii_case("input")
         && element
             .attribute("type")
-            .is_none_or(|input_type| input_type.eq_ignore_ascii_case("text"))
+            .is_none_or(|t| t.eq_ignore_ascii_case("text") || t.eq_ignore_ascii_case("password"))
+}
+
+fn is_editable_text_input(element: &ElementNode) -> bool {
+    is_native_text_input(element)
+        && element.attribute("disabled").is_none()
+        && element.attribute("readonly").is_none()
+}
+
+fn is_password_input(element: &ElementNode) -> bool {
+    element
+        .attribute("type")
+        .is_some_and(|t| t.eq_ignore_ascii_case("password"))
+}
+
+fn display_value(value: &str, password: bool) -> String {
+    if password {
+        "*".repeat(value.chars().count())
+    } else {
+        value.to_owned()
+    }
+}
+
+fn collect_inputs(node: &Node, path: &ElementPath, inputs: &mut Vec<(String, ElementPath, bool)>) {
+    if let Some((modal, modal_path)) = last_modal(node, path) {
+        collect_editable_inputs(modal, &modal_path, inputs);
+    } else {
+        collect_editable_inputs(node, path, inputs);
+    }
+}
+
+fn last_modal<'a>(node: &'a Node, path: &ElementPath) -> Option<(&'a Node, ElementPath)> {
+    let Node::Element(element) = node else {
+        return None;
+    };
+    let mut found = (element.attribute("aria-modal") == Some("true")).then(|| (node, path.clone()));
+    let mut index = 0;
+    for child in &element.children {
+        if matches!(child, Node::Element(_)) {
+            if let Some(modal) = last_modal(child, &path.with_child(index)) {
+                found = Some(modal);
+            }
+            index += 1;
+        }
+    }
+    found
+}
+
+fn collect_editable_inputs(
+    node: &Node,
+    path: &ElementPath,
+    inputs: &mut Vec<(String, ElementPath, bool)>,
+) {
+    let Node::Element(element) = node else {
+        return;
+    };
+    if is_editable_text_input(element) {
+        inputs.push((
+            text_input_key(element, path),
+            path.clone(),
+            element.attribute("autofocus").is_some(),
+        ));
+    }
+    let mut index = 0;
+    for child in &element.children {
+        if matches!(child, Node::Element(_)) {
+            collect_editable_inputs(child, &path.with_child(index), inputs);
+            index += 1;
+        }
+    }
 }
 
 fn text_input_key(element: &ElementNode, path: &ElementPath) -> String {
@@ -589,18 +866,27 @@ fn element_path_key(path: &ElementPath) -> String {
 
 fn text_edit_decoration(
     state: &NativeTextInputState,
+    password: bool,
     selection_style: crate::core::TextSelectionStyle,
 ) -> TextEditDecoration {
+    let display_index = |index| {
+        if password {
+            state.value[..index].chars().count()
+        } else {
+            index
+        }
+    };
     let selection = state
         .selection_range()
         .map(|(start, end)| TextSelectionRange {
-            start,
-            end,
+            start: display_index(start),
+            end: display_index(end),
             style: selection_style,
         });
 
     TextEditDecoration {
-        caret: selection.is_none().then_some(state.cursor),
+        backgrounds: None,
+        caret: selection.is_none().then_some(display_index(state.cursor)),
         selection,
     }
 }
@@ -610,10 +896,22 @@ fn caret_index_from_pointer_or_value(
     path: &ElementPath,
     value: &str,
     x: f32,
+    password: bool,
 ) -> Option<usize> {
     scene
         .and_then(|scene| find_render_node_at_path(scene, path))
-        .map(|node| caret_index_from_pointer(node, value, x))
+        .map(|node| {
+            let index = caret_index_from_pointer(node, &display_value(value, password), x);
+            if password {
+                value
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .nth(index)
+                    .unwrap_or(value.len())
+            } else {
+                index
+            }
+        })
 }
 
 fn caret_index_from_pointer(node: &RenderNode, value: &str, x: f32) -> usize {
@@ -621,13 +919,23 @@ fn caret_index_from_pointer(node: &RenderNode, value: &str, x: f32) -> usize {
         return 0;
     }
 
-    let content_x = x - node.layout.x - node.content_inset.left;
+    let caret_stops = layout_text_caret_stops(value, &node.style.text);
+    let full_width = caret_stops.last().map(|stop| stop.offset_px).unwrap_or(0.0);
+    let mut origin = node.layout.x + node.content_inset.left;
+    let mut width = node.layout.width - node.content_inset.left - node.content_inset.right;
+    if let Some(scrollbars) = node.scrollbars {
+        origin -= scrollbars.metrics.offset_x;
+        width += scrollbars.metrics.max_offset_x;
+    }
+    origin += match node.style.text.text_align {
+        crate::fonts::TextAlign::Center => (width - full_width) * 0.5,
+        crate::fonts::TextAlign::Right | crate::fonts::TextAlign::End => width - full_width,
+        _ => 0.0,
+    };
+    let content_x = x - origin;
     if content_x <= 0.0 {
         return 0;
     }
-
-    let caret_stops = layout_text_caret_stops(value, &node.style.text);
-    let full_width = caret_stops.last().map(|stop| stop.offset_px).unwrap_or(0.0);
     if content_x >= full_width {
         return value.len();
     }
@@ -1100,6 +1408,7 @@ mod tests {
         assert_eq!(
             find_render_node_at_path(&scene, &path).and_then(|node| node.text_edit.as_ref()),
             Some(&TextEditDecoration {
+                backgrounds: None,
                 caret: Some(3),
                 selection: None,
             })
@@ -1124,4 +1433,243 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn password_input_masks_unicode_and_supports_mouse_keyboard_and_enter() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        static VALUES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        static ENTERS: AtomicUsize = AtomicUsize::new(0);
+        fn changed(value: &str) {
+            VALUES.lock().unwrap().push(value.into());
+        }
+        fn enter() {
+            ENTERS.fetch_add(1, Ordering::SeqCst);
+        }
+        let root: Node = Node::element("main")
+            .with_child(
+                Node::element("input")
+                    .with_id("password")
+                    .with_attribute("type", "password")
+                    .with_attribute("value", "éक3")
+                    .with_attribute("autofocus", "autofocus")
+                    .on_enter(enter)
+                    .on_input(changed)
+                    .into(),
+            )
+            .with_child(Node::element("input").with_id("next").into())
+            .with_child(
+                Node::element("button")
+                    .with_attribute("data-preserve-input-focus", "true")
+                    .into(),
+            )
+            .into();
+        let mut inputs = NativeTextInputs::default();
+        let rendered = inputs.materialize_root(0, root.clone());
+        let Node::Element(element) = &rendered else {
+            panic!()
+        };
+        let Node::Element(password) = &element.children[0] else {
+            panic!()
+        };
+        assert_eq!(password.attribute("value"), Some("éक3"));
+        assert!(matches!(&password.children[0], Node::Text(s) if s == "***"));
+        assert_eq!(inputs.focused.as_ref().unwrap().key, "id:password");
+
+        let mut world = RuntimeWorld::default();
+        world.sync_root(
+            0,
+            &root,
+            RuntimeSyncPolicy::ForceRebuild,
+            RuntimeDirtyClass::Structure,
+        );
+        let password_path = ElementPath::root(0).with_child(0);
+        let mut scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 300.0, 30.0))
+                .with_element_path(ElementPath::root(0))
+                .with_child(
+                    RenderNode::text(LayoutBox::new(0.0, 0.0, 100.0, 30.0), "***")
+                        .with_element_path(password_path.clone()),
+                )
+                .with_child(
+                    RenderNode::text(LayoutBox::new(100.0, 0.0, 100.0, 30.0), "")
+                        .with_element_path(ElementPath::root(0).with_child(1)),
+                )
+                .with_child(
+                    RenderNode::text(LayoutBox::new(200.0, 0.0, 100.0, 30.0), "Clear")
+                        .with_element_path(ElementPath::root(0).with_child(2)),
+                ),
+        ];
+        inputs.decorate_scene(&mut scene, &Stylesheet::default(), &world);
+        assert_eq!(
+            find_render_node_at_path(&scene, &password_path)
+                .unwrap()
+                .text_edit
+                .as_ref()
+                .unwrap()
+                .caret,
+            Some(3)
+        );
+        let key = |name: &str| {
+            EngineEvent::Key(KeyboardEvent {
+                logical_key: KeyIdentity::Named(name.into()),
+                physical_key: None,
+                location: Default::default(),
+                state: ButtonState::Pressed,
+                repeat: false,
+                modifiers: Default::default(),
+            })
+        };
+        assert!(inputs.handle_engine_event(&key("Backspace"), Some(&scene), &world));
+        assert_eq!(VALUES.lock().unwrap().last().unwrap(), "éक");
+        assert!(inputs.handle_engine_event(
+            &EngineEvent::TextInput(TextInputEvent::Commit("४".into())),
+            Some(&scene),
+            &world
+        ));
+        assert_eq!(VALUES.lock().unwrap().last().unwrap(), "éक४");
+        assert!(inputs.handle_engine_event(&key("Enter"), Some(&scene), &world));
+        assert_eq!(ENTERS.load(Ordering::SeqCst), 1);
+        let mut repeat = key("Enter");
+        if let EngineEvent::Key(e) = &mut repeat {
+            e.repeat = true;
+        }
+        assert!(!inputs.handle_engine_event(&repeat, Some(&scene), &world));
+        assert_eq!(ENTERS.load(Ordering::SeqCst), 1);
+        assert!(inputs.handle_engine_event(&key("Tab"), Some(&scene), &world));
+        assert_eq!(inputs.focused.as_ref().unwrap().key, "id:next");
+        let mut reverse = key("Tab");
+        if let EngineEvent::Key(e) = &mut reverse {
+            e.modifiers.shift = true;
+        }
+        assert!(inputs.handle_engine_event(&reverse, Some(&scene), &world));
+        assert_eq!(inputs.focused.as_ref().unwrap().key, "id:password");
+        let mut select_all = key("unused");
+        if let EngineEvent::Key(e) = &mut select_all {
+            e.logical_key = KeyIdentity::Character("a".into());
+            e.modifiers.super_key = true;
+        }
+        assert!(inputs.handle_engine_event(&select_all, Some(&scene), &world));
+        assert!(inputs.handle_engine_event(
+            &EngineEvent::TextInput(TextInputEvent::Commit("1234".into())),
+            Some(&scene),
+            &world
+        ));
+        assert_eq!(VALUES.lock().unwrap().last().unwrap(), "1234");
+        // Mouse focusing a password measures the mask but retains source UTF-8 indices.
+        inputs.handle_engine_event(
+            &EngineEvent::PointerMoved {
+                position: PointerPosition { x: 99.0, y: 4.0 },
+                modifiers: Default::default(),
+            },
+            Some(&scene),
+            &world,
+        );
+        inputs.handle_engine_event(
+            &EngineEvent::PointerButton {
+                button: PointerButton::Primary,
+                state: ButtonState::Pressed,
+                modifiers: Default::default(),
+            },
+            Some(&scene),
+            &world,
+        );
+        assert_eq!(inputs.states["id:password"].cursor, 4);
+        inputs.handle_engine_event(
+            &EngineEvent::PointerMoved {
+                position: PointerPosition { x: 250.0, y: 4.0 },
+                modifiers: Default::default(),
+            },
+            Some(&scene),
+            &world,
+        );
+        inputs.handle_engine_event(
+            &EngineEvent::PointerButton {
+                button: PointerButton::Primary,
+                state: ButtonState::Released,
+                modifiers: Default::default(),
+            },
+            Some(&scene),
+            &world,
+        );
+        inputs.handle_engine_event(
+            &EngineEvent::PointerButton {
+                button: PointerButton::Primary,
+                state: ButtonState::Pressed,
+                modifiers: Default::default(),
+            },
+            Some(&scene),
+            &world,
+        );
+        assert_eq!(inputs.focused.as_ref().unwrap().key, "id:password");
+    }
+
+    #[test]
+    fn newest_autofocus_field_wins_and_removed_inputs_lose_focus() {
+        let login = || {
+            Node::element("input")
+                .with_id("login")
+                .with_attribute("autofocus", "autofocus")
+                .into()
+        };
+        let mut inputs = NativeTextInputs::default();
+        inputs.materialize_root(0, Node::element("main").with_child(login()).into());
+        assert_eq!(inputs.focused.as_ref().unwrap().key, "id:login");
+        inputs.materialize_root(
+            0,
+            Node::element("main")
+                .with_child(login())
+                .with_child(
+                    Node::element("input")
+                        .with_id("modal")
+                        .with_attribute("autofocus", "autofocus")
+                        .into(),
+                )
+                .into(),
+        );
+        assert_eq!(inputs.focused.as_ref().unwrap().key, "id:modal");
+        inputs.materialize_root(0, Node::element("main").with_child(login()).into());
+        assert_eq!(inputs.focused.as_ref().unwrap().key, "id:login");
+        inputs.materialize_root(0, Node::element("main").into());
+        assert!(inputs.focused.is_none());
+    }
+    #[test]
+    fn modal_input_scope_excludes_background_fields() {
+        let root: Node = Node::element("main")
+            .with_child(Node::element("input").with_id("background").into())
+            .with_child(
+                Node::element("section")
+                    .with_attribute("aria-modal", "true")
+                    .with_child(Node::element("input").with_id("modal-field").into())
+                    .into(),
+            )
+            .with_child(Node::element("input").with_id("outside-after-modal").into())
+            .into();
+        let mut inputs = Vec::new();
+        collect_inputs(&root, &ElementPath::root(0), &mut inputs);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].0, "id:modal-field");
+    }
+
+    #[test]
+    fn readonly_password_is_masked_but_not_editable() {
+        let root: Node = Node::element("input")
+            .with_id("locked")
+            .with_attribute("type", "password")
+            .with_attribute("value", "secret")
+            .with_attribute("readonly", "readonly")
+            .with_attribute("autofocus", "autofocus")
+            .into();
+        let mut inputs = NativeTextInputs::default();
+        let Node::Element(rendered) = inputs.materialize_root(0, root) else {
+            panic!()
+        };
+        assert!(matches!(&rendered.children[0], Node::Text(s) if s == "******"));
+        assert!(inputs.focused.is_none());
+    }
 }
+
+#[cfg(test)]
+mod editing_tests;

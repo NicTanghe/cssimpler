@@ -49,6 +49,34 @@ impl AffineTransform {
         self == Self::IDENTITY
     }
 
+    pub(crate) fn uniform_scale(self) -> Option<f32> {
+        (self.b == 0.0
+            && self.c == 0.0
+            && self.g == 0.0
+            && self.h == 0.0
+            && self.i == 1.0
+            && self.a > 0.0
+            && self.a == self.d)
+            .then_some(self.a)
+    }
+
+    /// Largest singular value of the linear transform exceeds one. Logical
+    /// subtree rasters must not be enlarged in place of device-size outlines.
+    pub(crate) fn magnifies(self) -> bool {
+        if self.g != 0.0 || self.h != 0.0 || self.i != 1.0 {
+            return true;
+        }
+        let xx = self.a * self.a + self.b * self.b;
+        let yy = self.c * self.c + self.d * self.d;
+        let xy = self.a * self.c + self.b * self.d;
+        0.5 * (xx + yy + ((xx - yy).powi(2) + 4.0 * xy * xy).sqrt()) > 1.0
+    }
+
+    pub(crate) fn scaled_layout(self, layout: LayoutBox) -> LayoutBox {
+        let (x, y) = self.transform_point(layout.x, layout.y);
+        LayoutBox::new(x, y, layout.width * self.a, layout.height * self.d)
+    }
+
     pub(crate) fn multiply(self, other: Self) -> Self {
         Self {
             a: self.a * other.a + self.c * other.b + self.e * other.g,
@@ -166,11 +194,13 @@ impl ClipState {
             .coarse
             .intersect(transform_layout_bounds(layout, matrix)?)?;
         let mut regions = self.regions.clone();
-        regions.push(ClipRegion {
-            layout,
-            radius,
-            inverse,
-        });
+        if radius != CornerRadius::ZERO || matrix.uniform_scale().is_none() {
+            regions.push(ClipRegion {
+                layout,
+                radius,
+                inverse,
+            });
+        }
         Some(Self { coarse, regions })
     }
 }

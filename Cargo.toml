@@ -5,6 +5,7 @@ edition = "2024"
 
 [workspace]
 members = ["core", "renderer", "style", "macro"]
+exclude = ["vendor/softbuffer"]
 resolver = "2"
 
 [workspace.package]
@@ -20,14 +21,16 @@ ab_glyph = "0.2.32"
 anyhow = "1"
 font8x8 = "0.3"
 fontdb = "0.23.0"
-lightningcss = "1.0.0-alpha.70"
-softbuffer = "0.4.8"
+lightningcss = "=1.0.0-alpha.70"
+parcel_selectors = "=0.28.2"
+softbuffer = { path = "vendor/softbuffer" }
 taffy = "0.7"
 cssparser = "0.33.0"
 unicode-segmentation = "1.12"
 winit = "0.30.13"
 
 [dependencies]
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 anyhow.workspace = true
 cssimpler-core.workspace = true
 cssimpler-macro.workspace = true

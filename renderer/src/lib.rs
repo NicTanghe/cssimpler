@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 mod backdrop;
 mod color;
+mod dpi;
 mod fonts;
 mod gradient;
 mod image;
@@ -19,10 +20,15 @@ mod input;
 mod native_glass;
 mod runtime;
 mod scrollbar;
+mod selection_geometry;
 mod shadow;
 mod shapes;
 mod softbuffer_dither;
 mod svg;
+mod text_edit;
+pub use selection_geometry::prepare_text_selection_backgrounds;
+mod touch;
+pub use text_edit::text_index_at_position;
 mod transform;
 
 use self::{
@@ -1187,6 +1193,10 @@ pub struct WindowConfig {
     pub middle_button_auto_scroll: bool,
     pub glass_capable: bool,
     pub decorations: bool,
+    /// Height of the draggable strip at the top of the client area, in logical pixels.
+    pub drag_region_height: f32,
+    /// Width of the client-area resize border, in logical pixels (zero disables it).
+    pub resize_border_width: f32,
 }
 
 impl WindowConfig {
@@ -1200,6 +1210,8 @@ impl WindowConfig {
             middle_button_auto_scroll: true,
             glass_capable: false,
             decorations: true,
+            drag_region_height: 0.0,
+            resize_border_width: 0.0,
         }
     }
 
@@ -1210,6 +1222,16 @@ impl WindowConfig {
 
     pub fn with_decorations(mut self, decorations: bool) -> Self {
         self.decorations = decorations;
+        self
+    }
+
+    pub fn with_drag_region_height(mut self, height: f32) -> Self {
+        self.drag_region_height = height.max(0.0);
+        self
+    }
+
+    pub fn with_resize_border_width(mut self, width: f32) -> Self {
+        self.resize_border_width = width.max(0.0);
         self
     }
 }
@@ -1261,6 +1283,15 @@ pub enum RedrawSchedule {
 }
 
 pub trait SceneProvider {
+    /// Return false to defer a window close (for example, while confirming a draft).
+    fn can_close(&mut self) -> bool {
+        true
+    }
+    /// Allows a deferred close to complete after an application update.
+    fn wants_close(&self) -> bool {
+        false
+    }
+
     fn update(&mut self, frame: FrameInfo);
 
     fn scene(&self) -> &[RenderNode];
@@ -1759,6 +1790,20 @@ pub fn render_to_buffer(
         GlassRenderMode::Fallback,
         None,
     );
+}
+
+/// Render a logical scene into a physical-pixel buffer at `scale_factor`.
+/// Layout and hit testing remain in logical CSS pixels.
+pub fn render_to_buffer_at_scale(
+    scene: &[RenderNode],
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+    scale_factor: f32,
+) {
+    let scene = dpi::device_scene(scene.to_vec(), scale_factor);
+    render_to_buffer(&scene, buffer, width, height, clear_color);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3530,16 +3575,22 @@ fn draw_node_contents_internal_impl(
     if let RenderKind::Text(content) = &node.kind {
         let text_layout = scrollbar::text_layout(node);
         let text_clip = scrollbar::text_clip(node, clip);
-        fonts::draw_text(
-            buffer,
-            width,
-            height,
-            text_layout,
-            content,
-            node.text_layout.as_ref(),
-            &node.style,
-            text_clip,
-        );
+        if node
+            .text_edit
+            .as_ref()
+            .is_none_or(|edit| edit.selection.is_none())
+        {
+            fonts::draw_text(
+                buffer,
+                width,
+                height,
+                text_layout,
+                content,
+                node.text_layout.as_ref(),
+                &node.style,
+                text_clip,
+            );
+        }
         draw_text_edit_decorations(
             buffer,
             width,
@@ -3759,8 +3810,9 @@ enum MouseEventKind {
     MouseUp,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn dispatch_click(scene: &[RenderNode], x: f32, y: f32) -> bool {
+/// Dispatch a primary click through the normal scene hit testing.
+/// Useful for embedded hosts and headless input tests; returns whether a handler ran.
+pub fn dispatch_click(scene: &[RenderNode], x: f32, y: f32) -> bool {
     dispatch_mouse_event(scene, x, y, MouseEventKind::Click)
 }
 
@@ -4680,7 +4732,10 @@ fn draw_node_transformed_internal_impl(
         return;
     }
 
-    if allow_surface_promotion && node_can_use_promoted_surface(node, cached_bounds) {
+    if allow_surface_promotion
+        && !matrix.magnifies()
+        && node_can_use_promoted_surface(node, cached_bounds)
+    {
         if let Some(surface) = cached_promoted_surface(node, width, height) {
             draw_cached_surface_transformed(
                 buffer,
@@ -4774,17 +4829,23 @@ fn draw_node_transformed_internal_impl(
         } else {
             clip_state.clone()
         };
-        fonts::draw_text_transformed(
-            buffer,
-            width,
-            height,
-            text_layout,
-            content,
-            node.text_layout.as_ref(),
-            &node.style,
-            matrix,
-            &text_clip_state,
-        );
+        if node
+            .text_edit
+            .as_ref()
+            .is_none_or(|edit| edit.selection.is_none())
+        {
+            fonts::draw_text_transformed(
+                buffer,
+                width,
+                height,
+                text_layout,
+                content,
+                node.text_layout.as_ref(),
+                &node.style,
+                matrix,
+                &text_clip_state,
+            );
+        }
         draw_text_edit_decorations_transformed(
             buffer,
             width,
@@ -4902,9 +4963,7 @@ fn draw_node_transformed_internal_impl(
         }
     }
 
-    if matrix.is_identity() {
-        scrollbar::draw_scrollbars(node, buffer, width, height, clip_state.coarse);
-    }
+    scrollbar::draw_scrollbars_transformed(node, buffer, width, height, matrix, clip_state);
 
     for entry in deferred.iter().filter(|entry| entry.level >= 0) {
         draw_deferred_transformed_render_context(
@@ -4921,6 +4980,7 @@ fn draw_node_transformed_internal_impl(
 
 #[derive(Clone, Debug)]
 struct TextRangeSegment {
+    #[cfg(test)]
     text: String,
     layout: LayoutBox,
 }
@@ -4950,6 +5010,7 @@ fn draw_text_edit_decorations(
             prepared_text_layout,
             style,
             selection,
+            edit.backgrounds.as_deref(),
             clip,
         );
         return;
@@ -5006,6 +5067,7 @@ fn draw_text_selection(
     prepared_text_layout: Option<&PreparedTextLayout>,
     style: &VisualStyle,
     selection: &TextSelectionRange,
+    backgrounds: Option<&[cssimpler_core::TextSelectionBackground]>,
     clip: ClipRect,
 ) {
     let segments = text_range_segments(
@@ -5016,38 +5078,39 @@ fn draw_text_selection(
         selection.start,
         selection.end,
     );
-    if segments.is_empty() {
-        return;
-    }
 
-    for segment in &segments {
-        draw_rounded_rect(
-            buffer,
-            width,
-            height,
-            segment.layout,
-            CornerRadius::ZERO,
-            selection.style.background,
-            clip,
-        );
-    }
+    let owned_backgrounds;
+    let backgrounds = if let Some(backgrounds) = backgrounds {
+        backgrounds
+    } else {
+        owned_backgrounds =
+            selection_geometry::local_backgrounds(layout, &segments, style.text.size_px * 0.1);
+        &owned_backgrounds
+    };
+    selection_geometry::paint_background(
+        buffer,
+        width,
+        height,
+        layout,
+        backgrounds,
+        selection.style.background,
+        AffineTransform::IDENTITY,
+        &ClipState::new(clip),
+    );
 
-    let mut selected_style = style.clone();
-    selected_style.foreground = selection.style.foreground;
-    selected_style.text_shadows = selection.style.text_shadows.clone();
-    selected_style.text.text_align = TextAlign::Left;
-    for segment in segments {
-        fonts::draw_text(
-            buffer,
-            width,
-            height,
-            segment.layout,
-            &segment.text,
-            None,
-            &selected_style,
-            clip,
-        );
-    }
+    let regions: Vec<_> = segments.iter().map(|segment| segment.layout).collect();
+    fonts::draw_text_selected(
+        buffer,
+        width,
+        height,
+        layout,
+        text,
+        prepared_text_layout,
+        style,
+        clip,
+        selection.style.foreground,
+        &regions,
+    );
 }
 
 fn draw_text_edit_decorations_transformed(
@@ -5076,6 +5139,7 @@ fn draw_text_edit_decorations_transformed(
             prepared_text_layout,
             style,
             selection,
+            edit.backgrounds.as_deref(),
             matrix,
             clip_state,
         );
@@ -5136,6 +5200,7 @@ fn draw_text_selection_transformed(
     prepared_text_layout: Option<&PreparedTextLayout>,
     style: &VisualStyle,
     selection: &TextSelectionRange,
+    backgrounds: Option<&[cssimpler_core::TextSelectionBackground]>,
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
@@ -5147,40 +5212,40 @@ fn draw_text_selection_transformed(
         selection.start,
         selection.end,
     );
-    if segments.is_empty() {
-        return;
-    }
 
-    for segment in &segments {
-        draw_transformed_rounded_rect(
-            buffer,
-            width,
-            height,
-            segment.layout,
-            CornerRadius::ZERO,
-            selection.style.background,
-            matrix,
-            clip_state,
-        );
-    }
+    let owned_backgrounds;
+    let backgrounds = if let Some(backgrounds) = backgrounds {
+        backgrounds
+    } else {
+        owned_backgrounds =
+            selection_geometry::local_backgrounds(layout, &segments, style.text.size_px * 0.1);
+        &owned_backgrounds
+    };
+    selection_geometry::paint_background(
+        buffer,
+        width,
+        height,
+        layout,
+        backgrounds,
+        selection.style.background,
+        matrix,
+        clip_state,
+    );
 
-    let mut selected_style = style.clone();
-    selected_style.foreground = selection.style.foreground;
-    selected_style.text_shadows = selection.style.text_shadows.clone();
-    selected_style.text.text_align = TextAlign::Left;
-    for segment in segments {
-        fonts::draw_text_transformed(
-            buffer,
-            width,
-            height,
-            segment.layout,
-            &segment.text,
-            None,
-            &selected_style,
-            matrix,
-            clip_state,
-        );
-    }
+    let regions: Vec<_> = segments.iter().map(|segment| segment.layout).collect();
+    fonts::draw_text_selected_transformed(
+        buffer,
+        width,
+        height,
+        layout,
+        text,
+        prepared_text_layout,
+        style,
+        matrix,
+        clip_state,
+        selection.style.foreground,
+        &regions,
+    );
 }
 
 fn text_range_segments(
@@ -5205,31 +5270,36 @@ fn text_range_segments(
         &owned_layout
     };
 
+    let spans = text_edit::source_spans(text, style, text_layout);
+    let display_style = text_edit::display_style(style);
     let mut segments = Vec::new();
-    let mut line_start = 0;
     for (line_index, line) in text_layout.lines.iter().enumerate() {
-        let line_end = line_start + line.text.len();
-        let segment_start = start.max(line_start).min(line_end);
-        let segment_end = end.max(line_start).min(line_end);
-        if segment_start < segment_end {
-            let local_start = clamp_to_char_boundary(&line.text, segment_start - line_start);
-            let local_end = clamp_to_char_boundary(&line.text, segment_end - line_start);
-            let selected_text = line.text[local_start..local_end].to_string();
-            let prefix = &line.text[..local_start];
-            let selected_width = layout_text_block(&selected_text, style, None).width;
-            if selected_width > f32::EPSILON {
-                let x = aligned_text_line_start_x(layout, line.width, style.text_align)
-                    + layout_text_block(prefix, style, None).width;
-                let y = layout.y + line_index as f32 * text_layout.line_height;
-                segments.push(TextRangeSegment {
-                    text: selected_text,
-                    layout: LayoutBox::new(x, y, selected_width, text_layout.line_height),
-                });
-            }
-        }
-        line_start = line_end;
-        if end <= line_start {
-            break;
+        let selected: Vec<_> = spans[line_index]
+            .iter()
+            .filter(|span| span.source_end > start && span.source_start < end)
+            .collect();
+        let (Some(first), Some(last)) = (selected.first(), selected.last()) else {
+            continue;
+        };
+        let stops = fonts::line_caret_stops(&line.text, &display_style);
+        let start_x = stops
+            .iter()
+            .rev()
+            .find(|stop| stop.byte_index <= first.display_start)
+            .map_or(0.0, |stop| stop.offset_px);
+        let end_x = stops
+            .iter()
+            .find(|stop| stop.byte_index >= last.display_end)
+            .map_or(line.width, |stop| stop.offset_px);
+        let selected_width = end_x - start_x;
+        if selected_width > f32::EPSILON {
+            let x = aligned_text_line_start_x(layout, line.width, style.text_align) + start_x;
+            let y = layout.y + line_index as f32 * text_layout.line_height;
+            segments.push(TextRangeSegment {
+                #[cfg(test)]
+                text: line.text[first.display_start..last.display_end].to_owned(),
+                layout: LayoutBox::new(x, y, selected_width, text_layout.line_height),
+            });
         }
     }
 
@@ -5256,17 +5326,24 @@ fn text_caret_rect(
         return Some(empty_text_caret_rect(layout, style));
     }
 
-    let mut line_start = 0;
+    let spans = text_edit::source_spans(text, style, text_layout);
+    let display_style = text_edit::display_style(style);
     for (line_index, line) in text_layout.lines.iter().enumerate() {
-        let line_end = line_start + line.text.len();
-        if caret <= line_end || line_index + 1 == text_layout.lines.len() {
-            let local_caret = clamp_to_char_boundary(&line.text, caret.saturating_sub(line_start));
-            let x = aligned_text_line_start_x(layout, line.width, style.text_align)
-                + layout_text_block(&line.text[..local_caret], style, None).width;
+        let source_end = spans[line_index].last().map_or(0, |span| span.source_end);
+        if caret <= source_end || line_index + 1 == text_layout.lines.len() {
+            let display_caret = spans[line_index]
+                .iter()
+                .find(|span| span.source_start >= caret)
+                .map_or(line.text.len(), |span| span.display_start);
+            let stops = fonts::line_caret_stops(&line.text, &display_style);
+            let offset = stops
+                .iter()
+                .find(|stop| stop.byte_index >= display_caret)
+                .map_or(line.width, |stop| stop.offset_px);
+            let x = aligned_text_line_start_x(layout, line.width, style.text_align) + offset;
             let y = layout.y + line_index as f32 * text_layout.line_height;
             return Some(LayoutBox::new(x, y, 1.0, text_layout.line_height));
         }
-        line_start = line_end;
     }
 
     None
@@ -5956,6 +6033,33 @@ fn draw_transformed_rounded_rect(
         return;
     }
 
+    if clip_state.is_simple()
+        && let Some(scale) = matrix.uniform_scale()
+    {
+        let layout = matrix.scaled_layout(layout);
+        let radius = dpi::scaled_radius(radius, scale);
+        if !draw_axis_aligned_opaque_rect(
+            buffer,
+            width,
+            height,
+            layout,
+            radius,
+            color,
+            clip_state.coarse,
+        ) {
+            draw_rounded_rect(
+                buffer,
+                width,
+                height,
+                layout,
+                radius,
+                color,
+                clip_state.coarse,
+            );
+        }
+        return;
+    }
+
     let Some(inverse) = matrix.invert() else {
         return;
     };
@@ -6019,6 +6123,41 @@ fn draw_transformed_rounded_ring(
     clip_state: &ClipState,
 ) {
     if color.a == 0 {
+        return;
+    }
+
+    if clip_state.is_simple()
+        && let Some(scale) = matrix.uniform_scale()
+    {
+        let outer_layout = matrix.scaled_layout(outer_layout);
+        let outer_radius = dpi::scaled_radius(outer_radius, scale);
+        let inner = inner.map(|(layout, radius)| {
+            (
+                matrix.scaled_layout(layout),
+                dpi::scaled_radius(radius, scale),
+            )
+        });
+        if !draw_axis_aligned_opaque_ring(
+            buffer,
+            width,
+            height,
+            outer_layout,
+            outer_radius,
+            inner,
+            color,
+            clip_state.coarse,
+        ) {
+            draw_rounded_ring(
+                buffer,
+                width,
+                height,
+                outer_layout,
+                outer_radius,
+                inner,
+                color,
+                clip_state.coarse,
+            );
+        }
         return;
     }
 
@@ -6899,6 +7038,37 @@ fn node_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
 
 fn node_own_visual_bounds_untransformed(node: &RenderNode) -> Option<ClipRect> {
     let mut bounds = non_empty_layout_clip(node.layout);
+    if let Some(edit) = &node.text_edit
+        && let Some(selection) = &edit.selection
+        && let RenderKind::Text(content) = &node.kind
+    {
+        let origin = scrollbar::text_layout(node);
+        let owned;
+        let backgrounds = if let Some(backgrounds) = &edit.backgrounds {
+            backgrounds
+        } else {
+            let segments = text_range_segments(
+                origin,
+                content,
+                node.text_layout.as_ref(),
+                &node.style.text,
+                selection.start,
+                selection.end,
+            );
+            owned = selection_geometry::local_backgrounds(
+                origin,
+                &segments,
+                node.style.text.size_px * 0.1,
+            );
+            &owned
+        };
+        for piece in backgrounds {
+            bounds = union_optional_bounds(
+                bounds,
+                non_empty_layout_clip(selection_geometry::absolute(origin, piece)),
+            );
+        }
+    }
 
     if matches!(node.kind, RenderKind::Text(_)) && node.style.text_stroke.width > 0.0 {
         bounds = union_optional_bounds(
@@ -9523,6 +9693,7 @@ mod tests {
                     ..VisualStyle::default()
                 })
                 .with_text_edit(TextEditDecoration {
+                    backgrounds: None,
                     caret: None,
                     selection: Some(TextSelectionRange {
                         start: 1,
@@ -10850,7 +11021,11 @@ mod tests {
             Some(&extracted),
             &extracted,
             None,
-            Some(crate::scrollbar::AutoScrollIndicator { x: 24.0, y: 18.0 }),
+            Some(crate::scrollbar::AutoScrollIndicator {
+                x: 24.0,
+                y: 18.0,
+                scale: 1.0
+            }),
             false,
         ));
     }
@@ -12637,3 +12812,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod selection_paint_tests;

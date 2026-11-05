@@ -20,7 +20,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHan
 use winit::keyboard::{
     Key as WinitKey, KeyLocation as WinitKeyLocation, ModifiersState, PhysicalKey,
 };
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, Window, WindowAttributes, WindowId};
 
 use crate::input::{
     ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
@@ -178,6 +178,41 @@ fn system_drag_override_active() -> bool {
     SYSTEM_DRAG_OVERRIDE.load(Ordering::Relaxed)
 }
 
+fn drag_region_contains(scene: &[RenderNode], x: f32, y: f32, height: f32) -> bool {
+    y >= 0.0
+        && y < height
+        && super::hit_test_scene_for_event(scene, x, y, MouseEventKind::Click).is_none()
+        && super::hit_test_scene_for_event(scene, x, y, MouseEventKind::MouseDown).is_none()
+}
+
+fn resize_direction_at(
+    (x, y): (f32, f32),
+    (width, height): (f32, f32),
+    border: f32,
+) -> Option<ResizeDirection> {
+    if border <= 0.0 || !(x >= 0.0 && x < width && y >= 0.0 && y < height) {
+        return None;
+    }
+    // Keep opposite borders from overlapping if the window becomes very small.
+    let horizontal_border = border.min(width / 2.0);
+    let vertical_border = border.min(height / 2.0);
+    let left = x < horizontal_border;
+    let right = x >= width - horizontal_border;
+    let top = y < vertical_border;
+    let bottom = y >= height - vertical_border;
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(ResizeDirection::NorthWest),
+        (_, true, true, _) => Some(ResizeDirection::NorthEast),
+        (true, _, _, true) => Some(ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(ResizeDirection::SouthEast),
+        (true, _, _, _) => Some(ResizeDirection::West),
+        (_, true, _, _) => Some(ResizeDirection::East),
+        (_, _, true, _) => Some(ResizeDirection::North),
+        (_, _, _, true) => Some(ResizeDirection::South),
+        _ => None,
+    }
+}
+
 struct RuntimeApp<P> {
     config: WindowConfig,
     scene_provider: P,
@@ -200,6 +235,8 @@ struct RuntimeApp<P> {
     scale_factor: f64,
     modifiers: KeyboardModifiers,
     mouse_position: Option<(f32, f32)>,
+    native_resize_started: bool,
+    touch: super::touch::TouchController,
     pending_wheel: Option<(f32, f32)>,
     left_down: bool,
     right_down: bool,
@@ -248,6 +285,8 @@ where
             scale_factor: 1.0,
             modifiers: KeyboardModifiers::default(),
             mouse_position: None,
+            native_resize_started: false,
+            touch: super::touch::TouchController::default(),
             pending_wheel: None,
             left_down: false,
             right_down: false,
@@ -388,23 +427,63 @@ where
         };
         let size = window.inner_size();
         self.scale_factor = window.scale_factor();
-        if let Some(viewport) = drawable_viewport_size(size.width as usize, size.height as usize) {
+        if let Some(viewport) = logical_viewport(size.width, size.height, self.scale_factor) {
             self.scene_provider.set_viewport(viewport);
             self.resize_surface(event_loop);
         }
         self.handle_engine_event(
             event_loop,
             EngineEvent::ViewportChanged(ViewportEvent {
-                width: size.width as usize,
-                height: size.height as usize,
+                width: (size.width as f64 / self.scale_factor).round() as usize,
+                height: (size.height as f64 / self.scale_factor).round() as usize,
                 scale_factor: self.scale_factor,
             }),
         );
         self.request_immediate_redraw();
+        if !self.native_resize_started {
+            self.update_resize_cursor();
+        }
+    }
+
+    fn resize_direction(&self) -> Option<ResizeDirection> {
+        let window = self.window.as_ref()?;
+        if self.config.decorations
+            || !window.is_resizable()
+            || window.is_maximized()
+            || window.fullscreen().is_some()
+        {
+            return None;
+        }
+        let size = window.inner_size();
+        resize_direction_at(
+            self.mouse_position?,
+            (
+                (size.width as f64 / self.scale_factor) as f32,
+                (size.height as f64 / self.scale_factor) as f32,
+            ),
+            self.config.resize_border_width,
+        )
+    }
+
+    fn update_resize_cursor(&self) {
+        // Preserve content-drag cursors. Hover updates must still work if the
+        // native resize loop consumed the release event.
+        if self.left_down || self.right_down || self.middle_down {
+            return;
+        }
+        if let Some(window) = self.window.as_ref() {
+            let cursor = self
+                .resize_direction()
+                .map(CursorIcon::from)
+                .unwrap_or_default();
+            window.set_cursor(cursor);
+        }
     }
 
     fn clear_pointer_state(&mut self) {
+        self.touch.cancel();
         self.mouse_position = None;
+        self.native_resize_started = false;
         self.pending_wheel = None;
         self.left_down = false;
         self.right_down = false;
@@ -415,6 +494,7 @@ where
         self.previous_mouse_position = None;
         self.suppress_left_pointer_until_release = false;
         self.left_press_target = None;
+        self.update_resize_cursor();
     }
 
     fn prepare_suspend(&mut self, event_loop: &ActiveEventLoop) {
@@ -477,8 +557,7 @@ where
             return;
         };
         let size = window.inner_size();
-        let Some(viewport) = drawable_viewport_size(size.width as usize, size.height as usize)
-        else {
+        let Some(viewport) = logical_viewport(size.width, size.height, self.scale_factor) else {
             return;
         };
 
@@ -671,8 +750,20 @@ where
         }
 
         frame_stats.scene_prep_us = duration_to_us(scene_prep_start.elapsed());
-        let auto_scroll_indicator = self.scrollbar_controller.auto_scroll_indicator();
-        let resized = self.buffer_width != viewport.width || self.buffer_height != viewport.height;
+        let scale = self.scale_factor as f32;
+        let scene = crate::dpi::device_scene(scene, scale);
+        let auto_scroll_indicator =
+            self.scrollbar_controller
+                .auto_scroll_indicator()
+                .map(|mut indicator| {
+                    indicator.x *= scale;
+                    indicator.y *= scale;
+                    indicator.scale = scale;
+                    indicator
+                });
+        let physical_width = size.width as usize;
+        let physical_height = size.height as usize;
+        let resized = self.buffer_width != physical_width || self.buffer_height != physical_height;
         let defer_zero_progress_transition = should_defer_zero_progress_transition_paint(
             interaction_rerendered,
             self.scene_provider.transition_is_zero_progress(),
@@ -684,8 +775,8 @@ where
             &mut self.buffer,
             &mut self.buffer_width,
             &mut self.buffer_height,
-            viewport.width,
-            viewport.height,
+            physical_width,
+            physical_height,
             self.config.clear_color,
         );
 
@@ -825,6 +916,10 @@ where
                         Ok(mut target) => {
                             let target_width = target.width().get() as usize;
                             let target_height = target.height().get() as usize;
+                            let damage_rects = surface_damage_rects(
+                                target.age(),
+                                paint_stats.damage_rects.as_deref(),
+                            );
                             copy_render_buffer_into_surface(
                                 &mut target,
                                 target_width,
@@ -839,7 +934,7 @@ where
                                 },
                                 pack_softbuffer_rgb(self.config.clear_color),
                                 self.native_glass_active,
-                                paint_stats.damage_rects.as_deref(),
+                                damage_rects,
                             );
                             // Transparent pixels reveal native glass on Windows. Present the full
                             // surface so cleared transparent regions also replace stale pixels
@@ -1019,6 +1114,10 @@ where
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.scene_provider.wants_close() {
+            event_loop.exit();
+            return;
+        }
         if self.window.is_none() {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
@@ -1063,8 +1162,69 @@ where
         }
 
         match event {
-            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
-                event_loop.exit();
+            WindowEvent::CloseRequested => {
+                if self.scene_provider.can_close() {
+                    event_loop.exit();
+                } else {
+                    self.request_immediate_redraw();
+                }
+            }
+            WindowEvent::Destroyed => event_loop.exit(),
+            WindowEvent::Touch(touch) => {
+                let position = (
+                    (touch.location.x / self.scale_factor) as f32,
+                    (touch.location.y / self.scale_factor) as f32,
+                );
+                if let Some(update) =
+                    self.touch
+                        .update(touch.id, touch.phase, position, Instant::now())
+                {
+                    self.mouse_position = Some(update.position);
+                    self.handle_engine_event(
+                        event_loop,
+                        EngineEvent::PointerMoved {
+                            position: PointerPosition {
+                                x: position.0,
+                                y: position.1,
+                            },
+                            modifiers: self.modifiers,
+                        },
+                    );
+                    if update.cancel_click {
+                        self.left_press_target = None;
+                    }
+                    if update.press {
+                        self.left_down = true;
+                        self.handle_engine_event(
+                            event_loop,
+                            EngineEvent::PointerButton {
+                                button: PointerButton::Primary,
+                                state: ButtonState::Pressed,
+                                modifiers: self.modifiers,
+                            },
+                        );
+                    }
+                    if update.release {
+                        self.left_down = false;
+                        self.handle_engine_event(
+                            event_loop,
+                            EngineEvent::PointerButton {
+                                button: PointerButton::Primary,
+                                state: ButtonState::Released,
+                                modifiers: self.modifiers,
+                            },
+                        );
+                    }
+                    if let Some((x, y)) = update.scroll {
+                        self.accumulate_wheel(ScrollDelta::Pixels { x, y });
+                    }
+                    self.request_immediate_redraw();
+                    // Observe both edges even when a quick tap starts and ends
+                    // before the platform delivers the next redraw notification.
+                    if update.press || update.release {
+                        self.draw_frame(event_loop);
+                    }
+                }
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.handle_viewport_change(event_loop);
@@ -1082,26 +1242,74 @@ where
                 self.modifiers = normalize_modifiers(modifiers.state());
                 self.handle_engine_event(event_loop, EngineEvent::ModifiersChanged(self.modifiers));
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_position = Some((position.x as f32, position.y as f32));
+            WindowEvent::CursorMoved { position, .. }
+                if !self.touch.ignore_mouse(Instant::now()) =>
+            {
+                self.mouse_position = Some((
+                    (position.x / self.scale_factor) as f32,
+                    (position.y / self.scale_factor) as f32,
+                ));
+                self.update_resize_cursor();
                 self.handle_engine_event(
                     event_loop,
                     EngineEvent::PointerMoved {
                         position: PointerPosition {
-                            x: position.x as f32,
-                            y: position.y as f32,
+                            x: (position.x / self.scale_factor) as f32,
+                            y: (position.y / self.scale_factor) as f32,
                         },
                         modifiers: self.modifiers,
                     },
                 );
                 self.request_immediate_redraw();
             }
-            WindowEvent::CursorLeft { .. } => {
+            WindowEvent::CursorLeft { .. } if !self.touch.ignore_mouse(Instant::now()) => {
                 self.mouse_position = None;
+                self.update_resize_cursor();
                 self.handle_engine_event(event_loop, EngineEvent::PointerLeft);
                 self.request_immediate_redraw();
             }
-            WindowEvent::MouseInput { state, button, .. } => {
+            WindowEvent::MouseInput { state, button, .. }
+                if !self.touch.ignore_mouse(Instant::now()) =>
+            {
+                if button == WinitMouseButton::Left {
+                    let was_resizing = self.native_resize_started;
+                    // Some native resize loops consume the release. A new press also resets it.
+                    self.native_resize_started = false;
+                    if state == ElementState::Released && was_resizing {
+                        self.update_resize_cursor();
+                        return;
+                    }
+                    // Resize edges and corners take priority over title-bar dragging and UI clicks.
+                    // Start on this press so the native gesture has a current input serial.
+                    if state == ElementState::Pressed
+                        && let Some(direction) = self.resize_direction()
+                        && self
+                            .window
+                            .as_ref()
+                            .is_some_and(|window| window.drag_resize_window(direction).is_ok())
+                    {
+                        self.native_resize_started = true;
+                        return;
+                    }
+                }
+                // Give interactive content priority over the invisible drag region.
+                // Start the native move while the press is current (required by Wayland).
+                if button == WinitMouseButton::Left
+                    && state == ElementState::Pressed
+                    && self.mouse_position.is_some_and(|(x, y)| {
+                        let scene = self
+                            .previous_presented_scene
+                            .as_deref()
+                            .unwrap_or_else(|| self.scene_provider.scene());
+                        drag_region_contains(scene, x, y, self.config.drag_region_height)
+                    })
+                    && self
+                        .window
+                        .as_ref()
+                        .is_some_and(|window| window.drag_window().is_ok())
+                {
+                    return;
+                }
                 let normalized_state = normalize_button_state(state);
                 match button {
                     WinitMouseButton::Left => {
@@ -1115,6 +1323,7 @@ where
                     }
                     _ => {}
                 }
+                self.update_resize_cursor();
                 self.handle_engine_event(
                     event_loop,
                     EngineEvent::PointerButton {
@@ -1123,10 +1332,17 @@ where
                         modifiers: self.modifiers,
                     },
                 );
-                self.request_immediate_redraw();
+                // Preserve button edges even when press/release arrive before a redraw.
+                self.draw_frame(event_loop);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let delta = normalize_scroll_delta(delta);
+                let delta = match normalize_scroll_delta(delta) {
+                    ScrollDelta::Pixels { x, y } => ScrollDelta::Pixels {
+                        x: x / self.scale_factor as f32,
+                        y: y / self.scale_factor as f32,
+                    },
+                    other => other,
+                };
                 self.accumulate_wheel(delta);
                 self.handle_engine_event(
                     event_loop,
@@ -1150,7 +1366,11 @@ where
                     repeat: event.repeat,
                     modifiers: self.modifiers,
                 };
-                if let Some(text) = event.text.as_deref() {
+                if event.state == ElementState::Pressed
+                    && !self.modifiers.control
+                    && !self.modifiers.super_key
+                    && let Some(text) = event.text.as_deref()
+                {
                     self.maybe_emit_text_commit(event_loop, text);
                 }
                 self.handle_engine_event(event_loop, EngineEvent::Key(normalized));
@@ -1176,6 +1396,27 @@ where
     }
 }
 
+fn logical_viewport(width: u32, height: u32, scale: f64) -> Option<super::ViewportSize> {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    if width == 0 || height == 0 {
+        return None;
+    }
+    drawable_viewport_size(
+        (width as f64 / scale).round().max(1.0) as usize,
+        (height as f64 / scale).round().max(1.0) as usize,
+    )
+}
+
+// A partial copy is valid only when the buffer contains the last presented
+// frame. Some backends return fresh or older buffers that need the whole frame.
+fn surface_damage_rects(age: u8, damage_rects: Option<&[ClipRect]>) -> Option<&[ClipRect]> {
+    if age == 1 { damage_rects } else { None }
+}
+
 fn copy_render_buffer_into_surface(
     target: &mut [u32],
     target_width: usize,
@@ -1191,6 +1432,14 @@ fn copy_render_buffer_into_surface(
     debug_assert_eq!(target.len(), target_width.saturating_mul(target_height));
     debug_assert_eq!(source.len(), source_width.saturating_mul(source_height));
     debug_assert!(source_alpha.is_none_or(|alpha| alpha.len() == source.len()));
+
+    if target.is_empty() {
+        return;
+    }
+    if source.is_empty() {
+        target.fill(clear);
+        return;
+    }
 
     if target_width == source_width && target_height == source_height {
         if let Some(rects) = damage_rects {
@@ -1254,24 +1503,34 @@ fn copy_render_buffer_into_surface(
         return;
     }
 
-    target.fill(clear);
-    let copy_width = source_width.min(target_width);
-    let copy_height = source_height.min(target_height);
-    for row in 0..copy_height {
-        let src_row = row * source_width;
-        let dst_row = row * target_width;
-        for column in 0..copy_width {
-            let source_index = src_row + column;
-            target[dst_row + column] = surface_pixel(
-                source[source_index],
-                source_alpha.map(|alpha| alpha[source_index]),
-                column,
-                row,
-                clear,
-                preserve_transparency,
-            );
+    // Layout and hit testing use logical pixels; the native surface uses physical
+    // pixels. Fill the whole surface with the logical frame so visible controls
+    // and pointer coordinates agree on Retina and fractional-DPI displays.
+    // Repaint fully when scaled: incoming damage rectangles use logical pixels.
+    let rows_per_chunk = target_height.div_ceil(12).max(1);
+    crate::global_worker_pool().scope(|scope| {
+        for (chunk_index, chunk) in target.chunks_mut(rows_per_chunk * target_width).enumerate() {
+            let first_row = chunk_index * rows_per_chunk;
+            scope.spawn(move || {
+                for (row_offset, target_row) in chunk.chunks_mut(target_width).enumerate() {
+                    let row = first_row + row_offset;
+                    let source_row = row * source_height / target_height;
+                    for (column, target_pixel) in target_row.iter_mut().enumerate() {
+                        let source_column = column * source_width / target_width;
+                        let index = source_row * source_width + source_column;
+                        *target_pixel = surface_pixel(
+                            source[index],
+                            source_alpha.map(|alpha| alpha[index]),
+                            column,
+                            row,
+                            clear,
+                            preserve_transparency,
+                        );
+                    }
+                }
+            });
         }
-    }
+    });
 }
 
 fn surface_pixel(
@@ -1456,13 +1715,73 @@ mod tests {
     };
 
     use super::{
-        copy_render_buffer_into_surface, non_transparent_damage_rects, normalize_button_state,
-        normalize_key_location, normalize_logical_key, normalize_modifiers, normalize_physical_key,
-        normalize_pointer_button, normalize_scroll_delta,
-        should_defer_zero_progress_transition_paint, summarize_native_glass,
-        window_uses_native_glass,
+        copy_render_buffer_into_surface, drag_region_contains, non_transparent_damage_rects,
+        normalize_button_state, normalize_key_location, normalize_logical_key, normalize_modifiers,
+        normalize_physical_key, normalize_pointer_button, normalize_scroll_delta,
+        resize_direction_at, should_defer_zero_progress_transition_paint, summarize_native_glass,
+        surface_damage_rects, window_uses_native_glass,
     };
     use crate::WindowConfig;
+
+    #[test]
+    fn resize_border_selects_all_eight_directions() {
+        use winit::window::ResizeDirection::*;
+        let cases = [
+            ((0.0, 0.0), NorthWest),
+            ((100.0, 0.0), North),
+            ((199.0, 0.0), NorthEast),
+            ((0.0, 50.0), West),
+            ((199.0, 50.0), East),
+            ((0.0, 99.0), SouthWest),
+            ((100.0, 99.0), South),
+            ((199.0, 99.0), SouthEast),
+        ];
+        for (position, direction) in cases {
+            assert_eq!(
+                resize_direction_at(position, (200.0, 100.0), 8.0),
+                Some(direction),
+                "wrong resize direction at {position:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn resize_border_excludes_content_and_positions_outside_the_window() {
+        for position in [
+            (8.0, 8.0),
+            (100.0, 50.0),
+            (191.0, 91.0),
+            (-1.0, 20.0),
+            (20.0, -1.0),
+            (200.0, 20.0),
+            (20.0, 100.0),
+        ] {
+            assert_eq!(resize_direction_at(position, (200.0, 100.0), 8.0), None);
+        }
+        assert_eq!(resize_direction_at((0.0, 0.0), (200.0, 100.0), 0.0), None);
+        assert_eq!(resize_direction_at((0.0, 0.0), (0.0, 0.0), 8.0), None);
+        assert_eq!(
+            resize_direction_at((192.0, 92.0), (200.0, 100.0), 8.0),
+            Some(winit::window::ResizeDirection::SouthEast),
+        );
+        // Even below twice the border width, each half has an unambiguous corner.
+        assert_eq!(
+            resize_direction_at((9.0, 9.0), (10.0, 10.0), 8.0),
+            Some(winit::window::ResizeDirection::SouthEast),
+        );
+    }
+
+    #[test]
+    fn drag_region_yields_to_clickable_content() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 200.0, 100.0)).with_child(
+                RenderNode::container(LayoutBox::new(150.0, 10.0, 40.0, 30.0)).on_click(|| {}),
+            ),
+        ];
+        assert!(drag_region_contains(&scene, 20.0, 20.0, 48.0));
+        assert!(!drag_region_contains(&scene, 160.0, 20.0, 48.0));
+        assert!(!drag_region_contains(&scene, 20.0, 49.0, 48.0));
+    }
 
     fn glass_node(tint: Option<Color>) -> RenderNode {
         RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_style(VisualStyle {
@@ -1675,7 +1994,35 @@ mod tests {
     }
 
     #[test]
-    fn blit_to_surface_copies_rows_when_target_is_wider() {
+    fn retina_surface_scales_the_logical_frame_to_physical_pixels() {
+        let source = [
+            pack_rgb(Color::rgb(255, 0, 0)),
+            pack_rgb(Color::rgb(0, 255, 0)),
+            pack_rgb(Color::rgb(0, 0, 255)),
+            pack_rgb(Color::WHITE),
+        ];
+        let mut target = vec![0; 16];
+        copy_render_buffer_into_surface(&mut target, 4, 4, &source, 2, 2, None, 0, false, None);
+        for row in 0..4 {
+            for column in 0..4 {
+                assert_eq!(
+                    target[row * 4 + column],
+                    super::surface_pixel(
+                        source[(row / 2) * 2 + column / 2],
+                        None,
+                        column,
+                        row,
+                        0,
+                        false
+                    ),
+                    "visible pixel and logical hit target disagree at ({column}, {row})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blit_to_surface_scales_rows_when_target_is_wider() {
         let source = vec![
             pack_rgb(Color::rgb(1, 2, 3)),
             pack_rgb(Color::rgb(4, 5, 6)),
@@ -1686,25 +2033,18 @@ mod tests {
         ];
         let mut target = vec![9; 10];
         copy_render_buffer_into_surface(&mut target, 5, 2, &source, 3, 2, None, 0, false, None);
-        assert_eq!(
-            target,
-            vec![
-                to_softbuffer_rgb_blue_noise(source[0], 0, 0),
-                to_softbuffer_rgb_blue_noise(source[1], 1, 0),
-                to_softbuffer_rgb_blue_noise(source[2], 2, 0),
-                0,
-                0,
-                to_softbuffer_rgb_blue_noise(source[3], 0, 1),
-                to_softbuffer_rgb_blue_noise(source[4], 1, 1),
-                to_softbuffer_rgb_blue_noise(source[5], 2, 1),
-                0,
-                0,
-            ]
-        );
+        for row in 0..2 {
+            for (column, source_column) in [0, 0, 1, 1, 2].into_iter().enumerate() {
+                assert_eq!(
+                    target[row * 5 + column],
+                    to_softbuffer_rgb_blue_noise(source[row * 3 + source_column], column, row)
+                );
+            }
+        }
     }
 
     #[test]
-    fn blit_to_surface_copies_rows_when_target_is_narrower() {
+    fn blit_to_surface_scales_rows_when_target_is_narrower() {
         let source = vec![
             pack_rgb(Color::rgb(1, 2, 3)),
             pack_rgb(Color::rgb(4, 5, 6)),
@@ -1728,6 +2068,110 @@ mod tests {
                 to_softbuffer_rgb_blue_noise(source[6], 2, 1),
             ]
         );
+    }
+
+    #[test]
+    fn scaled_surface_preserves_alpha_at_fractional_dpi_and_after_damage() {
+        let source: Vec<_> = (0..16)
+            .map(|i| pack_rgb(Color::rgb(i * 10, 80, 120)))
+            .collect();
+        let alpha: Vec<_> = (0..16).map(|i| (i % 4) * 85).collect();
+        let damage = [ClipRect {
+            x0: 1.0,
+            y0: 1.0,
+            x1: 2.0,
+            y1: 2.0,
+        }];
+        for size in [5, 6, 8] {
+            for preserve in [false, true] {
+                let clear = 0x123456;
+                let mut target = vec![0; size * size];
+                copy_render_buffer_into_surface(
+                    &mut target,
+                    size,
+                    size,
+                    &source,
+                    4,
+                    4,
+                    Some(&alpha),
+                    clear,
+                    preserve,
+                    Some(&damage),
+                );
+                for row in 0..size {
+                    for column in 0..size {
+                        let index = (row * 4 / size) * 4 + column * 4 / size;
+                        assert_eq!(
+                            target[row * size + column],
+                            super::surface_pixel(
+                                source[index],
+                                Some(alpha[index]),
+                                column,
+                                row,
+                                clear,
+                                preserve
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_native_presentation_and_pointer_hit_testing_agree() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CLICKS: AtomicUsize = AtomicUsize::new(0);
+        fn click() {
+            CLICKS.fetch_add(1, Ordering::SeqCst);
+        }
+        let color = Color::rgb(255, 0, 0);
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(80.0, 40.0, 48.0, 48.0))
+                .with_style(VisualStyle {
+                    background: Some(color),
+                    ..VisualStyle::default()
+                })
+                .on_click(click),
+        ];
+        for (index, scale) in [1.0, 1.2, 1.25, 1.5, 2.0, 3.0].into_iter().enumerate() {
+            let width = (200.0 * scale) as usize;
+            let height = (120.0 * scale) as usize;
+            let mut target = vec![0; width * height];
+            let mut source = target.clone();
+            crate::render_to_buffer_at_scale(
+                &scene,
+                &mut source,
+                width,
+                height,
+                Color::WHITE,
+                scale as f32,
+            );
+            copy_render_buffer_into_surface(
+                &mut target,
+                width,
+                height,
+                &source,
+                width,
+                height,
+                None,
+                0,
+                false,
+                None,
+            );
+            let x = (104.0 * scale) as usize;
+            let y = (64.0 * scale) as usize;
+            assert_eq!(
+                target[y * width + x],
+                super::surface_pixel(pack_rgb(color), None, x, y, 0, false)
+            );
+            assert!(crate::dispatch_click(
+                &scene,
+                x as f32 / scale as f32,
+                y as f32 / scale as f32
+            ));
+            assert_eq!(CLICKS.load(Ordering::SeqCst), index + 1);
+        }
     }
 
     #[test]
@@ -1788,6 +2232,39 @@ mod tests {
                 to_softbuffer_rgb_blue_noise_with_alpha(source[2], alpha[2], 2, 0),
             ]
         );
+    }
+
+    #[test]
+    fn fresh_or_old_surface_receives_the_complete_frame() {
+        let source = vec![pack_rgb(Color::rgb(10, 20, 30)); 4];
+        let damage = [ClipRect {
+            x0: 1.0,
+            y0: 0.0,
+            x1: 2.0,
+            y1: 2.0,
+        }];
+        for age in [0, 2] {
+            let mut target = vec![0; 4];
+            copy_render_buffer_into_surface(
+                &mut target,
+                2,
+                2,
+                &source,
+                2,
+                2,
+                None,
+                0,
+                false,
+                surface_damage_rects(age, Some(&damage)),
+            );
+            for (index, pixel) in target.iter().enumerate() {
+                assert_eq!(
+                    *pixel,
+                    to_softbuffer_rgb_blue_noise(source[index], index % 2, index / 2)
+                );
+            }
+        }
+        assert!(surface_damage_rects(1, Some(&damage)).is_some());
     }
 
     #[test]
@@ -1868,5 +2345,18 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(simplified, vec![(0, 0, 2, 2)]);
+    }
+}
+
+#[cfg(test)]
+mod logical_pixel_tests {
+    use super::logical_viewport;
+    #[test]
+    fn dpi_scales_css_viewport_and_ignores_minimized_windows() {
+        let viewport = logical_viewport(1920, 1080, 1.5).unwrap();
+        assert_eq!((viewport.width, viewport.height), (1280, 720));
+        assert_eq!(logical_viewport(0, 1080, 1.5), None);
+        assert_eq!(logical_viewport(1920, 0, 1.5), None);
+        assert_eq!(logical_viewport(1920, 1080, f64::NAN).unwrap().width, 1920);
     }
 }
