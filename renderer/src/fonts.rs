@@ -51,7 +51,114 @@ fn record_build_time(counter: &AtomicUsize, started_at: Instant) {
     );
 }
 
+struct SelectionColor {
+    color: Color,
+    regions: Vec<LayoutBox>,
+}
+
+impl SelectionColor {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        self.regions.iter().any(|region| {
+            x >= region.x
+                && y >= region.y
+                && x < region.x + region.width
+                && y < region.y + region.height
+        })
+    }
+}
+
 pub(crate) fn draw_text(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    text: &str,
+    prepared: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+    clip: ClipRect,
+) {
+    draw_text_impl(
+        buffer, width, height, layout, text, prepared, style, clip, None,
+    );
+}
+
+pub(crate) fn draw_text_selected(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    text: &str,
+    prepared: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+    clip: ClipRect,
+    color: Color,
+    regions: &[LayoutBox],
+) {
+    let selection = SelectionColor {
+        color,
+        regions: regions.to_vec(),
+    };
+    draw_text_impl(
+        buffer,
+        width,
+        height,
+        layout,
+        text,
+        prepared,
+        style,
+        clip,
+        Some(&selection),
+    );
+}
+
+pub(crate) fn draw_text_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    text: &str,
+    prepared: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+    matrix: AffineTransform,
+    clip: &ClipState,
+) {
+    draw_text_transformed_impl(
+        buffer, width, height, layout, text, prepared, style, matrix, clip, None,
+    );
+}
+
+pub(crate) fn draw_text_selected_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    text: &str,
+    prepared: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+    matrix: AffineTransform,
+    clip: &ClipState,
+    color: Color,
+    regions: &[LayoutBox],
+) {
+    let selection = SelectionColor {
+        color,
+        regions: regions.to_vec(),
+    };
+    draw_text_transformed_impl(
+        buffer,
+        width,
+        height,
+        layout,
+        text,
+        prepared,
+        style,
+        matrix,
+        clip,
+        Some(&selection),
+    );
+}
+
+fn draw_text_impl(
     buffer: &mut [u32],
     width: usize,
     height: usize,
@@ -60,6 +167,7 @@ pub(crate) fn draw_text(
     prepared_text_layout: Option<&PreparedTextLayout>,
     style: &VisualStyle,
     clip: ClipRect,
+    selection: Option<&SelectionColor>,
 ) {
     let Some(raster) = cached_text_mask(layout, text, &style.text, prepared_text_layout) else {
         return;
@@ -93,7 +201,7 @@ pub(crate) fn draw_text(
         );
     }
 
-    draw_mask(
+    draw_mask_with_selection(
         buffer,
         width,
         height,
@@ -102,10 +210,11 @@ pub(crate) fn draw_text(
         raster.offset_x,
         raster.offset_y,
         clip,
+        selection,
     );
 }
 
-pub(crate) fn draw_text_transformed(
+fn draw_text_transformed_impl(
     buffer: &mut [u32],
     width: usize,
     height: usize,
@@ -115,10 +224,24 @@ pub(crate) fn draw_text_transformed(
     style: &VisualStyle,
     matrix: AffineTransform,
     clip_state: &ClipState,
+    selection: Option<&SelectionColor>,
 ) {
     // Rasterize axis-aligned text directly in device pixels, including its
     // fractional origin. Scaling an 8-bit glyph mask loses outline detail.
     let device_text = device_text(layout, text, style, prepared_text_layout, matrix);
+    let device_selection = if device_text.is_some() {
+        selection.map(|selection| SelectionColor {
+            color: selection.color,
+            regions: selection
+                .regions
+                .iter()
+                .map(|region| matrix.scaled_layout(*region))
+                .collect(),
+        })
+    } else {
+        None
+    };
+    let selection = device_selection.as_ref().or(selection);
     let (layout, style, prepared_text_layout, matrix) = match &device_text {
         Some((layout, style, prepared)) => {
             (*layout, style, Some(prepared), AffineTransform::IDENTITY)
@@ -126,7 +249,7 @@ pub(crate) fn draw_text_transformed(
         None => (layout, style, prepared_text_layout, matrix),
     };
     if matrix.is_identity() && clip_state.is_simple() {
-        draw_text(
+        draw_text_impl(
             buffer,
             width,
             height,
@@ -135,6 +258,7 @@ pub(crate) fn draw_text_transformed(
             prepared_text_layout,
             style,
             clip_state.coarse,
+            selection,
         );
         return;
     }
@@ -193,7 +317,7 @@ pub(crate) fn draw_text_transformed(
         );
     }
 
-    draw_mask_transformed(
+    draw_mask_transformed_with_selection(
         buffer,
         width,
         height,
@@ -203,6 +327,7 @@ pub(crate) fn draw_text_transformed(
         raster.offset_y,
         matrix,
         clip_state,
+        selection,
     );
 }
 
@@ -326,7 +451,42 @@ fn draw_mask(
     offset_y: i32,
     clip: ClipRect,
 ) {
-    if color.a == 0 || mask.width == 0 || mask.height == 0 {
+    draw_mask_with_selection(
+        buffer, width, height, mask, color, offset_x, offset_y, clip, None,
+    );
+}
+
+fn draw_mask_transformed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    mask: &AlphaMask,
+    color: Color,
+    offset_x: i32,
+    offset_y: i32,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) {
+    draw_mask_transformed_with_selection(
+        buffer, width, height, mask, color, offset_x, offset_y, matrix, clip_state, None,
+    );
+}
+
+fn draw_mask_with_selection(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    mask: &AlphaMask,
+    color: Color,
+    offset_x: i32,
+    offset_y: i32,
+    clip: ClipRect,
+    selection: Option<&SelectionColor>,
+) {
+    if (color.a == 0 && selection.is_none_or(|s| s.color.a == 0))
+        || mask.width == 0
+        || mask.height == 0
+    {
         return;
     }
 
@@ -349,6 +509,8 @@ fn draw_mask(
     }
 
     let prepared_color = PreparedBlendColor::new(color);
+    let selection = selection.filter(|selection| selection.color != color);
+    let selected_color = selection.map(|selection| PreparedBlendColor::new(selection.color));
     let local_x0 = (draw_x0 - mask_x0) as usize;
     let local_x1 = (draw_x1 - mask_x0) as usize;
     for y in draw_y0..draw_y1 {
@@ -357,17 +519,35 @@ fn draw_mask(
         let mask_row_end = local_y * mask.width + local_x1;
         let buffer_row_start = (y as usize - rows.start) * width + draw_x0 as usize;
         let buffer_row_end = buffer_row_start + (local_x1 - local_x0);
-        blend_mask_row(
-            &mut buffer[buffer_row_start..buffer_row_end],
-            buffer_row_start,
-            &mask.alpha[mask_row_start..mask_row_end],
-            prepared_color,
-            color.a,
-        );
+        if let (Some(selection), Some(selected_color)) = (selection, selected_color) {
+            for (index, x) in (draw_x0..draw_x1).enumerate() {
+                let selected = selection.contains(x as f32 + 0.5, y as f32 + 0.5);
+                let target = buffer_row_start + index;
+                blend_mask_row(
+                    &mut buffer[target..target + 1],
+                    target,
+                    &mask.alpha[mask_row_start + index..mask_row_start + index + 1],
+                    if selected {
+                        selected_color
+                    } else {
+                        prepared_color
+                    },
+                    if selected { selection.color.a } else { color.a },
+                );
+            }
+        } else {
+            blend_mask_row(
+                &mut buffer[buffer_row_start..buffer_row_end],
+                buffer_row_start,
+                &mask.alpha[mask_row_start..mask_row_end],
+                prepared_color,
+                color.a,
+            );
+        }
     }
 }
 
-fn draw_mask_transformed(
+fn draw_mask_transformed_with_selection(
     buffer: &mut [u32],
     width: usize,
     height: usize,
@@ -377,8 +557,12 @@ fn draw_mask_transformed(
     offset_y: i32,
     matrix: AffineTransform,
     clip_state: &ClipState,
+    selection: Option<&SelectionColor>,
 ) {
-    if color.a == 0 || mask.width == 0 || mask.height == 0 {
+    if (color.a == 0 && selection.is_none_or(|s| s.color.a == 0))
+        || mask.width == 0
+        || mask.height == 0
+    {
         return;
     }
 
@@ -400,6 +584,7 @@ fn draw_mask_transformed(
         return;
     };
     let prepared_color = PreparedBlendColor::new(color);
+    let selected_color = selection.map(|selection| PreparedBlendColor::new(selection.color));
     let rows = current_render_buffer_rows();
     let row_start = rows.start.min(height) as i32;
     let row_end = rows.end.min(height) as i32;
@@ -421,12 +606,20 @@ fn draw_mask_transformed(
 
             let row_start = (y as usize - rows.start) * width;
             let buffer_start = row_start + x as usize;
+            let (paint, opacity) = match (selection, selected_color) {
+                (Some(selection), Some(selected_color))
+                    if selection.contains(source_x, source_y) =>
+                {
+                    (selected_color, selection.color.a)
+                }
+                _ => (prepared_color, color.a),
+            };
             blend_mask_row(
                 &mut buffer[buffer_start..buffer_start + 1],
                 buffer_start,
                 &[alpha],
-                prepared_color,
-                color.a,
+                paint,
+                opacity,
             );
         }
     }
@@ -648,6 +841,54 @@ fn split_layout_for_cache(layout: LayoutBox) -> (LayoutBox, i32, i32) {
         offset_x,
         offset_y,
     )
+}
+
+/// Caret boundaries from the same full-line advances used by positioned_glyphs.
+/// Internal boundaries include tracking and the following glyph's kerning.
+pub(crate) fn line_caret_stops(
+    text: &str,
+    style: &TextStyle,
+) -> Vec<cssimpler_core::fonts::TextCaretStop> {
+    use cssimpler_core::fonts::{TextCaretStop, layout_text_caret_stops, requires_shaping};
+    let font = resolve_font(style);
+    if font.is_some() && requires_shaping(text) {
+        return layout_text_caret_stops(text, style);
+    }
+    let mut stops = Vec::new();
+    let mut x = 0.0;
+    if let Some(font) = font {
+        let scaled = font.font().as_scaled(font.size_px());
+        let mut previous = None;
+        for (byte_index, character) in text.char_indices() {
+            let glyph = scaled.glyph_id(character);
+            if let Some(previous) = previous {
+                x += scaled.kern(previous, glyph);
+            }
+            stops.push(TextCaretStop {
+                byte_index,
+                offset_px: x,
+            });
+            x += scaled.h_advance(glyph) + style.letter_spacing_px;
+            previous = Some(glyph);
+        }
+    } else {
+        let advance = BitmapFontMetrics::from_style(style).measure_text_width(" ");
+        for (byte_index, _) in text.char_indices() {
+            stops.push(TextCaretStop {
+                byte_index,
+                offset_px: x,
+            });
+            x += advance + style.letter_spacing_px;
+        }
+    }
+    if !text.is_empty() {
+        x -= style.letter_spacing_px;
+    }
+    stops.push(TextCaretStop {
+        byte_index: text.len(),
+        offset_px: x,
+    });
+    stops
 }
 
 fn positioned_glyphs(

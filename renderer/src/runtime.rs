@@ -20,7 +20,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHan
 use winit::keyboard::{
     Key as WinitKey, KeyLocation as WinitKeyLocation, ModifiersState, PhysicalKey,
 };
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, Window, WindowAttributes, WindowId};
 
 use crate::input::{
     ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
@@ -178,6 +178,41 @@ fn system_drag_override_active() -> bool {
     SYSTEM_DRAG_OVERRIDE.load(Ordering::Relaxed)
 }
 
+fn drag_region_contains(scene: &[RenderNode], x: f32, y: f32, height: f32) -> bool {
+    y >= 0.0
+        && y < height
+        && super::hit_test_scene_for_event(scene, x, y, MouseEventKind::Click).is_none()
+        && super::hit_test_scene_for_event(scene, x, y, MouseEventKind::MouseDown).is_none()
+}
+
+fn resize_direction_at(
+    (x, y): (f32, f32),
+    (width, height): (f32, f32),
+    border: f32,
+) -> Option<ResizeDirection> {
+    if border <= 0.0 || !(x >= 0.0 && x < width && y >= 0.0 && y < height) {
+        return None;
+    }
+    // Keep opposite borders from overlapping if the window becomes very small.
+    let horizontal_border = border.min(width / 2.0);
+    let vertical_border = border.min(height / 2.0);
+    let left = x < horizontal_border;
+    let right = x >= width - horizontal_border;
+    let top = y < vertical_border;
+    let bottom = y >= height - vertical_border;
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(ResizeDirection::NorthWest),
+        (_, true, true, _) => Some(ResizeDirection::NorthEast),
+        (true, _, _, true) => Some(ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(ResizeDirection::SouthEast),
+        (true, _, _, _) => Some(ResizeDirection::West),
+        (_, true, _, _) => Some(ResizeDirection::East),
+        (_, _, true, _) => Some(ResizeDirection::North),
+        (_, _, _, true) => Some(ResizeDirection::South),
+        _ => None,
+    }
+}
+
 struct RuntimeApp<P> {
     config: WindowConfig,
     scene_provider: P,
@@ -200,6 +235,7 @@ struct RuntimeApp<P> {
     scale_factor: f64,
     modifiers: KeyboardModifiers,
     mouse_position: Option<(f32, f32)>,
+    native_resize_started: bool,
     touch: super::touch::TouchController,
     pending_wheel: Option<(f32, f32)>,
     left_down: bool,
@@ -249,6 +285,7 @@ where
             scale_factor: 1.0,
             modifiers: KeyboardModifiers::default(),
             mouse_position: None,
+            native_resize_started: false,
             touch: super::touch::TouchController::default(),
             pending_wheel: None,
             left_down: false,
@@ -403,11 +440,50 @@ where
             }),
         );
         self.request_immediate_redraw();
+        if !self.native_resize_started {
+            self.update_resize_cursor();
+        }
+    }
+
+    fn resize_direction(&self) -> Option<ResizeDirection> {
+        let window = self.window.as_ref()?;
+        if self.config.decorations
+            || !window.is_resizable()
+            || window.is_maximized()
+            || window.fullscreen().is_some()
+        {
+            return None;
+        }
+        let size = window.inner_size();
+        resize_direction_at(
+            self.mouse_position?,
+            (
+                (size.width as f64 / self.scale_factor) as f32,
+                (size.height as f64 / self.scale_factor) as f32,
+            ),
+            self.config.resize_border_width,
+        )
+    }
+
+    fn update_resize_cursor(&self) {
+        // Preserve content-drag cursors. Hover updates must still work if the
+        // native resize loop consumed the release event.
+        if self.left_down || self.right_down || self.middle_down {
+            return;
+        }
+        if let Some(window) = self.window.as_ref() {
+            let cursor = self
+                .resize_direction()
+                .map(CursorIcon::from)
+                .unwrap_or_default();
+            window.set_cursor(cursor);
+        }
     }
 
     fn clear_pointer_state(&mut self) {
         self.touch.cancel();
         self.mouse_position = None;
+        self.native_resize_started = false;
         self.pending_wheel = None;
         self.left_down = false;
         self.right_down = false;
@@ -418,6 +494,7 @@ where
         self.previous_mouse_position = None;
         self.suppress_left_pointer_until_release = false;
         self.left_press_target = None;
+        self.update_resize_cursor();
     }
 
     fn prepare_suspend(&mut self, event_loop: &ActiveEventLoop) {
@@ -1172,6 +1249,7 @@ where
                     (position.x / self.scale_factor) as f32,
                     (position.y / self.scale_factor) as f32,
                 ));
+                self.update_resize_cursor();
                 self.handle_engine_event(
                     event_loop,
                     EngineEvent::PointerMoved {
@@ -1186,12 +1264,52 @@ where
             }
             WindowEvent::CursorLeft { .. } if !self.touch.ignore_mouse(Instant::now()) => {
                 self.mouse_position = None;
+                self.update_resize_cursor();
                 self.handle_engine_event(event_loop, EngineEvent::PointerLeft);
                 self.request_immediate_redraw();
             }
             WindowEvent::MouseInput { state, button, .. }
                 if !self.touch.ignore_mouse(Instant::now()) =>
             {
+                if button == WinitMouseButton::Left {
+                    let was_resizing = self.native_resize_started;
+                    // Some native resize loops consume the release. A new press also resets it.
+                    self.native_resize_started = false;
+                    if state == ElementState::Released && was_resizing {
+                        self.update_resize_cursor();
+                        return;
+                    }
+                    // Resize edges and corners take priority over title-bar dragging and UI clicks.
+                    // Start on this press so the native gesture has a current input serial.
+                    if state == ElementState::Pressed
+                        && let Some(direction) = self.resize_direction()
+                        && self
+                            .window
+                            .as_ref()
+                            .is_some_and(|window| window.drag_resize_window(direction).is_ok())
+                    {
+                        self.native_resize_started = true;
+                        return;
+                    }
+                }
+                // Give interactive content priority over the invisible drag region.
+                // Start the native move while the press is current (required by Wayland).
+                if button == WinitMouseButton::Left
+                    && state == ElementState::Pressed
+                    && self.mouse_position.is_some_and(|(x, y)| {
+                        let scene = self
+                            .previous_presented_scene
+                            .as_deref()
+                            .unwrap_or_else(|| self.scene_provider.scene());
+                        drag_region_contains(scene, x, y, self.config.drag_region_height)
+                    })
+                    && self
+                        .window
+                        .as_ref()
+                        .is_some_and(|window| window.drag_window().is_ok())
+                {
+                    return;
+                }
                 let normalized_state = normalize_button_state(state);
                 match button {
                     WinitMouseButton::Left => {
@@ -1205,6 +1323,7 @@ where
                     }
                     _ => {}
                 }
+                self.update_resize_cursor();
                 self.handle_engine_event(
                     event_loop,
                     EngineEvent::PointerButton {
@@ -1596,13 +1715,73 @@ mod tests {
     };
 
     use super::{
-        copy_render_buffer_into_surface, non_transparent_damage_rects, normalize_button_state,
-        normalize_key_location, normalize_logical_key, normalize_modifiers, normalize_physical_key,
-        normalize_pointer_button, normalize_scroll_delta,
-        should_defer_zero_progress_transition_paint, summarize_native_glass, surface_damage_rects,
-        window_uses_native_glass,
+        copy_render_buffer_into_surface, drag_region_contains, non_transparent_damage_rects,
+        normalize_button_state, normalize_key_location, normalize_logical_key, normalize_modifiers,
+        normalize_physical_key, normalize_pointer_button, normalize_scroll_delta,
+        resize_direction_at, should_defer_zero_progress_transition_paint, summarize_native_glass,
+        surface_damage_rects, window_uses_native_glass,
     };
     use crate::WindowConfig;
+
+    #[test]
+    fn resize_border_selects_all_eight_directions() {
+        use winit::window::ResizeDirection::*;
+        let cases = [
+            ((0.0, 0.0), NorthWest),
+            ((100.0, 0.0), North),
+            ((199.0, 0.0), NorthEast),
+            ((0.0, 50.0), West),
+            ((199.0, 50.0), East),
+            ((0.0, 99.0), SouthWest),
+            ((100.0, 99.0), South),
+            ((199.0, 99.0), SouthEast),
+        ];
+        for (position, direction) in cases {
+            assert_eq!(
+                resize_direction_at(position, (200.0, 100.0), 8.0),
+                Some(direction),
+                "wrong resize direction at {position:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn resize_border_excludes_content_and_positions_outside_the_window() {
+        for position in [
+            (8.0, 8.0),
+            (100.0, 50.0),
+            (191.0, 91.0),
+            (-1.0, 20.0),
+            (20.0, -1.0),
+            (200.0, 20.0),
+            (20.0, 100.0),
+        ] {
+            assert_eq!(resize_direction_at(position, (200.0, 100.0), 8.0), None);
+        }
+        assert_eq!(resize_direction_at((0.0, 0.0), (200.0, 100.0), 0.0), None);
+        assert_eq!(resize_direction_at((0.0, 0.0), (0.0, 0.0), 8.0), None);
+        assert_eq!(
+            resize_direction_at((192.0, 92.0), (200.0, 100.0), 8.0),
+            Some(winit::window::ResizeDirection::SouthEast),
+        );
+        // Even below twice the border width, each half has an unambiguous corner.
+        assert_eq!(
+            resize_direction_at((9.0, 9.0), (10.0, 10.0), 8.0),
+            Some(winit::window::ResizeDirection::SouthEast),
+        );
+    }
+
+    #[test]
+    fn drag_region_yields_to_clickable_content() {
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 200.0, 100.0)).with_child(
+                RenderNode::container(LayoutBox::new(150.0, 10.0, 40.0, 30.0)).on_click(|| {}),
+            ),
+        ];
+        assert!(drag_region_contains(&scene, 20.0, 20.0, 48.0));
+        assert!(!drag_region_contains(&scene, 160.0, 20.0, 48.0));
+        assert!(!drag_region_contains(&scene, 20.0, 49.0, 48.0));
+    }
 
     fn glass_node(tint: Option<Color>) -> RenderNode {
         RenderNode::container(LayoutBox::new(0.0, 0.0, 20.0, 20.0)).with_style(VisualStyle {

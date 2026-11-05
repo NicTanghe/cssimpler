@@ -24,7 +24,9 @@ mod shadow;
 mod shapes;
 mod softbuffer_dither;
 mod svg;
+mod text_edit;
 mod touch;
+pub use text_edit::text_index_at_position;
 mod transform;
 
 use self::{
@@ -1189,6 +1191,10 @@ pub struct WindowConfig {
     pub middle_button_auto_scroll: bool,
     pub glass_capable: bool,
     pub decorations: bool,
+    /// Height of the draggable strip at the top of the client area, in logical pixels.
+    pub drag_region_height: f32,
+    /// Width of the client-area resize border, in logical pixels (zero disables it).
+    pub resize_border_width: f32,
 }
 
 impl WindowConfig {
@@ -1202,6 +1208,8 @@ impl WindowConfig {
             middle_button_auto_scroll: true,
             glass_capable: false,
             decorations: true,
+            drag_region_height: 0.0,
+            resize_border_width: 0.0,
         }
     }
 
@@ -1212,6 +1220,16 @@ impl WindowConfig {
 
     pub fn with_decorations(mut self, decorations: bool) -> Self {
         self.decorations = decorations;
+        self
+    }
+
+    pub fn with_drag_region_height(mut self, height: f32) -> Self {
+        self.drag_region_height = height.max(0.0);
+        self
+    }
+
+    pub fn with_resize_border_width(mut self, width: f32) -> Self {
+        self.resize_border_width = width.max(0.0);
         self
     }
 }
@@ -3555,16 +3573,22 @@ fn draw_node_contents_internal_impl(
     if let RenderKind::Text(content) = &node.kind {
         let text_layout = scrollbar::text_layout(node);
         let text_clip = scrollbar::text_clip(node, clip);
-        fonts::draw_text(
-            buffer,
-            width,
-            height,
-            text_layout,
-            content,
-            node.text_layout.as_ref(),
-            &node.style,
-            text_clip,
-        );
+        if node
+            .text_edit
+            .as_ref()
+            .is_none_or(|edit| edit.selection.is_none())
+        {
+            fonts::draw_text(
+                buffer,
+                width,
+                height,
+                text_layout,
+                content,
+                node.text_layout.as_ref(),
+                &node.style,
+                text_clip,
+            );
+        }
         draw_text_edit_decorations(
             buffer,
             width,
@@ -4803,17 +4827,23 @@ fn draw_node_transformed_internal_impl(
         } else {
             clip_state.clone()
         };
-        fonts::draw_text_transformed(
-            buffer,
-            width,
-            height,
-            text_layout,
-            content,
-            node.text_layout.as_ref(),
-            &node.style,
-            matrix,
-            &text_clip_state,
-        );
+        if node
+            .text_edit
+            .as_ref()
+            .is_none_or(|edit| edit.selection.is_none())
+        {
+            fonts::draw_text_transformed(
+                buffer,
+                width,
+                height,
+                text_layout,
+                content,
+                node.text_layout.as_ref(),
+                &node.style,
+                matrix,
+                &text_clip_state,
+            );
+        }
         draw_text_edit_decorations_transformed(
             buffer,
             width,
@@ -4948,6 +4978,7 @@ fn draw_node_transformed_internal_impl(
 
 #[derive(Clone, Debug)]
 struct TextRangeSegment {
+    #[cfg(test)]
     text: String,
     layout: LayoutBox,
 }
@@ -5043,9 +5074,6 @@ fn draw_text_selection(
         selection.start,
         selection.end,
     );
-    if segments.is_empty() {
-        return;
-    }
 
     for segment in &segments {
         draw_rounded_rect(
@@ -5053,28 +5081,25 @@ fn draw_text_selection(
             width,
             height,
             segment.layout,
-            CornerRadius::ZERO,
+            CornerRadius::all(style.text.size_px * 0.1),
             selection.style.background,
             clip,
         );
     }
 
-    let mut selected_style = style.clone();
-    selected_style.foreground = selection.style.foreground;
-    selected_style.text_shadows = selection.style.text_shadows.clone();
-    selected_style.text.text_align = TextAlign::Left;
-    for segment in segments {
-        fonts::draw_text(
-            buffer,
-            width,
-            height,
-            segment.layout,
-            &segment.text,
-            None,
-            &selected_style,
-            clip,
-        );
-    }
+    let regions: Vec<_> = segments.iter().map(|segment| segment.layout).collect();
+    fonts::draw_text_selected(
+        buffer,
+        width,
+        height,
+        layout,
+        text,
+        prepared_text_layout,
+        style,
+        clip,
+        selection.style.foreground,
+        &regions,
+    );
 }
 
 fn draw_text_edit_decorations_transformed(
@@ -5174,9 +5199,6 @@ fn draw_text_selection_transformed(
         selection.start,
         selection.end,
     );
-    if segments.is_empty() {
-        return;
-    }
 
     for segment in &segments {
         draw_transformed_rounded_rect(
@@ -5184,30 +5206,27 @@ fn draw_text_selection_transformed(
             width,
             height,
             segment.layout,
-            CornerRadius::ZERO,
+            CornerRadius::all(style.text.size_px * 0.1),
             selection.style.background,
             matrix,
             clip_state,
         );
     }
 
-    let mut selected_style = style.clone();
-    selected_style.foreground = selection.style.foreground;
-    selected_style.text_shadows = selection.style.text_shadows.clone();
-    selected_style.text.text_align = TextAlign::Left;
-    for segment in segments {
-        fonts::draw_text_transformed(
-            buffer,
-            width,
-            height,
-            segment.layout,
-            &segment.text,
-            None,
-            &selected_style,
-            matrix,
-            clip_state,
-        );
-    }
+    let regions: Vec<_> = segments.iter().map(|segment| segment.layout).collect();
+    fonts::draw_text_selected_transformed(
+        buffer,
+        width,
+        height,
+        layout,
+        text,
+        prepared_text_layout,
+        style,
+        matrix,
+        clip_state,
+        selection.style.foreground,
+        &regions,
+    );
 }
 
 fn text_range_segments(
@@ -5232,31 +5251,36 @@ fn text_range_segments(
         &owned_layout
     };
 
+    let spans = text_edit::source_spans(text, style, text_layout);
+    let display_style = text_edit::display_style(style);
     let mut segments = Vec::new();
-    let mut line_start = 0;
     for (line_index, line) in text_layout.lines.iter().enumerate() {
-        let line_end = line_start + line.text.len();
-        let segment_start = start.max(line_start).min(line_end);
-        let segment_end = end.max(line_start).min(line_end);
-        if segment_start < segment_end {
-            let local_start = clamp_to_char_boundary(&line.text, segment_start - line_start);
-            let local_end = clamp_to_char_boundary(&line.text, segment_end - line_start);
-            let selected_text = line.text[local_start..local_end].to_string();
-            let prefix = &line.text[..local_start];
-            let selected_width = layout_text_block(&selected_text, style, None).width;
-            if selected_width > f32::EPSILON {
-                let x = aligned_text_line_start_x(layout, line.width, style.text_align)
-                    + layout_text_block(prefix, style, None).width;
-                let y = layout.y + line_index as f32 * text_layout.line_height;
-                segments.push(TextRangeSegment {
-                    text: selected_text,
-                    layout: LayoutBox::new(x, y, selected_width, text_layout.line_height),
-                });
-            }
-        }
-        line_start = line_end;
-        if end <= line_start {
-            break;
+        let selected: Vec<_> = spans[line_index]
+            .iter()
+            .filter(|span| span.source_end > start && span.source_start < end)
+            .collect();
+        let (Some(first), Some(last)) = (selected.first(), selected.last()) else {
+            continue;
+        };
+        let stops = fonts::line_caret_stops(&line.text, &display_style);
+        let start_x = stops
+            .iter()
+            .rev()
+            .find(|stop| stop.byte_index <= first.display_start)
+            .map_or(0.0, |stop| stop.offset_px);
+        let end_x = stops
+            .iter()
+            .find(|stop| stop.byte_index >= last.display_end)
+            .map_or(line.width, |stop| stop.offset_px);
+        let selected_width = end_x - start_x;
+        if selected_width > f32::EPSILON {
+            let x = aligned_text_line_start_x(layout, line.width, style.text_align) + start_x;
+            let y = layout.y + line_index as f32 * text_layout.line_height;
+            segments.push(TextRangeSegment {
+                #[cfg(test)]
+                text: line.text[first.display_start..last.display_end].to_owned(),
+                layout: LayoutBox::new(x, y, selected_width, text_layout.line_height),
+            });
         }
     }
 
@@ -5283,17 +5307,24 @@ fn text_caret_rect(
         return Some(empty_text_caret_rect(layout, style));
     }
 
-    let mut line_start = 0;
+    let spans = text_edit::source_spans(text, style, text_layout);
+    let display_style = text_edit::display_style(style);
     for (line_index, line) in text_layout.lines.iter().enumerate() {
-        let line_end = line_start + line.text.len();
-        if caret <= line_end || line_index + 1 == text_layout.lines.len() {
-            let local_caret = clamp_to_char_boundary(&line.text, caret.saturating_sub(line_start));
-            let x = aligned_text_line_start_x(layout, line.width, style.text_align)
-                + layout_text_block(&line.text[..local_caret], style, None).width;
+        let source_end = spans[line_index].last().map_or(0, |span| span.source_end);
+        if caret <= source_end || line_index + 1 == text_layout.lines.len() {
+            let display_caret = spans[line_index]
+                .iter()
+                .find(|span| span.source_start >= caret)
+                .map_or(line.text.len(), |span| span.display_start);
+            let stops = fonts::line_caret_stops(&line.text, &display_style);
+            let offset = stops
+                .iter()
+                .find(|stop| stop.byte_index >= display_caret)
+                .map_or(line.width, |stop| stop.offset_px);
+            let x = aligned_text_line_start_x(layout, line.width, style.text_align) + offset;
             let y = layout.y + line_index as f32 * text_layout.line_height;
             return Some(LayoutBox::new(x, y, 1.0, text_layout.line_height));
         }
-        line_start = line_end;
     }
 
     None
@@ -12730,3 +12761,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod selection_paint_tests;

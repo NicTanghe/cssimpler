@@ -1,3 +1,8 @@
+mod clipboard;
+mod selection;
+
+use clipboard::TextClipboard;
+use selection::DocumentSelection;
 use std::collections::HashMap;
 
 use crate::core::{
@@ -32,13 +37,15 @@ struct FocusedInput {
     path: ElementPath,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub(super) struct NativeTextInputs {
     states: HashMap<String, NativeTextInputState>,
     focused: Option<FocusedInput>,
     pointer_position: Option<PointerPosition>,
     active_drag: Option<ActiveInputDrag>,
     autofocus_keys: HashMap<usize, String>,
+    clipboard: TextClipboard,
+    document_selection: DocumentSelection,
 }
 
 impl NativeTextInputs {
@@ -73,34 +80,55 @@ impl NativeTextInputs {
         scene: Option<&[RenderNode]>,
         runtime_world: &RuntimeWorld,
     ) -> bool {
+        let selection_cleared = self.document_selection.reconcile(scene, runtime_world);
         let before = self.focused_value();
         let changed = match event {
             EngineEvent::PointerMoved { position, .. } => {
                 self.pointer_position = Some(*position);
-                self.update_drag_selection(scene)
+                let input = self.update_drag_selection(scene);
+                let document = self.document_selection.update(scene, *position);
+                input || document
             }
             EngineEvent::PointerLeft => {
                 self.pointer_position = None;
                 self.active_drag = None;
+                self.document_selection.finish();
                 false
             }
             EngineEvent::PointerButton {
                 button: PointerButton::Primary,
                 state: ButtonState::Pressed,
-                ..
-            } => self.focus_input_at_pointer(scene, runtime_world),
+                modifiers,
+            } => {
+                let cleared = self.document_selection.clear();
+                let input = self.focus_input_at_pointer(scene, runtime_world, modifiers.shift);
+                let document = if self.focused.is_none() {
+                    self.document_selection
+                        .begin(scene, runtime_world, self.pointer_position)
+                } else {
+                    false
+                };
+                cleared || input || document
+            }
             EngineEvent::PointerButton {
                 button: PointerButton::Primary,
                 state: ButtonState::Released,
                 ..
-            } => self.finish_drag_selection(),
+            } => {
+                self.document_selection.finish();
+                self.finish_drag_selection()
+            }
             EngineEvent::TextInput(TextInputEvent::Commit(text)) => self.insert_focused_text(text),
             EngineEvent::TextInput(TextInputEvent::Preedit { .. }) => false,
             EngineEvent::Key(event)
                 if event.state == ButtonState::Pressed
                     && event.logical_key == KeyIdentity::Named("Tab".into()) =>
             {
-                self.focus_next_input(scene, runtime_world, event.modifiers.shift)
+                let changed = self.focus_next_input(scene, runtime_world, event.modifiers.shift);
+                if changed {
+                    self.document_selection.clear();
+                }
+                changed
             }
             EngineEvent::Key(event)
                 if event.state == ButtonState::Pressed
@@ -112,7 +140,12 @@ impl NativeTextInputs {
                     false
                 }
             }
-            EngineEvent::Key(event) => self.handle_key_event(event),
+            EngineEvent::Key(event) => self.handle_key_event(event, scene, runtime_world),
+            EngineEvent::FocusChanged(false) | EngineEvent::Suspended => {
+                self.active_drag = None;
+                self.document_selection.finish();
+                false
+            }
             _ => false,
         };
 
@@ -120,7 +153,7 @@ impl NativeTextInputs {
             self.dispatch_input_if_value_changed(before, runtime_world);
         }
 
-        changed
+        changed || selection_cleared
     }
 
     fn materialize_node(&mut self, node: Node, element_path: Option<ElementPath>) -> Node {
@@ -199,6 +232,8 @@ impl NativeTextInputs {
         stylesheet: &Stylesheet,
         runtime_world: &RuntimeWorld,
     ) {
+        self.document_selection
+            .decorate(scene, stylesheet, runtime_world);
         let Some(focused) = self.focused.as_ref() else {
             return;
         };
@@ -266,6 +301,7 @@ impl NativeTextInputs {
         &mut self,
         scene: Option<&[RenderNode]>,
         runtime_world: &RuntimeWorld,
+        extend: bool,
     ) -> bool {
         let Some(scene) = scene else {
             return self.clear_focus();
@@ -315,7 +351,12 @@ impl NativeTextInputs {
             || state.cursor != cursor
             || state.selection_anchor.is_some();
 
-        state.set_cursor(cursor);
+        let anchor = if extend && self.focused.as_ref().is_some_and(|f| f.key == key) {
+            state.selection_anchor.unwrap_or(state.cursor)
+        } else {
+            cursor
+        };
+        state.set_selection(anchor, cursor);
         self.focused = Some(FocusedInput {
             key: key.clone(),
             path: path.clone(),
@@ -323,7 +364,7 @@ impl NativeTextInputs {
         self.active_drag = Some(ActiveInputDrag {
             key,
             path,
-            anchor: cursor,
+            anchor,
             password: is_password_input(element),
         });
 
@@ -471,29 +512,87 @@ impl NativeTextInputs {
         true
     }
 
-    fn handle_key_event(&mut self, event: &KeyboardEvent) -> bool {
+    fn handle_key_event(
+        &mut self,
+        event: &KeyboardEvent,
+        scene: Option<&[RenderNode]>,
+        world: &RuntimeWorld,
+    ) -> bool {
         if event.state != ButtonState::Pressed {
             return false;
         }
-        if (event.modifiers.control || event.modifiers.super_key)
-            && matches!(&event.logical_key, KeyIdentity::Character(c) if c.eq_ignore_ascii_case("a"))
-        {
+        let command =
+            (event.modifiers.control || event.modifiers.super_key) && !event.modifiers.alt;
+        let character = match &event.logical_key {
+            KeyIdentity::Character(c) => c.to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        let name = match &event.logical_key {
+            KeyIdentity::Named(n) => n.as_str(),
+            _ => "",
+        };
+        let copy = command && character == "c" || event.modifiers.control && name == "Insert";
+        let cut = command && character == "x" || event.modifiers.shift && name == "Delete";
+        let paste = command && character == "v" || event.modifiers.shift && name == "Insert";
+        if self.focused.is_none() {
+            if copy {
+                return self
+                    .document_selection
+                    .selected_text()
+                    .is_some_and(|text| self.clipboard.set_text(text));
+            }
+            if command && character == "a" {
+                return self.document_selection.select_all(scene, world);
+            }
+            if name == "Escape" {
+                return self.document_selection.clear();
+            }
+            return false;
+        }
+        // Resolve the current authored input: its type or editability may have changed.
+        let focused = self.focused.as_ref().unwrap();
+        let Some(root) = world.root_as_node(focused.path.root) else {
+            return false;
+        };
+        let Some(element) = element_at_path(&root, &focused.path) else {
+            return false;
+        };
+        if !is_editable_text_input(element) {
+            return false;
+        }
+        if copy || cut {
+            if is_password_input(element) {
+                return false;
+            }
+            let Some(state) = self.states.get(&focused.key) else {
+                return false;
+            };
+            let Some((start, end)) = state.selection_range() else {
+                return false;
+            };
+            if !self.clipboard.set_text(state.value[start..end].to_owned()) {
+                return false;
+            }
+            return if cut { self.delete_focused() } else { true };
+        }
+        if paste {
+            return self
+                .clipboard
+                .get_text()
+                .is_some_and(|text| self.insert_focused_text(&text));
+        }
+        if command && character == "a" {
             return self.with_focused_state_mut(|state| {
                 state.set_selection(0, state.value.len());
                 true
             });
         }
-        let KeyIdentity::Named(name) = &event.logical_key else {
-            return false;
-        };
-
-        match name.as_str() {
+        match name {
             "Backspace" => self.backspace_focused(),
             "Delete" => self.delete_focused(),
-            "ArrowLeft" => self.move_focused_cursor_left(),
-            "ArrowRight" => self.move_focused_cursor_right(),
-            "Home" => self.move_focused_cursor_home(),
-            "End" => self.move_focused_cursor_end(),
+            "ArrowLeft" | "ArrowRight" | "Home" | "End" => {
+                self.move_focused_cursor(name, event.modifiers.shift)
+            }
             "Escape" => self.clear_focus(),
             _ => false,
         }
@@ -586,55 +685,34 @@ impl NativeTextInputs {
         })
     }
 
-    fn move_focused_cursor_left(&mut self) -> bool {
+    fn move_focused_cursor(&mut self, direction: &str, extend: bool) -> bool {
         self.with_focused_state_mut(|state| {
-            if let Some((start, _)) = state.selection_range() {
-                state.cursor = start;
-                state.selection_anchor = None;
-                return true;
-            }
-            let Some(previous) = previous_char_boundary(&state.value, state.cursor) else {
-                return false;
+            let before = (state.cursor, state.selection_anchor);
+            let anchor = state.selection_anchor.unwrap_or(state.cursor);
+            let cursor = match direction {
+                "Home" => 0,
+                "End" => state.value.len(),
+                "ArrowLeft" => {
+                    if !extend && let Some((start, _)) = state.selection_range() {
+                        start
+                    } else {
+                        previous_char_boundary(&state.value, state.cursor).unwrap_or(0)
+                    }
+                }
+                _ => {
+                    if !extend && let Some((_, end)) = state.selection_range() {
+                        end
+                    } else {
+                        next_char_boundary(&state.value, state.cursor).unwrap_or(state.value.len())
+                    }
+                }
             };
-            state.cursor = previous;
-            true
-        })
-    }
-
-    fn move_focused_cursor_right(&mut self) -> bool {
-        self.with_focused_state_mut(|state| {
-            if let Some((_, end)) = state.selection_range() {
-                state.cursor = end;
-                state.selection_anchor = None;
-                return true;
+            if extend {
+                state.set_selection(anchor, cursor);
+            } else {
+                state.set_cursor(cursor);
             }
-            let Some(next) = next_char_boundary(&state.value, state.cursor) else {
-                return false;
-            };
-            state.cursor = next;
-            true
-        })
-    }
-
-    fn move_focused_cursor_home(&mut self) -> bool {
-        self.with_focused_state_mut(|state| {
-            if state.cursor == 0 && state.selection_anchor.is_none() {
-                return false;
-            }
-            state.cursor = 0;
-            state.selection_anchor = None;
-            true
-        })
-    }
-
-    fn move_focused_cursor_end(&mut self) -> bool {
-        self.with_focused_state_mut(|state| {
-            if state.cursor == state.value.len() && state.selection_anchor.is_none() {
-                return false;
-            }
-            state.cursor = state.value.len();
-            state.selection_anchor = None;
-            true
+            before != (state.cursor, state.selection_anchor)
         })
     }
 }
@@ -837,13 +915,23 @@ fn caret_index_from_pointer(node: &RenderNode, value: &str, x: f32) -> usize {
         return 0;
     }
 
-    let content_x = x - node.layout.x - node.content_inset.left;
+    let caret_stops = layout_text_caret_stops(value, &node.style.text);
+    let full_width = caret_stops.last().map(|stop| stop.offset_px).unwrap_or(0.0);
+    let mut origin = node.layout.x + node.content_inset.left;
+    let mut width = node.layout.width - node.content_inset.left - node.content_inset.right;
+    if let Some(scrollbars) = node.scrollbars {
+        origin -= scrollbars.metrics.offset_x;
+        width += scrollbars.metrics.max_offset_x;
+    }
+    origin += match node.style.text.text_align {
+        crate::fonts::TextAlign::Center => (width - full_width) * 0.5,
+        crate::fonts::TextAlign::Right | crate::fonts::TextAlign::End => width - full_width,
+        _ => 0.0,
+    };
+    let content_x = x - origin;
     if content_x <= 0.0 {
         return 0;
     }
-
-    let caret_stops = layout_text_caret_stops(value, &node.style.text);
-    let full_width = caret_stops.last().map(|stop| stop.offset_px).unwrap_or(0.0);
     if content_x >= full_width {
         return value.len();
     }
@@ -1577,3 +1665,6 @@ mod tests {
         assert!(inputs.focused.is_none());
     }
 }
+
+#[cfg(test)]
+mod editing_tests;

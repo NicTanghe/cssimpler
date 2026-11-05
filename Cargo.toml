@@ -30,6 +30,7 @@ unicode-segmentation = "1.12"
 winit = "0.30.13"
 
 [dependencies]
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 anyhow.workspace = true
 cssimpler-core.workspace = true
 cssimpler-macro.workspace = true
