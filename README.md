@@ -268,7 +268,7 @@ don`t be afraid to put in a request.
 
 ## License
 
-TBD
+MIT
 
 ## Text selection and frameless windows
 
