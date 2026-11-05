@@ -42,6 +42,7 @@ fn selection_preserves_original_text_pixels() {
                     .chain(std::iter::once([0, text.len()].as_slice()))
                 {
                     let selected = node.clone().with_text_edit(TextEditDecoration {
+                        backgrounds: None,
                         caret: None,
                         selection: Some(TextSelectionRange {
                             start: pair[0],
@@ -54,7 +55,9 @@ fn selection_preserves_original_text_pixels() {
                         }),
                     });
                     let mut pixels = vec![0; baseline.len()];
-                    render_to_buffer(&[selected], &mut pixels, 280, 160, Color::WHITE);
+                    let mut scene = vec![selected];
+                    prepare_text_selection_backgrounds(&mut scene);
+                    render_to_buffer(&scene, &mut pixels, 280, 160, Color::WHITE);
                     let different = baseline.iter().zip(&pixels).filter(|(a, b)| a != b).count();
                     assert_eq!(
                         different, 0,
@@ -122,6 +125,7 @@ fn transformed_selection_preserves_original_glyph_positions() {
             None,
             &style,
             &selection,
+            None,
             matrix,
             &clip,
         );

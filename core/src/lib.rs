@@ -400,10 +400,20 @@ pub struct TextSelectionRange {
     pub style: TextSelectionStyle,
 }
 
+/// A non-overlapping piece of a connected selection backdrop. The rectangle
+/// is relative to the owning text content's origin, independent of glyph layout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextSelectionBackground {
+    pub rect: LayoutBox,
+    pub radius: CornerRadius,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TextEditDecoration {
     pub caret: Option<usize>,
     pub selection: Option<TextSelectionRange>,
+    /// Prepared connected backdrop; None lets standalone text paint its own.
+    pub backgrounds: Option<Vec<TextSelectionBackground>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

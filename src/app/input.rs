@@ -235,9 +235,11 @@ impl NativeTextInputs {
         self.document_selection
             .decorate(scene, stylesheet, runtime_world);
         let Some(focused) = self.focused.as_ref() else {
+            renderer::prepare_text_selection_backgrounds(scene);
             return;
         };
         let Some(state) = self.states.get(&focused.key) else {
+            renderer::prepare_text_selection_backgrounds(scene);
             return;
         };
 
@@ -246,7 +248,7 @@ impl NativeTextInputs {
             cache_authored_roots(node, runtime_world, &mut authored_roots);
         }
 
-        for node in scene {
+        for node in scene.iter_mut() {
             Self::decorate_node(
                 node,
                 stylesheet,
@@ -256,6 +258,7 @@ impl NativeTextInputs {
                 state,
             );
         }
+        renderer::prepare_text_selection_backgrounds(scene);
     }
 
     fn decorate_node(
@@ -882,6 +885,7 @@ fn text_edit_decoration(
         });
 
     TextEditDecoration {
+        backgrounds: None,
         caret: selection.is_none().then_some(display_index(state.cursor)),
         selection,
     }
@@ -1404,6 +1408,7 @@ mod tests {
         assert_eq!(
             find_render_node_at_path(&scene, &path).and_then(|node| node.text_edit.as_ref()),
             Some(&TextEditDecoration {
+                backgrounds: None,
                 caret: Some(3),
                 selection: None,
             })

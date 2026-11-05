@@ -220,6 +220,7 @@ mod tests {
                     ..Default::default()
                 })
                 .with_text_edit(TextEditDecoration {
+                    backgrounds: None,
                     caret: None,
                     selection: Some(TextSelectionRange {
                         start: 0,
@@ -234,6 +235,6 @@ mod tests {
         let mut pixels = vec![0; 120 * 60];
         super::super::render_to_buffer(&scene, &mut pixels, 120, 60, Color::WHITE);
         assert_eq!(pixels[20 * 120 + 12], super::super::pack_rgb(color));
-        assert_ne!(pixels[10 * 120 + 10], super::super::pack_rgb(color));
+        assert_ne!(pixels[9 * 120 + 8], super::super::pack_rgb(color));
     }
 }

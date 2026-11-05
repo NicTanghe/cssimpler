@@ -276,7 +276,12 @@ Native text fields support drag selection, Shift+Arrow/Home/End, Shift+click,
 Ctrl/Cmd+A, and clipboard copy/cut/paste. Password fields accept paste but do not
 export their contents through copy or cut. Ordinary page text can be selected
 across text blocks and copied; interactive controls are excluded. Selection
-colours follow `::selection`, with subtly rounded highlights. Selecting text
+colours follow `::selection`. Connected highlights merge into one backdrop with
+only exposed corners rounded. Outer ends have 2px horizontal and 1px vertical
+padding; starts and ends within a bounded 20px range align within each block.
+The union is composited once to avoid seams and doubled opacity at any display
+scale. Manual render-tree clients can call `prepare_text_selection_backgrounds`
+before painting; applications do this automatically. Selecting text
 preserves the original full-run glyph positions, tracking, shaping, and wrapping.
 
 For frameless windows, `WindowConfig::with_drag_region_height(height)` enables a

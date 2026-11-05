@@ -20,11 +20,13 @@ mod input;
 mod native_glass;
 mod runtime;
 mod scrollbar;
+mod selection_geometry;
 mod shadow;
 mod shapes;
 mod softbuffer_dither;
 mod svg;
 mod text_edit;
+pub use selection_geometry::prepare_text_selection_backgrounds;
 mod touch;
 pub use text_edit::text_index_at_position;
 mod transform;
@@ -5008,6 +5010,7 @@ fn draw_text_edit_decorations(
             prepared_text_layout,
             style,
             selection,
+            edit.backgrounds.as_deref(),
             clip,
         );
         return;
@@ -5064,6 +5067,7 @@ fn draw_text_selection(
     prepared_text_layout: Option<&PreparedTextLayout>,
     style: &VisualStyle,
     selection: &TextSelectionRange,
+    backgrounds: Option<&[cssimpler_core::TextSelectionBackground]>,
     clip: ClipRect,
 ) {
     let segments = text_range_segments(
@@ -5075,17 +5079,24 @@ fn draw_text_selection(
         selection.end,
     );
 
-    for segment in &segments {
-        draw_rounded_rect(
-            buffer,
-            width,
-            height,
-            segment.layout,
-            CornerRadius::all(style.text.size_px * 0.1),
-            selection.style.background,
-            clip,
-        );
-    }
+    let owned_backgrounds;
+    let backgrounds = if let Some(backgrounds) = backgrounds {
+        backgrounds
+    } else {
+        owned_backgrounds =
+            selection_geometry::local_backgrounds(layout, &segments, style.text.size_px * 0.1);
+        &owned_backgrounds
+    };
+    selection_geometry::paint_background(
+        buffer,
+        width,
+        height,
+        layout,
+        backgrounds,
+        selection.style.background,
+        AffineTransform::IDENTITY,
+        &ClipState::new(clip),
+    );
 
     let regions: Vec<_> = segments.iter().map(|segment| segment.layout).collect();
     fonts::draw_text_selected(
@@ -5128,6 +5139,7 @@ fn draw_text_edit_decorations_transformed(
             prepared_text_layout,
             style,
             selection,
+            edit.backgrounds.as_deref(),
             matrix,
             clip_state,
         );
@@ -5188,6 +5200,7 @@ fn draw_text_selection_transformed(
     prepared_text_layout: Option<&PreparedTextLayout>,
     style: &VisualStyle,
     selection: &TextSelectionRange,
+    backgrounds: Option<&[cssimpler_core::TextSelectionBackground]>,
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
@@ -5200,18 +5213,24 @@ fn draw_text_selection_transformed(
         selection.end,
     );
 
-    for segment in &segments {
-        draw_transformed_rounded_rect(
-            buffer,
-            width,
-            height,
-            segment.layout,
-            CornerRadius::all(style.text.size_px * 0.1),
-            selection.style.background,
-            matrix,
-            clip_state,
-        );
-    }
+    let owned_backgrounds;
+    let backgrounds = if let Some(backgrounds) = backgrounds {
+        backgrounds
+    } else {
+        owned_backgrounds =
+            selection_geometry::local_backgrounds(layout, &segments, style.text.size_px * 0.1);
+        &owned_backgrounds
+    };
+    selection_geometry::paint_background(
+        buffer,
+        width,
+        height,
+        layout,
+        backgrounds,
+        selection.style.background,
+        matrix,
+        clip_state,
+    );
 
     let regions: Vec<_> = segments.iter().map(|segment| segment.layout).collect();
     fonts::draw_text_selected_transformed(
@@ -7019,6 +7038,37 @@ fn node_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
 
 fn node_own_visual_bounds_untransformed(node: &RenderNode) -> Option<ClipRect> {
     let mut bounds = non_empty_layout_clip(node.layout);
+    if let Some(edit) = &node.text_edit
+        && let Some(selection) = &edit.selection
+        && let RenderKind::Text(content) = &node.kind
+    {
+        let origin = scrollbar::text_layout(node);
+        let owned;
+        let backgrounds = if let Some(backgrounds) = &edit.backgrounds {
+            backgrounds
+        } else {
+            let segments = text_range_segments(
+                origin,
+                content,
+                node.text_layout.as_ref(),
+                &node.style.text,
+                selection.start,
+                selection.end,
+            );
+            owned = selection_geometry::local_backgrounds(
+                origin,
+                &segments,
+                node.style.text.size_px * 0.1,
+            );
+            &owned
+        };
+        for piece in backgrounds {
+            bounds = union_optional_bounds(
+                bounds,
+                non_empty_layout_clip(selection_geometry::absolute(origin, piece)),
+            );
+        }
+    }
 
     if matches!(node.kind, RenderKind::Text(_)) && node.style.text_stroke.width > 0.0 {
         bounds = union_optional_bounds(
@@ -9643,6 +9693,7 @@ mod tests {
                     ..VisualStyle::default()
                 })
                 .with_text_edit(TextEditDecoration {
+                    backgrounds: None,
                     caret: None,
                     selection: Some(TextSelectionRange {
                         start: 1,
