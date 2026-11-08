@@ -10,8 +10,8 @@ use std::time::Instant;
 use self::input::NativeTextInputs;
 use self::scene_transition::SceneTransition;
 use crate::core::{
-    ElementInteractionState, ElementPath, Node, RenderNode, RuntimeDirtyClass, RuntimeDirtyFlags,
-    RuntimeSyncAction, RuntimeSyncPolicy, RuntimeViewport, RuntimeWorld,
+    Color, ElementInteractionState, ElementPath, LayoutBox, Node, RenderNode, RuntimeDirtyClass,
+    RuntimeDirtyFlags, RuntimeSyncAction, RuntimeSyncPolicy, RuntimeViewport, RuntimeWorld,
 };
 use crate::renderer::{self, EngineEvent, FrameInfo, SceneProvider, ViewportSize, WindowConfig};
 use crate::style::{
@@ -482,6 +482,10 @@ where
         &self.state
     }
 
+    pub fn state_mut(&mut self) -> &mut State {
+        &mut self.state
+    }
+
     pub fn runtime_world(&self) -> &RuntimeWorld {
         &self.runtime_world
     }
@@ -505,6 +509,58 @@ where
     pub fn frame(&mut self, frame: FrameInfo) -> Vec<RenderNode> {
         self.advance(frame);
         self.scene().to_vec()
+    }
+
+    pub fn render_rgba8(
+        &mut self,
+        frame: FrameInfo,
+        rgba_out: &mut [u8],
+        width: usize,
+        height: usize,
+        scale_factor: f32,
+        clear_color: Color,
+    ) {
+        let scale = if scale_factor > 0.0 { scale_factor } else { 1.0 };
+        let logical_width = (width as f32 / scale).round().max(1.0) as usize;
+        let logical_height = (height as f32 / scale).round().max(1.0) as usize;
+        self.set_viewport(ViewportSize::new(logical_width, logical_height));
+        self.advance(frame);
+        renderer::render_to_rgba8_at_scale(
+            self.scene(),
+            rgba_out,
+            width,
+            height,
+            clear_color,
+            scale_factor,
+        );
+    }
+
+    pub fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        if self
+            .event_handler
+            .is_some_and(|handler| handler(&mut self.state, event))
+        {
+            self.invalidate(Invalidation::Structure);
+            return true;
+        }
+        if self.text_inputs.handle_engine_event(
+            event,
+            self.cached_scene.as_deref(),
+            &self.runtime_world,
+        ) {
+            self.invalidate(Invalidation::Structure);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
+        self.set_interaction_state(interaction)
+    }
+
+    pub fn find_element_bounds_by_id(&self, id: &str) -> Option<LayoutBox> {
+        renderer::find_element_bounds_by_id(self.scene(), id)
     }
 
     pub fn run(self, config: WindowConfig) -> renderer::Result<()> {
@@ -871,27 +927,11 @@ where
     }
 
     fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
-        App::set_interaction_state(self, interaction)
+        App::set_element_interaction(self, interaction)
     }
 
     fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
-        if self
-            .event_handler
-            .is_some_and(|handler| handler(&mut self.state, event))
-        {
-            self.invalidate(Invalidation::Structure);
-            return true;
-        }
-        if self.text_inputs.handle_engine_event(
-            event,
-            self.cached_scene.as_deref(),
-            &self.runtime_world,
-        ) {
-            self.invalidate(Invalidation::Structure);
-            true
-        } else {
-            false
-        }
+        App::handle_engine_event(self, event)
     }
 
     fn redraw_schedule(&self) -> renderer::RedrawSchedule {
@@ -1010,6 +1050,10 @@ where
         &self.state
     }
 
+    pub fn state_mut(&mut self) -> &mut State {
+        &mut self.state
+    }
+
     pub fn runtime_world(&self) -> &RuntimeWorld {
         &self.runtime_world
     }
@@ -1033,6 +1077,58 @@ where
     pub fn frame(&mut self, frame: FrameInfo) -> Vec<RenderNode> {
         self.advance(frame);
         self.scene().to_vec()
+    }
+
+    pub fn render_rgba8(
+        &mut self,
+        frame: FrameInfo,
+        rgba_out: &mut [u8],
+        width: usize,
+        height: usize,
+        scale_factor: f32,
+        clear_color: Color,
+    ) {
+        let scale = if scale_factor > 0.0 { scale_factor } else { 1.0 };
+        let logical_width = (width as f32 / scale).round().max(1.0) as usize;
+        let logical_height = (height as f32 / scale).round().max(1.0) as usize;
+        self.set_viewport(ViewportSize::new(logical_width, logical_height));
+        self.advance(frame);
+        renderer::render_to_rgba8_at_scale(
+            self.scene(),
+            rgba_out,
+            width,
+            height,
+            clear_color,
+            scale_factor,
+        );
+    }
+
+    pub fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        if self
+            .event_handler
+            .is_some_and(|handler| handler(&mut self.state, event))
+        {
+            self.invalidate(Invalidation::Structure);
+            return true;
+        }
+        if self.text_inputs.handle_engine_event(
+            event,
+            self.cached_scene.as_deref(),
+            &self.runtime_world,
+        ) {
+            self.invalidate(Invalidation::Structure);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
+        self.set_interaction_state(interaction)
+    }
+
+    pub fn find_element_bounds_by_id(&self, id: &str) -> Option<LayoutBox> {
+        renderer::find_element_bounds_by_id(self.scene(), id)
     }
 
     pub fn run(self, config: WindowConfig) -> renderer::Result<()> {
@@ -1204,7 +1300,7 @@ where
             .map(|viewport| ViewportSize::new(viewport.width, viewport.height))
     }
 
-    fn scene(&self) -> &[RenderNode] {
+    pub fn scene(&self) -> &[RenderNode] {
         self.cached_scene
             .as_deref()
             .expect("fragment app scene should be cached after the first frame")
@@ -1326,27 +1422,11 @@ where
     }
 
     fn set_element_interaction(&mut self, interaction: ElementInteractionState) -> bool {
-        FragmentApp::set_interaction_state(self, interaction)
+        FragmentApp::set_element_interaction(self, interaction)
     }
 
     fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
-        if self
-            .event_handler
-            .is_some_and(|handler| handler(&mut self.state, event))
-        {
-            self.invalidate(Invalidation::Structure);
-            return true;
-        }
-        if self.text_inputs.handle_engine_event(
-            event,
-            self.cached_scene.as_deref(),
-            &self.runtime_world,
-        ) {
-            self.invalidate(Invalidation::Structure);
-            true
-        } else {
-            false
-        }
+        FragmentApp::handle_engine_event(self, event)
     }
 
     fn redraw_schedule(&self) -> renderer::RedrawSchedule {
@@ -3236,5 +3316,133 @@ mod viewport_and_lifecycle_tests {
         ));
         assert!(*app.state());
         assert!(SceneProvider::needs_redraw(&app));
+    }
+
+    #[test]
+    fn headless_embed_api_state_mut_event_and_render_rgba8() {
+        use crate::app::{Fragment, FragmentApp};
+        use crate::core::Color;
+        use crate::renderer::{ButtonState, EngineEvent, KeyIdentity, KeyboardEvent};
+        use crate::style::parse_stylesheet;
+        use crate::ui;
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct HostState {
+            counter: usize,
+            action: String,
+        }
+
+        let stylesheet = parse_stylesheet(r#"
+            #viewport-3d { background-color: rgb(255, 0, 0); width: 50px; height: 50px; }
+            #viewport-2d { width: 50px; height: 50px; }
+            .button { width: 100px; height: 100px; }
+        "#).unwrap();
+
+        let mut app = App::new(
+            HostState { counter: 0, action: "initial".into() },
+            &stylesheet,
+            |state, _frame| {
+                state.counter += 1;
+                Invalidation::Structure
+            },
+            |_state| {
+                ui! {
+                    <div>
+                        <div id="viewport-3d" />
+                        <div id="viewport-2d" />
+                        <div class="button" />
+                    </div>
+                }
+            },
+        ).with_event_handler(|state, event| {
+            if matches!(event, EngineEvent::Key(k) if k.state == ButtonState::Pressed) {
+                state.action = "key_pressed".into();
+                true
+            } else {
+                false
+            }
+        });
+
+        // 1. Verify state_mut
+        assert_eq!(app.state().counter, 0);
+        app.state_mut().counter = 42;
+        assert_eq!(app.state().counter, 42);
+
+        // 2. Verify handle_engine_event
+        let handled = app.handle_engine_event(&EngineEvent::Key(KeyboardEvent {
+            logical_key: KeyIdentity::Named("Enter".into()),
+            physical_key: None,
+            location: Default::default(),
+            state: ButtonState::Pressed,
+            repeat: false,
+            modifiers: Default::default(),
+        }));
+        assert!(handled);
+        assert_eq!(app.state().action, "key_pressed");
+
+        // 3. Verify render_rgba8 headlessly
+        let width = 100;
+        let height = 100;
+        let mut rgba = vec![0u8; width * height * 4];
+        app.render_rgba8(
+            FrameInfo { delta: Duration::from_millis(16), frame_index: 0 },
+            &mut rgba,
+            width,
+            height,
+            1.0,
+            Color::rgba(0, 0, 0, 0),
+        );
+
+        // Advance increased counter from 42 to 43
+        assert_eq!(app.state().counter, 43);
+
+        // Verify find_element_bounds_by_id on app
+        let bounds_3d = app.find_element_bounds_by_id("#viewport-3d");
+        assert!(bounds_3d.is_some());
+        assert_eq!(bounds_3d.unwrap().width, 50.0);
+
+        let bounds_2d = app.find_element_bounds_by_id("viewport-2d");
+        assert!(bounds_2d.is_some());
+        assert_eq!(bounds_2d.unwrap().width, 50.0);
+
+        // Verify rgba buffer has painted pixels for the red button
+        let idx = (10 * width + 10) * 4;
+        assert_eq!(rgba[idx], 255); // R
+        assert_eq!(rgba[idx + 3], 255); // A
+
+        // 4. Verify FragmentApp embedding methods as well
+        let mut fragment_app = FragmentApp::new(
+            HostState { counter: 10, action: "frag".into() },
+            &stylesheet,
+            |state, _frame| {
+                state.counter += 1;
+                Invalidation::Structure
+            },
+            [
+                Fragment::new("root", |_| {
+                    ui! {
+                        <div>
+                            <div id="viewport-3d" />
+                        </div>
+                    }
+                }),
+            ],
+        );
+
+        fragment_app.state_mut().counter = 99;
+        assert_eq!(fragment_app.state().counter, 99);
+
+        let mut frag_rgba = vec![0u8; width * height * 4];
+        fragment_app.render_rgba8(
+            FrameInfo { delta: Duration::from_millis(16), frame_index: 0 },
+            &mut frag_rgba,
+            width,
+            height,
+            1.0,
+            Color::rgba(0, 0, 0, 0),
+        );
+        assert_eq!(fragment_app.state().counter, 100);
+        let frag_bounds = fragment_app.find_element_bounds_by_id("#viewport-3d");
+        assert!(frag_bounds.is_some());
     }
 }

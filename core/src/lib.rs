@@ -862,6 +862,14 @@ pub struct RenderNode {
 }
 
 impl RenderNode {
+    pub fn id(&self) -> Option<&str> {
+        self.element_id.as_deref()
+    }
+
+    pub fn bounds(&self) -> LayoutBox {
+        self.layout
+    }
+
     pub fn container(layout: LayoutBox) -> Self {
         Self {
             kind: RenderKind::Container,
