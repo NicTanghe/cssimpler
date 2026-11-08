@@ -54,8 +54,8 @@ use self::{
     },
 };
 use cssimpler_core::{
-    BackdropOcclusion, BorderLineStyle, Color, CornerRadius, ElementInteractionState, ElementPath,
-    EventHandler, ExtractedScene, LayoutBox, LinearRgba, NativeMaterial, RenderKind, RenderNode,
+    BackdropOcclusion, BorderLineStyle, CornerRadius, ElementInteractionState, ElementPath,
+    EventHandler, ExtractedScene, LinearRgba, NativeMaterial, RenderKind,
     TextEditDecoration, TextSelectionRange, TransformMatrix3d, TransformStyleMode, VisualStyle,
     establishes_stacking_context,
     fonts::{PreparedTextLayout, TextAlign, TextStyle, layout_text_block},
@@ -64,11 +64,10 @@ use cssimpler_core::{
 use softbuffer::SoftBufferError;
 use winit::error::{EventLoopError, OsError};
 
-#[cfg(any(test, target_os = "macos"))]
-pub(crate) use self::color::unpack_alpha8;
+pub use cssimpler_core::{Color, LayoutBox, RenderNode};
 pub(crate) use self::color::{
     is_transparent, pack_linear_rgb, pack_rgb, pack_rgba, pack_softbuffer_rgb, pack_transparent,
-    unpack_linear_rgb, unpack_rgb,
+    u10_to_u8_channel, unpack_alpha8, unpack_linear_rgb, unpack_rgb, unpack_rgb10,
 };
 pub use self::input::{
     ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
@@ -1808,6 +1807,91 @@ pub fn render_to_buffer_at_scale(
     render_to_buffer(&scene, buffer, width, height, clear_color);
 }
 
+/// Unpack a 10-bit packed RGB pixel and 2-bit or optional 8-bit alpha into RGBA8 bytes.
+pub fn unpack_rgba8(pixel: u32, alpha_override: Option<u8>) -> [u8; 4] {
+    let (r, g, b) = unpack_rgb10(pixel);
+    [
+        u10_to_u8_channel(r),
+        u10_to_u8_channel(g),
+        u10_to_u8_channel(b),
+        alpha_override.unwrap_or_else(|| unpack_alpha8(pixel)),
+    ]
+}
+
+/// Render a logical scene into an 8-bit RGBA pixel slice (`width * height * 4` bytes).
+/// Unpainted or transparent regions retain `clear_color.a` (or 0 when clear_color has alpha 0).
+pub fn render_to_rgba8(
+    scene: &[RenderNode],
+    rgba_out: &mut [u8],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+) {
+    let pixel_count = width
+        .checked_mul(height)
+        .expect("render dimensions overflow");
+    assert_eq!(
+        rgba_out.len(),
+        pixel_count * 4,
+        "rgba_out buffer length must match width * height * 4"
+    );
+
+    let mut color_buffer = vec![pack_rgba(clear_color); pixel_count];
+    let mut alpha_buffer = vec![clear_color.a; pixel_count];
+
+    let _ = render_to_buffer_internal_from_roots_with_alpha(
+        scene,
+        &mut color_buffer,
+        width,
+        height,
+        clear_color,
+        GlassRenderMode::Fallback,
+        Some(&mut alpha_buffer),
+    );
+
+    for (out_pixel, (&pixel, &alpha)) in rgba_out
+        .chunks_exact_mut(4)
+        .zip(color_buffer.iter().zip(alpha_buffer.iter()))
+    {
+        out_pixel.copy_from_slice(&unpack_rgba8(pixel, Some(alpha)));
+    }
+}
+
+/// Render a logical scene into an 8-bit RGBA pixel slice at `scale_factor`.
+/// Layout and hit testing remain in logical CSS pixels.
+pub fn render_to_rgba8_at_scale(
+    scene: &[RenderNode],
+    rgba_out: &mut [u8],
+    width: usize,
+    height: usize,
+    clear_color: Color,
+    scale_factor: f32,
+) {
+    let scene = dpi::device_scene(scene.to_vec(), scale_factor);
+    render_to_rgba8(&scene, rgba_out, width, height, clear_color);
+}
+
+/// Recursively search a `RenderNode` tree for an element matching `id` (with or without `#` prefix),
+/// returning its layout box.
+pub fn find_element_bounds_by_id(scene: &[RenderNode], id: &str) -> Option<LayoutBox> {
+    let normalized_query = id.strip_prefix('#').unwrap_or(id);
+    fn find_in_node(node: &RenderNode, normalized_query: &str) -> Option<LayoutBox> {
+        if let Some(ref elem_id) = node.element_id {
+            let normalized_elem = elem_id.strip_prefix('#').unwrap_or(elem_id);
+            if normalized_elem == normalized_query {
+                return Some(node.layout);
+            }
+        }
+        for child in &node.children {
+            if let Some(bounds) = find_in_node(child, normalized_query) {
+                return Some(bounds);
+            }
+        }
+        None
+    }
+    scene.iter().find_map(|node| find_in_node(node, normalized_query))
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn render_to_buffer_internal(
     scene: &ExtractedScene,
@@ -1968,8 +2052,8 @@ fn render_to_buffer_serial(
     alpha_buffer: Option<&mut [u8]>,
 ) {
     with_render_alpha_target(alpha_buffer, || {
-        buffer.fill(pack_rgb(clear_color));
-        fill_current_alpha_span(0, buffer.len(), u8::MAX);
+        buffer.fill(pack_rgba(clear_color));
+        fill_current_alpha_span(0, buffer.len(), clear_color.a);
         let clip = ClipRect::full(width as f32, height as f32);
 
         for index in sorted_scene_indices(scene) {
@@ -2016,7 +2100,7 @@ fn render_to_buffer_parallel(
         );
     }
 
-    let clear = pack_rgb(clear_color);
+    let clear = pack_rgba(clear_color);
     // More tasks than execution threads keep a single effect-heavy row band
     // from becoming the tail of the whole frame. This also leaves queued work
     // for the calling thread to steal after it finishes its first band.
@@ -2061,7 +2145,7 @@ fn render_to_buffer_parallel(
                     with_render_alpha_target(Some(worker_alpha_buffer), || {
                         with_render_buffer_rows(rows, || {
                             worker_buffer.fill(clear);
-                            fill_current_alpha_span(0, worker_buffer.len(), u8::MAX);
+                            fill_current_alpha_span(0, worker_buffer.len(), clear_color.a);
                             draw_cached_root_indices(
                                 scene,
                                 &cached_bounds.roots,
@@ -2373,7 +2457,7 @@ fn render_scene_update_parallel(
         .map(|rows| rows.pixel_len(width))
         .max()
         .unwrap_or_default();
-    let clear = pack_rgb(clear_color);
+    let clear = pack_rgba(clear_color);
     let worker_buffer_lengths = vec![worker_buffer_len; worker_count];
     let mut worker_buffers = acquire_worker_buffers(&worker_buffer_lengths);
     let next_job = AtomicUsize::new(0);
@@ -2398,7 +2482,7 @@ fn render_scene_update_parallel(
                     };
                     let rows = job_rows[job_index];
                     with_render_buffer_rows(rows, || {
-                        clear_clip_packed(worker_buffer, width, height, job.clip, clear);
+                        clear_clip_packed(worker_buffer, width, height, job.clip, clear, clear_color.a);
                         draw_cached_root_indices(
                             scene,
                             cached_bounds,
@@ -5883,7 +5967,7 @@ fn clear_rounded_rect_to_scene(
         return;
     };
 
-    let clear = pack_rgb(clear_color);
+    let clear = pack_rgba(clear_color);
     let clear = if render_alpha_target_active() {
         pack_transparent()
     } else {
@@ -5993,7 +6077,7 @@ fn clear_transformed_rounded_rect_to_scene(
         return;
     };
 
-    let clear = pack_rgb(clear_color);
+    let clear = pack_rgba(clear_color);
     let clear = if render_alpha_target_active() {
         pack_transparent()
     } else {
@@ -7123,10 +7207,17 @@ fn transform_bounds_with_context(
 }
 
 fn clear_clip(buffer: &mut [u32], width: usize, height: usize, clip: ClipRect, clear_color: Color) {
-    clear_clip_packed(buffer, width, height, clip, pack_rgb(clear_color));
+    clear_clip_packed(buffer, width, height, clip, pack_rgba(clear_color), clear_color.a);
 }
 
-fn clear_clip_packed(buffer: &mut [u32], width: usize, height: usize, clip: ClipRect, clear: u32) {
+fn clear_clip_packed(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    clip: ClipRect,
+    clear: u32,
+    clear_alpha: u8,
+) {
     let Some((x0, y0, x1, y1)) = clip_pixel_bounds(clip, width, height) else {
         return;
     };
@@ -7139,7 +7230,7 @@ fn clear_clip_packed(buffer: &mut [u32], width: usize, height: usize, clip: Clip
         let start = local_row_start + x0 as usize;
         let end = local_row_start + x1 as usize;
         buffer[start..end].fill(clear);
-        fill_current_alpha_span(start, end - start, u8::MAX);
+        fill_current_alpha_span(start, end - start, clear_alpha);
     }
 }
 
@@ -7160,7 +7251,7 @@ fn resize_buffer(
 
     *width = next_width;
     *height = next_height;
-    buffer.resize(next_width * next_height, pack_rgb(clear_color));
+    buffer.resize(next_width * next_height, pack_rgba(clear_color));
 }
 
 fn full_redraw_worker_count(width: usize, height: usize) -> usize {
@@ -12812,6 +12903,116 @@ mod tests {
                 y1: 200.0,
             }
         );
+    }
+
+    #[test]
+    fn test_unpack_rgba8() {
+        use super::unpack_rgba8;
+        use crate::color::pack_rgb;
+
+        let pixel = pack_rgb(Color::rgb(255, 100, 50));
+        let unpacked = unpack_rgba8(pixel, None);
+        assert_eq!(unpacked, [255, 100, 50, 255]);
+
+        let unpacked_override = unpack_rgba8(pixel, Some(128));
+        assert_eq!(unpacked_override, [255, 100, 50, 128]);
+
+        let transparent_pixel = pack_rgba(Color::rgba(0, 0, 0, 0));
+        let unpacked_trans = unpack_rgba8(transparent_pixel, None);
+        assert_eq!(unpacked_trans, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_render_to_rgba8_transparent_clear_color_and_accurate_alpha() {
+        use super::{render_to_rgba8, render_to_rgba8_at_scale};
+
+        let opaque_node = RenderNode::container(LayoutBox::new(0.0, 0.0, 10.0, 10.0))
+            .with_style(VisualStyle {
+                background: Some(Color::rgb(255, 0, 0)),
+                ..VisualStyle::default()
+            });
+
+        let translucent_node = RenderNode::container(LayoutBox::new(10.0, 0.0, 10.0, 10.0))
+            .with_style(VisualStyle {
+                background: Some(Color::rgba(0, 255, 0, 128)),
+                ..VisualStyle::default()
+            });
+
+        let scene = vec![opaque_node, translucent_node];
+        let width = 20;
+        let height = 20;
+        let mut rgba = vec![255u8; width * height * 4];
+
+        render_to_rgba8(&scene, &mut rgba, width, height, Color::rgba(0, 0, 0, 0));
+
+        // Unpainted region (x: 5, y: 15) must be strictly [0, 0, 0, 0]
+        let unpainted_idx = (15 * width + 5) * 4;
+        assert_eq!(
+            &rgba[unpainted_idx..unpainted_idx + 4],
+            &[0, 0, 0, 0],
+            "unpainted region must have zero alpha and zero color"
+        );
+
+        // Opaque red region (x: 5, y: 5) must be [255, 0, 0, 255]
+        let opaque_idx = (5 * width + 5) * 4;
+        assert_eq!(
+            &rgba[opaque_idx..opaque_idx + 4],
+            &[255, 0, 0, 255],
+            "opaque panel must render accurate RGBA8"
+        );
+
+        // Translucent green region (x: 15, y: 5) must have green=255 and alpha close to 128
+        let trans_idx = (5 * width + 15) * 4;
+        let trans_pixel = &rgba[trans_idx..trans_idx + 4];
+        assert_eq!(trans_pixel[0], 0);
+        assert_eq!(trans_pixel[1], 255);
+        assert_eq!(trans_pixel[2], 0);
+        assert!(
+            (trans_pixel[3] as i32 - 128).abs() <= 1,
+            "translucent panel alpha expected ~128, got {}",
+            trans_pixel[3]
+        );
+
+        // Render at scale
+        let mut rgba_scaled = vec![0u8; 40 * 40 * 4];
+        render_to_rgba8_at_scale(&scene, &mut rgba_scaled, 40, 40, Color::rgba(0, 0, 0, 0), 2.0);
+        let scaled_unpainted_idx = (30 * 40 + 10) * 4;
+        assert_eq!(&rgba_scaled[scaled_unpainted_idx..scaled_unpainted_idx + 4], &[0, 0, 0, 0]);
+        let scaled_opaque_idx = (10 * 40 + 10) * 4;
+        assert_eq!(&rgba_scaled[scaled_opaque_idx..scaled_opaque_idx + 4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn test_find_element_bounds_by_id_locates_viewports() {
+        use super::find_element_bounds_by_id;
+
+        let vp_3d = RenderNode::container(LayoutBox::new(0.0, 0.0, 1280.0, 720.0))
+            .with_element_id("viewport-3d");
+        let vp_2d = RenderNode::container(LayoutBox::new(1280.0, 0.0, 640.0, 720.0))
+            .with_element_id("#viewport-2d");
+
+        let root = RenderNode::container(LayoutBox::new(0.0, 0.0, 1920.0, 720.0))
+            .with_children(vec![vp_3d, vp_2d]);
+
+        let scene = vec![root];
+
+        assert_eq!(
+            find_element_bounds_by_id(&scene, "viewport-3d"),
+            Some(LayoutBox::new(0.0, 0.0, 1280.0, 720.0))
+        );
+        assert_eq!(
+            find_element_bounds_by_id(&scene, "#viewport-3d"),
+            Some(LayoutBox::new(0.0, 0.0, 1280.0, 720.0))
+        );
+        assert_eq!(
+            find_element_bounds_by_id(&scene, "viewport-2d"),
+            Some(LayoutBox::new(1280.0, 0.0, 640.0, 720.0))
+        );
+        assert_eq!(
+            find_element_bounds_by_id(&scene, "#viewport-2d"),
+            Some(LayoutBox::new(1280.0, 0.0, 640.0, 720.0))
+        );
+        assert_eq!(find_element_bounds_by_id(&scene, "unknown"), None);
     }
 }
 
