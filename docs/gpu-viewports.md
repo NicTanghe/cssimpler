@@ -4,11 +4,18 @@ Enable the optional `gpu-viewport` feature to embed a `wgpu` viewport in the
 CPU-rendered UI. Default builds retain the existing CPU-only path and do not
 include the GPU or USD dependencies.
 
-The first native backend uses Windows DirectComposition visuals. These are
-separate presentation surfaces above the parent UI, sharing one GPU device.
+Native backends use Windows DirectComposition visuals or Linux X11 child windows.
+These are separate presentation surfaces above the parent UI, sharing one GPU device.
 Transparent pixels reveal CSSimpler's background; the CPU UI is not uploaded to
-the GPU. macOS, X11, and Wayland embedding are still pending and currently return
-an explicit unsupported-platform error when a visible viewport is registered.
+the GPU. X11 transparency uses an ARGB visual and automatic X Composite
+redirection; X Shape 1.1 keeps input on the parent window. Transparent X11 views
+require X Composite 0.4 and an ARGB visual. macOS and native Wayland embedding
+are still pending and return an explicit unsupported-platform error when a
+visible viewport is registered. On Wayland desktops with XWayland, use:
+
+```sh
+env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET cargo run --features gpu-viewport --example usd_glass_cube
+```
 
 ## Try the USD preview
 

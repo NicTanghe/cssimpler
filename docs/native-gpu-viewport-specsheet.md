@@ -1,7 +1,7 @@
 # Native GPU and USD viewport specsheet
 
 Date: 2026-11-09  
-Status: **Implementation in progress — experimental Windows backend**
+Status: **Implementation in progress — experimental Windows and X11 backends**
 
 This document records the agreed target and acceptance criteria. Implementation
 has started behind the optional feature; the complete cross-platform target is
@@ -12,8 +12,10 @@ Current progress (2026-11-09):
 
 - Feature gating, registration on both application types, a shared lazy device,
   and independent GPU scheduling are implemented.
-- The initial Windows host uses DirectComposition visuals for opaque and
-  transparent output. macOS, X11, and Wayland native hosts remain pending.
+- The Windows host uses DirectComposition visuals for opaque and transparent
+  output. Linux X11 uses child windows with empty input shapes and automatic
+  X Composite redirection for ARGB output. macOS and Wayland native hosts remain
+  pending.
 - The initial USD backend renders mesh cages with flat studio shading and USD
   cameras. USD materials and lights remain canonical stage data; evaluating their
   shading and lighting is still pending. Orbit cameras currently use a separate

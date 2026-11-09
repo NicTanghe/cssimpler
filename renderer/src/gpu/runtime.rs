@@ -105,6 +105,8 @@ impl GpuRuntime {
             if self.live[index].is_none() {
                 let host =
                     native::NativeHost::new(event_loop, parent.clone(), entry.options.transparent)?;
+                // X11 swapchains derive their extent from the native child window.
+                host.place(origin, physical_size)?;
                 let instance = self.instance.get_or_insert_with(wgpu::Instance::default);
                 // SAFETY: LiveViewport retains the host and drops the surface first.
                 let surface =
@@ -146,6 +148,13 @@ impl GpuRuntime {
                     [
                         wgpu::CompositeAlphaMode::PreMultiplied,
                         wgpu::CompositeAlphaMode::PostMultiplied,
+                        // X11 delegates premultiplied ARGB composition to XRender.
+                        #[cfg(target_os = "linux")]
+                        wgpu::CompositeAlphaMode::Inherit,
+                        // NVIDIA X11 exposes only Opaque. Our redirected ARGB child
+                        // retains alpha; X Composite performs the blending itself.
+                        #[cfg(target_os = "linux")]
+                        wgpu::CompositeAlphaMode::Opaque,
                     ]
                     .into_iter()
                     .find(|m| caps.alpha_modes.contains(m))
@@ -165,7 +174,16 @@ impl GpuRuntime {
                     physical_size,
                     scale_factor: scale,
                     format: config.format,
-                    alpha_mode: config.alpha_mode,
+                    alpha_mode: if cfg!(target_os = "linux")
+                        && entry.options.transparent
+                        && config.alpha_mode == wgpu::CompositeAlphaMode::Opaque
+                    {
+                        // Describe the renderer's pixel encoding, independent of the
+                        // WSI mode when native X Composite owns alpha composition.
+                        wgpu::CompositeAlphaMode::PreMultiplied
+                    } else {
+                        config.alpha_mode
+                    },
                 };
                 let factory = entry
                     .factory
@@ -189,6 +207,8 @@ impl GpuRuntime {
                 });
             }
             let live = self.live[index].as_mut().unwrap();
+            // Resize the native drawable before reconfiguring its swapchain.
+            live.host.place(origin, physical_size)?;
             let info = GpuViewportInfo {
                 bounds,
                 physical_size,
@@ -201,6 +221,7 @@ impl GpuRuntime {
                     live.config.height = physical_size[1];
                     live.surface
                         .configure(&self.gpu.as_ref().unwrap().device, &live.config);
+                    live.host.commit()?;
                 }
                 live.info = info;
                 live.renderer.resize(self.gpu.as_ref().unwrap(), info)?;
@@ -209,7 +230,6 @@ impl GpuRuntime {
             if !live.visible {
                 entry.redraw.0.dirty.store(true, Ordering::Release);
             }
-            live.host.place(origin, physical_size)?;
             live.visible = true;
         }
         Ok(())

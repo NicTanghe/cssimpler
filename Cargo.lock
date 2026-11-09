@@ -538,6 +538,8 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "winit",
+ "x11-dl",
+ "x11rb",
 ]
 
 [[package]]

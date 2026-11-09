@@ -6,6 +6,12 @@ use winit::{event_loop::ActiveEventLoop, window::Window};
 #[cfg(windows)]
 pub(super) use win32::NativeHost;
 
+#[cfg(target_os = "linux")]
+#[path = "native/x11.rs"]
+mod x11;
+#[cfg(target_os = "linux")]
+pub(super) use x11::NativeHost;
+
 #[cfg(windows)]
 mod win32 {
     use super::*;
@@ -116,9 +122,9 @@ mod win32 {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub(super) struct NativeHost;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 impl NativeHost {
     pub fn new(_: &ActiveEventLoop, _: Arc<Window>, _: bool) -> Result<Self> {
         Err(error(

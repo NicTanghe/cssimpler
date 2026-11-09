@@ -47,6 +47,8 @@ pub struct GpuViewportInfo {
     pub physical_size: [u32; 2],
     pub scale_factor: f64,
     pub format: wgpu::TextureFormat,
+    /// Alpha encoding expected from the renderer. Native composition may use a
+    /// different swapchain mode (for example, redirected X11 ARGB windows).
     pub alpha_mode: wgpu::CompositeAlphaMode,
 }
 
