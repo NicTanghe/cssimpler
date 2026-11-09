@@ -39,6 +39,14 @@ use super::{
     to_softbuffer_rgb_blue_noise, to_softbuffer_rgb_blue_noise_with_alpha,
 };
 
+#[cfg(feature = "gpu-viewport")]
+#[derive(Clone, Copy, Debug)]
+enum RuntimeEvent {
+    GpuRedraw,
+}
+#[cfg(not(feature = "gpu-viewport"))]
+type RuntimeEvent = ();
+
 const DEFAULT_NATIVE_GLASS_TINT: Color = Color::rgba(245, 250, 255, 128);
 static SYSTEM_DRAG_OVERRIDE: AtomicBool = AtomicBool::new(false);
 
@@ -163,9 +171,20 @@ pub(super) fn run_with_scene_provider<P>(config: WindowConfig, scene_provider: P
 where
     P: SceneProvider,
 {
-    let event_loop = EventLoop::new().map_err(RendererError::from)?;
+    let event_loop = EventLoop::<RuntimeEvent>::with_user_event()
+        .build()
+        .map_err(RendererError::from)?;
     let context = Context::new(event_loop.owned_display_handle()).map_err(RendererError::from)?;
     let mut app = RuntimeApp::new(config, scene_provider, context);
+    #[cfg(feature = "gpu-viewport")]
+    {
+        let gpu = super::gpu::runtime::GpuRuntime::new(app.scene_provider.take_gpu_viewports())?;
+        let proxy = event_loop.create_proxy();
+        gpu.install_wake(move || {
+            let _ = proxy.send_event(RuntimeEvent::GpuRedraw);
+        });
+        app.gpu = Some(gpu);
+    }
     event_loop.run_app(&mut app).map_err(RendererError::from)?;
     app.finish()
 }
@@ -214,6 +233,8 @@ fn resize_direction_at(
 }
 
 struct RuntimeApp<P> {
+    #[cfg(feature = "gpu-viewport")]
+    gpu: Option<super::gpu::runtime::GpuRuntime>,
     config: WindowConfig,
     scene_provider: P,
     context: Context<OwnedDisplayHandle>,
@@ -266,6 +287,8 @@ where
 {
     fn new(config: WindowConfig, scene_provider: P, context: Context<OwnedDisplayHandle>) -> Self {
         Self {
+            #[cfg(feature = "gpu-viewport")]
+            gpu: None,
             config,
             scene_provider,
             context,
@@ -313,7 +336,44 @@ where
         }
     }
 
+    fn schedule_ui_redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if self.scene_provider.wants_close() {
+            event_loop.exit();
+            return;
+        }
+        if self.window.is_none() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        if self.immediate_redraw {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            self.request_redraw_if_possible();
+            return;
+        }
+        if !self.can_draw() {
+            self.next_redraw_at = None;
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        if self.wants_continuous_redraw() {
+            let deadline = self
+                .next_redraw_at
+                .unwrap_or_else(|| Instant::now() + self.config.frame_time);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            if Instant::now() >= deadline {
+                self.request_redraw_if_possible();
+            }
+        } else {
+            self.next_redraw_at = None;
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+
     fn finish(mut self) -> Result<()> {
+        #[cfg(feature = "gpu-viewport")]
+        {
+            self.gpu = None;
+        }
         self.clear_native_glass();
         self.surface = None;
         self.window = None;
@@ -419,9 +479,43 @@ where
         self.request_redraw_if_possible();
     }
 
-    fn handle_engine_event(&mut self, _event_loop: &ActiveEventLoop, event: EngineEvent) {
+    fn handle_engine_event(&mut self, _event_loop: &ActiveEventLoop, event: EngineEvent) -> bool {
+        #[cfg(feature = "gpu-viewport")]
+        {
+            if self.scene_provider.handle_application_event(&event) {
+                self.request_immediate_redraw();
+                return true;
+            }
+            if self.gpu.as_mut().is_some_and(|gpu| gpu.event(&event)) {
+                if matches!(
+                    event,
+                    EngineEvent::PointerButton {
+                        state: ButtonState::Pressed,
+                        ..
+                    }
+                ) && self.scene_provider.focus_gpu_viewport()
+                {
+                    self.request_immediate_redraw();
+                }
+                self.pending_wheel = None;
+                self.left_down = false;
+                self.right_down = false;
+                self.middle_down = false;
+                self.left_press_target = None;
+                return true;
+            }
+            if self.scene_provider.handle_ui_event(&event) {
+                self.request_immediate_redraw();
+                return true;
+            }
+            return false;
+        }
+        #[cfg(not(feature = "gpu-viewport"))]
         if self.scene_provider.handle_engine_event(&event) {
             self.request_immediate_redraw();
+            true
+        } else {
+            false
         }
     }
 
@@ -625,6 +719,10 @@ where
 
     fn prepare_suspend(&mut self, event_loop: &ActiveEventLoop) {
         self.suspended = true;
+        #[cfg(feature = "gpu-viewport")]
+        if let Some(gpu) = &mut self.gpu {
+            gpu.hide();
+        }
         self.clear_native_glass();
         let _ = self.scrollbar_controller.cancel_middle_button_auto_scroll();
         self.surface = None;
@@ -876,6 +974,18 @@ where
         }
 
         frame_stats.scene_prep_us = duration_to_us(scene_prep_start.elapsed());
+        #[cfg(feature = "gpu-viewport")]
+        if let Some(gpu) = &mut self.gpu {
+            if let Err(error) = gpu.sync(
+                event_loop,
+                self.window.as_ref().unwrap().clone(),
+                &scene,
+                self.scale_factor,
+            ) {
+                self.fail(event_loop, error);
+                return;
+            }
+        }
         let scale = self.scale_factor as f32;
         let scene = crate::dpi::device_scene(scene, scale);
         let auto_scroll_indicator =
@@ -1226,7 +1336,7 @@ fn finish_window_setup(window: &Window, config: &WindowConfig) {
     let _ = (window, config);
 }
 
-impl<P> ApplicationHandler for RuntimeApp<P>
+impl<P> ApplicationHandler<RuntimeEvent> for RuntimeApp<P>
 where
     P: SceneProvider,
 {
@@ -1240,39 +1350,30 @@ where
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.scene_provider.wants_close() {
-            event_loop.exit();
-            return;
-        }
-        if self.window.is_none() {
-            event_loop.set_control_flow(ControlFlow::Wait);
-            return;
-        }
-        if self.immediate_redraw {
-            event_loop.set_control_flow(ControlFlow::Wait);
-            self.request_redraw_if_possible();
-            return;
-        }
-        if !self.can_draw() {
-            self.next_redraw_at = None;
-            event_loop.set_control_flow(ControlFlow::Wait);
-            return;
-        }
-        if self.wants_continuous_redraw() {
-            let deadline = self
-                .next_redraw_at
-                .unwrap_or_else(|| Instant::now() + self.config.frame_time);
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            if Instant::now() >= deadline {
-                self.request_redraw_if_possible();
+        self.schedule_ui_redraw(event_loop);
+        #[cfg(feature = "gpu-viewport")]
+        if self.can_draw() && !event_loop.exiting() {
+            if let Some(gpu) = &mut self.gpu {
+                if let Err(error) = gpu.draw(self.config.frame_time) {
+                    self.fail(event_loop, error);
+                    return;
+                }
+                if let Some(deadline) = gpu.deadline() {
+                    let deadline = match event_loop.control_flow() {
+                        ControlFlow::WaitUntil(cpu) => cpu.min(deadline),
+                        _ => deadline,
+                    };
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                }
             }
-        } else {
-            self.next_redraw_at = None;
-            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "gpu-viewport")]
+        {
+            self.gpu = None;
+        }
         self.surface = None;
         self.window = None;
     }
@@ -1364,6 +1465,10 @@ where
             }
             WindowEvent::Occluded(occluded) => {
                 self.occluded = occluded;
+                #[cfg(feature = "gpu-viewport")]
+                if occluded && let Some(gpu) = &mut self.gpu {
+                    gpu.hide();
+                }
                 if !occluded {
                     self.request_immediate_redraw();
                 }

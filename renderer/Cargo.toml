@@ -3,14 +3,25 @@ name = "cssimpler-renderer"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+gpu-viewport = ["dep:wgpu", "dep:pollster", "dep:openusd", "dep:openusd-schemas", "dep:bytemuck", "dep:glam", "dep:windows"]
+
 [dependencies]
 ab_glyph.workspace = true
 cssimpler-core.workspace = true
 font8x8.workspace = true
 softbuffer.workspace = true
 winit.workspace = true
+wgpu = { version = "30.0", optional = true }
+pollster = { version = "0.4", optional = true }
+openusd = { version = "0.8", optional = true }
+openusd-schemas = { version = "0.8", features = ["geom", "shade", "lux"], optional = true }
+bytemuck = { version = "1.25", features = ["derive"], optional = true }
+glam = { version = "0.34", optional = true }
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Graphics_DirectComposition", "Win32_Graphics_Dxgi"], optional = true }
 winapi = { version = "0.3.9", features = ["winuser"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
 

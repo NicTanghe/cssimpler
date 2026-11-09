@@ -3,6 +3,10 @@ name = "cssimpler"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+gpu-viewport = ["cssimpler-renderer/gpu-viewport"]
+
 [workspace]
 members = ["core", "renderer", "style", "macro"]
 exclude = ["vendor/softbuffer"]
@@ -43,6 +47,14 @@ codegen-units = 1
 lto = "thin"
 panic = "abort"
 strip = "debuginfo"
+
+[[example]]
+name = "usd_viewport"
+required-features = ["gpu-viewport"]
+
+[[example]]
+name = "usd_glass_cube"
+required-features = ["gpu-viewport"]
 
 [profile.dev.package."*"]
 opt-level = 3

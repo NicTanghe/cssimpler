@@ -14,6 +14,8 @@ mod backdrop;
 mod color;
 mod dpi;
 mod fonts;
+#[cfg(feature = "gpu-viewport")]
+pub mod gpu;
 mod gradient;
 mod image;
 mod input;
@@ -55,8 +57,8 @@ use self::{
 };
 use cssimpler_core::{
     BackdropOcclusion, BorderLineStyle, CornerRadius, ElementInteractionState, ElementPath,
-    EventHandler, ExtractedScene, LinearRgba, NativeMaterial, RenderKind,
-    TextEditDecoration, TextSelectionRange, TransformMatrix3d, TransformStyleMode, VisualStyle,
+    EventHandler, ExtractedScene, LinearRgba, NativeMaterial, RenderKind, TextEditDecoration,
+    TextSelectionRange, TransformMatrix3d, TransformStyleMode, VisualStyle,
     establishes_stacking_context,
     fonts::{PreparedTextLayout, TextAlign, TextStyle, layout_text_block},
     stacking_context_level,
@@ -64,7 +66,6 @@ use cssimpler_core::{
 use softbuffer::SoftBufferError;
 use winit::error::{EventLoopError, OsError};
 
-pub use cssimpler_core::{Color, LayoutBox, RenderNode};
 pub(crate) use self::color::{
     is_transparent, pack_linear_rgb, pack_rgb, pack_rgba, pack_softbuffer_rgb, pack_transparent,
     u10_to_u8_channel, unpack_alpha8, unpack_linear_rgb, unpack_rgb, unpack_rgb10,
@@ -81,6 +82,7 @@ use self::{
     shadow::cached_shadow_mask,
     shapes::{expand_corner_radius, expand_layout},
 };
+pub use cssimpler_core::{Color, LayoutBox, RenderNode};
 
 const MAX_INCREMENTAL_DIRTY_REGIONS: usize = 256;
 const MAX_INCREMENTAL_DIRTY_AREA_RATIO: f32 = 0.85;
@@ -1284,6 +1286,27 @@ pub enum RedrawSchedule {
 }
 
 pub trait SceneProvider {
+    /// Transfer optional native GPU viewport registrations to the window runtime.
+    #[cfg(feature = "gpu-viewport")]
+    fn take_gpu_viewports(&mut self) -> gpu::GpuViewportRegistry {
+        gpu::GpuViewportRegistry::default()
+    }
+
+    #[cfg(feature = "gpu-viewport")]
+    fn handle_application_event(&mut self, _event: &EngineEvent) -> bool {
+        false
+    }
+
+    #[cfg(feature = "gpu-viewport")]
+    fn handle_ui_event(&mut self, event: &EngineEvent) -> bool {
+        self.handle_engine_event(event)
+    }
+
+    #[cfg(feature = "gpu-viewport")]
+    fn focus_gpu_viewport(&mut self) -> bool {
+        false
+    }
+
     /// Return false to defer a window close (for example, while confirming a draft).
     fn can_close(&mut self) -> bool {
         true
@@ -1889,7 +1912,9 @@ pub fn find_element_bounds_by_id(scene: &[RenderNode], id: &str) -> Option<Layou
         }
         None
     }
-    scene.iter().find_map(|node| find_in_node(node, normalized_query))
+    scene
+        .iter()
+        .find_map(|node| find_in_node(node, normalized_query))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2482,7 +2507,14 @@ fn render_scene_update_parallel(
                     };
                     let rows = job_rows[job_index];
                     with_render_buffer_rows(rows, || {
-                        clear_clip_packed(worker_buffer, width, height, job.clip, clear, clear_color.a);
+                        clear_clip_packed(
+                            worker_buffer,
+                            width,
+                            height,
+                            job.clip,
+                            clear,
+                            clear_color.a,
+                        );
                         draw_cached_root_indices(
                             scene,
                             cached_bounds,
@@ -7207,7 +7239,14 @@ fn transform_bounds_with_context(
 }
 
 fn clear_clip(buffer: &mut [u32], width: usize, height: usize, clip: ClipRect, clear_color: Color) {
-    clear_clip_packed(buffer, width, height, clip, pack_rgba(clear_color), clear_color.a);
+    clear_clip_packed(
+        buffer,
+        width,
+        height,
+        clip,
+        pack_rgba(clear_color),
+        clear_color.a,
+    );
 }
 
 fn clear_clip_packed(
@@ -12926,8 +12965,8 @@ mod tests {
     fn test_render_to_rgba8_transparent_clear_color_and_accurate_alpha() {
         use super::{render_to_rgba8, render_to_rgba8_at_scale};
 
-        let opaque_node = RenderNode::container(LayoutBox::new(0.0, 0.0, 10.0, 10.0))
-            .with_style(VisualStyle {
+        let opaque_node =
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 10.0, 10.0)).with_style(VisualStyle {
                 background: Some(Color::rgb(255, 0, 0)),
                 ..VisualStyle::default()
             });
@@ -12975,11 +13014,24 @@ mod tests {
 
         // Render at scale
         let mut rgba_scaled = vec![0u8; 40 * 40 * 4];
-        render_to_rgba8_at_scale(&scene, &mut rgba_scaled, 40, 40, Color::rgba(0, 0, 0, 0), 2.0);
+        render_to_rgba8_at_scale(
+            &scene,
+            &mut rgba_scaled,
+            40,
+            40,
+            Color::rgba(0, 0, 0, 0),
+            2.0,
+        );
         let scaled_unpainted_idx = (30 * 40 + 10) * 4;
-        assert_eq!(&rgba_scaled[scaled_unpainted_idx..scaled_unpainted_idx + 4], &[0, 0, 0, 0]);
+        assert_eq!(
+            &rgba_scaled[scaled_unpainted_idx..scaled_unpainted_idx + 4],
+            &[0, 0, 0, 0]
+        );
         let scaled_opaque_idx = (10 * 40 + 10) * 4;
-        assert_eq!(&rgba_scaled[scaled_opaque_idx..scaled_opaque_idx + 4], &[255, 0, 0, 255]);
+        assert_eq!(
+            &rgba_scaled[scaled_opaque_idx..scaled_opaque_idx + 4],
+            &[255, 0, 0, 255]
+        );
     }
 
     #[test]

@@ -414,7 +414,7 @@ impl NativeTextInputs {
         false
     }
 
-    fn clear_focus(&mut self) -> bool {
+    pub(super) fn clear_focus(&mut self) -> bool {
         self.active_drag = None;
         let Some(focused) = self.focused.take() else {
             return false;

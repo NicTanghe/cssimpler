@@ -410,6 +410,8 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     cached_scene: Option<Vec<RenderNode>>,
     scene_transition: Option<SceneTransition>,
     last_stats: RuntimeStats,
+    #[cfg(feature = "gpu-viewport")]
+    gpu_viewports: renderer::gpu::GpuViewportRegistry,
     signal: PhantomData<Signal>,
 }
 
@@ -436,8 +438,49 @@ where
             cached_scene: None,
             scene_transition: None,
             last_stats: RuntimeStats::default(),
+            #[cfg(feature = "gpu-viewport")]
+            gpu_viewports: renderer::gpu::GpuViewportRegistry::default(),
             signal: PhantomData,
         }
+    }
+
+    /// Bind a native GPU renderer to an existing element ID. Initialization is lazy.
+    #[cfg(feature = "gpu-viewport")]
+    pub fn with_gpu_viewport<F>(
+        mut self,
+        element_id: impl Into<String>,
+        options: renderer::gpu::GpuViewportOptions,
+        factory: F,
+    ) -> Self
+    where
+        F: FnOnce(
+                renderer::gpu::GpuViewportInit<'_>,
+            ) -> renderer::Result<Box<dyn renderer::gpu::GpuViewportRenderer>>
+            + 'static,
+    {
+        self.gpu_viewports.register(element_id, options, factory);
+        self
+    }
+
+    /// Render a USD file or shared stage using the built-in GPU backend.
+    #[cfg(feature = "gpu-viewport")]
+    pub fn with_usd_viewport(
+        self,
+        element_id: impl Into<String>,
+        source: impl Into<renderer::gpu::usd::UsdSource>,
+        camera: renderer::gpu::usd::UsdCameraMode,
+    ) -> Self {
+        self.with_gpu_viewport(
+            element_id,
+            renderer::gpu::GpuViewportOptions::default(),
+            renderer::gpu::usd::factory(source, camera),
+        )
+    }
+
+    #[cfg(feature = "gpu-viewport")]
+    pub fn with_gpu_device_options(mut self, options: renderer::gpu::GpuDeviceOptions) -> Self {
+        self.gpu_viewports.device_options = options;
+        self
     }
 
     /// Handle application shortcuts before native text editing. Return true to
@@ -520,7 +563,11 @@ where
         scale_factor: f32,
         clear_color: Color,
     ) {
-        let scale = if scale_factor > 0.0 { scale_factor } else { 1.0 };
+        let scale = if scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
         let logical_width = (width as f32 / scale).round().max(1.0) as usize;
         let logical_height = (height as f32 / scale).round().max(1.0) as usize;
         self.set_viewport(ViewportSize::new(logical_width, logical_height));
@@ -909,6 +956,48 @@ where
         self.invalidate(Invalidation::Structure);
         result
     }
+    #[cfg(feature = "gpu-viewport")]
+    fn handle_application_event(&mut self, event: &EngineEvent) -> bool {
+        if self
+            .event_handler
+            .is_some_and(|handler| handler(&mut self.state, event))
+        {
+            self.invalidate(Invalidation::Structure);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "gpu-viewport")]
+    fn handle_ui_event(&mut self, event: &EngineEvent) -> bool {
+        if self.text_inputs.handle_engine_event(
+            event,
+            self.cached_scene.as_deref(),
+            &self.runtime_world,
+        ) {
+            self.invalidate(Invalidation::Structure);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "gpu-viewport")]
+    fn focus_gpu_viewport(&mut self) -> bool {
+        if self.text_inputs.clear_focus() {
+            self.invalidate(Invalidation::Paint);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "gpu-viewport")]
+    fn take_gpu_viewports(&mut self) -> renderer::gpu::GpuViewportRegistry {
+        std::mem::take(&mut self.gpu_viewports)
+    }
+
     fn wants_close(&self) -> bool {
         self.exit_when
             .is_some_and(|predicate| predicate(&self.state))
@@ -974,6 +1063,8 @@ pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     cached_scene: Option<Vec<RenderNode>>,
     scene_transition: Option<SceneTransition>,
     last_stats: RuntimeStats,
+    #[cfg(feature = "gpu-viewport")]
+    gpu_viewports: renderer::gpu::GpuViewportRegistry,
     signal: PhantomData<Signal>,
 }
 
@@ -1004,8 +1095,49 @@ where
             cached_scene: None,
             scene_transition: None,
             last_stats: RuntimeStats::default(),
+            #[cfg(feature = "gpu-viewport")]
+            gpu_viewports: renderer::gpu::GpuViewportRegistry::default(),
             signal: PhantomData,
         }
+    }
+
+    /// Bind a native GPU renderer to an existing element ID. Initialization is lazy.
+    #[cfg(feature = "gpu-viewport")]
+    pub fn with_gpu_viewport<F>(
+        mut self,
+        element_id: impl Into<String>,
+        options: renderer::gpu::GpuViewportOptions,
+        factory: F,
+    ) -> Self
+    where
+        F: FnOnce(
+                renderer::gpu::GpuViewportInit<'_>,
+            ) -> renderer::Result<Box<dyn renderer::gpu::GpuViewportRenderer>>
+            + 'static,
+    {
+        self.gpu_viewports.register(element_id, options, factory);
+        self
+    }
+
+    /// Render a USD file or shared stage using the built-in GPU backend.
+    #[cfg(feature = "gpu-viewport")]
+    pub fn with_usd_viewport(
+        self,
+        element_id: impl Into<String>,
+        source: impl Into<renderer::gpu::usd::UsdSource>,
+        camera: renderer::gpu::usd::UsdCameraMode,
+    ) -> Self {
+        self.with_gpu_viewport(
+            element_id,
+            renderer::gpu::GpuViewportOptions::default(),
+            renderer::gpu::usd::factory(source, camera),
+        )
+    }
+
+    #[cfg(feature = "gpu-viewport")]
+    pub fn with_gpu_device_options(mut self, options: renderer::gpu::GpuDeviceOptions) -> Self {
+        self.gpu_viewports.device_options = options;
+        self
     }
 
     /// Handle application shortcuts before native text editing. Return true to
@@ -1088,7 +1220,11 @@ where
         scale_factor: f32,
         clear_color: Color,
     ) {
-        let scale = if scale_factor > 0.0 { scale_factor } else { 1.0 };
+        let scale = if scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
         let logical_width = (width as f32 / scale).round().max(1.0) as usize;
         let logical_height = (height as f32 / scale).round().max(1.0) as usize;
         self.set_viewport(ViewportSize::new(logical_width, logical_height));
@@ -1404,6 +1540,48 @@ where
         self.invalidate(Invalidation::Structure);
         result
     }
+    #[cfg(feature = "gpu-viewport")]
+    fn handle_application_event(&mut self, event: &EngineEvent) -> bool {
+        if self
+            .event_handler
+            .is_some_and(|handler| handler(&mut self.state, event))
+        {
+            self.invalidate(Invalidation::Structure);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "gpu-viewport")]
+    fn handle_ui_event(&mut self, event: &EngineEvent) -> bool {
+        if self.text_inputs.handle_engine_event(
+            event,
+            self.cached_scene.as_deref(),
+            &self.runtime_world,
+        ) {
+            self.invalidate(Invalidation::Structure);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "gpu-viewport")]
+    fn focus_gpu_viewport(&mut self) -> bool {
+        if self.text_inputs.clear_focus() {
+            self.invalidate(Invalidation::Paint);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "gpu-viewport")]
+    fn take_gpu_viewports(&mut self) -> renderer::gpu::GpuViewportRegistry {
+        std::mem::take(&mut self.gpu_viewports)
+    }
+
     fn wants_close(&self) -> bool {
         self.exit_when
             .is_some_and(|predicate| predicate(&self.state))
@@ -3332,14 +3510,20 @@ mod viewport_and_lifecycle_tests {
             action: String,
         }
 
-        let stylesheet = parse_stylesheet(r#"
+        let stylesheet = parse_stylesheet(
+            r#"
             #viewport-3d { background-color: rgb(255, 0, 0); width: 50px; height: 50px; }
             #viewport-2d { width: 50px; height: 50px; }
             .button { width: 100px; height: 100px; }
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         let mut app = App::new(
-            HostState { counter: 0, action: "initial".into() },
+            HostState {
+                counter: 0,
+                action: "initial".into(),
+            },
             &stylesheet,
             |state, _frame| {
                 state.counter += 1;
@@ -3354,7 +3538,8 @@ mod viewport_and_lifecycle_tests {
                     </div>
                 }
             },
-        ).with_event_handler(|state, event| {
+        )
+        .with_event_handler(|state, event| {
             if matches!(event, EngineEvent::Key(k) if k.state == ButtonState::Pressed) {
                 state.action = "key_pressed".into();
                 true
@@ -3385,7 +3570,10 @@ mod viewport_and_lifecycle_tests {
         let height = 100;
         let mut rgba = vec![0u8; width * height * 4];
         app.render_rgba8(
-            FrameInfo { delta: Duration::from_millis(16), frame_index: 0 },
+            FrameInfo {
+                delta: Duration::from_millis(16),
+                frame_index: 0,
+            },
             &mut rgba,
             width,
             height,
@@ -3412,21 +3600,22 @@ mod viewport_and_lifecycle_tests {
 
         // 4. Verify FragmentApp embedding methods as well
         let mut fragment_app = FragmentApp::new(
-            HostState { counter: 10, action: "frag".into() },
+            HostState {
+                counter: 10,
+                action: "frag".into(),
+            },
             &stylesheet,
             |state, _frame| {
                 state.counter += 1;
                 Invalidation::Structure
             },
-            [
-                Fragment::new("root", |_| {
-                    ui! {
-                        <div>
-                            <div id="viewport-3d" />
-                        </div>
-                    }
-                }),
-            ],
+            [Fragment::new("root", |_| {
+                ui! {
+                    <div>
+                        <div id="viewport-3d" />
+                    </div>
+                }
+            })],
         );
 
         fragment_app.state_mut().counter = 99;
@@ -3434,7 +3623,10 @@ mod viewport_and_lifecycle_tests {
 
         let mut frag_rgba = vec![0u8; width * height * 4];
         fragment_app.render_rgba8(
-            FrameInfo { delta: Duration::from_millis(16), frame_index: 0 },
+            FrameInfo {
+                delta: Duration::from_millis(16),
+                frame_index: 0,
+            },
             &mut frag_rgba,
             width,
             height,

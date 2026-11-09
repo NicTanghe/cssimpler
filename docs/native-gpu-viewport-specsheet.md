@@ -1,11 +1,25 @@
 # Native GPU and USD viewport specsheet
 
 Date: 2026-11-09  
-Status: **Planned — not implemented**
+Status: **Implementation in progress — experimental Windows backend**
 
-This document records the agreed implementation plan. It does not introduce a
-Cargo feature, add dependencies, or implement a renderer. The milestones and
-acceptance criteria below describe future work.
+This document records the agreed target and acceptance criteria. Implementation
+has started behind the optional feature; the complete cross-platform target is
+not yet implemented or verified. See [GPU viewport usage](./gpu-viewports.md) for
+the current API, test command, and supported rendering subset.
+
+Current progress (2026-11-09):
+
+- Feature gating, registration on both application types, a shared lazy device,
+  and independent GPU scheduling are implemented.
+- The initial Windows host uses DirectComposition visuals for opaque and
+  transparent output. macOS, X11, and Wayland native hosts remain pending.
+- The initial USD backend renders mesh cages with flat studio shading and USD
+  cameras. USD materials and lights remain canonical stage data; evaluating their
+  shading and lighting is still pending. Orbit cameras currently use a separate
+  transient in-memory USD stage rather than a session layer on the input stage.
+- Full milestone acceptance, including all native platform smoke tests, remains
+  outstanding. Individual milestone statuses below describe the overall target.
 
 ## Objective
 
@@ -159,10 +173,10 @@ Purpose:
   presenter for the surrounding window.
 
 Support:
-- Windows: a child HWND host, with clipping for opaque presentation so CPU updates
-  do not overwrite the child surface. Transparent presentation requires an
-  alpha-capable native composition path that preserves the underlying CPU/glass
-  background rather than leaving an unpainted hole.
+- Windows: separate DirectComposition visuals attached to the parent HWND, with
+  one shared composition root and a viewport-sized swapchain per visual. Preserve
+  the underlying CPU/glass background for transparent pixels; no child-window
+  clipping should leave an unpainted hole beneath them.
 - macOS: a child NSView backed by a Metal layer, coordinated with the existing
   native-glass view and layer hierarchy.
 - X11: an embedded child window.
@@ -442,7 +456,7 @@ GPU5 with the existing runtime, apply GPU6 before exposing general application u
 implement USD1 on that infrastructure, and finish with GPU7's full validation
 matrix. USD2 remains a future upstream-dependent migration.
 
-Every milestone remains planned until implemented and verified. This specsheet
+Every milestone remains incomplete until implemented and verified. This specsheet
 does not authorize changing the selected architecture to a shared GPU presenter,
 dropping a desktop backend, or adding a cloth solver or production PBR to the
 initial scope. Native USD loading, scene representation, and built-in rendering
