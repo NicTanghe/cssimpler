@@ -19,13 +19,44 @@ struct LiveViewport {
     next_frame: Instant,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PointerCapture {
+    index: usize,
+    buttons: Vec<crate::PointerButton>,
+}
+
+impl PointerCapture {
+    fn press(
+        current: Option<Self>,
+        hit: Option<usize>,
+        button: crate::PointerButton,
+    ) -> Option<Self> {
+        if let Some(mut current) = current {
+            if !current.buttons.contains(&button) {
+                current.buttons.push(button);
+            }
+            Some(current)
+        } else {
+            hit.map(|index| Self {
+                index,
+                buttons: vec![button],
+            })
+        }
+    }
+
+    fn release(mut self, button: crate::PointerButton) -> Option<Self> {
+        self.buttons.retain(|pressed| *pressed != button);
+        (!self.buttons.is_empty()).then_some(self)
+    }
+}
+
 pub(crate) struct GpuRuntime {
     live: Vec<Option<LiveViewport>>,
     registry: GpuViewportRegistry,
     gpu: Option<GpuContext>,
     instance: Option<wgpu::Instance>,
     focused: Option<usize>,
-    captured: Option<usize>,
+    captured: Option<PointerCapture>,
     pointer: Option<crate::PointerPosition>,
 }
 
@@ -87,7 +118,14 @@ impl GpuRuntime {
                 if self.focused == Some(index) {
                     self.focused = None;
                 }
-                if self.captured == Some(index) {
+                if self
+                    .captured
+                    .as_ref()
+                    .is_some_and(|capture| capture.index == index)
+                {
+                    if let Some(live) = &mut self.live[index] {
+                        live.renderer.event(&EngineEvent::Suspended);
+                    }
                     self.captured = None;
                 }
                 continue;
@@ -107,7 +145,7 @@ impl GpuRuntime {
             if self.live[index].is_none() {
                 let host =
                     native::NativeHost::new(event_loop, parent.clone(), entry.options.transparent)?;
-                // X11 swapchains derive their extent from the native child window.
+                // Native swapchains derive their extent from the child window/layer.
                 host.place(origin, physical_size)?;
                 let instance = self.instance.get_or_insert_with(wgpu::Instance::default);
                 // SAFETY: LiveViewport retains the host and drops the surface first.
@@ -140,15 +178,15 @@ impl GpuRuntime {
                 let mut config = surface
                     .get_default_config(&gpu.adapter, physical_size[0], physical_size[1])
                     .ok_or_else(|| error("surface is incompatible with shared GPU adapter"))?;
+                let native_premultiplied = cfg!(any(target_os = "linux", target_os = "macos"))
+                    && entry.options.transparent;
                 config.format = caps
                     .formats
                     .iter()
                     .copied()
-                    // X11 composes premultiplied *encoded* RGB. Resolve coverage
-                    // in that space so partially covered edges do not acquire halos.
-                    .find(|f| {
-                        f.is_srgb() != (cfg!(target_os = "linux") && entry.options.transparent)
-                    })
+                    // Native transparent layers compose premultiplied encoded RGB.
+                    // Resolve in that space to avoid halos on partially covered edges.
+                    .find(|f| f.is_srgb() != native_premultiplied)
                     .unwrap_or(config.format);
                 config.alpha_mode = if entry.options.transparent {
                     [
@@ -175,6 +213,12 @@ impl GpuRuntime {
                     ));
                 }
                 config.present_mode = wgpu::PresentMode::Fifo;
+                #[cfg(target_os = "macos")]
+                {
+                    // Two Metal drawables keep interactive frames from queuing
+                    // behind an additional stale camera pose. wgpu clamps support.
+                    config.desired_maximum_frame_latency = 1;
+                }
                 if caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
                     config.usage |= wgpu::TextureUsages::COPY_DST;
                 }
@@ -184,9 +228,10 @@ impl GpuRuntime {
                     physical_size,
                     scale_factor: scale,
                     format: config.format,
-                    alpha_mode: if cfg!(target_os = "linux") && entry.options.transparent {
+                    alpha_mode: if native_premultiplied {
                         // Describe the renderer's pixel encoding, independent of the
-                        // WSI mode when native X Composite owns alpha composition.
+                        // WSI mode. Metal's PostMultiplied mode only marks the layer
+                        // non-opaque; Core Animation still consumes premultiplied RGB.
                         wgpu::CompositeAlphaMode::PreMultiplied
                     } else {
                         config.alpha_mode
@@ -255,6 +300,7 @@ impl GpuRuntime {
 
     pub fn hide(&mut self) {
         for live in self.live.iter_mut().flatten() {
+            live.renderer.event(&EngineEvent::Suspended);
             live.host.hide();
             live.visible = false;
         }
@@ -365,6 +411,23 @@ impl GpuRuntime {
     }
 
     pub fn event(&mut self, event: &EngineEvent) -> bool {
+        #[cfg(target_os = "macos")]
+        if let EngineEvent::PointerMoved { modifiers, .. } = event {
+            if self
+                .captured
+                .as_ref()
+                .is_some_and(|capture| capture.buttons.contains(&crate::PointerButton::Primary))
+                && !native::primary_button_pressed()
+            {
+                // A native move/resize or trackpad gesture can consume mouseUp.
+                // Never infer a press from movement; only repair a stale release.
+                self.event(&EngineEvent::PointerButton {
+                    button: crate::PointerButton::Primary,
+                    state: crate::ButtonState::Released,
+                    modifiers: *modifiers,
+                });
+            }
+        }
         if let EngineEvent::PointerMoved { position, .. } = event {
             self.pointer = Some(*position);
         }
@@ -382,15 +445,15 @@ impl GpuRuntime {
                 })
             })
         });
-        if matches!(
-            event,
-            EngineEvent::PointerButton {
-                state: crate::ButtonState::Pressed,
-                ..
-            }
-        ) {
+        if let EngineEvent::PointerButton {
+            button,
+            state: crate::ButtonState::Pressed,
+            ..
+        } = event
+        {
             self.focused = hit;
-            self.captured = hit;
+            // An additional button must not replace the original drag owner.
+            self.captured = PointerCapture::press(self.captured.take(), hit, *button);
         }
         let target = match event {
             EngineEvent::Key(_) | EngineEvent::TextInput(_) => self.focused,
@@ -402,7 +465,7 @@ impl GpuRuntime {
                 self.captured = None;
                 return false;
             }
-            _ => self.captured.or(hit),
+            _ => self.captured.as_ref().map(|capture| capture.index).or(hit),
         };
         let consumed = target
             .and_then(|i| {
@@ -420,15 +483,58 @@ impl GpuRuntime {
                 })
             })
             .unwrap_or(false);
-        if matches!(
-            event,
-            EngineEvent::PointerButton {
-                state: crate::ButtonState::Released,
-                ..
-            }
-        ) {
-            self.captured = None;
+        if let EngineEvent::PointerButton {
+            button,
+            state: crate::ButtonState::Released,
+            ..
+        } = event
+        {
+            self.captured = self
+                .captured
+                .take()
+                .and_then(|capture| capture.release(*button));
         }
         consumed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PointerButton::{Primary, Secondary};
+
+    #[test]
+    fn additional_button_does_not_steal_or_release_the_original_drag() {
+        let first = PointerCapture::press(None, Some(1), Primary);
+        let second = PointerCapture::press(first.clone(), Some(2), Secondary);
+        assert_eq!(second.as_ref().unwrap().index, 1);
+        let after_secondary_release = second.and_then(|capture| capture.release(Secondary));
+        assert_eq!(after_secondary_release, first);
+        assert_eq!(
+            after_secondary_release.and_then(|capture| capture.release(Primary)),
+            None
+        );
+    }
+
+    #[test]
+    fn release_outside_the_viewport_still_goes_to_the_drag_owner() {
+        let capture = PointerCapture::press(None, Some(3), Primary);
+        let combined = PointerCapture::press(capture, None, Secondary);
+        assert_eq!(combined.as_ref().unwrap().index, 3);
+        let capture = combined.and_then(|capture| capture.release(Secondary));
+        assert_eq!(capture.and_then(|capture| capture.release(Primary)), None);
+        assert_eq!(PointerCapture::press(None, None, Primary), None);
+    }
+
+    #[test]
+    fn capture_survives_until_all_buttons_are_released_in_either_order() {
+        for (first, second) in [(Primary, Secondary), (Secondary, Primary)] {
+            let capture = PointerCapture::press(None, Some(2), first);
+            let both = PointerCapture::press(capture, None, second);
+            let one = both.and_then(|capture| capture.release(first)).unwrap();
+            assert_eq!(one.index, 2);
+            assert_eq!(one.buttons, vec![second]);
+            assert_eq!(one.release(second), None);
+        }
     }
 }

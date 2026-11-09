@@ -1,7 +1,7 @@
 # Native GPU and USD viewport specsheet
 
 Date: 2026-11-09  
-Status: **Implementation in progress — experimental Windows and X11 backends**
+Status: **Implementation in progress — experimental Windows, macOS and X11 backends**
 
 This document records the agreed target and acceptance criteria. Implementation
 has started behind the optional feature; the complete cross-platform target is
@@ -14,8 +14,10 @@ Current progress (2026-11-09):
   and independent GPU scheduling are implemented.
 - The Windows host uses DirectComposition visuals for opaque and transparent
   output. Linux X11 uses child windows with empty input shapes and automatic
-  X Composite redirection for ARGB output. macOS and Wayland native hosts remain
-  pending.
+  X Composite redirection for ARGB output. macOS uses input-transparent Metal
+  sublayers coordinated with native glass. Apple GPUs use memoryless 4× MSAA
+  and a direct resolve; other adapters use the bounded-memory Linux strip path.
+  The Wayland native host remains pending.
 - The initial USD backend renders mesh cages with flat studio shading and USD
   cameras. USD materials and lights remain canonical stage data; evaluating their
   shading and lighting is still pending. Orbit cameras currently use a separate
@@ -179,8 +181,9 @@ Support:
   one shared composition root and a viewport-sized swapchain per visual. Preserve
   the underlying CPU/glass background for transparent pixels; no child-window
   clipping should leave an unpainted hole beneath them.
-- macOS: a child NSView backed by a Metal layer, coordinated with the existing
-  native-glass view and layer hierarchy.
+- macOS: a Metal sublayer in the current content view, coordinated with the existing
+  native-glass view and layer hierarchy. A layer-only host preserves parent input
+  routing without an additional NSView.
 - X11: an embedded child window.
 - Wayland: a `wl_surface` and `wl_subsurface` on the existing connection, using a
   separate guest event queue. Use desynchronized buffer commits for independent

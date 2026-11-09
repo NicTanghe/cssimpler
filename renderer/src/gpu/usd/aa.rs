@@ -1,4 +1,4 @@
-//! Reuse a narrow MSAA strip instead of allocating full-window MSAA attachments.
+//! Use tile memory on Apple GPUs, or bounded reusable strips on other adapters.
 use super::*;
 
 pub(super) struct Targets {
@@ -11,12 +11,24 @@ pub(super) struct Targets {
 
 impl Targets {
     pub fn new(gpu: &GpuContext, info: GpuViewportInfo) -> Self {
+        let adapter = gpu.adapter.get_info();
+        let memoryless = cfg!(target_os = "macos")
+            && adapter.backend == wgpu::Backend::Metal
+            && adapter.transient_saves_memory == Some(true);
+        Self::with_memoryless(gpu, info, memoryless)
+    }
+
+    pub(super) fn with_memoryless(
+        gpu: &GpuContext,
+        info: GpuViewportInfo,
+        memoryless: bool,
+    ) -> Self {
         let color_flags = gpu.adapter.get_texture_format_features(info.format).flags;
         let depth_flags = gpu
             .adapter
             .get_texture_format_features(wgpu::TextureFormat::Depth32Float)
             .flags;
-        let enabled = cfg!(target_os = "linux")
+        let enabled = cfg!(any(target_os = "linux", target_os = "macos"))
             && matches!(
                 info.format,
                 wgpu::TextureFormat::Rgba8Unorm
@@ -25,14 +37,25 @@ impl Targets {
                     | wgpu::TextureFormat::Bgra8UnormSrgb
             )
             && info.physical_size[1] >= 16
-            && info.texture_usage.contains(wgpu::TextureUsages::COPY_DST)
+            && (memoryless || info.texture_usage.contains(wgpu::TextureUsages::COPY_DST))
             && color_flags.contains(
                 wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4
                     | wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE,
             )
             && depth_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4);
         let samples = if enabled { 4 } else { 1 };
-        let height = strip_height(info.physical_size[1], enabled);
+        let memoryless = enabled && memoryless;
+        let height = if memoryless {
+            info.physical_size[1]
+        } else {
+            strip_height(info.physical_size[1], enabled)
+        };
+        let attachment_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | if memoryless {
+                wgpu::TextureUsages::TRANSIENT_ATTACHMENT
+            } else {
+                wgpu::TextureUsages::empty()
+            };
         let texture = |label, format, sample_count, usage| {
             gpu.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -51,20 +74,20 @@ impl Targets {
         };
         Self {
             depth: texture(
-                "USD depth strip",
+                "USD depth attachment",
                 wgpu::TextureFormat::Depth32Float,
                 samples,
-                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                attachment_usage,
             ),
             color: enabled.then(|| {
                 texture(
-                    "USD MSAA strip",
+                    "USD MSAA attachment",
                     info.format,
                     samples,
-                    wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    attachment_usage,
                 )
             }),
-            resolve: enabled.then(|| {
+            resolve: (enabled && !memoryless).then(|| {
                 texture(
                     "USD resolved strip",
                     info.format,

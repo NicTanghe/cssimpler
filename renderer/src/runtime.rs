@@ -974,6 +974,9 @@ where
         }
 
         frame_stats.scene_prep_us = duration_to_us(scene_prep_start.elapsed());
+        // Install/clear the macOS glass content view before attaching GPU layers.
+        let native_glass = summarize_native_glass(&scene);
+        self.sync_native_glass(native_glass);
         #[cfg(feature = "gpu-viewport")]
         if let Some(gpu) = &mut self.gpu {
             if let Err(error) = gpu.sync(
@@ -1017,8 +1020,6 @@ where
             self.config.clear_color,
         );
 
-        let native_glass = summarize_native_glass(&scene);
-        self.sync_native_glass(native_glass);
         let glass_mode = self.glass_render_mode();
         let use_alpha_buffer = self.native_glass_active;
         if use_alpha_buffer {
@@ -1486,7 +1487,7 @@ where
                     (position.y / self.scale_factor) as f32,
                 ));
                 self.update_resize_cursor();
-                self.handle_engine_event(
+                let consumed = self.handle_engine_event(
                     event_loop,
                     EngineEvent::PointerMoved {
                         position: PointerPosition {
@@ -1496,7 +1497,9 @@ where
                         modifiers: self.modifiers,
                     },
                 );
-                self.request_immediate_redraw();
+                if !consumed {
+                    self.request_immediate_redraw();
+                }
             }
             WindowEvent::CursorLeft { .. } if !self.touch.ignore_mouse(Instant::now()) => {
                 self.mouse_position = None;
@@ -1580,14 +1583,16 @@ where
                     other => other,
                 };
                 self.accumulate_wheel(delta);
-                self.handle_engine_event(
+                let consumed = self.handle_engine_event(
                     event_loop,
                     EngineEvent::Scroll {
                         delta,
                         modifiers: self.modifiers,
                     },
                 );
-                self.request_immediate_redraw();
+                if !consumed {
+                    self.request_immediate_redraw();
+                }
             }
             WindowEvent::KeyboardInput {
                 event,

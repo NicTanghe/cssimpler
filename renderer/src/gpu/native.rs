@@ -12,6 +12,14 @@ mod x11;
 #[cfg(target_os = "linux")]
 pub(super) use x11::NativeHost;
 
+#[cfg(target_os = "macos")]
+#[path = "native/macos.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+pub(super) use macos::NativeHost;
+#[cfg(target_os = "macos")]
+pub(super) use macos::primary_button_pressed;
+
 #[cfg(windows)]
 mod win32 {
     use super::*;
@@ -122,9 +130,9 @@ mod win32 {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub(super) struct NativeHost;
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 impl NativeHost {
     pub fn new(_: &ActiveEventLoop, _: Arc<Window>, _: bool) -> Result<Self> {
         Err(error(

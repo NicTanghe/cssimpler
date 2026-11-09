@@ -156,15 +156,16 @@ mod platform {
 
     use cssimpler_core::Color;
     use objc2::rc::Retained;
-    use objc2::runtime::{AnyClass, AnyObject, Bool};
-    use objc2::{MainThreadMarker, msg_send};
-    use objc2_core_foundation::{CFRetained, CGFloat, CGPoint, CGRect};
+    use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
+    use objc2::{MainThreadMarker, msg_send, sel};
+    use objc2_core_foundation::{CFRetained, CGPoint, CGRect};
     use objc2_core_graphics::{
         CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage,
         CGImageAlphaInfo, CGImageByteOrderInfo, CGImageComponentInfo, CGImagePixelFormatInfo,
     };
     use objc2_foundation::{NSInteger, NSUInteger, ns_string};
     use objc2_quartz_core::{CALayer, CATransaction, kCAGravityResize};
+    use std::sync::OnceLock;
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::Window;
 
@@ -185,7 +186,6 @@ mod platform {
 
     struct MacGlassState {
         view: Retained<AnyObject>,
-        view_alpha: CGFloat,
         effect_view: Retained<AnyObject>,
         root_layer: Retained<CALayer>,
         root_layer_was_opaque: bool,
@@ -222,11 +222,9 @@ mod platform {
             if let Some(state) = states.borrow_mut().remove(&key) {
                 restore_hidden_sublayers(&state.hidden_sublayers);
                 state.root_layer.setOpaque(state.root_layer_was_opaque);
-                let _: () = unsafe { msg_send![&*state.view, setAlphaValue: state.view_alpha] };
                 state.tint_layer.removeFromSuperlayer();
                 state.overlay_layer.removeFromSuperlayer();
-                let _: () = unsafe { msg_send![&*state.view, removeFromSuperview] };
-                let _: () = unsafe { msg_send![&*ns_window, setContentView: Some(&*state.view)] };
+                let _: () = unsafe { msg_send![&*state.effect_view, removeFromSuperview] };
             }
         });
         Ok(())
@@ -300,25 +298,16 @@ mod platform {
             .ok_or_else(|| "AppKit view handle was null".to_string())?;
         let view = unsafe { Retained::retain(view as *const _ as *mut AnyObject) }
             .ok_or_else(|| "failed to retain AppKit view".to_string())?;
-        let view_alpha: CGFloat = unsafe { msg_send![&*view, alphaValue] };
-
-        let frame: CGRect = unsafe { msg_send![&*view, frame] };
-        let effect_view = new_visual_effect_view(frame, tint)?;
+        let bounds: CGRect = unsafe { msg_send![&*view, bounds] };
+        let effect_view = new_visual_effect_view(bounds, tint)?;
         let clear_color = ns_color("clearColor")?;
 
         let _: () = unsafe { msg_send![&*ns_window, setOpaque: Bool::NO] };
         let _: () = unsafe { msg_send![&*ns_window, setBackgroundColor: Some(&*clear_color)] };
-        let _: () = unsafe { msg_send![&*ns_window, setContentView: Some(&*effect_view)] };
-
-        let bounds: CGRect = unsafe { msg_send![&*effect_view, bounds] };
-        let _: () = unsafe { msg_send![&*view, setFrame: bounds] };
-        let _: () = unsafe {
-            msg_send![
-                &*view,
-                setAutoresizingMask: NS_VIEW_WIDTH_SIZABLE | NS_VIEW_HEIGHT_SIZABLE
-            ]
-        };
-        let _: () = unsafe { msg_send![&*effect_view, addSubview: &*view] };
+        // winit assumes NSWindow.contentView is its WinitView and casts it
+        // without a runtime check (including for cursor and IME updates).
+        // Keep that view in place. An input-transparent vibrancy subview sits
+        // below the custom CPU/GPU layers, within the window's content area.
         let _: () = unsafe { msg_send![&*view, setWantsLayer: Bool::YES] };
 
         let root_layer: Option<Retained<CALayer>> = unsafe { msg_send![&*view, layer] };
@@ -327,6 +316,9 @@ mod platform {
         let root_layer_was_opaque = root_layer.isOpaque();
         root_layer.setOpaque(false);
         let hidden_sublayers = hide_existing_sublayers(&root_layer);
+        let _: () = unsafe {
+            msg_send![&*view, addSubview: &*effect_view, positioned: -1 as NSInteger, relativeTo: None::<&AnyObject>]
+        };
 
         let effect_layer: Option<Retained<CALayer>> = unsafe { msg_send![&*effect_view, layer] };
         let effect_layer = effect_layer
@@ -345,14 +337,11 @@ mod platform {
             1_000_000.0,
             window.scale_factor(),
         );
-        effect_layer.addSublayer(&tint_layer);
-        effect_layer.addSublayer(&overlay_layer);
-
-        let _: () = unsafe { msg_send![&*view, setAlphaValue: 0.0 as CGFloat] };
+        root_layer.addSublayer(&tint_layer);
+        root_layer.addSublayer(&overlay_layer);
 
         Ok(MacGlassState {
             view,
-            view_alpha,
             effect_view,
             root_layer,
             root_layer_was_opaque,
@@ -404,8 +393,21 @@ mod platform {
     }
 
     fn new_visual_effect_view(frame: CGRect, tint: Color) -> Result<Retained<AnyObject>, String> {
-        let class = AnyClass::get(c"NSVisualEffectView")
-            .ok_or_else(|| "NSVisualEffectView is unavailable".to_string())?;
+        static CLASS: OnceLock<Option<&'static AnyClass>> = OnceLock::new();
+        let class = (*CLASS.get_or_init(|| {
+            let superclass = AnyClass::get(c"NSVisualEffectView")?;
+            let mut builder = ClassBuilder::new(c"CSSimplerVisualEffectView", superclass)?;
+            // SAFETY: NSView.hitTest: accepts an NSPoint and returns NSView*.
+            // This decorative view must leave all events to its winit parent.
+            unsafe {
+                builder.add_method(
+                    sel!(hitTest:),
+                    glass_hit_test as extern "C" fn(*mut AnyObject, Sel, CGPoint) -> *mut AnyObject,
+                );
+            }
+            Some(builder.register())
+        }))
+        .ok_or_else(|| "failed to create input-transparent NSVisualEffectView".to_string())?;
         let effect_view: Retained<AnyObject> = unsafe { msg_send![class, new] };
         let _: () = unsafe { msg_send![&*effect_view, setFrame: frame] };
         let _: () = unsafe { msg_send![&*effect_view, setWantsLayer: Bool::YES] };
@@ -417,6 +419,10 @@ mod platform {
         };
         configure_effect_view(&effect_view, tint);
         Ok(effect_view)
+    }
+
+    extern "C" fn glass_hit_test(_: *mut AnyObject, _: Sel, _: CGPoint) -> *mut AnyObject {
+        ptr::null_mut()
     }
 
     fn configure_effect_view(effect_view: &AnyObject, _tint: Color) {
@@ -464,7 +470,7 @@ mod platform {
                 return Err("native glass presenter received a mismatched alpha buffer".to_string());
             }
 
-            let bounds: CGRect = unsafe { msg_send![&*self.effect_view, bounds] };
+            let bounds: CGRect = unsafe { msg_send![&*self.view, bounds] };
             let content_image =
                 create_alpha_image(buffer, alpha, width, height, AlphaImageLayer::Content)?;
             let tint_image =
@@ -472,6 +478,7 @@ mod platform {
 
             CATransaction::begin();
             CATransaction::setDisableActions(true);
+            let _: () = unsafe { msg_send![&*self.effect_view, setFrame: bounds] };
             self.tint_layer.setFrame(bounds);
             self.tint_layer.setContentsScale(scale_factor);
             self.overlay_layer.setFrame(bounds);
@@ -689,4 +696,3 @@ mod tests {
         }
     }
 }
-

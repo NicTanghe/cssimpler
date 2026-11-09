@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = []
-gpu-viewport = ["dep:wgpu", "dep:pollster", "dep:openusd", "dep:openusd-schemas", "dep:bytemuck", "dep:glam", "dep:windows", "dep:x11rb", "dep:x11-dl"]
+gpu-viewport = ["dep:wgpu", "dep:pollster", "dep:openusd", "dep:openusd-schemas", "dep:bytemuck", "dep:glam", "dep:windows", "dep:x11rb", "dep:x11-dl", "objc2-quartz-core/CAMetalLayer"]
 
 [dependencies]
 ab_glyph.workspace = true

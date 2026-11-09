@@ -15,7 +15,7 @@ use std::{
 use wgpu::util::DeviceExt;
 
 mod aa;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod aa_tests;
 
 /// An orbit viewer or a camera authored in the USD stage.
@@ -425,10 +425,12 @@ impl GpuViewportRenderer for UsdRenderer {
                 let mut pass = frame
                     .encoder
                     .begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("USD mesh strip"),
+                        label: Some("USD mesh"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: color.as_ref().unwrap_or(frame.target),
-                            resolve_target: resolve.as_ref(),
+                            resolve_target: resolve
+                                .as_ref()
+                                .or_else(|| color.as_ref().map(|_| frame.target)),
                             depth_slice: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(clear),
