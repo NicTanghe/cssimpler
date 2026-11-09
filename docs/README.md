@@ -13,3 +13,7 @@ Current focus:
 - `examples/text_render_stress.rs` generates large pseudo-random documents to pressure text layout, wrapping, and scrolling.
 
 The workspace now has the foundations through rendering, typography and font resolution, interaction, scoped invalidation, and renderer-side dirty-region diffing in place.
+
+## Planned extensions
+
+- [Native GPU viewport specsheet](./native-gpu-viewport-specsheet.md) — optional native `wgpu` surfaces inside CPU-rendered UI; planned, not implemented.
