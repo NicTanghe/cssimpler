@@ -981,6 +981,7 @@ where
                 self.window.as_ref().unwrap().clone(),
                 &scene,
                 self.scale_factor,
+                self.config.clear_color,
             ) {
                 self.fail(event_loop, error);
                 return;

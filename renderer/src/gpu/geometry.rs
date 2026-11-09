@@ -12,12 +12,29 @@ fn contains(a: LayoutBox, b: LayoutBox) -> bool {
     b.x >= a.x && b.y >= a.y && b.x + b.width <= a.x + a.width && b.y + b.height <= a.y + a.height
 }
 
+pub(super) struct Location {
+    pub bounds: LayoutBox,
+    pub background: Color,
+    pub glass: bool,
+}
+
+fn over(top: Color, bottom: Color) -> Color {
+    let a = u32::from(top.a);
+    let channel = |t: u8, b: u8| ((u32::from(t) * a + u32::from(b) * (255 - a) + 127) / 255) as u8;
+    Color::rgb(
+        channel(top.r, bottom.r),
+        channel(top.g, bottom.g),
+        channel(top.b, bottom.b),
+    )
+}
+
 /// Return a fully visible content rectangle. Unsupported composition hides it.
 pub(super) fn locate(
     roots: &[RenderNode],
     id: &str,
     window: LayoutBox,
-) -> Result<Option<LayoutBox>> {
+    fallback: Color,
+) -> Result<Option<Location>> {
     fn find<'a>(
         nodes: &'a [RenderNode],
         id: &str,
@@ -112,7 +129,27 @@ pub(super) fn locate(
     }
     let extracted = ExtractedScene::from_render_roots_owned(marked);
     let mut after = false;
+    let mut background = fallback;
+    let mut glass = false;
     for item in extracted.items {
+        if !after && contains(item.layout, bounds) {
+            if item.kind == ExtractedPaintKind::GlassReveal {
+                glass = true;
+            }
+            if item.kind == ExtractedPaintKind::Background {
+                let color = if item.path == path {
+                    node.style.background
+                } else {
+                    item.style.background
+                };
+                if let Some(color) = color {
+                    background = over(color, background);
+                    if color.a == 255 {
+                        glass = false;
+                    }
+                }
+            }
+        }
         if item.path == path {
             if item.kind == ExtractedPaintKind::Background {
                 after = true;
@@ -133,12 +170,54 @@ pub(super) fn locate(
             return Ok(None);
         }
     }
-    Ok(Some(bounds))
+    Ok(Some(Location {
+        bounds,
+        background,
+        glass,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn backdrop_follows_paint_order_and_opaque_background_covers_glass() {
+        let window = LayoutBox::new(0.0, 0.0, 200.0, 200.0);
+        let viewport = RenderNode::container(window).with_element_id("scene");
+        let mut underneath = RenderNode::container(window);
+        underneath.style.background = Some(Color::rgb(24, 38, 56));
+        let result = locate(
+            &[underneath.clone(), viewport.clone()],
+            "scene",
+            window,
+            Color::WHITE,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.background, Color::rgb(24, 38, 56));
+        assert!(!result.glass);
+        underneath.style.native_material = cssimpler_core::NativeMaterial::Glass;
+        underneath.style.background = None;
+        assert!(
+            locate(
+                &[underneath.clone(), viewport.clone()],
+                "scene",
+                window,
+                Color::WHITE
+            )
+            .unwrap()
+            .unwrap()
+            .glass
+        );
+        let mut opaque = viewport;
+        opaque.style.background = Some(Color::BLACK);
+        let result = locate(&[underneath, opaque], "scene", window, Color::WHITE)
+            .unwrap()
+            .unwrap();
+        assert!(!result.glass);
+        assert_eq!(result.background, Color::BLACK);
+    }
+
     #[test]
     fn covering_ui_hides_surface_and_removal_restores_it() {
         let viewport = RenderNode::container(LayoutBox::new(10.0, 10.0, 100.0, 100.0))
@@ -147,12 +226,16 @@ mod tests {
         modal.style.background = Some(Color::BLACK);
         let window = LayoutBox::new(0.0, 0.0, 200.0, 200.0);
         assert!(
-            locate(&[viewport.clone(), modal], "scene", window)
+            locate(&[viewport.clone(), modal], "scene", window, Color::WHITE)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
-            locate(&[viewport], "scene", window).unwrap().unwrap().width,
+            locate(&[viewport], "scene", window, Color::WHITE)
+                .unwrap()
+                .unwrap()
+                .bounds
+                .width,
             100.0
         );
     }
@@ -162,10 +245,10 @@ mod tests {
             RenderNode::container(LayoutBox::new(90.0, 0.0, 20.0, 20.0)).with_element_id("scene");
         let window = LayoutBox::new(0.0, 0.0, 100.0, 100.0);
         assert!(
-            locate(&[viewport.clone()], "scene", window)
+            locate(&[viewport.clone()], "scene", window, Color::WHITE)
                 .unwrap()
                 .is_none()
         );
-        assert!(locate(&[viewport.clone(), viewport], "scene", window).is_err());
+        assert!(locate(&[viewport.clone(), viewport], "scene", window, Color::WHITE).is_err());
     }
 }

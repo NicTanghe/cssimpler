@@ -14,6 +14,10 @@ use std::{
 };
 use wgpu::util::DeviceExt;
 
+mod aa;
+#[cfg(all(test, target_os = "linux"))]
+mod aa_tests;
+
 /// An orbit viewer or a camera authored in the USD stage.
 #[derive(Clone, Debug, Default)]
 pub enum UsdCameraMode {
@@ -132,6 +136,7 @@ struct Vertex {
 struct CameraUniform {
     view_projection: [[f32; 4]; 4],
     view: [[f32; 4]; 4],
+    viewport: [f32; 4],
 }
 
 struct MeshCache {
@@ -155,7 +160,8 @@ pub struct UsdRenderer {
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_binding: wgpu::BindGroup,
-    depth: wgpu::Texture,
+    targets: aa::Targets,
+    pipeline_layout: wgpu::PipelineLayout,
     info: GpuViewportInfo,
     redraw_sink: scene::StageSinkId,
 }
@@ -247,7 +253,7 @@ impl UsdRenderer {
                 label: Some("USD camera layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -264,12 +270,6 @@ impl UsdRenderer {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
-        let shader = gpu
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("USD studio shading"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("usd.wgsl").into()),
-            });
         let pipeline_layout = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -277,15 +277,8 @@ impl UsdRenderer {
                 bind_group_layouts: &[Some(&layout)],
                 immediate_size: 0,
             });
-        let pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("USD mesh pipeline"), layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vertex"), compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3] })] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fragment"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: init.info.format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
-            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Less), stencil: Default::default(), bias: Default::default() }),
-            multisample: Default::default(), multiview_mask: None, cache: None,
-        });
-        let depth = depth_texture(gpu, init.info);
+        let targets = aa::Targets::new(gpu, init.info);
+        let pipeline = mesh_pipeline(gpu, &pipeline_layout, init.info, targets.samples);
         let redraw_sink = scene
             .stage
             .add_sink(move |_: &Stage, _: &scene::CommittedChange| {
@@ -304,7 +297,8 @@ impl UsdRenderer {
             pipeline,
             camera_buffer,
             camera_binding,
-            depth,
+            targets,
+            pipeline_layout,
             info: init.info,
             redraw_sink,
         })
@@ -368,14 +362,26 @@ impl UsdRenderer {
         Ok(CameraUniform {
             view_projection: (projection * view).to_cols_array_2d(),
             view: view.to_cols_array_2d(),
+            viewport: [
+                self.info.physical_size[0] as f32,
+                self.info.physical_size[1] as f32,
+                self.targets.height as f32,
+                if self.info.format.is_srgb() { 0.0 } else { 1.0 },
+            ],
         })
     }
 }
 
 impl GpuViewportRenderer for UsdRenderer {
     fn resize(&mut self, gpu: &GpuContext, info: GpuViewportInfo) -> Result<()> {
+        if self.info.physical_size != info.physical_size || self.info.format != info.format {
+            let targets = aa::Targets::new(gpu, info);
+            if self.targets.samples != targets.samples || self.info.format != info.format {
+                self.pipeline = mesh_pipeline(gpu, &self.pipeline_layout, info, targets.samples);
+            }
+            self.targets = targets;
+        }
         self.info = info;
-        self.depth = depth_texture(gpu, info);
         Ok(())
     }
     fn event(&mut self, event: &EngineEvent) -> bool {
@@ -398,44 +404,71 @@ impl GpuViewportRenderer for UsdRenderer {
             0,
             bytemuck::bytes_of(&self.camera_uniform(time)?),
         );
-        let depth = self.depth.create_view(&Default::default());
-        let clear = if frame.info.alpha_mode == wgpu::CompositeAlphaMode::Opaque {
-            wgpu::Color {
-                r: 0.035,
-                g: 0.045,
-                b: 0.06,
-                a: 1.0,
+        let depth = self.targets.depth.create_view(&Default::default());
+        let color = self
+            .targets
+            .color
+            .as_ref()
+            .map(|t| t.create_view(&Default::default()));
+        let resolve = self
+            .targets
+            .resolve
+            .as_ref()
+            .map(|t| t.create_view(&Default::default()));
+        let clear = clear_color(frame.info);
+        let height = frame.info.physical_size[1];
+        for (strip, row) in (0..height)
+            .step_by(self.targets.height as usize)
+            .enumerate()
+        {
+            {
+                let mut pass = frame
+                    .encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("USD mesh strip"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: color.as_ref().unwrap_or(frame.target),
+                            resolve_target: resolve.as_ref(),
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(clear),
+                                store: if color.is_some() {
+                                    wgpu::StoreOp::Discard
+                                } else {
+                                    wgpu::StoreOp::Store
+                                },
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.camera_binding, &[]);
+                pass.set_vertex_buffer(0, self.vertices.slice(..));
+                pass.draw(0..self.vertex_count, strip as u32..strip as u32 + 1);
             }
-        } else {
-            wgpu::Color::TRANSPARENT
-        };
-        let mut pass = frame
-            .encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("USD mesh viewport"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame.target,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
-                        store: wgpu::StoreOp::Store,
+            if let Some(resolve) = &self.targets.resolve {
+                frame.encoder.copy_texture_to_texture(
+                    resolve.as_image_copy(),
+                    wgpu::TexelCopyTextureInfo {
+                        origin: wgpu::Origin3d { x: 0, y: row, z: 0 },
+                        ..frame.texture.as_image_copy()
                     },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                ..Default::default()
-            });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.camera_binding, &[]);
-        pass.set_vertex_buffer(0, self.vertices.slice(..));
-        pass.draw(0..self.vertex_count, 0..1);
+                    wgpu::Extent3d {
+                        width: frame.info.physical_size[0],
+                        height: self.targets.height.min(height - row),
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -540,22 +573,45 @@ fn update_orbit_camera(stage: &Stage, path: &sdf::Path, orbit: &Orbit) -> Result
     Ok(())
 }
 
-fn depth_texture(gpu: &GpuContext, info: GpuViewportInfo) -> wgpu::Texture {
-    gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("USD viewport depth"),
-        size: wgpu::Extent3d {
-            width: info.physical_size[0],
-            height: info.physical_size[1],
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    })
+fn mesh_pipeline(
+    gpu: &GpuContext,
+    pipeline_layout: &wgpu::PipelineLayout,
+    info: GpuViewportInfo,
+    samples: u32,
+) -> wgpu::RenderPipeline {
+    let shader = gpu
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("USD studio shading"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("usd.wgsl").into()),
+        });
+    gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("USD mesh pipeline"), layout: Some(pipeline_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vertex"), compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3] })] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fragment"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: info.format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Less), stencil: Default::default(), bias: Default::default() }),
+            multisample: wgpu::MultisampleState { count: samples, ..Default::default() }, multiview_mask: None, cache: None,
+        })
 }
+
+fn clear_color(info: GpuViewportInfo) -> wgpu::Color {
+    let Some(color) = info.background else {
+        return wgpu::Color::TRANSPARENT;
+    };
+    let [r, g, b] = if info.format.is_srgb() {
+        let linear = color.to_linear_rgba();
+        [linear.r as f64, linear.g as f64, linear.b as f64]
+    } else {
+        [
+            color.r as f64 / 255.0,
+            color.g as f64 / 255.0,
+            color.b as f64 / 255.0,
+        ]
+    };
+    wgpu::Color { r, g, b, a: 1.0 }
+}
+
 fn vertex_buffer(gpu: &GpuContext, vertices: &[Vertex]) -> wgpu::Buffer {
     gpu.device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {

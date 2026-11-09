@@ -50,12 +50,17 @@ pub struct GpuViewportInfo {
     /// Alpha encoding expected from the renderer. Native composition may use a
     /// different swapchain mode (for example, redirected X11 ARGB windows).
     pub alpha_mode: wgpu::CompositeAlphaMode,
+    /// Known solid backdrop, or None when native glass must show through.
+    pub background: Option<cssimpler_core::Color>,
+    pub texture_usage: wgpu::TextureUsages,
 }
 
 pub struct GpuViewportFrame<'a> {
     pub info: GpuViewportInfo,
     pub frame: FrameInfo,
     pub target: &'a wgpu::TextureView,
+    /// Native presentation image; COPY_DST is available when texture_usage includes it.
+    pub texture: &'a wgpu::Texture,
     pub encoder: &'a mut wgpu::CommandEncoder,
 }
 

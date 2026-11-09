@@ -59,6 +59,7 @@ impl GpuRuntime {
         parent: Arc<Window>,
         roots: &[RenderNode],
         scale: f64,
+        background: cssimpler_core::Color,
     ) -> Result<()> {
         if self.registry.is_empty() {
             return Ok(());
@@ -75,10 +76,10 @@ impl GpuRuntime {
             .registry
             .entries
             .iter()
-            .map(|e| geometry::locate(roots, &e.id, window))
+            .map(|e| geometry::locate(roots, &e.id, window, background))
             .collect::<Result<Vec<_>>>()?;
         for (index, bounds) in locations.into_iter().enumerate() {
-            let Some(bounds) = bounds else {
+            let Some(location) = bounds else {
                 if let Some(live) = &mut self.live[index] {
                     live.host.hide();
                     live.visible = false;
@@ -91,6 +92,7 @@ impl GpuRuntime {
                 }
                 continue;
             };
+            let bounds = location.bounds;
             let origin = [
                 (f64::from(bounds.x) * scale).round() as i32,
                 (f64::from(bounds.y) * scale).round() as i32,
@@ -142,11 +144,16 @@ impl GpuRuntime {
                     .formats
                     .iter()
                     .copied()
-                    .find(|f| f.is_srgb())
+                    // X11 composes premultiplied *encoded* RGB. Resolve coverage
+                    // in that space so partially covered edges do not acquire halos.
+                    .find(|f| {
+                        f.is_srgb() != (cfg!(target_os = "linux") && entry.options.transparent)
+                    })
                     .unwrap_or(config.format);
                 config.alpha_mode = if entry.options.transparent {
                     [
                         wgpu::CompositeAlphaMode::PreMultiplied,
+                        #[cfg(not(target_os = "linux"))]
                         wgpu::CompositeAlphaMode::PostMultiplied,
                         // X11 delegates premultiplied ARGB composition to XRender.
                         #[cfg(target_os = "linux")]
@@ -168,22 +175,28 @@ impl GpuRuntime {
                     ));
                 }
                 config.present_mode = wgpu::PresentMode::Fifo;
+                if caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
+                    config.usage |= wgpu::TextureUsages::COPY_DST;
+                }
                 surface.configure(&gpu.device, &config);
                 let info = GpuViewportInfo {
                     bounds,
                     physical_size,
                     scale_factor: scale,
                     format: config.format,
-                    alpha_mode: if cfg!(target_os = "linux")
-                        && entry.options.transparent
-                        && config.alpha_mode == wgpu::CompositeAlphaMode::Opaque
-                    {
+                    alpha_mode: if cfg!(target_os = "linux") && entry.options.transparent {
                         // Describe the renderer's pixel encoding, independent of the
                         // WSI mode when native X Composite owns alpha composition.
                         wgpu::CompositeAlphaMode::PreMultiplied
                     } else {
                         config.alpha_mode
                     },
+                    background: if entry.options.transparent && location.glass {
+                        None
+                    } else {
+                        Some(location.background)
+                    },
+                    texture_usage: config.usage,
                 };
                 let factory = entry
                     .factory
@@ -213,6 +226,11 @@ impl GpuRuntime {
                 bounds,
                 physical_size,
                 scale_factor: scale,
+                background: if entry.options.transparent && location.glass {
+                    None
+                } else {
+                    Some(location.background)
+                },
                 ..live.info
             };
             if info != live.info {
@@ -309,6 +327,7 @@ impl GpuRuntime {
                             .unwrap_or_default(),
                     },
                     target: &target,
+                    texture: &texture.texture,
                     encoder: &mut encoder,
                 },
             )?;

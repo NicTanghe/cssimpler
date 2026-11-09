@@ -101,5 +101,53 @@ regions. A viewport hides when partially clipped, covered by later-painted UI,
 rounded, or affected by unsupported transforms. Its CPU background remains visible
 while hidden. Full CSS stacking and background effects sampling live 3D are pending.
 
+## Linux anti-aliasing and memory
+
+The USD renderer uses 4× MSAA on Linux when the surface supports GPU copies and
+the RGBA8 color/depth formats support 4× sampling. It renders into one reusable
+horizontal strip, resolves coverage there, then copies the strip directly into
+the presentation texture on the GPU. CPU UI pixels are never uploaded for AA;
+production rendering does not read back GPU images.
+
+For glass, the renderer clears to transparent black and resolves premultiplied
+color and coverage for native X11 composition. Transparent X11 targets use an
+encoded UNORM format so the resolved RGB stays premultiplied in the compositor's
+color space. Non-glass views clear to the solid background found beneath the
+viewport in paint order, including its own background color and the window clear
+color as fallback. This assumes a solid backdrop; gradients and images are not
+sampled or copied into the GPU renderer.
+
+The strip uses 36 bytes per pixel: 4× RGBA8 color, 4× Depth32, and one resolved
+RGBA8 image. Its height is capped at 64 rows and sized so these attachments plus
+the extra uniform data fit within the previous full-window Depth32 allocation.
+Views below 16 pixels high and unsupported surfaces retain single-sample rendering.
+Strips repeat vertex processing, trading extra GPU work for bounded memory; no
+full-window MSAA or history textures are allocated. Background-only changes do
+not reallocate render targets.
+
+Validation commands (the image comparison test requires a GPU):
+
+```sh
+cargo test -p cssimpler-renderer --features gpu-viewport --lib gpu::
+cargo test -p cssimpler-renderer --features gpu-viewport --lib strip_resolve_matches -- --ignored
+```
+
+The GPU test compares strip output with full-frame 4× MSAA, checks fractional
+edge coverage and premultiplied RGB, and covers a partial final strip. Readback
+and full-frame MSAA allocations are confined to that test.
+
+On the development X11/NVIDIA RTX 3070 system, paired release-build measurements
+at matching 1912×2152 window sizes gave:
+
+| Example | Process RAM before → after (KiB) | RAM growth | Reported VRAM before → after |
+| --- | ---: | ---: | ---: |
+| Glass cube | 209,184 → 216,760 | 3.6% | 203 → 203 MiB |
+| Regular viewport | 212,244 → 222,152 | 4.7% | 203 → 203 MiB |
+
+These are whole-process `VmHWM`/`VmRSS` and NVIDIA `pmon` samples after four
+seconds, within the requested 10% growth limit for these workloads. Driver
+allocation and scene complexity can affect other workloads. Native 120-frame
+smoke tests also passed for the glass cube and two transparent viewports.
+
 See the [specsheet](./native-gpu-viewport-specsheet.md) for the full target, deferred
 platform work, and future upstream Hydra-like backend migration.
