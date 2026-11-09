@@ -382,44 +382,7 @@ impl GpuViewportRenderer for UsdRenderer {
         let Some(orbit) = &mut self.orbit else {
             return false;
         };
-        match event {
-            EngineEvent::PointerButton {
-                button: crate::PointerButton::Primary,
-                state,
-                ..
-            } => {
-                orbit.drag = *state == crate::ButtonState::Pressed;
-                orbit.last = None;
-            }
-            EngineEvent::PointerMoved { position, .. } => {
-                let next = [position.x, position.y];
-                if orbit.drag
-                    && let Some(last) = orbit.last
-                {
-                    orbit.yaw -= (next[0] - last[0]) * 0.01;
-                    orbit.pitch = (orbit.pitch + (next[1] - last[1]) * 0.01).clamp(-1.5, 1.5);
-                }
-                orbit.last = Some(next);
-            }
-            EngineEvent::Scroll { delta, .. } => {
-                let dy = match delta {
-                    crate::ScrollDelta::Lines { y, .. } => *y,
-                    crate::ScrollDelta::Pixels { y, .. } => *y / 40.0,
-                };
-                orbit.radius = (orbit.radius * (-dy * 0.1).exp()).clamp(0.001, 1e10);
-            }
-            EngineEvent::FocusChanged(false) | EngineEvent::Suspended => {
-                orbit.drag = false;
-                orbit.last = None;
-                return false;
-            }
-            _ => return false,
-        }
-        // Author the camera in a viewport-owned USD stage, never the input file.
-        if let Err(e) = update_orbit_camera(&self.camera_stage, &self.camera_path, orbit) {
-            eprintln!("cssimpler: {e}");
-        }
-        true
+        handle_orbit_event(&self.camera_stage, &self.camera_path, orbit, event)
     }
     fn render(&mut self, gpu: &GpuContext, frame: GpuViewportFrame<'_>) -> Result<()> {
         let time = self.control.0.borrow().time;
@@ -481,6 +444,63 @@ impl Drop for UsdRenderer {
     fn drop(&mut self) {
         self.scene.stage.remove_sink(self.redraw_sink);
     }
+}
+
+fn handle_orbit_event(
+    stage: &Stage,
+    path: &sdf::Path,
+    orbit: &mut Orbit,
+    event: &EngineEvent,
+) -> bool {
+    match event {
+        EngineEvent::PointerButton {
+            button: crate::PointerButton::Primary,
+            state,
+            ..
+        } => {
+            orbit.drag = *state == crate::ButtonState::Pressed;
+            // Capture changes alone do not change the camera pose.
+            return true;
+        }
+        EngineEvent::PointerMoved { position, .. } => {
+            let next = [position.x, position.y];
+            let previous = orbit.last.replace(next);
+            if !orbit.drag {
+                // Includes cursor movement while the OS is dragging the window:
+                // do not author USD or request a GPU redraw for hover events.
+                return false;
+            }
+            let Some(last) = previous else {
+                return true;
+            };
+            if last == next {
+                return true;
+            }
+            orbit.yaw -= (next[0] - last[0]) * 0.01;
+            orbit.pitch = (orbit.pitch + (next[1] - last[1]) * 0.01).clamp(-1.5, 1.5);
+        }
+        EngineEvent::Scroll { delta, .. } => {
+            let dy = match delta {
+                crate::ScrollDelta::Lines { y, .. } => *y,
+                crate::ScrollDelta::Pixels { y, .. } => *y / 40.0,
+            };
+            if dy == 0.0 {
+                return false;
+            }
+            orbit.radius = (orbit.radius * (-dy * 0.1).exp()).clamp(0.001, 1e10);
+        }
+        EngineEvent::FocusChanged(false) | EngineEvent::Suspended => {
+            orbit.drag = false;
+            orbit.last = None;
+            return false;
+        }
+        _ => return false,
+    }
+    // Author only actual orbit/zoom changes in the viewport-owned USD stage.
+    if let Err(e) = update_orbit_camera(stage, path, orbit) {
+        eprintln!("cssimpler: {e}");
+    }
+    true
 }
 
 fn update_orbit_camera(stage: &Stage, path: &sdf::Path, orbit: &Orbit) -> Result<()> {
@@ -664,6 +684,84 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hover_and_button_edges_do_not_author_camera_but_orbit_and_zoom_do() {
+        let stage = Stage::builder()
+            .schema_registry(openusd_schemas::schema_registry())
+            .in_memory("camera-test.usda")
+            .unwrap();
+        let path = sdf::Path::new("/Camera").unwrap();
+        geom::Camera::define(&stage, &path).unwrap();
+        let mut orbit = Orbit {
+            center: Vec3::ZERO,
+            up: Vec3::Y,
+            radius: 5.0,
+            yaw: 0.5,
+            pitch: 0.25,
+            drag: false,
+            last: None,
+        };
+        update_orbit_camera(&stage, &path, &orbit).unwrap();
+        let writes = Rc::new(Cell::new(0));
+        let observed = writes.clone();
+        stage.add_sink(move |_: &Stage, _: &scene::CommittedChange| {
+            observed.set(observed.get() + 1)
+        });
+        let moved = |x| EngineEvent::PointerMoved {
+            position: crate::PointerPosition { x, y: 10.0 },
+            modifiers: Default::default(),
+        };
+        let button = |state| EngineEvent::PointerButton {
+            button: crate::PointerButton::Primary,
+            state,
+            modifiers: Default::default(),
+        };
+        for x in 0..100 {
+            assert!(!handle_orbit_event(
+                &stage,
+                &path,
+                &mut orbit,
+                &moved(x as f32)
+            ));
+        }
+        assert_eq!(writes.get(), 0);
+        assert_eq!((orbit.yaw, orbit.pitch), (0.5, 0.25));
+        assert!(handle_orbit_event(
+            &stage,
+            &path,
+            &mut orbit,
+            &button(crate::ButtonState::Pressed)
+        ));
+        assert_eq!(writes.get(), 0);
+        assert!(handle_orbit_event(&stage, &path, &mut orbit, &moved(110.0)));
+        assert!(writes.get() > 0);
+        let orbit_writes = writes.get();
+        assert!(handle_orbit_event(
+            &stage,
+            &path,
+            &mut orbit,
+            &button(crate::ButtonState::Released)
+        ));
+        assert!(!handle_orbit_event(
+            &stage,
+            &path,
+            &mut orbit,
+            &moved(120.0)
+        ));
+        assert_eq!(writes.get(), orbit_writes);
+        assert!(handle_orbit_event(
+            &stage,
+            &path,
+            &mut orbit,
+            &EngineEvent::Scroll {
+                delta: crate::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+                modifiers: Default::default()
+            }
+        ));
+        assert!(writes.get() > orbit_writes);
+        assert!(orbit.radius < 5.0);
+    }
+
     fn triangle() -> Stage {
         let stage = Stage::builder()
             .schema_registry(openusd_schemas::schema_registry())
