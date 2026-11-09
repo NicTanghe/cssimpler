@@ -1,4 +1,4 @@
-# Native GPU viewport specsheet
+# Native GPU and USD viewport specsheet
 
 Date: 2026-11-09  
 Status: **Planned — not implemented**
@@ -35,20 +35,35 @@ GPU animation must not force CPU scene rebuilding, rasterization, or parent
 presentation. Neither GPU readback nor uploading the CPU UI into GPU textures is
 part of this design.
 
+Native USD rendering is also part of the planned feature: an application supplies
+a USD file and a camera mode, and CSSimpler loads and renders the scene. Use the
+native Rust [`openusd` crate](https://docs.rs/openusd/latest/openusd/) for file
+loading and the internal scene representation, with its matching
+[`openusd-schemas` crate](https://docs.rs/openusd-schemas/latest/openusd_schemas/)
+for standard geometry, camera, material, and lighting schemas. USD is not merely an
+import format that gets converted into a second CSSimpler scene format.
+
 ## Scope and defaults
 
 - Support Windows, macOS, Linux X11, and Linux Wayland.
-- Provide generic GPU viewport registration and rendering callbacks. Applications
-  remain responsible for their scene data, shaders, and rendering pipelines.
+- Provide both generic GPU viewport callbacks and a built-in USD viewport renderer.
+  The generic path permits application-defined rendering; the USD path must render
+  a file without application-supplied mesh conversion, shaders, or render callbacks.
+- Use USD stages, prims, attributes, and standard schemas as the canonical internal
+  representation for geometry, transforms, cameras, lights, materials, bindings,
+  and scene animation. Do not introduce a parallel scene graph or serialized format.
 - Preserve existing `App`, `FragmentApp`, `ui!`, CSS, CPU rendering, and native-glass
   behavior around viewports and beneath transparent viewport pixels.
 - Support rectangular viewport content regions with opaque presentation by default
   and an explicit transparent presentation option. CPU controls remain around
   them. Full CSS composition of CPU content over live GPU content is deferred.
 - Support multiple nonoverlapping viewports sharing one GPU device per runtime.
-- Keep USD loading, cloth simulation, production PBR, and Bevy integration outside
-  the initial implementation. The generic API must permit later compute and render
-  passes on the same device.
+- Include native USD loading and rendering in the initial implementation. Keep
+  cloth simulation, production PBR, and Bevy integration outside it. The generic
+  API must permit later compute and render passes on the same device.
+- Start with a built-in `wgpu` USD rendering backend. Plan to replace it with a
+  suitable upstream Hydra-like renderer when that becomes available in the Rust
+  USD stack; the application's USD scene representation must not change.
 - These requirements concern native desktop applications; web and mobile embedding
   are outside this version.
 
@@ -74,6 +89,9 @@ Support:
   the renderer crate behind its corresponding feature.
 - Use `wgpu` 30.0 for the planned implementation and re-export it through
   `cssimpler::renderer::gpu` so consumers can use compatible GPU types.
+- Gate `openusd` 0.8 and matching `openusd-schemas` 0.8 dependencies behind the same
+  optional feature. Enable the `geom`, `shade`, and `lux` schema families and
+  install their schema registry when opening or creating a stage.
 - Add `with_gpu_viewport(element_id, options, renderer_factory)` to both `App` and
   `FragmentApp`, binding a registration to an existing element ID. For example,
   `<div id="scene" class="viewport"></div>` can reserve the region without new
@@ -84,7 +102,8 @@ Support:
   registrations and duplicate matching element IDs explicitly.
 
 Acceptance:
-- Default builds do not compile `wgpu` or the new GPU-specific dependencies.
+- Default builds do not compile `wgpu`, `openusd`, `openusd-schemas`, or the new
+  GPU-specific dependencies.
 - Enabling the feature without registering a viewport does not initialize a GPU
   device or replace the parent presenter.
 - Registration works through both application types and custom scene providers.
@@ -272,12 +291,13 @@ Acceptance:
 
 ## GPU7. Example, tests, and acceptance evidence
 
-Depends: GPU1 through GPU6  
+Depends: GPU1 through GPU6, USD1
+
 Status: planned
 
 Purpose:
-- Prove native embedding, CPU/GPU scheduling separation, and feature isolation
-  before applications build USD or simulation integrations on this API.
+- Prove native embedding, built-in USD rendering, CPU/GPU scheduling separation,
+  and feature isolation before applications build simulation integrations on it.
 
 Support:
 - Add a feature-gated example with an animated depth-tested mesh, CPU sidebar
@@ -286,6 +306,15 @@ Support:
   available. Require the feature explicitly for this example target.
 - Add mock-backed tests for registration, content-box geometry, fractional DPI,
   visibility and overlap decisions, input capture, scheduling, and surface recovery.
+- Add a USD example that accepts a file and camera mode without custom render
+  callbacks. Include a scene with geometry, authored cameras, materials, and lights,
+  plus an orbit view and time-sampled mesh playback. Show the same stage in two
+  widgets with independent cameras and reusable GPU resources.
+- Test `.usda`, `.usdc`, and `.usdz` inputs, referenced assets, stage transforms and
+  units, camera selection, stage edits, and animation-time changes. Verify missing
+  files, invalid camera paths, missing dependencies, and unsupported rendering
+  features produce useful diagnostics. Check that runtime camera changes do not
+  modify the source file.
 - Run existing workspace tests and example checks with the feature disabled and
   enabled. Inspect the default dependency graph for GPU dependency leakage.
 - Record native smoke tests on Windows, macOS, X11, and Wayland, covering input,
@@ -304,17 +333,127 @@ Acceptance:
 - Transparent presentation reveals the live CPU background without black/opaque
   replacement pixels or blend fringes. Glass remains entirely in CSSimpler's
   existing UI/native presentation path.
+- A supported USD scene renders from a file and camera mode using the built-in
+  renderer. Geometry, cameras, materials, and lights retain their USD identities;
+  changing USD attributes updates the corresponding rendering state.
 - Cross-platform support has native execution evidence for all four backends.
   Cross-compilation or build-only checks must be recorded separately and must not
   be presented as native runtime verification.
+
+---
+
+## USD1. Native USD scene model and built-in rendering
+
+Depends: GPU1, GPU2, GPU4, GPU5
+
+Status: planned
+
+Purpose:
+- Make USD the native scene model and provide a direct file-to-viewport experience
+  without requiring applications to assemble a renderer themselves.
+
+Support:
+- Load USD through the requested `openusd` crate, using its composed `usd::Stage`
+  rather than parsing layers into an application-specific geometry format. Accept
+  an existing in-memory stage as well as a file so programmatically created scenes
+  use the same rendering path.
+- Add a high-level `with_usd_viewport(element_id, file_or_stage, camera_mode)`
+  registration API to both `App` and `FragmentApp`. Expose optional settings for
+  shading, animation time, background alpha, and redraw scheduling while keeping
+  file plus camera mode sufficient for a visible first render.
+- Offer an interactive orbit camera mode that frames scene bounds by default, and
+  an authored-camera mode selecting a USD camera prim by path. Honor the selected
+  camera's USD projection and optical attributes. Represent generated camera poses
+  and projection in USD camera prims in a transient session layer, without saving
+  changes to the input file. Give each view its own camera identity.
+- Read geometry, transforms, visibility, normals, primvars, and time-sampled values
+  through USD. Respect stage axis/unit metadata and camera conventions when
+  deriving GPU transforms. Start with mesh-based scenes and cloth cache playback;
+  do not imply every USD primitive or extension is renderable in the first backend.
+- Use `UsdShade` materials and bindings and `UsdLux` lights for internal material
+  and lighting representation. Light types, transforms, colors, intensities, and
+  animation remain USD data; do not add a parallel CSSimpler lighting format.
+- Provide built-in matcap shading for the initial file-and-camera experience,
+  including scenes without authored lighting. A matcap is a viewport display
+  choice; it does not replace or rewrite the scene's USD materials and lights.
+  Document the initial backend's supported geometry, material, and lighting
+  subset, report unsupported features, and preserve their USD data for a later
+  renderer. Full production shading remains deferred.
+- Derive vertex/index buffers, evaluated matrices, textures, material uniforms,
+  lighting buffers, and draw commands as disposable rendering caches keyed by
+  stage/prim identity. These caches are necessary GPU execution data, not a second
+  authoritative scene graph, editable scene model, or asset format.
+- Reuse a stage across logical views and reuse compatible GPU assets on the shared
+  device. Keep camera, time, and shading choices view-specific. Give the renderer
+  a target rectangle so logical views are not inherently tied to one native
+  surface each; later surface grouping must not require another scene model.
+- Invalidate derived render data when relevant USD changes or view-time changes
+  occur. Such changes redraw GPU content without forcing unrelated CPU UI repaint.
+- Keep stage ownership and mutation on its owning thread. The inspected crate's
+  `Stage` handle is neither `Send` nor `Sync`; sharing between views must not rely
+  on moving it across worker threads or assuming that `Arc` makes it thread-safe.
+
+Acceptance:
+- A file path and camera mode render a supported USD scene with built-in shading.
+- Geometry, cameras, lights, and materials are queried and edited as USD data;
+  there is no required conversion to glTF or a custom CSSimpler scene format.
+- A stage created in memory renders through the same API as a file-backed stage.
+- Two logical widgets can render the same stage with independent cameras without
+  reparsing its file or duplicating an authoritative scene representation.
+- Runtime camera changes leave the source asset unchanged. Unsupported features
+  are diagnosed while their authored data remains in the stage.
+
+---
+
+## USD2. Future upstream Hydra-like backend
+
+Depends: USD1 and a suitable upstream Rust USD rendering implementation
+
+Status: deferred until upstream support exists
+
+Purpose:
+- Allow adoption of upstream scene-to-renderer integration without migrating
+  application scenes or coupling the public viewport API to the first backend.
+
+Support:
+- Keep a private renderer-backend boundary accepting USD stage/prim identities,
+  camera selection, evaluation time, viewport display settings, and a GPU target.
+  The first implementation evaluates USD and issues `wgpu` commands itself.
+- Replace that backend with an upstream Hydra-like implementation when available
+  and suitable for the native surfaces and GPU resource requirements. This is an
+  intended migration, not a claim that the current crate already supplies Hydra
+  or has committed to a particular future rendering API.
+- Preserve the file/stage-plus-camera entry point, native surface lifecycle,
+  transparent presentation, CPU UI separation, and canonical USD representation.
+  Do not introduce a custom intermediate scene format to emulate future Hydra.
+
+Acceptance for the future migration:
+- Applications keep their USD assets, stage-based scene editing, and viewport
+  registration APIs when the backend changes.
+- The USD rendering and native composition acceptance suite can exercise either
+  backend. Backend-specific GPU resources remain derived caches.
+- Upstream renderer availability does not block completion of the initial `wgpu`
+  backend and USD1; USD2 is a later migration milestone.
 
 ## Implementation order and completion gate
 
 Implement GPU1 and GPU2 first, then GPU3 for all four backends. Integrate GPU4 and
 GPU5 with the existing runtime, apply GPU6 before exposing general application use,
-and finish with GPU7's full validation matrix.
+implement USD1 on that infrastructure, and finish with GPU7's full validation
+matrix. USD2 remains a future upstream-dependent migration.
 
 Every milestone remains planned until implemented and verified. This specsheet
 does not authorize changing the selected architecture to a shared GPU presenter,
-dropping a desktop backend, or adding USD, a cloth solver, or production PBR to the
-initial scope.
+dropping a desktop backend, or adding a cloth solver or production PBR to the
+initial scope. Native USD loading, scene representation, and built-in rendering
+are explicitly included in the initial scope.
+
+## USD API references
+
+- [`openusd` crate](https://docs.rs/openusd/latest/openusd/): requested native Rust
+  USD implementation and file-format entry point.
+- [`openusd::usd::Stage`](https://docs.rs/openusd/latest/openusd/usd/struct.Stage.html):
+  composed scene access, edits, session layers, change notifications, and ownership
+  constraints.
+- [`openusd-schemas`](https://docs.rs/openusd-schemas/latest/openusd_schemas/): typed
+  geometry, camera, material, and lighting schema views and registry setup.

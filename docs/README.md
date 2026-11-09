@@ -16,4 +16,4 @@ The workspace now has the foundations through rendering, typography and font res
 
 ## Planned extensions
 
-- [Native GPU viewport specsheet](./native-gpu-viewport-specsheet.md) — optional native `wgpu` surfaces inside CPU-rendered UI; planned, not implemented.
+- [Native GPU and USD viewport specsheet](./native-gpu-viewport-specsheet.md) — optional native `wgpu` surfaces, USD scene representation, and built-in file-and-camera rendering inside CPU-rendered UI; planned, not implemented.
