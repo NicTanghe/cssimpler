@@ -411,23 +411,9 @@ impl GpuRuntime {
     }
 
     pub fn event(&mut self, event: &EngineEvent) -> bool {
-        #[cfg(target_os = "macos")]
-        if let EngineEvent::PointerMoved { modifiers, .. } = event {
-            if self
-                .captured
-                .as_ref()
-                .is_some_and(|capture| capture.buttons.contains(&crate::PointerButton::Primary))
-                && !native::primary_button_pressed()
-            {
-                // A native move/resize or trackpad gesture can consume mouseUp.
-                // Never infer a press from movement; only repair a stale release.
-                self.event(&EngineEvent::PointerButton {
-                    button: crate::PointerButton::Primary,
-                    state: crate::ButtonState::Released,
-                    modifiers: *modifiers,
-                });
-            }
-        }
+        // Button events and motion share the event queue. Do not compare a
+        // queued move with the current OS button state: the physical release
+        // can already have happened while these valid drag events were queued.
         if let EngineEvent::PointerMoved { position, .. } = event {
             self.pointer = Some(*position);
         }
@@ -502,6 +488,40 @@ impl GpuRuntime {
 mod tests {
     use super::*;
     use crate::PointerButton::{Primary, Secondary};
+
+    #[test]
+    fn queued_motion_keeps_capture_until_the_queued_release() {
+        let mut runtime = GpuRuntime::new(GpuViewportRegistry::default()).unwrap();
+        // Input routing can be exercised without creating a native surface.
+        runtime.live.push(None);
+        runtime.captured = PointerCapture::press(None, Some(0), Primary);
+        for x in 0..256 {
+            runtime.event(&EngineEvent::PointerMoved {
+                position: crate::PointerPosition {
+                    x: x as f32,
+                    y: 20.0,
+                },
+                modifiers: Default::default(),
+            });
+            let capture = runtime
+                .captured
+                .as_ref()
+                .expect("queued motion must not synthesize a release");
+            assert_eq!(capture.index, 0);
+            assert_eq!(capture.buttons, vec![Primary]);
+        }
+        runtime.event(&EngineEvent::PointerButton {
+            button: Primary,
+            state: crate::ButtonState::Released,
+            modifiers: Default::default(),
+        });
+        assert!(runtime.captured.is_none());
+        runtime.event(&EngineEvent::PointerMoved {
+            position: crate::PointerPosition { x: 300.0, y: 20.0 },
+            modifiers: Default::default(),
+        });
+        assert!(runtime.captured.is_none(), "hover cannot start a drag");
+    }
 
     #[test]
     fn additional_button_does_not_steal_or_release_the_original_drag() {

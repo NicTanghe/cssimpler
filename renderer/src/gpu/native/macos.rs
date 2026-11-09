@@ -3,23 +3,13 @@ use super::*;
 use objc2::{
     MainThreadMarker, msg_send,
     rc::Retained,
-    runtime::{AnyClass, AnyObject, Bool},
+    runtime::{AnyObject, Bool},
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::ns_string;
 use objc2_quartz_core::{CALayer, CAMetalLayer, CATransaction};
 use std::cell::Cell;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-pub(crate) fn primary_button_pressed() -> bool {
-    let Some(class) = AnyClass::get(c"NSEvent") else {
-        return true;
-    };
-    // SAFETY: AppKit documents pressedMouseButtons as a process-independent
-    // NSUInteger bitmask. Recover a release consumed by a native window gesture.
-    let buttons: usize = unsafe { msg_send![class, pressedMouseButtons] };
-    buttons & 1 != 0
-}
 
 pub(crate) struct NativeHost {
     layer: Retained<CAMetalLayer>,

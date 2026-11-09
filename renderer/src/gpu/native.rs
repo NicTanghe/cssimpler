@@ -17,8 +17,6 @@ pub(super) use x11::NativeHost;
 mod macos;
 #[cfg(target_os = "macos")]
 pub(super) use macos::NativeHost;
-#[cfg(target_os = "macos")]
-pub(super) use macos::primary_button_pressed;
 
 #[cfg(windows)]
 mod win32 {

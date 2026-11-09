@@ -180,7 +180,20 @@ are outside that benchmark. Native Metal surfaces use two drawables to limit
 queued camera frames. GPU-consumed orbit/zoom events do not schedule CPU UI
 redraws. Drag capture retains its original viewport until all held buttons are
 released, is cancelled when hidden,
-and on macOS recovers a missed release using AppKit's pressed-button state.
+and follows queued press/release events on every platform. Live OS button polling
+is deliberately avoided: it can cancel valid queued drag movement after the
+physical release, particularly when native glass adds presentation latency.
+
+Exercise the glass example's on-demand redraw path (rather than continuous
+smoke rendering) with:
+
+```sh
+cargo run --features gpu-viewport --example usd_glass_cube -- --smoke-on-demand
+```
+
+This requests each subsequent frame through the redraw handle and exits after
+120 frames, reporting elapsed time. It checks redraw scheduling independently
+of manual pointer input.
 
 On the development X11/NVIDIA RTX 3070 system, paired release-build measurements
 at matching 1912×2152 window sizes gave:
