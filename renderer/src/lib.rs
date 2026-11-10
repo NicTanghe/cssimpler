@@ -7555,6 +7555,7 @@ fn blend_mask_row(
         }
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     blend_mask_row_scalar(buffer_row, buffer_start, coverages, color, base_alpha);
 }
 

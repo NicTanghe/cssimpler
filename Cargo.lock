@@ -520,6 +520,7 @@ name = "cssimpler-renderer"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "block2 0.6.2",
  "bytemuck",
  "cssimpler-core",
  "font8x8",

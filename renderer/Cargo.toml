@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = []
-gpu-viewport = ["dep:wgpu", "dep:pollster", "dep:openusd", "dep:openusd-schemas", "dep:bytemuck", "dep:glam", "dep:windows", "dep:x11rb", "dep:x11-dl", "objc2-quartz-core/CAMetalLayer"]
+gpu-viewport = ["dep:wgpu", "dep:pollster", "dep:openusd", "dep:openusd-schemas", "dep:bytemuck", "dep:glam", "dep:windows", "dep:x11rb", "dep:x11-dl", "dep:block2", "objc2-quartz-core/CAMetalLayer"]
 
 [dependencies]
 ab_glyph.workspace = true
@@ -30,6 +30,7 @@ winapi = { version = "0.3.9", features = ["winuser"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6.2", optional = true }
 objc2 = { version = "0.6.4", default-features = false }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFCGTypes"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGColorSpace", "CGDataProvider", "CGImage"] }
