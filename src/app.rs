@@ -583,6 +583,9 @@ where
     }
 
     pub fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        if self.text_inputs.is_composing() && matches!(event, EngineEvent::Key(_)) {
+            return true;
+        }
         if self
             .event_handler
             .is_some_and(|handler| handler(&mut self.state, event))
@@ -949,6 +952,14 @@ where
     View: FnMut(&State) -> Node,
     Signal: Into<Refresh>,
 {
+    fn ime_target(&self) -> Option<ElementPath> {
+        self.text_inputs.ime_target()
+    }
+
+    fn ime_composing(&self) -> bool {
+        self.text_inputs.is_composing()
+    }
+
     fn can_close(&mut self) -> bool {
         let result = self
             .close_handler
@@ -958,6 +969,9 @@ where
     }
     #[cfg(feature = "gpu-viewport")]
     fn handle_application_event(&mut self, event: &EngineEvent) -> bool {
+        if self.text_inputs.is_composing() && matches!(event, EngineEvent::Key(_)) {
+            return true;
+        }
         if self
             .event_handler
             .is_some_and(|handler| handler(&mut self.state, event))
@@ -986,7 +1000,7 @@ where
     #[cfg(feature = "gpu-viewport")]
     fn focus_gpu_viewport(&mut self) -> bool {
         if self.text_inputs.clear_focus() {
-            self.invalidate(Invalidation::Paint);
+            self.invalidate(Invalidation::Structure);
             true
         } else {
             false
@@ -1240,6 +1254,9 @@ where
     }
 
     pub fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
+        if self.text_inputs.is_composing() && matches!(event, EngineEvent::Key(_)) {
+            return true;
+        }
         if self
             .event_handler
             .is_some_and(|handler| handler(&mut self.state, event))
@@ -1533,6 +1550,14 @@ where
     Update: FnMut(&mut State, FrameInfo) -> Signal,
     Signal: Into<Refresh>,
 {
+    fn ime_target(&self) -> Option<ElementPath> {
+        self.text_inputs.ime_target()
+    }
+
+    fn ime_composing(&self) -> bool {
+        self.text_inputs.is_composing()
+    }
+
     fn can_close(&mut self) -> bool {
         let result = self
             .close_handler
@@ -1542,6 +1567,9 @@ where
     }
     #[cfg(feature = "gpu-viewport")]
     fn handle_application_event(&mut self, event: &EngineEvent) -> bool {
+        if self.text_inputs.is_composing() && matches!(event, EngineEvent::Key(_)) {
+            return true;
+        }
         if self
             .event_handler
             .is_some_and(|handler| handler(&mut self.state, event))
@@ -1570,7 +1598,7 @@ where
     #[cfg(feature = "gpu-viewport")]
     fn focus_gpu_viewport(&mut self) -> bool {
         if self.text_inputs.clear_focus() {
-            self.invalidate(Invalidation::Paint);
+            self.invalidate(Invalidation::Structure);
             true
         } else {
             false

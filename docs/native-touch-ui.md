@@ -46,3 +46,35 @@ Use `autofocus="autofocus"` to focus a field when it appears. The last autofocus
 
 
 `App::with_event_handler(fn(&mut State, &EngineEvent) -> bool)` and the equivalent `FragmentApp` hook handle application shortcuts or open-menu keyboard navigation before native text editing. Return true to consume an event and invalidate the view; return false to keep default input behavior. Window/event dispatch remains in CSSimpler.
+
+## IME composition
+
+Native editable inputs in `App` and `FragmentApp` display temporary IME text
+inline with an underline, the IME's selected range, and its caret. A missing IME
+cursor hides the caret. Composition replaces the selected text visually, but
+the field's `value` and `oninput` remain unchanged until commit. Commit replaces
+the original selection once, including when winit first sends an empty preedit.
+Password fields mask composing text as well as committed text.
+
+While composing, the OS owns keyboard editing and navigation: Enter, Escape,
+arrows, Tab, and shortcuts do not reach field editing, `onenter`, or application
+keyboard handlers. Empty preedit cancels the preview. IME disable, window focus
+loss, suspension, pointer repositioning, input removal/editability changes, and
+focus changes discard pending composition. A changed controlled value also
+discards it; rebuilding with the same value preserves it.
+
+The native runtime enables IME for the focused input and updates the candidate
+popup anchor from the rendered caret using logical coordinates, including text
+alignment, padding, scrolling, and CSS transforms. Custom `SceneProvider`
+implementations using native editing should implement `ime_target` and
+`ime_composing` and provide the matching `TextEditDecoration`. Headless hosts
+can forward `TextInputEvent::Preedit`, `Commit`, and `Disabled` themselves.
+
+Native IME behavior still needs manual validation on each desktop backend. Run
+`cargo run --example input_fields`, focus a text field, compose Japanese/Chinese
+or Korean text, change candidates, confirm and cancel, replace a selection, and
+switch fields/windows during composition. Check that the candidate popup follows
+the caret after moving, resizing, scrolling, and changing display scale. Repeat
+in a password field to verify the preview remains masked. Automated tests cover
+the editor state, callbacks, candidate geometry, and full/incremental painting;
+they do not drive an OS candidate popup.

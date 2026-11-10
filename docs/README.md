@@ -1,5 +1,7 @@
 # cssimpler workspace
 
+- [todo: OS support sheet, remaining features, and optimisations](../todo.md)
+
 Current focus:
 
 - `src/app.rs` owns the explicit application loop for Epic G: state, invalidation, scoped refresh, and DOM rerender policy.
