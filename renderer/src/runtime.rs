@@ -1510,6 +1510,13 @@ where
             WindowEvent::MouseInput { state, button, .. }
                 if !self.touch.ignore_mouse(Instant::now()) =>
             {
+                #[cfg(feature = "gpu-viewport")]
+                if crate::gpu::input_trace_enabled() {
+                    eprintln!(
+                        "GPU input winit: {button:?} {state:?} resize={}",
+                        self.native_resize_started
+                    );
+                }
                 if button == WinitMouseButton::Left {
                     let was_resizing = self.native_resize_started;
                     // Some native resize loops consume the release. A new press also resets it.
@@ -1563,7 +1570,7 @@ where
                     _ => {}
                 }
                 self.update_resize_cursor();
-                self.handle_engine_event(
+                let consumed = self.handle_engine_event(
                     event_loop,
                     EngineEvent::PointerButton {
                         button: normalize_pointer_button(button),
@@ -1572,7 +1579,9 @@ where
                     },
                 );
                 // Preserve button edges even when press/release arrive before a redraw.
-                self.draw_frame(event_loop);
+                if !consumed || self.immediate_redraw {
+                    self.draw_frame(event_loop);
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let delta = match normalize_scroll_delta(delta) {

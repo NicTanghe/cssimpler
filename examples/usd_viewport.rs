@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
                     <div class="sidebar">
                         <h1>USD viewport</h1>
                         <p>CPU-rendered CSSimpler UI</p>
-                        <p>Drag to orbit. Scroll to zoom.</p>
+                        <p>Hold the primary button to orbit or scroll to zoom.</p>
                         <input type="text" placeholder="CPU text input" />
                         <p>The native GPU surface renders independently.</p>
                     </div>

@@ -315,4 +315,42 @@ fn check_strip_resolve(format: wgpu::TextureFormat) {
             "interior color must match"
         );
     }
+
+    // Check the deferred camera commit through actual rendered pixels, then
+    // verify that post-release hover and trackpad momentum leave them unchanged.
+    let moved = |x, y| EngineEvent::PointerMoved {
+        position: crate::PointerPosition { x, y },
+        modifiers: Default::default(),
+    };
+    renderer.event(&moved(40.0, 40.0));
+    assert!(renderer.event(&EngineEvent::PointerButton {
+        button: crate::PointerButton::Primary,
+        state: crate::ButtonState::Pressed,
+        modifiers: Default::default(),
+    }));
+    for step in 1..=1000 {
+        assert!(renderer.event(&moved(40.0 + step as f32 * 0.04, 40.0 + step as f32 * 0.02)));
+    }
+    renderer.event(&EngineEvent::PointerButton {
+        button: crate::PointerButton::Primary,
+        state: crate::ButtonState::Released,
+        modifiers: Default::default(),
+    });
+    let turned = draw(&mut renderer);
+    assert_ne!(
+        turned, reference,
+        "held movement must reach the rendered camera"
+    );
+    for step in 1..=1000 {
+        assert!(!renderer.event(&moved(80.0 + step as f32, 60.0)));
+        assert!(!renderer.event(&EngineEvent::Scroll {
+            delta: crate::ScrollDelta::Pixels { x: 0.0, y: 4.0 },
+            modifiers: Default::default(),
+        }));
+    }
+    assert_eq!(
+        draw(&mut renderer),
+        turned,
+        "post-release hover and scrolling must not change the image"
+    );
 }

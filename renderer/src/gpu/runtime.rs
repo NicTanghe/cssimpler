@@ -58,6 +58,7 @@ pub(crate) struct GpuRuntime {
     focused: Option<usize>,
     captured: Option<PointerCapture>,
     pointer: Option<crate::PointerPosition>,
+    trace_motion_count: u64,
 }
 
 impl GpuRuntime {
@@ -72,6 +73,7 @@ impl GpuRuntime {
             focused: None,
             captured: None,
             pointer: None,
+            trace_motion_count: 0,
         })
     }
 
@@ -145,6 +147,8 @@ impl GpuRuntime {
             if self.live[index].is_none() {
                 let host =
                     native::NativeHost::new(event_loop, parent.clone(), entry.options.transparent)?;
+                #[cfg(target_os = "macos")]
+                host.set_input_redraw(entry.redraw.clone());
                 // Native swapchains derive their extent from the child window/layer.
                 host.place(origin, physical_size)?;
                 let instance = self.instance.get_or_insert_with(wgpu::Instance::default);
@@ -308,7 +312,70 @@ impl GpuRuntime {
         self.captured = None;
     }
 
+    #[cfg(target_os = "macos")]
+    fn forward_native_input(&mut self) {
+        let mut released = None;
+        let mut motion = None;
+        let owner = self
+            .captured
+            .as_ref()
+            .filter(|capture| capture.buttons.contains(&crate::PointerButton::Primary))
+            .map(|capture| capture.index);
+        // Drain every host, including multiple viewports sharing one window.
+        for (index, live) in self.live.iter().enumerate() {
+            if let Some(live) = live {
+                let moved = live.host.take_native_motion();
+                let up = live.host.take_primary_release();
+                if owner == Some(index) {
+                    motion = moved;
+                    released = up;
+                }
+            }
+        }
+        if let Some((position, modifiers)) = motion {
+            self.event(&EngineEvent::PointerMoved {
+                position,
+                modifiers,
+            });
+        }
+        self.forward_primary_release(released);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_native_capture(&self) {
+        let owner = self
+            .captured
+            .as_ref()
+            .filter(|capture| capture.buttons.contains(&crate::PointerButton::Primary))
+            .map(|capture| capture.index);
+        for (index, live) in self.live.iter().enumerate() {
+            if let Some(live) = live {
+                live.host.set_primary_capture(owner == Some(index));
+            }
+        }
+    }
+
+    #[cfg(any(test, target_os = "macos"))]
+    fn forward_primary_release(&mut self, released: Option<crate::KeyboardModifiers>) {
+        if let Some(modifiers) = released.filter(|_| {
+            self.captured
+                .as_ref()
+                .is_some_and(|capture| capture.buttons.contains(&crate::PointerButton::Primary))
+        }) {
+            if input_trace_enabled() {
+                eprintln!("GPU input native release forwarded to viewport");
+            }
+            self.event(&EngineEvent::PointerButton {
+                button: crate::PointerButton::Primary,
+                state: crate::ButtonState::Released,
+                modifiers,
+            });
+        }
+    }
+
     pub fn draw(&mut self, cadence: Duration) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        self.forward_native_input();
         let Some(gpu) = &self.gpu else {
             return Ok(());
         };
@@ -323,6 +390,7 @@ impl GpuRuntime {
             {
                 continue;
             }
+            let timing = input_trace_enabled().then(Instant::now);
             let (texture, reconfigure) = match live.surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t) => (t, false),
                 wgpu::CurrentSurfaceTexture::Suboptimal(t) => (t, true),
@@ -354,6 +422,7 @@ impl GpuRuntime {
                     return Err(error("GPU surface acquisition validation failed"));
                 }
             };
+            let acquired = timing.map(|_| Instant::now());
             entry.redraw.take_dirty();
             let target = texture.texture.create_view(&Default::default());
             let mut encoder = gpu
@@ -377,8 +446,30 @@ impl GpuRuntime {
                     encoder: &mut encoder,
                 },
             )?;
+            let encoded = timing.map(|_| Instant::now());
             gpu.queue.submit([encoder.finish()]);
             gpu.queue.present(texture);
+            if let Some(start) = timing {
+                let end = Instant::now();
+                if live.frame_index % 60 == 0
+                    || end.duration_since(start) > Duration::from_millis(8)
+                {
+                    eprintln!(
+                        "GPU frame trace: interval_us={} acquire_us={} encode_us={} submit_present_us={} cpu_frame={} cpu_total_us={}",
+                        live.last_frame
+                            .map(|last| now.duration_since(last).as_micros())
+                            .unwrap_or(0),
+                        acquired.unwrap().duration_since(start).as_micros(),
+                        encoded
+                            .unwrap()
+                            .duration_since(acquired.unwrap())
+                            .as_micros(),
+                        end.duration_since(encoded.unwrap()).as_micros(),
+                        crate::latest_frame_timing_stats().frame_index,
+                        crate::latest_frame_timing_stats().total_us
+                    );
+                }
+            }
             if reconfigure {
                 live.surface.configure(&gpu.device, &live.config);
                 live.host.commit()?;
@@ -411,6 +502,28 @@ impl GpuRuntime {
     }
 
     pub fn event(&mut self, event: &EngineEvent) -> bool {
+        // A local NSEvent monitor observes real drag/up packets before view
+        // routing can swallow them. No live button-state polling is involved.
+        #[cfg(target_os = "macos")]
+        self.forward_native_input();
+        if input_trace_enabled() {
+            if let EngineEvent::PointerButton { button, state, .. } = event {
+                self.trace_motion_count = 0;
+                eprintln!(
+                    "GPU input viewport: {button:?} {state:?} captured={:?}",
+                    self.captured
+                );
+            }
+            if matches!(event, EngineEvent::PointerMoved { .. }) {
+                if self.trace_motion_count % 60 == 0 {
+                    eprintln!(
+                        "GPU input viewport: motion count={} captured={:?}",
+                        self.trace_motion_count, self.captured
+                    );
+                }
+                self.trace_motion_count += 1;
+            }
+        }
         // Button events and motion share the event queue. Do not compare a
         // queued move with the current OS button state: the physical release
         // can already have happened while these valid drag events were queued.
@@ -449,6 +562,8 @@ impl GpuRuntime {
                 }
                 self.focused = None;
                 self.captured = None;
+                #[cfg(target_os = "macos")]
+                self.sync_native_capture();
                 return false;
             }
             _ => self.captured.as_ref().map(|capture| capture.index).or(hit),
@@ -480,6 +595,10 @@ impl GpuRuntime {
                 .take()
                 .and_then(|capture| capture.release(*button));
         }
+        #[cfg(target_os = "macos")]
+        if matches!(event, EngineEvent::PointerButton { .. }) {
+            self.sync_native_capture();
+        }
         consumed
     }
 }
@@ -488,6 +607,43 @@ impl GpuRuntime {
 mod tests {
     use super::*;
     use crate::PointerButton::{Primary, Secondary};
+
+    #[test]
+    fn native_release_stops_capture_when_winit_mouse_up_is_missing() {
+        let mut runtime = GpuRuntime::new(GpuViewportRegistry::default()).unwrap();
+        runtime.live.push(None);
+        runtime.captured = PointerCapture::press(None, Some(0), Primary);
+        runtime.forward_primary_release(None);
+        assert!(runtime.captured.is_some(), "no release may be invented");
+        // AppKit saw mouseUp, but winit delivered no MouseInput::Released.
+        runtime.forward_primary_release(Some(Default::default()));
+        assert!(runtime.captured.is_none());
+        for x in 0..100 {
+            runtime.event(&EngineEvent::PointerMoved {
+                position: crate::PointerPosition {
+                    x: x as f32,
+                    y: 10.0,
+                },
+                modifiers: Default::default(),
+            });
+            assert!(runtime.captured.is_none());
+        }
+        runtime.forward_primary_release(Some(Default::default()));
+        assert!(
+            runtime.captured.is_none(),
+            "duplicate native/winit releases must be harmless"
+        );
+    }
+
+    #[test]
+    fn native_primary_release_preserves_other_held_buttons() {
+        let mut runtime = GpuRuntime::new(GpuViewportRegistry::default()).unwrap();
+        runtime.live.push(None);
+        let first = PointerCapture::press(None, Some(0), Primary);
+        runtime.captured = PointerCapture::press(first, Some(0), Secondary);
+        runtime.forward_primary_release(Some(Default::default()));
+        assert_eq!(runtime.captured.as_ref().unwrap().buttons, vec![Secondary]);
+    }
 
     #[test]
     fn queued_motion_keeps_capture_until_the_queued_release() {
