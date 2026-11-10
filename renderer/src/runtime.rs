@@ -35,8 +35,8 @@ use super::{
     record_frame_timing_stats, redraw_auto_scroll_indicator_regions,
     render_scene_update_internal_from_roots_with_glass, render_to_buffer_internal_from_roots,
     render_to_buffer_internal_from_roots_with_alpha, resize_buffer, scrollbar,
-    settle_element_interaction, should_present_frame_from_roots, should_suspend_updates,
-    to_softbuffer_rgb_blue_noise, to_softbuffer_rgb_blue_noise_with_alpha,
+    settle_element_interaction, should_present_frame_from_roots, to_softbuffer_rgb_blue_noise,
+    to_softbuffer_rgb_blue_noise_with_alpha,
 };
 
 #[cfg(feature = "gpu-viewport")]
@@ -193,7 +193,7 @@ pub(super) fn set_system_drag_override(active: bool) {
     SYSTEM_DRAG_OVERRIDE.store(active, Ordering::Relaxed);
 }
 
-fn system_drag_override_active() -> bool {
+pub(crate) fn system_drag_override_active() -> bool {
     SYSTEM_DRAG_OVERRIDE.load(Ordering::Relaxed)
 }
 
@@ -257,6 +257,7 @@ struct RuntimeApp<P> {
     modifiers: KeyboardModifiers,
     mouse_position: Option<(f32, f32)>,
     native_resize_started: bool,
+    system_pointer_yielded: bool,
     touch: super::touch::TouchController,
     #[cfg(windows)]
     touch_window: Option<super::touch_window::Gesture>,
@@ -268,7 +269,6 @@ struct RuntimeApp<P> {
     previous_right_down: bool,
     previous_middle_down: bool,
     previous_mouse_position: Option<(f32, f32)>,
-    suppress_left_pointer_until_release: bool,
     left_press_target: Option<ElementPath>,
     last_click: Option<(Instant, ElementPath)>,
     element_interaction: ElementInteractionState,
@@ -311,6 +311,7 @@ where
             modifiers: KeyboardModifiers::default(),
             mouse_position: None,
             native_resize_started: false,
+            system_pointer_yielded: false,
             touch: super::touch::TouchController::default(),
             #[cfg(windows)]
             touch_window: None,
@@ -322,7 +323,6 @@ where
             previous_right_down: false,
             previous_middle_down: false,
             previous_mouse_position: None,
-            suppress_left_pointer_until_release: false,
             left_press_target: None,
             last_click: None,
             element_interaction: ElementInteractionState::default(),
@@ -479,7 +479,63 @@ where
         self.request_redraw_if_possible();
     }
 
+    fn windowed(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_none_or(|window| window.fullscreen().is_none())
+    }
+
+    fn pointer_reserved_for_system(&self) -> bool {
+        super::input::system_pointer_gesture(
+            self.windowed(),
+            self.modifiers,
+            system_drag_override_active(),
+        )
+    }
+
+    fn yield_pointer_to_system(&mut self) {
+        if self.system_pointer_yielded {
+            return;
+        }
+        #[cfg(feature = "gpu-viewport")]
+        if crate::gpu::input_trace_enabled() {
+            eprintln!(
+                "GPU input runtime: yielding pointer modifiers={:?}",
+                self.modifiers
+            );
+        }
+        #[cfg(feature = "gpu-viewport")]
+        if let Some(gpu) = &mut self.gpu {
+            gpu.cancel_pointer_capture(self.modifiers);
+        }
+        // Cancel selection/scrollbar drags while retaining keyboard focus.
+        #[cfg(feature = "gpu-viewport")]
+        self.scene_provider
+            .handle_ui_event(&EngineEvent::PointerLeft);
+        #[cfg(not(feature = "gpu-viewport"))]
+        self.scene_provider
+            .handle_engine_event(&EngineEvent::PointerLeft);
+        let _ = self.scrollbar_controller.cancel_middle_button_auto_scroll();
+        let position = self.mouse_position;
+        self.clear_pointer_state();
+        self.mouse_position = position;
+        self.system_pointer_yielded = true;
+        self.request_immediate_redraw();
+    }
+
     fn handle_engine_event(&mut self, _event_loop: &ActiveEventLoop, event: EngineEvent) -> bool {
+        if super::input::system_pointer_event(
+            &event,
+            self.windowed(),
+            system_drag_override_active(),
+        )
+        .is_some()
+        {
+            self.yield_pointer_to_system();
+            if !matches!(event, EngineEvent::ModifiersChanged(_)) {
+                return false;
+            }
+        }
         #[cfg(feature = "gpu-viewport")]
         {
             if self.scene_provider.handle_application_event(&event) {
@@ -697,6 +753,7 @@ where
     }
 
     fn clear_pointer_state(&mut self) {
+        self.system_pointer_yielded = false;
         self.touch.cancel();
         #[cfg(windows)]
         {
@@ -712,7 +769,6 @@ where
         self.previous_right_down = false;
         self.previous_middle_down = false;
         self.previous_mouse_position = None;
-        self.suppress_left_pointer_until_release = false;
         self.left_press_target = None;
         self.update_resize_cursor();
     }
@@ -777,6 +833,9 @@ where
         if !self.can_draw() {
             return;
         }
+        if self.pointer_reserved_for_system() {
+            self.yield_pointer_to_system();
+        }
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -804,19 +863,7 @@ where
             ..FrameTimingStats::default()
         };
 
-        let suppress_pointer_for_system_drag = should_suspend_updates(
-            self.left_down,
-            self.modifiers.super_key,
-            system_drag_override_active(),
-        );
-        if suppress_pointer_for_system_drag {
-            self.suppress_left_pointer_until_release = true;
-        } else if !self.left_down {
-            self.suppress_left_pointer_until_release = false;
-        }
-        let interactive_left_down = self.left_down
-            && !suppress_pointer_for_system_drag
-            && !self.suppress_left_pointer_until_release;
+        let interactive_left_down = self.left_down;
 
         self.scene_provider.set_viewport(viewport);
         let update_start = Instant::now();
@@ -826,7 +873,11 @@ where
         let scene_prep_start = Instant::now();
         let mut scene = self.scene_provider.capture_scene();
         self.scrollbar_controller.apply_to_scene(&mut scene);
-        let mouse_position = self.mouse_position;
+        let mouse_position = if self.system_pointer_yielded {
+            None
+        } else {
+            self.mouse_position
+        };
         let previous_hovered = self.element_interaction.hovered.clone();
         let click_started = interactive_left_down && !self.previous_left_down;
         let right_press_started = self.right_down && !self.previous_right_down;
@@ -1295,6 +1346,26 @@ where
     }
 }
 
+#[cfg(target_os = "macos")]
+fn native_window_drag_enabled() -> bool {
+    use objc2::{
+        msg_send,
+        runtime::{AnyClass, AnyObject, Bool},
+    };
+    use objc2_foundation::ns_string;
+    let Some(class) = AnyClass::get(c"NSUserDefaults") else {
+        return false;
+    };
+    // SAFETY: Called from the window's main-thread mouse-down handler. The
+    // standard defaults object includes the user's global AppKit preferences.
+    unsafe {
+        let defaults: &AnyObject = msg_send![class, standardUserDefaults];
+        let enabled: Bool =
+            msg_send![defaults, boolForKey: ns_string!("NSWindowShouldDragOnGesture")];
+        enabled.as_bool()
+    }
+}
+
 fn window_attributes_for_config(config: &WindowConfig) -> WindowAttributes {
     #[allow(unused_mut)]
     let mut attributes = Window::default_attributes()
@@ -1400,6 +1471,11 @@ where
             }
             WindowEvent::Destroyed => event_loop.exit(),
             WindowEvent::Touch(touch) => {
+                if self.pointer_reserved_for_system() {
+                    self.yield_pointer_to_system();
+                    return;
+                }
+                self.system_pointer_yielded = false;
                 #[cfg(windows)]
                 if self.handle_touch_window_gesture(event_loop, &touch) {
                     return;
@@ -1477,11 +1553,21 @@ where
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = normalize_modifiers(modifiers.state());
+                if self.pointer_reserved_for_system() {
+                    self.yield_pointer_to_system();
+                } else {
+                    self.system_pointer_yielded = false;
+                }
                 self.handle_engine_event(event_loop, EngineEvent::ModifiersChanged(self.modifiers));
             }
             WindowEvent::CursorMoved { position, .. }
                 if !self.touch.ignore_mouse(Instant::now()) =>
             {
+                if self.pointer_reserved_for_system() {
+                    self.yield_pointer_to_system();
+                    return;
+                }
+                self.system_pointer_yielded = false;
                 self.mouse_position = Some((
                     (position.x / self.scale_factor) as f32,
                     (position.y / self.scale_factor) as f32,
@@ -1510,6 +1596,30 @@ where
             WindowEvent::MouseInput { state, button, .. }
                 if !self.touch.ignore_mouse(Instant::now()) =>
             {
+                if self.pointer_reserved_for_system() {
+                    self.yield_pointer_to_system();
+                    // Frameless NSWindows do not reliably start the user's
+                    // native Ctrl+Command drag themselves. Hand this press to
+                    // AppKit's window-drag loop, honoring the system preference.
+                    #[cfg(target_os = "macos")]
+                    if button == WinitMouseButton::Left
+                        && state == ElementState::Pressed
+                        && self.windowed()
+                        && self.modifiers.control
+                        && self.modifiers.super_key
+                        && native_window_drag_enabled()
+                        && let Some(window) = self.window.as_ref()
+                    {
+                        let result = window.drag_window();
+                        #[cfg(feature = "gpu-viewport")]
+                        if crate::gpu::input_trace_enabled() {
+                            eprintln!("GPU input runtime: native system window drag {result:?}");
+                        }
+                        let _ = result;
+                    }
+                    return;
+                }
+                self.system_pointer_yielded = false;
                 #[cfg(feature = "gpu-viewport")]
                 if crate::gpu::input_trace_enabled() {
                     eprintln!(
@@ -1584,6 +1694,11 @@ where
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.pointer_reserved_for_system() {
+                    self.yield_pointer_to_system();
+                    return;
+                }
+                self.system_pointer_yielded = false;
                 let delta = match normalize_scroll_delta(delta) {
                     ScrollDelta::Pixels { x, y } => ScrollDelta::Pixels {
                         x: x / self.scale_factor as f32,

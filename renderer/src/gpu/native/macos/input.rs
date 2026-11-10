@@ -6,10 +6,35 @@ use std::{cell::RefCell, ptr::NonNull, rc::Rc};
 
 pub(super) struct InputMonitor {
     token: Retained<AnyObject>,
-    primary_release: Rc<Cell<Option<crate::KeyboardModifiers>>>,
-    motion: Rc<Cell<Option<(crate::PointerPosition, crate::KeyboardModifiers)>>>,
-    captured: Rc<Cell<bool>>,
+    pointer: Rc<NativePointerState>,
     redraw: Rc<RefCell<Option<crate::gpu::GpuRedrawHandle>>>,
+}
+
+#[derive(Default)]
+struct NativePointerState {
+    primary_release: Cell<Option<crate::KeyboardModifiers>>,
+    motion: Cell<Option<(crate::PointerPosition, crate::KeyboardModifiers)>>,
+    captured: Cell<bool>,
+    windowed: Cell<bool>,
+    system_gesture: Cell<Option<crate::KeyboardModifiers>>,
+}
+
+impl NativePointerState {
+    fn yield_to_system(&self, modifiers: crate::KeyboardModifiers) -> bool {
+        if !crate::input::system_pointer_gesture(
+            self.windowed.get(),
+            modifiers,
+            crate::runtime::system_drag_override_active(),
+        ) {
+            return false;
+        }
+        self.motion.take();
+        self.primary_release.take();
+        if self.captured.replace(false) {
+            self.system_gesture.set(Some(modifiers));
+        }
+        true
+    }
 }
 
 impl InputMonitor {
@@ -28,12 +53,9 @@ impl InputMonitor {
         let window_key = window as usize;
         let class = AnyClass::get(c"NSEvent").ok_or_else(|| error("NSEvent unavailable"))?;
         let phase = Rc::new(Cell::new(0usize));
-        let primary_release = Rc::new(Cell::new(None));
-        let release = primary_release.clone();
-        let motion = Rc::new(Cell::new(None));
-        let native_motion = motion.clone();
-        let captured = Rc::new(Cell::new(false));
-        let active = captured.clone();
+        let pointer = Rc::new(NativePointerState::default());
+        pointer.windowed.set(parent.fullscreen().is_none());
+        let native_pointer = pointer.clone();
         let redraw = Rc::new(RefCell::new(None::<crate::gpu::GpuRedrawHandle>));
         let wake = redraw.clone();
         let handler = RcBlock::new(move |event: NonNull<AnyObject>| -> *mut AnyObject {
@@ -45,7 +67,9 @@ impl InputMonitor {
                 return event.as_ptr();
             }
             let kind: usize = unsafe { msg_send![event_ref, type] };
-            if kind == 2 || (kind == 6 && active.get()) {
+            // flagsChanged also cancels an existing drag when a window manager
+            // takes over, even if winit never receives that modifier change.
+            if matches!(kind, 2 | 6 | 12) {
                 let flags: usize = unsafe { msg_send![event_ref, modifierFlags] };
                 let modifiers = crate::KeyboardModifiers {
                     shift: flags & (1 << 17) != 0,
@@ -53,14 +77,16 @@ impl InputMonitor {
                     alt: flags & (1 << 19) != 0,
                     super_key: flags & (1 << 20) != 0,
                 };
-                if kind == 2 {
-                    release.set(Some(modifiers));
-                } else {
+                let was_captured = native_pointer.captured.get();
+                let reserved = native_pointer.yield_to_system(modifiers);
+                if !reserved && kind == 2 {
+                    native_pointer.primary_release.set(Some(modifiers));
+                } else if !reserved && kind == 6 && was_captured {
                     let point: CGPoint = unsafe { msg_send![event_ref, locationInWindow] };
                     let point: CGPoint = unsafe {
                         msg_send![&*view, convertPoint: point, fromView: None::<&AnyObject>]
                     };
-                    native_motion.set(Some((
+                    native_pointer.motion.set(Some((
                         crate::PointerPosition {
                             x: point.x as f32,
                             y: point.y as f32,
@@ -68,7 +94,7 @@ impl InputMonitor {
                         modifiers,
                     )));
                 }
-                if active.get() {
+                if was_captured && (reserved || kind == 2 || kind == 6) {
                     if let Some(redraw) = wake.borrow().as_ref() {
                         redraw.request_redraw();
                     }
@@ -80,8 +106,9 @@ impl InputMonitor {
             let timestamp: f64 = unsafe { msg_send![event_ref, timestamp] };
             match kind {
                 1 | 2 => {
+                    let flags: usize = unsafe { msg_send![event_ref, modifierFlags] };
                     eprintln!(
-                        "GPU input native: {} t={timestamp:.6}",
+                        "GPU input native: {} t={timestamp:.6} flags={flags:#x}",
                         if kind == 1 {
                             "primary-down"
                         } else {
@@ -92,8 +119,11 @@ impl InputMonitor {
                         if let Some(window_ref) = unsafe { source_window.as_ref() } {
                             let background_drag: objc2::runtime::Bool =
                                 unsafe { msg_send![window_ref, isMovableByWindowBackground] };
+                            let movable: objc2::runtime::Bool =
+                                unsafe { msg_send![window_ref, isMovable] };
+                            let style: usize = unsafe { msg_send![window_ref, styleMask] };
                             eprintln!(
-                                "GPU input native: background_window_drag={background_drag:?}"
+                                "GPU input native: background_window_drag={background_drag:?} movable={movable:?} style={style:#x}"
                             );
                         }
                     }
@@ -116,6 +146,7 @@ impl InputMonitor {
         });
         let mask: usize = (1 << 2)
             | (1 << 6)
+            | (1 << 12)
             | if trace {
                 (1 << 1) | (1 << 5) | (1 << 6) | (1 << 22)
             } else {
@@ -132,19 +163,25 @@ impl InputMonitor {
         }
         Ok(Self {
             token,
-            primary_release,
-            motion,
-            captured,
+            pointer,
             redraw,
         })
     }
 
     pub fn take_primary_release(&self) -> Option<crate::KeyboardModifiers> {
-        self.primary_release.take()
+        self.pointer.primary_release.take()
     }
 
     pub fn take_motion(&self) -> Option<(crate::PointerPosition, crate::KeyboardModifiers)> {
-        self.motion.take()
+        self.pointer.motion.take()
+    }
+
+    pub fn take_system_gesture(&self) -> Option<crate::KeyboardModifiers> {
+        self.pointer.system_gesture.take()
+    }
+
+    pub fn set_windowed(&self, windowed: bool) {
+        self.pointer.windowed.set(windowed);
     }
 
     pub fn set_redraw(&self, redraw: crate::gpu::GpuRedrawHandle) {
@@ -152,9 +189,9 @@ impl InputMonitor {
     }
 
     pub fn set_captured(&self, captured: bool) {
-        self.captured.set(captured);
+        self.pointer.captured.set(captured);
         if !captured {
-            self.motion.take();
+            self.pointer.motion.take();
         }
     }
 }
@@ -165,5 +202,47 @@ impl Drop for InputMonitor {
             // SAFETY: token came from addLocalMonitor; the host drops on main.
             let _: () = unsafe { msg_send![class, removeMonitor: &*self.token] };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_takeover_discards_buffered_motion_and_stops_native_capture() {
+        let pointer = NativePointerState::default();
+        pointer.windowed.set(true);
+        pointer.captured.set(true);
+        pointer.motion.set(Some((
+            crate::PointerPosition { x: 90.0, y: 20.0 },
+            Default::default(),
+        )));
+        pointer.primary_release.set(Some(Default::default()));
+        let modifiers = crate::KeyboardModifiers {
+            control: true,
+            super_key: true,
+            ..Default::default()
+        };
+        assert!(pointer.yield_to_system(modifiers));
+        assert!(!pointer.captured.get());
+        assert_eq!(pointer.motion.take(), None);
+        assert_eq!(pointer.primary_release.take(), None);
+        assert_eq!(pointer.system_gesture.take(), Some(modifiers));
+        assert!(!pointer.yield_to_system(Default::default()));
+        assert!(
+            !pointer.captured.get(),
+            "modifier release must not restart a drag"
+        );
+        assert!(pointer.yield_to_system(modifiers));
+        assert_eq!(pointer.system_gesture.take(), None, "wake only on takeover");
+
+        pointer.windowed.set(false);
+        pointer.captured.set(true);
+        assert!(!pointer.yield_to_system(modifiers));
+        assert!(
+            pointer.captured.get(),
+            "fullscreen modifier gestures belong to the app"
+        );
     }
 }
