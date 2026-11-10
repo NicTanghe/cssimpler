@@ -1,0 +1,44 @@
+#lab {
+    min-height: 100vh;
+    padding: 24px;
+    background: #eef2f7;
+    color: #172033;
+    font-family: "Segoe UI", "Noto Sans", sans-serif;
+    font-size: 15px;
+}
+h1 { margin: 0 0 8px; font-size: 28px; }
+h2 { margin: 0 0 14px; font-size: 19px; }
+p { margin: 0 0 12px; line-height: 1.4; }
+.intro { margin-bottom: 20px; }
+.columns { display: flex; gap: 20px; align-items: flex-start; }
+.panel { padding: 20px; background: #ffffff; border: 1px solid #d7deea; border-radius: 10px; }
+.fields { width: 540px; flex-shrink: 0; }
+.diagnostics { flex-grow: 1; min-width: 280px; }
+label { display: block; margin: 0 0 8px; font-weight: 600; }
+input {
+    display: block;
+    width: 100%;
+    height: 42px;
+    padding: 8px 12px;
+    background: #ffffff;
+    border: 1px solid #8d9bb0;
+    border-radius: 5px;
+    font-size: 20px;
+    white-space: pre;
+}
+input::selection { background: #a9dcf5; color: #132a40; }
+.status { margin: 8px 0 20px; color: #175a55; font-size: 14px; white-space: pre-wrap; }
+.scroll-case { height: 110px; overflow: auto; border: 1px solid #c3cfdf; }
+.scroll-content { min-height: 240px; padding: 20px 34px 70px 10px; }
+.offset-case { transform: translate(18px, 6px); padding: 8px; }
+.offset-case input { text-align: center; }
+.scroll-content p { margin-top: 25px; }
+.buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+button { padding: 9px 12px; background: #e5edf8; border: 1px solid #b9cae2; border-radius: 5px; font-size: 14px; }
+button:hover { background: #d2e3fa; }
+.event-log { min-height: 185px; padding: 12px; background: #eef3fa; font-size: 13px; white-space: pre-wrap; }
+.note { color: #526178; font-size: 13px; }
+@media (max-width: 900px) {
+    .columns { flex-direction: column; }
+    .fields, .diagnostics { width: 100%; }
+}

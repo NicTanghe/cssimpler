@@ -71,10 +71,8 @@ implementations using native editing should implement `ime_target` and
 can forward `TextInputEvent::Preedit`, `Commit`, and `Disabled` themselves.
 
 Native IME behavior still needs manual validation on each desktop backend. Run
-`cargo run --example input_fields`, focus a text field, compose Japanese/Chinese
-or Korean text, change candidates, confirm and cancel, replace a selection, and
-switch fields/windows during composition. Check that the candidate popup follows
-the caret after moving, resizing, scrolling, and changing display scale. Repeat
-in a password field to verify the preview remains masked. Automated tests cover
-the editor state, callbacks, candidate geometry, and full/incremental painting;
-they do not drive an OS candidate popup.
+`cargo run --example ime_composition` for a dedicated test window with text and
+password fields, callback counters, an event log, and a transformed/scrolling
+case. Run it with `-- --smoke` for an automated headless replay. See the
+[IME testing guide](ime-testing.md) for commands, expected results, and a native
+verification checklist. Replay and pixel tests do not drive an OS candidate popup.

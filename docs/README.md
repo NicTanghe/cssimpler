@@ -1,6 +1,7 @@
 # cssimpler workspace
 
 - [todo: OS support sheet, remaining features, and optimisations](../todo.md)
+- [IME test lab: automated replay and native verification](./ime-testing.md)
 
 Current focus:
 
