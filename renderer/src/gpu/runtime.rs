@@ -59,6 +59,7 @@ pub(crate) struct GpuRuntime {
     captured: Option<PointerCapture>,
     pointer: Option<crate::PointerPosition>,
     trace_motion_count: u64,
+    windowed: bool,
 }
 
 impl GpuRuntime {
@@ -74,6 +75,7 @@ impl GpuRuntime {
             captured: None,
             pointer: None,
             trace_motion_count: 0,
+            windowed: true,
         })
     }
 
@@ -94,6 +96,7 @@ impl GpuRuntime {
         scale: f64,
         background: cssimpler_core::Color,
     ) -> Result<()> {
+        self.windowed = parent.fullscreen().is_none();
         if self.registry.is_empty() {
             return Ok(());
         }
@@ -312,10 +315,28 @@ impl GpuRuntime {
         self.captured = None;
     }
 
+    pub fn cancel_pointer_capture(&mut self, modifiers: crate::KeyboardModifiers) {
+        if let Some(capture) = self.captured.take() {
+            if let Some(live) = self.live.get_mut(capture.index).and_then(Option::as_mut) {
+                for button in capture.buttons {
+                    live.renderer.event(&EngineEvent::PointerButton {
+                        button,
+                        state: crate::ButtonState::Released,
+                        modifiers,
+                    });
+                }
+                live.renderer.event(&EngineEvent::PointerLeft);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        self.sync_native_capture();
+    }
+
     #[cfg(target_os = "macos")]
     fn forward_native_input(&mut self) {
         let mut released = None;
         let mut motion = None;
+        let mut system_gesture = None;
         let owner = self
             .captured
             .as_ref()
@@ -326,11 +347,17 @@ impl GpuRuntime {
             if let Some(live) = live {
                 let moved = live.host.take_native_motion();
                 let up = live.host.take_primary_release();
+                let yielded = live.host.take_system_gesture();
                 if owner == Some(index) {
                     motion = moved;
                     released = up;
+                    system_gesture = yielded;
                 }
             }
+        }
+        if let Some(modifiers) = system_gesture {
+            self.cancel_pointer_capture(modifiers);
+            return;
         }
         if let Some((position, modifiers)) = motion {
             self.event(&EngineEvent::PointerMoved {
@@ -502,6 +529,14 @@ impl GpuRuntime {
     }
 
     pub fn event(&mut self, event: &EngineEvent) -> bool {
+        if let Some(modifiers) = crate::input::system_pointer_event(
+            event,
+            self.windowed,
+            crate::runtime::system_drag_override_active(),
+        ) {
+            self.cancel_pointer_capture(modifiers);
+            return false;
+        }
         // A local NSEvent monitor observes real drag/up packets before view
         // routing can swallow them. No live button-state polling is involved.
         #[cfg(target_os = "macos")]
@@ -607,6 +642,80 @@ impl GpuRuntime {
 mod tests {
     use super::*;
     use crate::PointerButton::{Primary, Secondary};
+
+    #[test]
+    fn system_modifier_cancels_capture_without_resuming_on_modifier_release() {
+        let mut runtime = GpuRuntime::new(GpuViewportRegistry::default()).unwrap();
+        runtime.live.push(None);
+        runtime.focused = Some(0);
+        runtime.captured = PointerCapture::press(None, Some(0), Primary);
+        let modifiers = crate::KeyboardModifiers {
+            super_key: true,
+            control: cfg!(target_os = "macos"),
+            ..Default::default()
+        };
+        runtime.event(&EngineEvent::ModifiersChanged(modifiers));
+        assert!(runtime.captured.is_none());
+        assert_eq!(runtime.focused, Some(0), "retain keyboard focus");
+        runtime.event(&EngineEvent::PointerButton {
+            button: Primary,
+            state: crate::ButtonState::Pressed,
+            modifiers,
+        });
+        assert!(runtime.captured.is_none());
+        runtime.event(&EngineEvent::ModifiersChanged(Default::default()));
+        runtime.event(&EngineEvent::PointerMoved {
+            position: crate::PointerPosition { x: 300.0, y: 20.0 },
+            modifiers: Default::default(),
+        });
+        assert!(
+            runtime.captured.is_none(),
+            "a fresh press must start the next drag"
+        );
+
+        runtime.windowed = false;
+        runtime.captured = PointerCapture::press(None, Some(0), Primary);
+        runtime.event(&EngineEvent::ModifiersChanged(modifiers));
+        assert!(
+            runtime.captured.is_some(),
+            "fullscreen modifier input stays in the app"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_window_chord_yields_before_viewport_routing() {
+        let mut runtime = GpuRuntime::new(GpuViewportRegistry::default()).unwrap();
+        runtime.live.push(None);
+        let modifiers = crate::KeyboardModifiers {
+            control: true,
+            super_key: true,
+            ..Default::default()
+        };
+        for event in [
+            EngineEvent::PointerMoved {
+                position: crate::PointerPosition { x: 100.0, y: 20.0 },
+                modifiers,
+            },
+            EngineEvent::Scroll {
+                delta: crate::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+                modifiers,
+            },
+            EngineEvent::PointerButton {
+                button: Primary,
+                state: crate::ButtonState::Pressed,
+                modifiers,
+            },
+        ] {
+            runtime.captured = PointerCapture::press(None, Some(0), Primary);
+            assert!(!runtime.event(&event));
+            assert!(runtime.captured.is_none());
+            assert_eq!(
+                runtime.pointer, None,
+                "system motion must not reach viewport routing"
+            );
+        }
+    }
 
     #[test]
     fn native_release_stops_capture_when_winit_mouse_up_is_missing() {

@@ -77,6 +77,10 @@ impl NativeHost {
         self.input.take_motion()
     }
 
+    pub fn take_system_gesture(&self) -> Option<crate::KeyboardModifiers> {
+        self.input.take_system_gesture()
+    }
+
     pub fn set_input_redraw(&self, redraw: crate::gpu::GpuRedrawHandle) {
         self.input.set_redraw(redraw);
     }
@@ -93,6 +97,7 @@ impl NativeHost {
 
     pub fn place(&self, origin: [i32; 2], size: [u32; 2]) -> Result<()> {
         let _main = main_thread()?;
+        self.input.set_windowed(self.parent.fullscreen().is_none());
         let root = self.content_layer()?;
         let scale = self.parent.scale_factor();
         let frame = layer_frame(root.bounds(), root.isGeometryFlipped(), origin, size, scale);

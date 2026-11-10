@@ -31,6 +31,12 @@ impl GpuViewportRenderer for Cube {
         self.usd.resize(gpu, info)
     }
     fn event(&mut self, event: &renderer::EngineEvent) -> bool {
+        // The stress test owns its synthetic press/release sequence. Real
+        // mouse-up/focus events must not interrupt that sequence and turn a
+        // manual interaction with the test window into a failed assertion.
+        if self.input_smoke {
+            return false;
+        }
         self.usd.event(event)
     }
     fn render(&mut self, gpu: &GpuContext, frame: GpuViewportFrame<'_>) -> renderer::Result<()> {

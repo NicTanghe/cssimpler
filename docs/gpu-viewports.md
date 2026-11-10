@@ -230,6 +230,16 @@ the captured viewport and forwards its final held position before release.
 Only the captured viewport is awakened, and native events remain available to
 AppKit. This bridge uses real event edges rather than polling global buttons.
 
+In windowed mode, macOS Ctrl+Command pointer gestures yield to system window
+management before UI hit testing or GPU capture. Completing that chord during a
+drag cancels capture and discards buffered native movement; releasing the
+modifier does not resume the drag without a fresh click. Window moves and resizes
+alone do not cancel pointer capture. A primary press with that chord starts
+AppKit's window-drag loop when the user's `NSWindowShouldDragOnGesture`
+preference is enabled, including for frameless windows. Keyboard shortcuts remain
+available, and fullscreen keeps modifier pointer gestures in the app.
+`set_system_drag_override` can explicitly yield pointer input in either mode.
+
 For native input and frame-timing diagnostics:
 
 ```sh
@@ -261,6 +271,9 @@ cargo run --release --features gpu-viewport --example usd_glass_cube -- --smoke-
 Input samples accumulate camera changes; USD camera attributes are committed
 once per rendered frame. Redraw wakeups coalesce while a frame is pending, and
 GPU-consumed button events avoid an unnecessary CPU glass frame.
+During `--smoke-input`, the cube deliberately rotates under scripted input and
+ignores physical input callbacks so manual window interaction cannot interrupt
+the test's simulated press/release sequence. Normal runs use physical input.
 
 A release-build run on the development Mac completed this native glass stress
 test in 1984 ms for 120 frames. The samples enter renderer callbacks directly;
