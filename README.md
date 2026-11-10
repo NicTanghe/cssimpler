@@ -13,7 +13,8 @@ No JavaScript runtime.
 Frontend development got overengineered.
 
 We abstracted CSS because it felt slow.  
-Then we abstracted those abstractions with state systems, signals, and frameworks.
+Then we abstracted those abstractions.
+Packaged and sold libraries for them.
 
 Now AI writes and adjusts CSS instantly — but the complexity stayed.
 
