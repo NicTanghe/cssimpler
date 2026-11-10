@@ -221,7 +221,10 @@ cargo run --release --features gpu-viewport --example usd_glass_cube
 The feature is disabled by default; CPU-only builds do not include the GPU or
 USD dependencies. The initial USD renderer supports mesh geometry and cameras,
 with built-in studio shading; production PBR and arbitrary material networks
-are still pending. See [native GPU viewport documentation](docs/gpu-viewports.md)
+are still pending. We plan to migrate to a Hydra-based rendering backend in the
+future, replacing the initial USD renderer.
+
+See [native GPU viewport documentation](docs/gpu-viewports.md)
 for registration APIs, platform requirements, supported USD features, and AA
 performance and memory details.
 
