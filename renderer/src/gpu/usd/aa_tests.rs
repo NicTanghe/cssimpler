@@ -1,5 +1,18 @@
 use super::*;
 
+fn test_instance() -> wgpu::Instance {
+    // Match Windows DirectComposition's backend instead of the default Vulkan
+    // adapter selected by headless request_adapter on multi-backend systems.
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: if cfg!(windows) {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::all()
+        },
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    })
+}
+
 #[test]
 #[ignore = "requires a hardware GPU; reads back only test images"]
 fn strip_resolve_matches_full_msaa_and_preserves_premultiplied_coverage() {
@@ -8,20 +21,29 @@ fn strip_resolve_matches_full_msaa_and_preserves_premultiplied_coverage() {
 
 #[test]
 #[ignore = "requires a hardware GPU; reads back only test images"]
-fn strip_resolve_matches_full_msaa_on_bgra_metal_surfaces() {
+fn strip_resolve_matches_full_msaa_on_bgra_surfaces() {
     check_strip_resolve(wgpu::TextureFormat::Bgra8Unorm);
 }
 
-#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a hardware GPU; reads back only test images"]
+fn strip_resolve_matches_full_msaa_on_srgb_surfaces() {
+    check_strip_resolve(wgpu::TextureFormat::Rgba8UnormSrgb);
+    check_strip_resolve(wgpu::TextureFormat::Bgra8UnormSrgb);
+}
+
 #[test]
 #[ignore = "GPU timing benchmark; requires a hardware GPU"]
-fn metal_msaa_frame_cost() {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
-    if adapter.get_info().transient_saves_memory != Some(true) {
-        eprintln!("Memoryless AA benchmark requires an adapter with tile-memory attachments");
-        return;
+fn usd_msaa_frame_cost() {
+    for size in [[800, 600], [1600, 1200]] {
+        measure_msaa_frame_cost(size);
     }
+}
+
+fn measure_msaa_frame_cost(size: [u32; 2]) {
+    let instance = test_instance();
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+    eprintln!("AA benchmark adapter: {:?}", adapter.get_info());
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
     let gpu = GpuContext {
         adapter,
@@ -30,7 +52,7 @@ fn metal_msaa_frame_cost() {
     };
     let info = GpuViewportInfo {
         bounds: cssimpler_core::LayoutBox::new(0.0, 0.0, 800.0, 600.0),
-        physical_size: [1600, 1200],
+        physical_size: size,
         scale_factor: 2.0,
         format: wgpu::TextureFormat::Bgra8Unorm,
         alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
@@ -55,8 +77,8 @@ fn metal_msaa_frame_cost() {
     let image = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("AA benchmark output"),
         size: wgpu::Extent3d {
-            width: 1600,
-            height: 1200,
+            width: size[0],
+            height: size[1],
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -67,22 +89,51 @@ fn metal_msaa_frame_cost() {
         view_formats: &[],
     });
     let view = image.create_view(&Default::default());
-    let mut measurements = [(0u128, 0u128); 2];
+    let mut strategies = vec![
+        ("single-sample-uncached", aa::Strategy::FullFrame, true),
+        ("strips", aa::Strategy::Strips, false),
+        ("full-frame", aa::Strategy::FullFrame, false),
+        ("full-frame-uncached", aa::Strategy::FullFrame, true),
+    ];
+    if cfg!(target_os = "macos") && gpu.adapter.get_info().transient_saves_memory == Some(true) {
+        strategies.push(("memoryless", aa::Strategy::Memoryless, false));
+    }
+    let mut measurements = vec![(0u128, 0u128); strategies.len()];
     // Alternate strategies to reduce warmup/order bias. No vsync or readback;
     // completion time includes CPU encoding, submission, and waiting for the GPU.
     for round in 0..4 {
-        for (index, memoryless) in [false, true].into_iter().enumerate() {
-            renderer.targets = aa::Targets::with_memoryless(&gpu, info, memoryless);
-            if memoryless {
-                assert!(
-                    renderer
-                        .targets
-                        .depth
-                        .usage()
-                        .contains(wgpu::TextureUsages::TRANSIENT_ATTACHMENT)
-                );
+        let mut order: Vec<_> = (0..strategies.len()).collect();
+        if round % 2 != 0 {
+            order.reverse();
+        }
+        for index in order {
+            let (_, strategy, uncached) = strategies[index];
+            renderer.targets = aa::Targets::with_strategy(&gpu, info, strategy);
+            if index == 0 {
+                renderer.targets.depth = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Single-sample benchmark depth"),
+                    size: image.size(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth32Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                renderer.targets.color = None;
+                renderer.targets.samples = 1;
             }
+            renderer.pipeline = mesh_pipeline(
+                &gpu,
+                &renderer.pipeline_layout,
+                info,
+                renderer.targets.samples,
+            );
             for frame_index in 0..40 {
+                if uncached {
+                    // Reproduce the old per-frame USD camera evaluation/upload.
+                    renderer.camera_key = None;
+                }
                 let start = std::time::Instant::now();
                 let mut encoder = gpu.device.create_command_encoder(&Default::default());
                 renderer
@@ -113,9 +164,11 @@ fn metal_msaa_frame_cost() {
             }
         }
     }
-    for (label, (encode, complete)) in ["strips", "memoryless"].into_iter().zip(measurements) {
+    for ((label, _, _), (encode, complete)) in strategies.into_iter().zip(measurements) {
         eprintln!(
-            "Metal AA 1600x1200 {label}: mean_encode_us={} mean_complete_us={}",
+            "USD AA {}x{} {label}: mean_encode_us={} mean_complete_us={}",
+            size[0],
+            size[1],
             encode / 120,
             complete / 120
         );
@@ -123,7 +176,7 @@ fn metal_msaa_frame_cost() {
 }
 
 fn check_strip_resolve(format: wgpu::TextureFormat) {
-    let instance = wgpu::Instance::default();
+    let instance = test_instance();
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
     let gpu = GpuContext {
@@ -159,7 +212,7 @@ fn check_strip_resolve(format: wgpu::TextureFormat) {
     .unwrap();
     assert_eq!(renderer.targets.samples, 4);
     // Exercise the strip fallback even on Apple GPUs that use a direct resolve.
-    renderer.targets = aa::Targets::with_memoryless(&gpu, info, false);
+    renderer.targets = aa::Targets::with_strategy(&gpu, info, aa::Strategy::Strips);
     let image = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("AA test presentation image"),
         size: wgpu::Extent3d {
@@ -235,12 +288,14 @@ fn check_strip_resolve(format: wgpu::TextureFormat) {
         "expected an opaque cube interior"
     );
     assert_eq!(&strips[..4], &[0, 0, 0, 0]);
-    assert!(
-        strips
-            .chunks_exact(4)
-            .all(|p| p[..3].iter().all(|c| *c <= p[3])),
-        "RGB must be premultiplied by coverage"
-    );
+    if !format.is_srgb() {
+        assert!(
+            strips
+                .chunks_exact(4)
+                .all(|p| p[..3].iter().all(|c| *c <= p[3])),
+            "RGB must be premultiplied by coverage"
+        );
+    }
 
     // Test-only full-frame reference catches strip seams and last-strip clipping.
     let texture = |format, samples| {
@@ -270,21 +325,9 @@ fn check_strip_resolve(format: wgpu::TextureFormat) {
     }));
     let reference = draw(&mut renderer);
     let native_targets = aa::Targets::new(&gpu, info);
-    if native_targets
-        .depth
-        .usage()
-        .contains(wgpu::TextureUsages::TRANSIENT_ATTACHMENT)
-    {
+    if native_targets.samples == 4 && native_targets.resolve.is_none() {
         assert_eq!(native_targets.height, info.physical_size[1]);
         assert!(native_targets.resolve.is_none());
-        assert!(
-            native_targets
-                .color
-                .as_ref()
-                .unwrap()
-                .usage()
-                .contains(wgpu::TextureUsages::TRANSIENT_ATTACHMENT)
-        );
         renderer.targets = native_targets;
         let native = draw(&mut renderer);
         assert!(
@@ -292,7 +335,7 @@ fn check_strip_resolve(format: wgpu::TextureFormat) {
                 .iter()
                 .zip(&reference)
                 .all(|(a, b)| a.abs_diff(*b) <= 2),
-            "memoryless direct resolve must match full-frame MSAA"
+            "native direct resolve must match full-frame MSAA"
         );
     }
     let different: Vec<_> = strips
@@ -353,4 +396,73 @@ fn check_strip_resolve(format: wgpu::TextureFormat) {
         turned,
         "post-release hover and scrolling must not change the image"
     );
+
+    // A cached uniform must still follow orbit input, authored camera edits,
+    // animation time and target changes. Repeated frames retain the same key.
+    let before = draw(&mut renderer);
+    let key = renderer.camera_key;
+    assert_eq!(before, draw(&mut renderer));
+    assert!(key == renderer.camera_key);
+    assert!(renderer.event(&EngineEvent::PointerButton {
+        button: crate::PointerButton::Primary,
+        state: crate::ButtonState::Pressed,
+        modifiers: Default::default(),
+    }));
+    assert!(renderer.event(&EngineEvent::Scroll {
+        delta: crate::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+        modifiers: Default::default(),
+    }));
+    assert!(renderer.event(&EngineEvent::PointerButton {
+        button: crate::PointerButton::Primary,
+        state: crate::ButtonState::Released,
+        modifiers: Default::default(),
+    }));
+    assert_ne!(before, draw(&mut renderer));
+    assert!(key != renderer.camera_key);
+
+    let before = draw(&mut renderer);
+    let camera = geom::Camera::get(&renderer.camera_stage, &renderer.camera_path)
+        .unwrap()
+        .unwrap();
+    camera
+        .create_focal_length_attr()
+        .unwrap()
+        .set(20.0f32)
+        .unwrap();
+    assert_ne!(before, draw(&mut renderer));
+
+    renderer.control().set_time(Some(12.0)).unwrap();
+    draw(&mut renderer);
+    assert!(renderer.camera_key.unwrap().time == Some(scene::TimeCode::new(12.0)));
+
+    let depth = renderer.targets.depth.clone();
+    renderer
+        .resize(
+            &gpu,
+            GpuViewportInfo {
+                background: Some(cssimpler_core::Color::rgb(20, 30, 40)),
+                ..info
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        depth, renderer.targets.depth,
+        "backdrop changes must reuse attachments"
+    );
+    renderer
+        .resize(
+            &gpu,
+            GpuViewportInfo {
+                texture_usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                ..info
+            },
+        )
+        .unwrap();
+    if cfg!(windows) {
+        assert_eq!(
+            renderer.targets.samples, 4,
+            "direct resolve needs no COPY_DST"
+        );
+        assert!(renderer.targets.resolve.is_none());
+    }
 }

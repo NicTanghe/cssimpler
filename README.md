@@ -39,7 +39,7 @@ If you know HTML and CSS, you already know this library.
 - Real CSS (no custom styling DSL)  
 - Taffy layout engine  
 - CPU renderer (current)  
-- Optional GPU renderer (planned)  
+- Optional native GPU viewports for USD 3D scenes (`gpu-viewport`)
 - Minimal runtime overhead  
 
 ---
@@ -178,7 +178,7 @@ If you want a reactive framework — this is not it.
 ~~~text
 core/      - DOM, layout bridge, style resolution  
 style/     - CSS parsing (lightningcss), selectors  
-renderer/  - CPU renderer (current), GPU (planned)  
+renderer/  - CPU UI renderer and optional native GPU 3D viewports
 macro/     - ui! macro (HTML-like → AST)  
 app/       - entrypoint + render loop  
 ~~~
@@ -193,8 +193,37 @@ app/       - entrypoint + render loop
 - Deterministic output  
 
 **Planned**
-- Optional GPU backend  
+- Optional GPU backend for UI rasterization
 - Same API  
+
+---
+
+## 3D Viewports (experimental)
+
+Enable the opt-in `gpu-viewport` feature to embed GPU-rendered USD scenes in the
+CPU-rendered UI. Native viewports use DirectComposition on Windows, Metal on
+macOS, and X11 on Linux. The USD examples support orbit/zoom controls,
+on-demand rendering, transparent composition over native glass, and 4× MSAA
+when supported by the GPU. Native Wayland embedding is still pending.
+
+```toml
+[dependencies]
+cssimpler = { path = "path/to/cssimpler", features = ["gpu-viewport"] }
+```
+
+Try the USD viewer or the transparent glass cube:
+
+```sh
+cargo run --release --features gpu-viewport --example usd_viewport
+cargo run --release --features gpu-viewport --example usd_glass_cube
+```
+
+The feature is disabled by default; CPU-only builds do not include the GPU or
+USD dependencies. The initial USD renderer supports mesh geometry and cameras,
+with built-in studio shading; production PBR and arbitrary material networks
+are still pending. See [native GPU viewport documentation](docs/gpu-viewports.md)
+for registration APIs, platform requirements, supported USD features, and AA
+performance and memory details.
 
 ---
 

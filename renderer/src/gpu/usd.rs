@@ -15,7 +15,7 @@ use std::{
 use wgpu::util::DeviceExt;
 
 mod aa;
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(test)]
 mod aa_tests;
 
 /// An orbit viewer or a camera authored in the USD stage.
@@ -139,6 +139,15 @@ struct CameraUniform {
     viewport: [f32; 4],
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct CameraKey {
+    revision: u64,
+    time: Option<scene::TimeCode>,
+    size: [u32; 2],
+    target_height: u32,
+    format: wgpu::TextureFormat,
+}
+
 struct MeshCache {
     vertices: Vec<Vertex>,
     minimum: Vec3,
@@ -160,6 +169,9 @@ pub struct UsdRenderer {
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_binding: wgpu::BindGroup,
+    camera_revision: Rc<Cell<u64>>,
+    camera_sink: scene::StageSinkId,
+    camera_key: Option<CameraKey>,
     targets: aa::Targets,
     pipeline_layout: wgpu::PipelineLayout,
     info: GpuViewportInfo,
@@ -286,6 +298,11 @@ impl UsdRenderer {
             .add_sink(move |_: &Stage, _: &scene::CommittedChange| {
                 redraw.request_redraw();
             });
+        let camera_revision = Rc::new(Cell::new(0u64));
+        let changes = camera_revision.clone();
+        let camera_sink = camera_stage.add_sink(move |_: &Stage, _: &scene::CommittedChange| {
+            changes.set(changes.get().wrapping_add(1));
+        });
         Ok(Self {
             revision: scene.revision.get(),
             evaluated_time: initial_time,
@@ -299,6 +316,9 @@ impl UsdRenderer {
             pipeline,
             camera_buffer,
             camera_binding,
+            camera_revision,
+            camera_sink,
+            camera_key: None,
             targets,
             pipeline_layout,
             info: init.info,
@@ -376,7 +396,10 @@ impl UsdRenderer {
 
 impl GpuViewportRenderer for UsdRenderer {
     fn resize(&mut self, gpu: &GpuContext, info: GpuViewportInfo) -> Result<()> {
-        if self.info.physical_size != info.physical_size || self.info.format != info.format {
+        if self.info.physical_size != info.physical_size
+            || self.info.format != info.format
+            || self.info.texture_usage != info.texture_usage
+        {
             let targets = aa::Targets::new(gpu, info);
             if self.targets.samples != targets.samples || self.info.format != info.format {
                 self.pipeline = mesh_pipeline(gpu, &self.pipeline_layout, info, targets.samples);
@@ -404,11 +427,21 @@ impl GpuViewportRenderer for UsdRenderer {
             self.revision = self.scene.revision.get();
             self.evaluated_time = time;
         }
-        gpu.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::bytes_of(&self.camera_uniform(time)?),
-        );
+        let key = CameraKey {
+            revision: self.camera_revision.get(),
+            time,
+            size: self.info.physical_size,
+            target_height: self.targets.height,
+            format: self.info.format,
+        };
+        if self.camera_key != Some(key) {
+            gpu.queue.write_buffer(
+                &self.camera_buffer,
+                0,
+                bytemuck::bytes_of(&self.camera_uniform(time)?),
+            );
+            self.camera_key = Some(key);
+        }
         let depth = self.targets.depth.create_view(&Default::default());
         let color = self
             .targets
@@ -483,6 +516,7 @@ impl GpuViewportRenderer for UsdRenderer {
 impl Drop for UsdRenderer {
     fn drop(&mut self) {
         self.scene.stage.remove_sink(self.redraw_sink);
+        self.camera_stage.remove_sink(self.camera_sink);
     }
 }
 
