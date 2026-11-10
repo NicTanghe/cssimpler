@@ -45,6 +45,7 @@ mod win32 {
         visual: IDCompositionVisual,
         root: Rc<CompositionRoot>,
         shown: Cell<bool>,
+        origin: Cell<Option<[i32; 2]>>,
     }
 
     impl NativeHost {
@@ -85,6 +86,7 @@ mod win32 {
                 visual,
                 root,
                 shown: Cell::new(false),
+                origin: Cell::new(None),
             })
         }
         pub fn target(&self) -> Result<wgpu::SurfaceTargetUnsafe> {
@@ -94,6 +96,9 @@ mod win32 {
             ))
         }
         pub fn place(&self, origin: [i32; 2], _: [u32; 2]) -> Result<()> {
+            if self.shown.get() && self.origin.get() == Some(origin) {
+                return Ok(());
+            }
             unsafe {
                 self.visual.SetOffsetX2(origin[0] as f32).map_err(error)?;
                 self.visual.SetOffsetY2(origin[1] as f32).map_err(error)?;
@@ -107,6 +112,7 @@ mod win32 {
                 self.root.device.Commit().map_err(error)?;
             }
             self.shown.set(true);
+            self.origin.set(Some(origin));
             Ok(())
         }
         pub fn hide(&self) {

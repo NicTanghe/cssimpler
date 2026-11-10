@@ -1,4 +1,4 @@
-//! cargo run --features gpu-viewport --example usd_viewport -- [file.usd] [--transparent] [--smoke]
+//! cargo run --features gpu-viewport --example usd_viewport -- [file.usd] [--transparent] [--continuous] [--smoke]
 use cssimpler::{
     app::{App, Invalidation},
     renderer::{
@@ -57,6 +57,7 @@ fn main() -> anyhow::Result<()> {
         });
     let transparent = args.iter().any(|a| a == "--transparent");
     let smoke = args.iter().any(|a| a == "--smoke");
+    let continuous = smoke || args.iter().any(|a| a == "--continuous");
     let two_views = args.iter().any(|a| a == "--two-views");
     let camera = args
         .iter()
@@ -108,7 +109,11 @@ fn main() -> anyhow::Result<()> {
         "scene",
         GpuViewportOptions {
             transparent,
-            redraw: RedrawSchedule::EveryFrame,
+            redraw: if continuous {
+                RedrawSchedule::EveryFrame
+            } else {
+                RedrawSchedule::OnInvalidation
+            },
         },
         move |init| {
             Ok(Box::new(Preview {

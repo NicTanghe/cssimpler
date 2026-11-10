@@ -42,7 +42,9 @@ cargo run --features gpu-viewport --example usd_viewport -- --camera=/World/Came
 ```
 
 Drag with the primary mouse button to orbit and use the wheel to zoom. The
-sidebar and text input are CPU-rendered. `--smoke` runs 120 GPU frames, prints GPU
+sidebar and text input are CPU-rendered. Both USD examples render on demand by
+default, so an idle scene does not keep submitting GPU work. `usd_viewport`
+accepts `--continuous` to render every frame. `--smoke` runs 120 GPU frames, prints GPU
 and CPU frame diagnostics, and exits through the normal application lifecycle.
 
 ## Register a USD viewport
@@ -123,14 +125,22 @@ Core Animation. wgpu's Metal `PostMultiplied` surface mode marks the layer
 non-opaque; it does not convert pixels, so renderer callbacks receive
 `GpuViewportInfo::alpha_mode = PreMultiplied` to describe the required encoding.
 
-## Linux and macOS anti-aliasing and memory
+## Anti-aliasing, performance and memory
 
-The USD renderer uses 4× MSAA on Linux and macOS when the RGBA8/BGRA8 color and
-depth formats support 4× sampling. On Apple GPUs where Metal reports that
+The USD renderer uses 4× MSAA on Windows, Linux and macOS when the RGBA8/BGRA8
+color and depth formats support 4× sampling. On Apple GPUs where Metal reports that
 transient attachments save memory, it renders once using memoryless MSAA color
 and depth attachments and resolves directly into the presentation texture.
 These attachments live in tile memory; no persistent full-frame MSAA buffers or
 intermediate resolve image are allocated.
+
+Windows renders once into reusable full-frame MSAA color and depth attachments,
+then resolves directly into the presentation texture. This avoids repeating
+geometry processing, render-pass setup and GPU copies for every strip, and does
+not require surface `COPY_DST` support. It trades memory for speed: the two
+attachments use 32 bytes per pixel (about 58.6 MiB at 1600×1200), compared with
+4 bytes per pixel for the former single-sample depth attachment. There is no
+intermediate resolve image or history texture.
 
 Other macOS adapters and Linux use one reusable horizontal strip, resolve
 coverage there, then copy the strip directly into the presentation texture on
@@ -138,8 +148,8 @@ the GPU. This fallback requires surface GPU-copy support. CPU UI pixels are
 never uploaded for AA; production rendering does not read back GPU images.
 
 For glass, the renderer clears to transparent black and resolves premultiplied
-color and coverage for native composition. Transparent X11 and Metal targets use an
-encoded UNORM format so the resolved RGB stays premultiplied in the compositor's
+color and coverage for native composition. Transparent DirectComposition, X11
+and Metal targets use an encoded UNORM format so the resolved RGB stays premultiplied in the compositor's
 color space. Non-glass views clear to the solid background found beneath the
 viewport in paint order, including its own background color and the window clear
 color as fallback. This assumes a solid backdrop; gradients and images are not
@@ -148,10 +158,13 @@ sampled or copied into the GPU renderer.
 The fallback strip uses 36 bytes per pixel: 4× RGBA8 color, 4× Depth32, and one resolved
 RGBA8 image. Its height is capped at 64 rows and sized so these attachments plus
 the extra uniform data fit within the previous full-window Depth32 allocation.
-Views below 16 pixels high and unsupported surfaces retain single-sample rendering.
-Strips repeat vertex processing, trading extra GPU work for bounded memory; no
-full-window persistent MSAA or history textures are allocated. Background-only changes do
-not reallocate render targets.
+Strip-based views below 16 pixels high and unsupported surfaces retain
+single-sample rendering. Strips repeat vertex processing, trading extra GPU
+work for bounded memory. Background-only changes do not reallocate render targets.
+Camera uniforms are evaluated and uploaded only when the camera stage, animation
+time, physical dimensions or target projection changes. Unchanged Windows visual
+placement skips redundant DirectComposition updates; swapchain configuration
+changes are still committed explicitly.
 
 Validation commands (the image comparison test requires a GPU):
 
@@ -160,20 +173,44 @@ cargo test -p cssimpler-renderer --features gpu-viewport --lib gpu::
 cargo test -p cssimpler-renderer --features gpu-viewport --lib strip_resolve_matches -- --ignored
 ```
 
-The GPU tests compare RGBA8/BGRA8 strip and memoryless direct-resolve output with
+The GPU tests compare RGBA8/BGRA8 strip and native direct-resolve output with
 full-frame 4× MSAA, check fractional edge coverage and premultiplied RGB, and
 cover a partial final strip. The Metal strip fallback permits one color-only
 shared-edge pixel difference with identical alpha; the memoryless path matches
-the reference within two channel levels throughout. Readback and persistent
-full-frame reference MSAA allocations are confined to tests.
+the reference within two channel levels throughout. They also exercise camera
+cache invalidation and target reuse. Readback and reference images are confined
+to tests. On Windows these tests use DX12 to match native DirectComposition.
 
-To compare strip and memoryless AA costs on Apple silicon (without vsync):
+To compare single-sample rendering, strip AA, full-frame AA and (on supported
+Apple GPUs) memoryless AA without vsync:
 
 ```sh
-cargo test -p cssimpler-renderer --features gpu-viewport --lib metal_msaa_frame_cost -- --ignored --nocapture
+cargo test -p cssimpler-renderer --release --features gpu-viewport --lib usd_msaa_frame_cost -- --ignored --nocapture --test-threads=1
 ```
 
-In a development-build run at 1600×1200, mean CPU encoding time decreased from
+On Windows with a GTX 1660 Ti / DX12 (driver 27.21.14.5751), release-build
+measurements of the bundled cube gave the following medians across five process
+runs. Each run discards one warmup round and averages 120 measured frames per
+strategy, reversing strategy order between rounds. Times are microseconds.
+
+| Size | Strategy | CPU encode | Encode, submit and GPU completion |
+| --- | --- | ---: | ---: |
+| 800×600 | Single-sample, camera evaluated every frame | 99 | 234 |
+| 800×600 | Strip 4× MSAA, cached camera | 610 | 913 |
+| 800×600 | Direct 4× MSAA, cached camera | 64 | 183 |
+| 1600×1200 | Single-sample, camera evaluated every frame | 100 | 259 |
+| 1600×1200 | Strip 4× MSAA, cached camera | 1131 | 1732 |
+| 1600×1200 | Direct 4× MSAA, cached camera | 64 | 275 |
+
+At 1600×1200, direct AA completion times ranged from 269 to 282 µs across the
+five runs, versus 1697 to 1851 µs for strips. For direct AA, disabling camera
+caching raised median encoding time to 121 µs and total completion time to
+370 µs. The single-sample case simulates the former per-frame camera work;
+these are fixed-camera render-work comparisons, excluding native composition,
+window dragging, vsync and input latency. Moving cameras still incur evaluation
+and upload work, and AA adds GPU cost compared with single-sample rendering.
+
+In an earlier Metal development-build run at 1600×1200, mean CPU encoding time decreased from
 813 to 88 µs and encoding/submission/GPU completion time from 2568 to 460 µs.
 These are render-work measurements; native glass, presentation and input latency
 are outside that benchmark. Native Metal surfaces use two drawables to limit

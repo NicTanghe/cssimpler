@@ -178,8 +178,7 @@ impl GpuRuntime {
                 let mut config = surface
                     .get_default_config(&gpu.adapter, physical_size[0], physical_size[1])
                     .ok_or_else(|| error("surface is incompatible with shared GPU adapter"))?;
-                let native_premultiplied = cfg!(any(target_os = "linux", target_os = "macos"))
-                    && entry.options.transparent;
+                let native_premultiplied = entry.options.transparent;
                 config.format = caps
                     .formats
                     .iter()
@@ -223,6 +222,7 @@ impl GpuRuntime {
                     config.usage |= wgpu::TextureUsages::COPY_DST;
                 }
                 surface.configure(&gpu.device, &config);
+                host.commit()?;
                 let info = GpuViewportInfo {
                     bounds,
                     physical_size,

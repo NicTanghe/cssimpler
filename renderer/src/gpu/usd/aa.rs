@@ -1,5 +1,12 @@
-//! Use tile memory on Apple GPUs, or bounded reusable strips on other adapters.
+//! Tile memory on Apple GPUs, direct resolve on Windows, bounded strips elsewhere.
 use super::*;
+
+#[derive(Clone, Copy)]
+pub(super) enum Strategy {
+    Strips,
+    FullFrame,
+    Memoryless,
+}
 
 pub(super) struct Targets {
     pub depth: wgpu::Texture,
@@ -15,40 +22,47 @@ impl Targets {
         let memoryless = cfg!(target_os = "macos")
             && adapter.backend == wgpu::Backend::Metal
             && adapter.transient_saves_memory == Some(true);
-        Self::with_memoryless(gpu, info, memoryless)
+        let strategy = if memoryless {
+            Strategy::Memoryless
+        } else if cfg!(windows) {
+            // Avoid repeating vertex work and render-pass/copy overhead per strip.
+            Strategy::FullFrame
+        } else {
+            Strategy::Strips
+        };
+        Self::with_strategy(gpu, info, strategy)
     }
 
-    pub(super) fn with_memoryless(
+    pub(super) fn with_strategy(
         gpu: &GpuContext,
         info: GpuViewportInfo,
-        memoryless: bool,
+        strategy: Strategy,
     ) -> Self {
         let color_flags = gpu.adapter.get_texture_format_features(info.format).flags;
         let depth_flags = gpu
             .adapter
             .get_texture_format_features(wgpu::TextureFormat::Depth32Float)
             .flags;
-        let enabled = cfg!(any(target_os = "linux", target_os = "macos"))
-            && matches!(
-                info.format,
-                wgpu::TextureFormat::Rgba8Unorm
-                    | wgpu::TextureFormat::Rgba8UnormSrgb
-                    | wgpu::TextureFormat::Bgra8Unorm
-                    | wgpu::TextureFormat::Bgra8UnormSrgb
-            )
-            && info.physical_size[1] >= 16
-            && (memoryless || info.texture_usage.contains(wgpu::TextureUsages::COPY_DST))
+        let strips = matches!(strategy, Strategy::Strips);
+        let enabled = matches!(
+            info.format,
+            wgpu::TextureFormat::Rgba8Unorm
+                | wgpu::TextureFormat::Rgba8UnormSrgb
+                | wgpu::TextureFormat::Bgra8Unorm
+                | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) && (!strips || info.physical_size[1] >= 16)
+            && (!strips || info.texture_usage.contains(wgpu::TextureUsages::COPY_DST))
             && color_flags.contains(
                 wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4
                     | wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE,
             )
             && depth_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4);
         let samples = if enabled { 4 } else { 1 };
-        let memoryless = enabled && memoryless;
-        let height = if memoryless {
-            info.physical_size[1]
-        } else {
+        let memoryless = enabled && matches!(strategy, Strategy::Memoryless);
+        let height = if strips {
             strip_height(info.physical_size[1], enabled)
+        } else {
+            info.physical_size[1]
         };
         let attachment_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
             | if memoryless {
@@ -87,7 +101,7 @@ impl Targets {
                     attachment_usage,
                 )
             }),
-            resolve: (enabled && !memoryless).then(|| {
+            resolve: (enabled && strips).then(|| {
                 texture(
                     "USD resolved strip",
                     info.format,
