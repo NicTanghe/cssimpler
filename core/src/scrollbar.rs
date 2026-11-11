@@ -20,7 +20,7 @@ impl OverflowMode {
     }
 
     pub const fn reserves_gutter(self) -> bool {
-        matches!(self, Self::Scroll)
+        matches!(self, Self::Auto | Self::Scroll)
     }
 }
 
@@ -41,8 +41,8 @@ impl Default for ScrollbarWidth {
 impl ScrollbarWidth {
     pub fn resolve_px(self) -> f32 {
         match self {
-            Self::Auto => 12.0,
-            Self::Thin => 8.0,
+            Self::Auto => 8.0,
+            Self::Thin => 5.0,
             Self::None => 0.0,
             Self::Px(value) => value.max(0.0),
         }
