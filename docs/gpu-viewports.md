@@ -27,7 +27,9 @@ pixels everywhere around the cube:
 cargo run --features gpu-viewport --example usd_glass_cube
 ```
 
-Drag the cube to orbit, scroll to zoom, and drag the top 28 pixels to move the
+Hold the primary button and drag the cube to orbit; scroll while holding it to
+zoom. Release stops both camera controls, including trackpad scroll momentum.
+Drag the top 28 pixels to move the
 borderless window. The example uses on-demand rendering by default. Add
 `-- --smoke` for a 120-frame native composition check.
 
@@ -41,7 +43,7 @@ cargo run --features gpu-viewport --example usd_viewport -- --transparent --two-
 cargo run --features gpu-viewport --example usd_viewport -- --camera=/World/Camera
 ```
 
-Drag with the primary mouse button to orbit and use the wheel to zoom. The
+Hold the primary mouse button to orbit or zoom with the wheel/trackpad. The
 sidebar and text input are CPU-rendered. Both USD examples render on demand by
 default, so an idle scene does not keep submitting GPU work. `usd_viewport`
 accepts `--continuous` to render every frame. `--smoke` runs 120 GPU frames, prints GPU
@@ -221,6 +223,32 @@ and follows queued press/release events on every platform. Live OS button pollin
 is deliberately avoided: it can cancel valid queued drag movement after the
 physical release, particularly when native glass adds presentation latency.
 
+The macOS host also observes native AppKit drag/release events for its own
+window. Native vibrancy can receive those events without winit delivering the
+corresponding cursor motion or mouse-up. The host coalesces native movement for
+the captured viewport and forwards its final held position before release.
+Only the captured viewport is awakened, and native events remain available to
+AppKit. This bridge uses real event edges rather than polling global buttons.
+
+In windowed mode, macOS Ctrl+Command pointer gestures yield to system window
+management before UI hit testing or GPU capture. Completing that chord during a
+drag cancels capture and discards buffered native movement; releasing the
+modifier does not resume the drag without a fresh click. Window moves and resizes
+alone do not cancel pointer capture. A primary press with that chord starts
+AppKit's window-drag loop when the user's `NSWindowShouldDragOnGesture`
+preference is enabled, including for frameless windows. Keyboard shortcuts remain
+available, and fullscreen keeps modifier pointer gestures in the app.
+`set_system_drag_override` can explicitly yield pointer input in either mode.
+
+For native input and frame-timing diagnostics:
+
+```sh
+cargo run --release --features gpu-viewport --example usd_glass_cube -- --trace-input
+```
+
+The trace distinguishes AppKit input, winit delivery, viewport capture, and
+GPU acquisition/encoding/presentation timing. It is disabled in normal runs.
+
 Exercise the glass example's on-demand redraw path (rather than continuous
 smoke rendering) with:
 
@@ -231,6 +259,26 @@ cargo run --features gpu-viewport --example usd_glass_cube -- --smoke-on-demand
 This requests each subsequent frame through the redraw handle and exits after
 120 frames, reporting elapsed time. It checks redraw scheduling independently
 of manual pointer input.
+
+`--smoke-input` additionally feeds 1,000 pointer samples per frame while orbiting
+and presenting native glass, then checks that hover and scrolling are rejected
+after releasing the button. For an optimized native run:
+
+```sh
+cargo run --release --features gpu-viewport --example usd_glass_cube -- --smoke-input
+```
+
+Input samples accumulate camera changes; USD camera attributes are committed
+once per rendered frame. Redraw wakeups coalesce while a frame is pending, and
+GPU-consumed button events avoid an unnecessary CPU glass frame.
+During `--smoke-input`, the cube deliberately rotates under scripted input and
+ignores physical input callbacks so manual window interaction cannot interrupt
+the test's simulated press/release sequence. Normal runs use physical input.
+
+A release-build run on the development Mac completed this native glass stress
+test in 1984 ms for 120 frames. The samples enter renderer callbacks directly;
+this verifies input processing and presentation capacity, not physical trackpad
+event delivery or input-to-display latency.
 
 On the development X11/NVIDIA RTX 3070 system, paired release-build measurements
 at matching 1912×2152 window sizes gave:

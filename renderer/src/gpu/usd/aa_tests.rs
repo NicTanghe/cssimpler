@@ -359,14 +359,62 @@ fn check_strip_resolve(format: wgpu::TextureFormat) {
         );
     }
 
+    // Check the deferred camera commit through actual rendered pixels, then
+    // verify that post-release hover and trackpad momentum leave them unchanged.
+    let moved = |x, y| EngineEvent::PointerMoved {
+        position: crate::PointerPosition { x, y },
+        modifiers: Default::default(),
+    };
+    renderer.event(&moved(40.0, 40.0));
+    assert!(renderer.event(&EngineEvent::PointerButton {
+        button: crate::PointerButton::Primary,
+        state: crate::ButtonState::Pressed,
+        modifiers: Default::default(),
+    }));
+    for step in 1..=1000 {
+        assert!(renderer.event(&moved(40.0 + step as f32 * 0.04, 40.0 + step as f32 * 0.02)));
+    }
+    renderer.event(&EngineEvent::PointerButton {
+        button: crate::PointerButton::Primary,
+        state: crate::ButtonState::Released,
+        modifiers: Default::default(),
+    });
+    let turned = draw(&mut renderer);
+    assert_ne!(
+        turned, reference,
+        "held movement must reach the rendered camera"
+    );
+    for step in 1..=1000 {
+        assert!(!renderer.event(&moved(80.0 + step as f32, 60.0)));
+        assert!(!renderer.event(&EngineEvent::Scroll {
+            delta: crate::ScrollDelta::Pixels { x: 0.0, y: 4.0 },
+            modifiers: Default::default(),
+        }));
+    }
+    assert_eq!(
+        draw(&mut renderer),
+        turned,
+        "post-release hover and scrolling must not change the image"
+    );
+
     // A cached uniform must still follow orbit input, authored camera edits,
     // animation time and target changes. Repeated frames retain the same key.
     let before = draw(&mut renderer);
     let key = renderer.camera_key;
     assert_eq!(before, draw(&mut renderer));
     assert!(key == renderer.camera_key);
+    assert!(renderer.event(&EngineEvent::PointerButton {
+        button: crate::PointerButton::Primary,
+        state: crate::ButtonState::Pressed,
+        modifiers: Default::default(),
+    }));
     assert!(renderer.event(&EngineEvent::Scroll {
         delta: crate::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+        modifiers: Default::default(),
+    }));
+    assert!(renderer.event(&EngineEvent::PointerButton {
+        button: crate::PointerButton::Primary,
+        state: crate::ButtonState::Released,
         modifiers: Default::default(),
     }));
     assert_ne!(before, draw(&mut renderer));

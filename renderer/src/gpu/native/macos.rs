@@ -11,9 +11,13 @@ use objc2_quartz_core::{CALayer, CAMetalLayer, CATransaction};
 use std::cell::Cell;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+#[path = "macos/input.rs"]
+mod input;
+
 pub(crate) struct NativeHost {
     layer: Retained<CAMetalLayer>,
     placement: Cell<Option<Placement>>,
+    input: input::InputMonitor,
     // Keeps the NSView/NSWindow alive until after the Metal surface is dropped.
     parent: Arc<Window>,
 }
@@ -37,6 +41,7 @@ impl NativeHost {
         // Geometry validation hides viewports occluded by later-painted CPU UI.
         layer.setZPosition(1_000_001.0);
         let host = Self {
+            input: input::InputMonitor::install(&parent)?,
             layer,
             parent,
             placement: Cell::new(None),
@@ -64,6 +69,26 @@ impl NativeHost {
         root.ok_or_else(|| error("AppKit content view has no backing layer"))
     }
 
+    pub fn take_primary_release(&self) -> Option<crate::KeyboardModifiers> {
+        self.input.take_primary_release()
+    }
+
+    pub fn take_native_motion(&self) -> Option<(crate::PointerPosition, crate::KeyboardModifiers)> {
+        self.input.take_motion()
+    }
+
+    pub fn take_system_gesture(&self) -> Option<crate::KeyboardModifiers> {
+        self.input.take_system_gesture()
+    }
+
+    pub fn set_input_redraw(&self, redraw: crate::gpu::GpuRedrawHandle) {
+        self.input.set_redraw(redraw);
+    }
+
+    pub fn set_primary_capture(&self, captured: bool) {
+        self.input.set_captured(captured);
+    }
+
     pub fn target(&self) -> Result<wgpu::SurfaceTargetUnsafe> {
         Ok(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(
             Retained::as_ptr(&self.layer).cast_mut().cast(),
@@ -72,6 +97,7 @@ impl NativeHost {
 
     pub fn place(&self, origin: [i32; 2], size: [u32; 2]) -> Result<()> {
         let _main = main_thread()?;
+        self.input.set_windowed(self.parent.fullscreen().is_none());
         let root = self.content_layer()?;
         let scale = self.parent.scale_factor();
         let frame = layer_frame(root.bounds(), root.isGeometryFlipped(), origin, size, scale);
@@ -102,6 +128,7 @@ impl NativeHost {
     }
 
     pub fn hide(&self) {
+        self.input.set_captured(false);
         if self.layer.isHidden() {
             return;
         }

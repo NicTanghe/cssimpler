@@ -3814,6 +3814,34 @@ mod tests {
     }
 
     #[test]
+    fn auto_overflow_reserves_gutter_with_default_scrollbar_width() {
+        let stylesheet = parse_stylesheet(
+            "#pane {
+                width: 100px;
+                height: 80px;
+                overflow-y: auto;
+                background-color: #ffffff;
+            }
+            .tall {
+                width: 88px;
+                height: 200px;
+                background-color: #0f172a;
+            }",
+        )
+        .expect("auto overflow stylesheet should parse");
+        let tree = Node::element("div")
+            .with_id("pane")
+            .with_child(Node::element("div").with_class("tall").into())
+            .into();
+        let scene = build_render_tree(&tree, &stylesheet);
+        let scrollbars = scene.scrollbars.expect("scrollbars should be attached for overflowing content");
+
+        assert!(scrollbars.shows_vertical());
+        assert_eq!(scrollbars.metrics.reserved_width, 8.0);
+        assert!(scrollbars.metrics.max_offset_y > 0.0);
+    }
+
+    #[test]
     fn viewport_layout_supports_percentage_sized_roots() {
         let stylesheet = parse_stylesheet(
             "#app {

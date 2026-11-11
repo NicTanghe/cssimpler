@@ -97,7 +97,11 @@ impl Default for GpuRedrawHandle {
 
 impl GpuRedrawHandle {
     pub fn request_redraw(&self) {
-        self.0.dirty.store(true, Ordering::Release);
+        // The first invalidation wakes the event loop. Later pointer samples
+        // only update the pending frame; they must not flood its user-event queue.
+        if self.0.dirty.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if let Some(wake) = self
             .0
             .wake
@@ -184,6 +188,14 @@ pub(crate) fn error(message: impl std::fmt::Display) -> RendererError {
     RendererError::Surface(format!("GPU viewport: {message}"))
 }
 
+pub(crate) fn input_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CSSIMPLER_GPU_INPUT_TRACE").is_some()
+            || std::env::args_os().any(|arg| arg == "--trace-input")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,13 +215,17 @@ mod tests {
         let handle = GpuRedrawHandle::default();
         assert!(handle.take_dirty());
         assert!(!handle.take_dirty());
-        let awake = Arc::new(AtomicBool::new(false));
+        let awake = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let out = awake.clone();
         handle.set_wake(Box::new(move || {
-            out.store(true, Ordering::Release);
+            out.fetch_add(1, Ordering::AcqRel);
         }));
-        handle.request_redraw();
-        assert!(awake.load(Ordering::Acquire));
+        for _ in 0..1000 {
+            handle.request_redraw();
+        }
+        assert_eq!(awake.load(Ordering::Acquire), 1);
         assert!(handle.take_dirty());
+        handle.request_redraw();
+        assert_eq!(awake.load(Ordering::Acquire), 2);
     }
 }

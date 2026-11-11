@@ -2933,10 +2933,6 @@ fn visual_styles_match_ignoring_projection(left: &VisualStyle, right: &VisualSty
         && left.scrollbar == right.scrollbar
 }
 
-fn should_suspend_updates(left_down: bool, left_super_down: bool, right_super_down: bool) -> bool {
-    left_down && (left_super_down || right_super_down)
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CachedSceneBounds {
     pub(crate) roots: Vec<CachedSubtreeBounds>,
@@ -7555,6 +7551,7 @@ fn blend_mask_row(
         }
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     blend_mask_row_scalar(buffer_row, buffer_start, coverages, color, base_alpha);
 }
 
@@ -7824,7 +7821,7 @@ mod tests {
         pack_rgb, pack_rgba, render_scene_update, render_scene_update_internal_from_roots,
         render_to_buffer, reset_deferred_hit_collection_visits, resize_buffer,
         scenes_match_visuals, should_full_redraw, should_present_frame, should_present_scene,
-        should_suspend_updates, unpack_alpha8, unpack_rgb,
+        unpack_alpha8, unpack_rgb,
     };
 
     static CLICK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -11079,15 +11076,6 @@ mod tests {
         let extracted = ExtractedScene::from_render_roots(&scene);
 
         assert!(should_present_scene(Some(&extracted), &extracted, true));
-    }
-
-    #[test]
-    fn super_dragging_suspends_updates() {
-        assert!(should_suspend_updates(true, true, false));
-        assert!(should_suspend_updates(true, false, true));
-        assert!(should_suspend_updates(true, true, true));
-        assert!(!should_suspend_updates(false, true, false));
-        assert!(!should_suspend_updates(true, false, false));
     }
 
     #[test]

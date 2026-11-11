@@ -186,6 +186,7 @@ struct Orbit {
     pitch: f32,
     drag: bool,
     last: Option<[f32; 2]>,
+    camera_dirty: bool,
 }
 
 impl UsdRenderer {
@@ -246,6 +247,7 @@ impl UsdRenderer {
                     pitch: 0.25,
                     drag: false,
                     last: None,
+                    camera_dirty: false,
                 };
                 update_orbit_camera(&camera_stage, &camera_path, &orbit)?;
                 (camera_stage, camera_path, Some(orbit))
@@ -411,9 +413,12 @@ impl GpuViewportRenderer for UsdRenderer {
         let Some(orbit) = &mut self.orbit else {
             return false;
         };
-        handle_orbit_event(&self.camera_stage, &self.camera_path, orbit, event)
+        handle_orbit_event(orbit, event)
     }
     fn render(&mut self, gpu: &GpuContext, frame: GpuViewportFrame<'_>) -> Result<()> {
+        if let Some(orbit) = &mut self.orbit {
+            flush_orbit_camera(&self.camera_stage, &self.camera_path, orbit)?;
+        }
         let time = self.control.0.borrow().time;
         if self.revision != self.scene.revision.get() || self.evaluated_time != time {
             let cache = extract_meshes(&self.scene.stage, time)?;
@@ -515,12 +520,7 @@ impl Drop for UsdRenderer {
     }
 }
 
-fn handle_orbit_event(
-    stage: &Stage,
-    path: &sdf::Path,
-    orbit: &mut Orbit,
-    event: &EngineEvent,
-) -> bool {
+fn handle_orbit_event(orbit: &mut Orbit, event: &EngineEvent) -> bool {
     match event {
         EngineEvent::PointerButton {
             button: crate::PointerButton::Primary,
@@ -528,6 +528,9 @@ fn handle_orbit_event(
             ..
         } => {
             orbit.drag = *state == crate::ButtonState::Pressed;
+            if !orbit.drag {
+                orbit.last = None;
+            }
             // Capture changes alone do not change the camera pose.
             return true;
         }
@@ -549,6 +552,10 @@ fn handle_orbit_event(
             orbit.pitch = (orbit.pitch + (next[1] - last[1]) * 0.01).clamp(-1.5, 1.5);
         }
         EngineEvent::Scroll { delta, .. } => {
+            if !orbit.drag {
+                // Includes trackpad scroll momentum delivered after mouseUp.
+                return false;
+            }
             let dy = match delta {
                 crate::ScrollDelta::Lines { y, .. } => *y,
                 crate::ScrollDelta::Pixels { y, .. } => *y / 40.0,
@@ -565,11 +572,18 @@ fn handle_orbit_event(
         }
         _ => return false,
     }
-    // Author only actual orbit/zoom changes in the viewport-owned USD stage.
-    if let Err(e) = update_orbit_camera(stage, path, orbit) {
-        eprintln!("cssimpler: {e}");
-    }
+    // Accumulate input cheaply; author the canonical USD camera once before
+    // rendering. Hundreds of queued samples must not delay the release event.
+    orbit.camera_dirty = true;
     true
+}
+
+fn flush_orbit_camera(stage: &Stage, path: &sdf::Path, orbit: &mut Orbit) -> Result<()> {
+    if orbit.camera_dirty {
+        update_orbit_camera(stage, path, orbit)?;
+        orbit.camera_dirty = false;
+    }
+    Ok(())
 }
 
 fn update_orbit_camera(stage: &Stage, path: &sdf::Path, orbit: &Orbit) -> Result<()> {
@@ -792,6 +806,7 @@ mod tests {
             pitch: 0.25,
             drag: false,
             last: None,
+            camera_dirty: false,
         };
         update_orbit_camera(&stage, &path, &orbit).unwrap();
         let writes = Rc::new(Cell::new(0));
@@ -809,47 +824,69 @@ mod tests {
             modifiers: Default::default(),
         };
         for x in 0..100 {
-            assert!(!handle_orbit_event(
-                &stage,
-                &path,
-                &mut orbit,
-                &moved(x as f32)
-            ));
+            assert!(!handle_orbit_event(&mut orbit, &moved(x as f32)));
         }
         assert_eq!(writes.get(), 0);
         assert_eq!((orbit.yaw, orbit.pitch), (0.5, 0.25));
         assert!(handle_orbit_event(
-            &stage,
-            &path,
             &mut orbit,
             &button(crate::ButtonState::Pressed)
         ));
         assert_eq!(writes.get(), 0);
-        assert!(handle_orbit_event(&stage, &path, &mut orbit, &moved(110.0)));
+        assert!(handle_orbit_event(&mut orbit, &moved(110.0)));
+        // A high-rate pointer burst is accumulated without composing USD for
+        // each sample. The camera is committed once when the frame is rendered.
+        for x in 111..1111 {
+            assert!(handle_orbit_event(&mut orbit, &moved(x as f32)));
+        }
+        assert_eq!(writes.get(), 0);
+        assert!(orbit.camera_dirty);
+        flush_orbit_camera(&stage, &path, &mut orbit).unwrap();
         assert!(writes.get() > 0);
         let orbit_writes = writes.get();
+        flush_orbit_camera(&stage, &path, &mut orbit).unwrap();
+        assert_eq!(
+            writes.get(),
+            orbit_writes,
+            "unchanged frames must not author the camera"
+        );
         assert!(handle_orbit_event(
-            &stage,
-            &path,
             &mut orbit,
             &button(crate::ButtonState::Released)
         ));
-        assert!(!handle_orbit_event(
-            &stage,
-            &path,
-            &mut orbit,
-            &moved(120.0)
-        ));
+        assert!(!handle_orbit_event(&mut orbit, &moved(120.0)));
         assert_eq!(writes.get(), orbit_writes);
+        let released_pose = (orbit.yaw, orbit.pitch, orbit.radius);
+        for delta in [
+            crate::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            crate::ScrollDelta::Pixels { x: 0.0, y: 40.0 },
+        ] {
+            assert!(!handle_orbit_event(
+                &mut orbit,
+                &EngineEvent::Scroll {
+                    delta,
+                    modifiers: Default::default()
+                }
+            ));
+        }
+        assert_eq!((orbit.yaw, orbit.pitch, orbit.radius), released_pose);
+        assert!(
+            !orbit.camera_dirty,
+            "release must stop both rotation and scroll momentum"
+        );
         assert!(handle_orbit_event(
-            &stage,
-            &path,
+            &mut orbit,
+            &button(crate::ButtonState::Pressed)
+        ));
+        assert!(handle_orbit_event(
             &mut orbit,
             &EngineEvent::Scroll {
                 delta: crate::ScrollDelta::Lines { x: 0.0, y: 1.0 },
                 modifiers: Default::default()
             }
         ));
+        assert_eq!(writes.get(), orbit_writes);
+        flush_orbit_camera(&stage, &path, &mut orbit).unwrap();
         assert!(writes.get() > orbit_writes);
         assert!(orbit.radius < 5.0);
     }

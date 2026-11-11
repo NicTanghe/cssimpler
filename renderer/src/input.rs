@@ -6,6 +6,36 @@ pub struct KeyboardModifiers {
     pub super_key: bool,
 }
 
+/// Leave window-management pointer chords to the OS. An explicit host override
+/// remains effective in fullscreen, where ordinary modifier chords belong to UI.
+pub(crate) fn system_pointer_gesture(
+    windowed: bool,
+    modifiers: KeyboardModifiers,
+    override_active: bool,
+) -> bool {
+    let window_chord = if cfg!(target_os = "macos") {
+        modifiers.control && modifiers.super_key
+    } else {
+        modifiers.super_key
+    };
+    override_active || (windowed && window_chord)
+}
+
+pub(crate) fn system_pointer_event(
+    event: &EngineEvent,
+    windowed: bool,
+    override_active: bool,
+) -> Option<KeyboardModifiers> {
+    let modifiers = match event {
+        EngineEvent::ModifiersChanged(modifiers)
+        | EngineEvent::PointerMoved { modifiers, .. }
+        | EngineEvent::PointerButton { modifiers, .. }
+        | EngineEvent::Scroll { modifiers, .. } => *modifiers,
+        _ => return None,
+    };
+    system_pointer_gesture(windowed, modifiers, override_active).then_some(modifiers)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ButtonState {
     Pressed,
@@ -100,4 +130,61 @@ pub enum EngineEvent {
     TextInput(TextInputEvent),
     Suspended,
     Resumed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_management_modifiers_yield_only_windowed_pointer_input() {
+        for modifiers in [KeyboardModifiers {
+            super_key: true,
+            control: cfg!(target_os = "macos"),
+            ..Default::default()
+        }] {
+            assert!(system_pointer_gesture(true, modifiers, false));
+            assert!(!system_pointer_gesture(false, modifiers, false));
+        }
+        for modifiers in [
+            KeyboardModifiers::default(),
+            KeyboardModifiers {
+                shift: true,
+                alt: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(!system_pointer_gesture(true, modifiers, false));
+            assert!(system_pointer_gesture(false, modifiers, true));
+        }
+        #[cfg(target_os = "macos")]
+        for modifiers in [
+            KeyboardModifiers {
+                control: true,
+                ..Default::default()
+            },
+            KeyboardModifiers {
+                super_key: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                !system_pointer_gesture(true, modifiers, false),
+                "individual modifiers must not disable ordinary app input"
+            );
+        }
+        let key = EngineEvent::Key(KeyboardEvent {
+            logical_key: KeyIdentity::Character("c".into()),
+            physical_key: None,
+            location: KeyLocation::Standard,
+            state: ButtonState::Pressed,
+            repeat: false,
+            modifiers: KeyboardModifiers {
+                control: true,
+                super_key: true,
+                ..Default::default()
+            },
+        });
+        assert_eq!(system_pointer_event(&key, true, false), None);
+    }
 }

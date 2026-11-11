@@ -73,8 +73,8 @@ pub(crate) fn taffy_overflow_from_mode(mode: OverflowMode) -> taffy::Overflow {
     match mode {
         OverflowMode::Visible => taffy::Overflow::Visible,
         OverflowMode::Clip => taffy::Overflow::Clip,
-        OverflowMode::Hidden | OverflowMode::Auto => taffy::Overflow::Hidden,
-        OverflowMode::Scroll => taffy::Overflow::Scroll,
+        OverflowMode::Hidden => taffy::Overflow::Hidden,
+        OverflowMode::Auto | OverflowMode::Scroll => taffy::Overflow::Scroll,
     }
 }
 
