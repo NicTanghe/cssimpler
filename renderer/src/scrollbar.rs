@@ -1444,24 +1444,31 @@ fn resolved_scrollbar_colors(
     node: &RenderNode,
     scrollbars: cssimpler_core::ScrollbarData,
 ) -> ResolvedScrollbarColors {
-    let base_background = node.style.background.unwrap_or(Color::rgb(241, 245, 249));
     let track = scrollbars
         .style
         .track_color
-        .unwrap_or_else(|| mix_color(base_background, node.style.foreground, 0.12).with_alpha(208));
+        .unwrap_or(Color::TRANSPARENT);
     let thumb = scrollbars
         .style
         .thumb_color
-        .unwrap_or_else(|| mix_color(base_background, node.style.foreground, 0.36).with_alpha(232));
+        .unwrap_or_else(|| node.style.foreground.with_alpha(80));
 
     ResolvedScrollbarColors { track, thumb }
 }
 
 fn axis_thumb_color(base: Color, hovered: bool, active: bool) -> Color {
     if active {
-        mix_color(base, Color::BLACK, 0.12)
+        if base.a < 200 {
+            base.with_alpha((base.a as f32 * 1.75).min(230.0).max(120.0) as u8)
+        } else {
+            mix_color(base, Color::BLACK, 0.15)
+        }
     } else if hovered {
-        mix_color(base, Color::WHITE, 0.08)
+        if base.a < 200 {
+            base.with_alpha((base.a as f32 * 1.35).min(180.0).max(95.0) as u8)
+        } else {
+            mix_color(base, Color::WHITE, 0.10)
+        }
     } else {
         base
     }
