@@ -1,5 +1,5 @@
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation};
@@ -10,10 +10,9 @@ use cssimpler::ui;
 
 const ACTION_TOGGLE_DRAWER: u64 = 1 << 0;
 
-static ACTIONS: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 struct DrawerState {
+    actions: Arc<AtomicU64>,
     collapsed: bool,
 }
 
@@ -31,7 +30,7 @@ fn main() -> Result<()> {
 }
 
 fn update(state: &mut DrawerState, _frame: FrameInfo) -> Invalidation {
-    let actions = ACTIONS.swap(0, Ordering::Relaxed);
+    let actions = state.actions.swap(0, Ordering::Relaxed);
     if actions & ACTION_TOGGLE_DRAWER == 0 {
         return Invalidation::Clean;
     }
@@ -41,10 +40,11 @@ fn update(state: &mut DrawerState, _frame: FrameInfo) -> Invalidation {
 }
 
 fn build_ui(state: &DrawerState) -> Node {
+    let actions = Arc::clone(&state.actions);
     let root = ui! {
         <div id="app">
             <aside class="drawer">
-                <button class="drawer-toggle" type="button" onclick={toggle_drawer}>
+                <button class="drawer-toggle" type="button" onclick_shared={move || { actions.fetch_or(ACTION_TOGGLE_DRAWER, Ordering::Relaxed); }}>
                     <span class="hamburger-line"></span>
                     <span class="hamburger-line"></span>
                     <span class="hamburger-line"></span>
@@ -123,10 +123,6 @@ fn add_class(node: Node, class_name: &'static str) -> Node {
     }
 }
 
-fn toggle_drawer() {
-    ACTIONS.fetch_or(ACTION_TOGGLE_DRAWER, Ordering::Relaxed);
-}
-
 fn stylesheet() -> &'static Stylesheet {
     static STYLESHEET: OnceLock<Stylesheet> = OnceLock::new();
 
@@ -138,7 +134,7 @@ fn stylesheet() -> &'static Stylesheet {
 
 #[cfg(test)]
 mod tests {
-    use super::{ACTION_TOGGLE_DRAWER, ACTIONS, DrawerState, build_ui, stylesheet, update};
+    use super::{ACTION_TOGGLE_DRAWER, DrawerState, build_ui, stylesheet, update};
     use cssimpler::app::Invalidation;
     use cssimpler::renderer::FrameInfo;
     use std::sync::atomic::Ordering;
@@ -159,7 +155,7 @@ mod tests {
     #[test]
     fn glass_drawer_toggle_collapses_the_drawer() {
         let mut state = DrawerState::default();
-        ACTIONS.store(ACTION_TOGGLE_DRAWER, Ordering::Relaxed);
+        state.actions.store(ACTION_TOGGLE_DRAWER, Ordering::Relaxed);
 
         let invalidation = update(
             &mut state,

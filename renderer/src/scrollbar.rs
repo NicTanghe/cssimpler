@@ -1447,7 +1447,7 @@ fn resolved_scrollbar_colors(
     let track = scrollbars
         .style
         .track_color
-        .unwrap_or(Color::TRANSPARENT);
+        .unwrap_or(Color::rgba(0, 0, 0, 0));
     let thumb = scrollbars
         .style
         .thumb_color

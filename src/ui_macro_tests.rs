@@ -185,3 +185,51 @@ fn dynamic_lists_and_optional_children_are_flattened_without_wrapper_nodes() {
         assert_eq!(element.tag, tag);
     }
 }
+
+#[test]
+fn captured_handlers_keep_instance_state_separate() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn button(count: &Arc<AtomicUsize>) -> Node {
+        let count = Arc::clone(count);
+        ui! { <button onclick_shared={move || { count.fetch_add(1, Ordering::Relaxed); }}>click</button> }
+    }
+
+    let first = Arc::new(AtomicUsize::new(0));
+    let second = Arc::new(AtomicUsize::new(0));
+    let Node::Element(first_button) = button(&first) else {
+        panic!("expected button")
+    };
+    let _second_button = button(&second);
+    first_button.handlers.click().unwrap()();
+    assert_eq!(first.load(Ordering::Relaxed), 1);
+    assert_eq!(second.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn changing_handler_kind_replaces_the_previous_handler() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let count = Arc::new(AtomicUsize::new(0));
+    let captured = count.clone();
+    let node = cssimpler_core::Node::element("button").on_click_shared(move || {
+        captured.fetch_add(1, Ordering::Relaxed);
+    });
+    let cloned = node.clone();
+    let replaced = node.on_click(increment);
+    replaced.handlers.click().unwrap()();
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+    cloned.handlers.click().unwrap()();
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    let captured = count.clone();
+    let replaced = replaced.on_click_shared(move || {
+        captured.fetch_add(1, Ordering::Relaxed);
+    });
+    replaced.handlers.click().unwrap()();
+    assert_eq!(count.load(Ordering::Relaxed), 2);
+}

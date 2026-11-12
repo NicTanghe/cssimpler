@@ -1,5 +1,5 @@
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation};
@@ -12,10 +12,9 @@ use cssimpler::ui;
 
 const ACTION_TOGGLE_INTERPOLATION: u64 = 1 << 0;
 
-static ACTIONS: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 struct GalleryState {
+    actions: Arc<AtomicU64>,
     interpolation: GradientInterpolation,
 }
 
@@ -89,7 +88,7 @@ fn main() -> Result<()> {
 }
 
 fn update(state: &mut GalleryState, _frame: FrameInfo) -> Invalidation {
-    let actions = ACTIONS.swap(0, Ordering::Relaxed);
+    let actions = state.actions.swap(0, Ordering::Relaxed);
     if actions == 0 {
         return Invalidation::Clean;
     }
@@ -159,9 +158,12 @@ fn build_ui(state: &GalleryState) -> Node {
 }
 
 fn build_mode_switch(state: &GalleryState) -> Node {
+    let actions = Arc::clone(&state.actions);
     Node::element("button")
         .with_class("mode-switch")
-        .on_click(toggle_interpolation)
+        .on_click_shared(move || {
+            actions.fetch_or(ACTION_TOGGLE_INTERPOLATION, Ordering::Relaxed);
+        })
         .with_child(
             Node::element("p")
                 .with_class("mode-kicker")
@@ -195,10 +197,6 @@ fn build_mode_switch(state: &GalleryState) -> Node {
                 .into(),
         )
         .into()
-}
-
-fn toggle_interpolation() {
-    ACTIONS.fetch_or(ACTION_TOGGLE_INTERPOLATION, Ordering::Relaxed);
 }
 
 fn next_interpolation(interpolation: GradientInterpolation) -> GradientInterpolation {
@@ -266,7 +264,7 @@ mod tests {
     }
 
     fn find_clickable_node(node: &RenderNode) -> Option<&RenderNode> {
-        if node.handlers.click.is_some() {
+        if node.handlers.click().is_some() {
             return Some(node);
         }
 

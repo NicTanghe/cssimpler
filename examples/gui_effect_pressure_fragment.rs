@@ -29,7 +29,7 @@ fn main() -> Result<()> {
 }
 
 fn update(state: &mut shared::EffectStressState, frame: FrameInfo) -> Refresh {
-    let actions = shared::take_actions();
+    let actions = shared::take_actions(state);
     let previous = state.clone();
     let invalidation = shared::apply_frame(state, frame, actions);
     shared::maybe_log_perf(state, actions);

@@ -165,7 +165,7 @@ impl NativeTextInputs {
                 {
                     let key = text_input_key(&element, path);
                     let initial_value = element.attribute("value").unwrap_or_default().to_string();
-                    let is_controlled = element.handlers.input.is_some();
+                    let is_controlled = element.handlers.input().is_some();
                     let state =
                         self.states
                             .entry(key.clone())
@@ -465,7 +465,7 @@ impl NativeTextInputs {
         if text_input_key(element, &focused.path) != focused.key {
             return false;
         }
-        if let Some(handler) = element.handlers.enter {
+        if let Some(handler) = element.handlers.enter() {
             handler();
             return true;
         }
@@ -650,7 +650,7 @@ impl NativeTextInputs {
         if !is_native_text_input(element) || text_input_key(element, &focused.path) != focused.key {
             return;
         }
-        if let Some(handler) = element.handlers.input {
+        if let Some(handler) = element.handlers.input() {
             handler(&state.value);
         }
     }

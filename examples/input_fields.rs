@@ -1,4 +1,4 @@
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation};
@@ -7,23 +7,19 @@ use cssimpler::renderer::{FrameInfo, WindowConfig};
 use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
 
-static PENDING_INPUT_CHANGES: Mutex<PendingInputChanges> = Mutex::new(PendingInputChanges {
-    first_name: None,
-    last_name: None,
-});
-
 #[derive(Debug)]
 struct InputFieldsState {
     first_name: String,
     last_name: String,
+    pending: Arc<Mutex<PendingInputChanges>>,
 }
 
 impl Default for InputFieldsState {
     fn default() -> Self {
-        clear_pending_input_changes();
         Self {
             first_name: "Ada".to_string(),
             last_name: "Lovelace".to_string(),
+            pending: Arc::default(),
         }
     }
 }
@@ -55,7 +51,8 @@ fn main() -> Result<()> {
 }
 
 fn update(state: &mut InputFieldsState, _frame: FrameInfo) -> Invalidation {
-    let mut pending = PENDING_INPUT_CHANGES
+    let mut pending = state
+        .pending
         .lock()
         .expect("input changes mutex should not be poisoned");
     let mut changed = false;
@@ -81,6 +78,8 @@ fn update(state: &mut InputFieldsState, _frame: FrameInfo) -> Invalidation {
 }
 
 fn build_ui(state: &InputFieldsState) -> Node {
+    let first_changes = Arc::clone(&state.pending);
+    let last_changes = Arc::clone(&state.pending);
     ui! {
         <div id="app">
             <form class="panel">
@@ -92,7 +91,7 @@ fn build_ui(state: &InputFieldsState) -> Node {
                     id="fname"
                     name="fname"
                     value={state.first_name.clone()}
-                    oninput={capture_first_name}
+                    oninput_shared={move |value: &str| { first_changes.lock().unwrap().first_name = Some(value.to_string()); }}
                 >
 
                 <label for="lname">Last Name</label>
@@ -101,33 +100,13 @@ fn build_ui(state: &InputFieldsState) -> Node {
                     id="lname"
                     name="lname"
                     value={state.last_name.clone()}
-                    oninput={capture_last_name}
+                    oninput_shared={move |value: &str| { last_changes.lock().unwrap().last_name = Some(value.to_string()); }}
                 >
 
                 <h3 class="letter-preview">{state.separated_caps()}</h3>
             </form>
         </div>
     }
-}
-
-fn capture_first_name(value: &str) {
-    PENDING_INPUT_CHANGES
-        .lock()
-        .expect("input changes mutex should not be poisoned")
-        .first_name = Some(value.to_string());
-}
-
-fn capture_last_name(value: &str) {
-    PENDING_INPUT_CHANGES
-        .lock()
-        .expect("input changes mutex should not be poisoned")
-        .last_name = Some(value.to_string());
-}
-
-fn clear_pending_input_changes() {
-    *PENDING_INPUT_CHANGES
-        .lock()
-        .expect("input changes mutex should not be poisoned") = PendingInputChanges::default();
 }
 
 fn stylesheet() -> &'static Stylesheet {

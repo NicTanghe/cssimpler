@@ -1,24 +1,23 @@
-use std::sync::OnceLock;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation, RenderMode};
 use cssimpler::renderer::{FrameInfo, WindowConfig};
-use cssimpler::style::{Stylesheet, parse_stylesheet};
+use cssimpler::style::parse_stylesheet;
 use cssimpler::ui;
 
 #[derive(Debug, Default)]
 struct DemoState {
-    click_count: u64,
+    click_count: Arc<AtomicU64>,
     frame_index: u64,
     last_frame_ms: u128,
 }
 
-static CLICK_COUNT: AtomicU64 = AtomicU64::new(0);
-
 fn main() -> Result<()> {
     let config = WindowConfig::new("cssimpler", 960, 540);
-    App::new(DemoState::default(), stylesheet(), update, build_ui)
+    let stylesheet = parse_stylesheet(include_str!("demo.css"))?;
+    App::new(DemoState::default(), &stylesheet, update, build_ui)
         //weirdly whith OnInvalifation it is still rendereing out at 60fps
         .with_render_mode(RenderMode::OnInvalidation)
         .run(config)
@@ -26,13 +25,14 @@ fn main() -> Result<()> {
 }
 
 fn update(state: &mut DemoState, frame: FrameInfo) -> Invalidation {
-    state.click_count = CLICK_COUNT.load(Ordering::Relaxed);
     state.frame_index = frame.frame_index;
     state.last_frame_ms = frame.delta.as_millis();
     Invalidation::Paint
 }
 
 fn build_ui(state: &DemoState) -> cssimpler::core::Node {
+    let count = state.click_count.load(Ordering::Relaxed);
+    let click_count = Arc::clone(&state.click_count);
     ui! {
         <div id="app">
             <section class="card">
@@ -40,9 +40,9 @@ fn build_ui(state: &DemoState) -> cssimpler::core::Node {
                     Increment button demo
                 </h1>
                 <p class="subtitle">
-                    {format!("count {}", state.click_count)}
+                    {format!("count {count}")}
                 </p>
-                <button class="button" onclick={increment}>
+                <button class="button" onclick_shared={move || { click_count.fetch_add(1, Ordering::Relaxed); }}>
                     Increment
                 </button>
                 <p class="meta">
@@ -51,16 +51,4 @@ fn build_ui(state: &DemoState) -> cssimpler::core::Node {
             </section>
         </div>
     }
-}
-
-fn increment() {
-    CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
-}
-
-fn stylesheet() -> &'static Stylesheet {
-    static STYLESHEET: OnceLock<Stylesheet> = OnceLock::new();
-
-    STYLESHEET.get_or_init(|| {
-        parse_stylesheet(include_str!("demo.css")).expect("demo stylesheet should stay valid")
-    })
 }

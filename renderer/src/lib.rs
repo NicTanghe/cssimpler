@@ -57,9 +57,8 @@ use self::{
 };
 use cssimpler_core::{
     BackdropOcclusion, BorderLineStyle, CornerRadius, ElementInteractionState, ElementPath,
-    EventHandler, ExtractedScene, LinearRgba, NativeMaterial, RenderKind, TextEditDecoration,
-    TextSelectionRange, TransformMatrix3d, TransformStyleMode, VisualStyle,
-    establishes_stacking_context,
+    ExtractedScene, LinearRgba, NativeMaterial, RenderKind, TextEditDecoration, TextSelectionRange,
+    TransformMatrix3d, TransformStyleMode, VisualStyle, establishes_stacking_context,
     fonts::{PreparedTextLayout, TextAlign, TextStyle, layout_text_block},
     stacking_context_level,
 };
@@ -3989,7 +3988,7 @@ fn hit_test_scene_for_event(
     x: f32,
     y: f32,
     event: MouseEventKind,
-) -> Option<EventHandler> {
+) -> Option<&(dyn Fn() + Send + Sync)> {
     sorted_scene_indices(scene)
         .into_iter()
         .rev()
@@ -4052,7 +4051,7 @@ fn hit_test_node_for_event(
     parent_perspective: Option<PerspectiveContext>,
     in_3d_context: bool,
     event: MouseEventKind,
-) -> Option<EventHandler> {
+) -> Option<&(dyn Fn() + Send + Sync)> {
     hit_test_node_for_event_internal(
         node,
         x,
@@ -4073,7 +4072,7 @@ fn hit_test_node_for_event_in_current_stacking_context(
     parent_perspective: Option<PerspectiveContext>,
     in_3d_context: bool,
     event: MouseEventKind,
-) -> Option<EventHandler> {
+) -> Option<&(dyn Fn() + Send + Sync)> {
     hit_test_node_for_event_internal(
         node,
         x,
@@ -4095,7 +4094,7 @@ fn hit_test_node_for_event_internal(
     in_3d_context: bool,
     event: MouseEventKind,
     collect_deferred_stacking_contexts: bool,
-) -> Option<EventHandler> {
+) -> Option<&(dyn Fn() + Send + Sync)> {
     if !clip.contains(x, y) {
         return None;
     }
@@ -4177,21 +4176,21 @@ fn hit_test_node_for_event_internal(
     contains.then(|| event_handler(node, event)).flatten()
 }
 
-fn find_handler_for_path(
-    scene: &[RenderNode],
+fn find_handler_for_path<'a>(
+    scene: &'a [RenderNode],
     path: &ElementPath,
     event: MouseEventKind,
-) -> Option<EventHandler> {
+) -> Option<&'a (dyn Fn() + Send + Sync)> {
     scene
         .iter()
         .find_map(|node| find_handler_for_path_node(node, path, event))
 }
 
-fn find_handler_for_path_node(
-    node: &RenderNode,
+fn find_handler_for_path_node<'a>(
+    node: &'a RenderNode,
     path: &ElementPath,
     event: MouseEventKind,
-) -> Option<EventHandler> {
+) -> Option<&'a (dyn Fn() + Send + Sync)> {
     if node.element_path.as_ref() == Some(path)
         && let Some(handler) = event_handler(node, event)
     {
@@ -4203,18 +4202,18 @@ fn find_handler_for_path_node(
         .find_map(|child| find_handler_for_path_node(child, path, event))
 }
 
-fn event_handler(node: &RenderNode, event: MouseEventKind) -> Option<EventHandler> {
+fn event_handler(node: &RenderNode, event: MouseEventKind) -> Option<&(dyn Fn() + Send + Sync)> {
     match event {
-        MouseEventKind::Click => node.handlers.click,
-        MouseEventKind::ContextMenu => node.handlers.contextmenu,
-        MouseEventKind::DblClick => node.handlers.dblclick,
-        MouseEventKind::MouseDown => node.handlers.mousedown,
-        MouseEventKind::MouseEnter => node.handlers.mouseenter,
-        MouseEventKind::MouseLeave => node.handlers.mouseleave,
-        MouseEventKind::MouseMove => node.handlers.mousemove,
-        MouseEventKind::MouseOut => node.handlers.mouseout,
-        MouseEventKind::MouseOver => node.handlers.mouseover,
-        MouseEventKind::MouseUp => node.handlers.mouseup,
+        MouseEventKind::Click => node.handlers.click(),
+        MouseEventKind::ContextMenu => node.handlers.contextmenu(),
+        MouseEventKind::DblClick => node.handlers.dblclick(),
+        MouseEventKind::MouseDown => node.handlers.mousedown(),
+        MouseEventKind::MouseEnter => node.handlers.mouseenter(),
+        MouseEventKind::MouseLeave => node.handlers.mouseleave(),
+        MouseEventKind::MouseMove => node.handlers.mousemove(),
+        MouseEventKind::MouseOut => node.handlers.mouseout(),
+        MouseEventKind::MouseOver => node.handlers.mouseover(),
+        MouseEventKind::MouseUp => node.handlers.mouseup(),
     }
 }
 
@@ -4322,12 +4321,12 @@ fn sort_deferred_hit_contexts(entries: &mut [DeferredHitStackingContext<'_>]) {
     });
 }
 
-fn hit_deferred_context_for_event(
-    entry: &DeferredHitStackingContext<'_>,
+fn hit_deferred_context_for_event<'a>(
+    entry: &DeferredHitStackingContext<'a>,
     x: f32,
     y: f32,
     event: MouseEventKind,
-) -> Option<EventHandler> {
+) -> Option<&'a (dyn Fn() + Send + Sync)> {
     if !node_requires_projected_path(entry.node) {
         hit_test_node_for_event(
             entry.node,
@@ -4512,8 +4511,8 @@ fn hit_test_element_path_node_internal(
     contains.then(|| node.element_path.clone().or_else(|| Some(path.clone())))?
 }
 
-fn hit_test_node_for_event_transformed(
-    node: &RenderNode,
+fn hit_test_node_for_event_transformed<'a>(
+    node: &'a RenderNode,
     x: f32,
     y: f32,
     clip_state: &ClipState,
@@ -4521,7 +4520,7 @@ fn hit_test_node_for_event_transformed(
     parent_perspective: Option<PerspectiveContext>,
     in_3d_context: bool,
     event: MouseEventKind,
-) -> Option<EventHandler> {
+) -> Option<&'a (dyn Fn() + Send + Sync)> {
     if !clip_state.contains(x, y) {
         return None;
     }
@@ -10072,6 +10071,22 @@ mod tests {
         assert!(dispatch_click(&scene, 12.0, 12.0));
         assert_eq!(CLICK_COUNT.load(Ordering::SeqCst), 1);
         assert!(!dispatch_click(&scene, 80.0, 80.0));
+    }
+
+    #[test]
+    fn dispatch_click_runs_captured_handler_after_scene_clone() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = count.clone();
+        let scene = vec![
+            RenderNode::container(LayoutBox::new(0.0, 0.0, 40.0, 24.0)).on_click_shared(
+                move || {
+                    captured.fetch_add(1, Ordering::Relaxed);
+                },
+            ),
+        ];
+        let cloned_scene = scene.clone();
+        assert!(dispatch_click(&cloned_scene, 12.0, 12.0));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

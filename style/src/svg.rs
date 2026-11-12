@@ -666,10 +666,7 @@ fn collect_svg_paths(
             let Some(points) = parse_svg_points(points_str) else {
                 return;
             };
-            let geometry = SvgPathGeometry::new(vec![SvgContour {
-                points,
-                closed,
-            }]);
+            let geometry = SvgPathGeometry::new(vec![SvgContour { points, closed }]);
             paths.push(SvgPathInstance {
                 geometry: translate_svg_geometry(
                     geometry,
@@ -1702,8 +1699,10 @@ mod tests {
             )
             .into();
 
-        let error = std::panic::catch_unwind(|| build_render_tree(&tree, &Stylesheet::default()))
-            .expect_err("missing paint-server references should panic");
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_render_tree(&tree, &Stylesheet::default())
+        }))
+        .expect_err("missing paint-server references should panic");
 
         assert!(panic_message(error).contains("missing SVG paint-server id `missing`"));
     }
@@ -1745,8 +1744,10 @@ mod tests {
             )
             .into();
 
-        let error = std::panic::catch_unwind(|| build_render_tree(&tree, &Stylesheet::default()))
-            .expect_err("duplicate paint-server ids should panic");
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_render_tree(&tree, &Stylesheet::default())
+        }))
+        .expect_err("duplicate paint-server ids should panic");
 
         assert!(panic_message(error).contains("duplicate SVG paint-server id `paint`"));
     }
@@ -1767,8 +1768,10 @@ mod tests {
             )
             .into();
 
-        let error = std::panic::catch_unwind(|| build_render_tree(&tree, &Stylesheet::default()))
-            .expect_err("unsupported defs children should panic");
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_render_tree(&tree, &Stylesheet::default())
+        }))
+        .expect_err("unsupported defs children should panic");
 
         assert!(panic_message(error).contains("unsupported SVG paint-server tag <filter>"));
     }
@@ -1786,10 +1789,11 @@ mod tests {
                         .into(),
                 ),
         );
-        let unsupported_units_error = std::panic::catch_unwind(|| {
-            build_render_tree(&unsupported_units, &Stylesheet::default())
-        })
-        .expect_err("unsupported gradient units should panic");
+        let unsupported_units_error =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_render_tree(&unsupported_units, &Stylesheet::default())
+            }))
+            .expect_err("unsupported gradient units should panic");
         assert!(panic_message(unsupported_units_error).contains("unsupported gradientUnits"));
 
         let stop_style = svg_with_gradient(
@@ -1800,9 +1804,10 @@ mod tests {
                     .into(),
             ),
         );
-        let stop_style_error =
-            std::panic::catch_unwind(|| build_render_tree(&stop_style, &Stylesheet::default()))
-                .expect_err("unsupported stop style should panic");
+        let stop_style_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_render_tree(&stop_style, &Stylesheet::default())
+        }))
+        .expect_err("unsupported stop style should panic");
         assert!(
             panic_message(stop_style_error).contains("stop style attributes are not supported")
         );
@@ -1819,9 +1824,10 @@ mod tests {
                     .into(),
             )
             .into();
-        let external_error =
-            std::panic::catch_unwind(|| build_render_tree(&external, &Stylesheet::default()))
-                .expect_err("external paint-server urls should panic");
+        let external_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_render_tree(&external, &Stylesheet::default())
+        }))
+        .expect_err("external paint-server urls should panic");
         assert!(panic_message(external_error).contains("only local url(#id) references"));
 
         let fallback = Node::element("svg")
@@ -1833,9 +1839,10 @@ mod tests {
                     .into(),
             )
             .into();
-        let fallback_error =
-            std::panic::catch_unwind(|| build_render_tree(&fallback, &Stylesheet::default()))
-                .expect_err("paint-server fallback values should panic");
+        let fallback_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_render_tree(&fallback, &Stylesheet::default())
+        }))
+        .expect_err("paint-server fallback values should panic");
         assert!(panic_message(fallback_error).contains("unsupported SVG paint fallback"));
     }
 
@@ -1911,8 +1918,10 @@ mod tests {
             )
             .into();
 
-        let error = std::panic::catch_unwind(|| build_render_tree(&tree, &Stylesheet::default()))
-            .expect_err("unsupported SVG attributes should panic");
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_render_tree(&tree, &Stylesheet::default())
+        }))
+        .expect_err("unsupported SVG attributes should panic");
         assert!(panic_message(error).contains("unsupported SVG transform attribute"));
     }
 

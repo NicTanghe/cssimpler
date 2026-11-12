@@ -88,76 +88,49 @@ Dynamic theming = changing variables. Nothing more.
 If you do want a button, it can stay simple too:
 
 ~~~rust
-use std::sync::OnceLock;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation};
 use cssimpler::core::Node;
 use cssimpler::renderer::{FrameInfo, WindowConfig};
-use cssimpler::style::{Stylesheet, parse_stylesheet};
+use cssimpler::style::parse_stylesheet;
 use cssimpler::ui;
 
-static CLICK_COUNT: AtomicU64 = AtomicU64::new(0);
-
 fn main() -> Result<()> {
+    let stylesheet = parse_stylesheet(".card { padding: 16px; }")?;
+    let count = Arc::new(AtomicU64::new(0));
     let config = WindowConfig::new("cssimpler / counter", 480, 220);
-
-    App::new((), stylesheet(), update, build_ui)
+    App::new(count, &stylesheet, update, build_ui)
         .run(config)
         .map_err(Into::into)
 }
 
-fn update(_state: &mut (), _frame: FrameInfo) -> Invalidation {
+fn update(_count: &mut Arc<AtomicU64>, _frame: FrameInfo) -> Invalidation {
     Invalidation::Clean
 }
 
-fn build_ui(_state: &()) -> Node {
-    let count = CLICK_COUNT.load(Ordering::Relaxed);
-
+fn build_ui(count: &Arc<AtomicU64>) -> Node {
+    let value = count.load(Ordering::Relaxed);
+    let count = Arc::clone(count);
     ui! {
         <div class="card">
-            <p>{format!("count: {count}")}</p>
-            <button class="button" type="button" onclick={increment}>
+            <p>{format!("count: {value}")}</p>
+            <button type="button" onclick_shared={move || { count.fetch_add(1, Ordering::Relaxed); }}>
                 Increment
             </button>
         </div>
     }
 }
-
-fn increment() {
-    CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
-}
-
-fn stylesheet() -> &'static Stylesheet {
-    static STYLESHEET: OnceLock<Stylesheet> = OnceLock::new();
-
-    STYLESHEET.get_or_init(|| {
-        parse_stylesheet(
-            r#"
-            .card {
-                min-height: 100vh;
-                display: flex;
-                gap: 12px;
-                justify-content: center;
-                align-items: center;
-                background: #101218;
-                color: #f5f7ff;
-            }
-
-            .button {
-                padding: 10px 14px;
-            }
-            "#,
-        )
-        .expect("counter stylesheet should stay valid")
-    })
-}
 ~~~
 
-No state struct.  
-No signals.  
-Just a counter and a button.
+The counter belongs to the app. The handler captures a shared reference to it,
+so separate app instances do not share their state. Event handlers can also be
+ordinary functions with `onclick={handler}` when they do not need to capture
+anything. Use `onclick_shared` for closures that capture state (and
+`oninput_shared` for captured input handlers). For more complex
+state, keep it in a struct and share only what the handlers need.
 
 ---
 

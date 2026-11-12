@@ -5,8 +5,9 @@ use crate::Style;
 pub type EventHandler = fn();
 pub type InputEventHandler = fn(&str);
 
-//revisit warning it if profiling shows DOM memory/build cost is a real bottleneck.
-#[derive(Clone, Copy, Debug, Default)]
+// Plain function handlers are stored inline. Captured handlers are allocated only
+// for nodes that need them and shared when a node is cloned.
+#[derive(Clone, Default)]
 pub struct EventHandlers {
     pub click: Option<EventHandler>,
     pub contextmenu: Option<EventHandler>,
@@ -20,6 +21,123 @@ pub struct EventHandlers {
     pub mouseout: Option<EventHandler>,
     pub mouseover: Option<EventHandler>,
     pub mouseup: Option<EventHandler>,
+    shared: Option<std::sync::Arc<SharedEventHandlers>>,
+}
+
+#[derive(Clone, Default)]
+struct SharedEventHandlers {
+    click: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    contextmenu: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    dblclick: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    input: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    enter: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    mousedown: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    mouseenter: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    mouseleave: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    mousemove: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    mouseout: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    mouseover: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    mouseup: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+macro_rules! event_handler_methods {
+    ($name:ident, $set:ident, $set_shared:ident, $handler:ty, ($($arg:ty),*)) => {
+        pub fn $name(&self) -> Option<&(dyn Fn($($arg),*) + Send + Sync)> {
+            if let Some(handler) = &self.$name {
+                Some(handler)
+            } else {
+                self.shared.as_ref().and_then(|shared| shared.$name.as_deref())
+            }
+        }
+
+        pub fn $set(&mut self, handler: $handler) {
+            self.$name = Some(handler);
+            if let Some(shared) = &mut self.shared {
+                std::sync::Arc::make_mut(shared).$name = None;
+            }
+        }
+
+        pub fn $set_shared(&mut self, handler: impl Fn($($arg),*) + Send + Sync + 'static) {
+            self.$name = None;
+            std::sync::Arc::make_mut(self.shared.get_or_insert_with(Default::default)).$name =
+                Some(std::sync::Arc::new(handler));
+        }
+    };
+}
+
+impl EventHandlers {
+    event_handler_methods!(click, set_click, set_click_shared, EventHandler, ());
+    event_handler_methods!(
+        contextmenu,
+        set_contextmenu,
+        set_contextmenu_shared,
+        EventHandler,
+        ()
+    );
+    event_handler_methods!(
+        dblclick,
+        set_dblclick,
+        set_dblclick_shared,
+        EventHandler,
+        ()
+    );
+    event_handler_methods!(
+        input,
+        set_input,
+        set_input_shared,
+        InputEventHandler,
+        (&str)
+    );
+    event_handler_methods!(enter, set_enter, set_enter_shared, EventHandler, ());
+    event_handler_methods!(
+        mousedown,
+        set_mousedown,
+        set_mousedown_shared,
+        EventHandler,
+        ()
+    );
+    event_handler_methods!(
+        mouseenter,
+        set_mouseenter,
+        set_mouseenter_shared,
+        EventHandler,
+        ()
+    );
+    event_handler_methods!(
+        mouseleave,
+        set_mouseleave,
+        set_mouseleave_shared,
+        EventHandler,
+        ()
+    );
+    event_handler_methods!(
+        mousemove,
+        set_mousemove,
+        set_mousemove_shared,
+        EventHandler,
+        ()
+    );
+    event_handler_methods!(
+        mouseout,
+        set_mouseout,
+        set_mouseout_shared,
+        EventHandler,
+        ()
+    );
+    event_handler_methods!(
+        mouseover,
+        set_mouseover,
+        set_mouseover_shared,
+        EventHandler,
+        ()
+    );
+    event_handler_methods!(mouseup, set_mouseup, set_mouseup_shared, EventHandler, ());
+}
+
+impl std::fmt::Debug for EventHandlers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventHandlers").finish_non_exhaustive()
+    }
 }
 
 /// Values accepted in a dynamic HTML child slot, including lists and optional nodes.
@@ -131,66 +249,102 @@ impl ElementNode {
         self
     }
 
-    pub fn on_click(mut self, handler: EventHandler) -> Self {
-        self.handlers.click = Some(handler);
-        self
-    }
-
-    pub fn on_contextmenu(mut self, handler: EventHandler) -> Self {
-        self.handlers.contextmenu = Some(handler);
-        self
-    }
-
-    pub fn on_dblclick(mut self, handler: EventHandler) -> Self {
-        self.handlers.dblclick = Some(handler);
-        self
-    }
-
-    /// Run when Enter is pressed in this input.
-    pub fn on_enter(mut self, handler: EventHandler) -> Self {
-        self.handlers.enter = Some(handler);
-        self
-    }
-
-    pub fn on_input(mut self, handler: InputEventHandler) -> Self {
-        self.handlers.input = Some(handler);
-        self
-    }
-
-    pub fn on_mousedown(mut self, handler: EventHandler) -> Self {
-        self.handlers.mousedown = Some(handler);
-        self
-    }
-
-    pub fn on_mouseenter(mut self, handler: EventHandler) -> Self {
-        self.handlers.mouseenter = Some(handler);
-        self
-    }
-
-    pub fn on_mouseleave(mut self, handler: EventHandler) -> Self {
-        self.handlers.mouseleave = Some(handler);
-        self
-    }
-
-    pub fn on_mousemove(mut self, handler: EventHandler) -> Self {
-        self.handlers.mousemove = Some(handler);
-        self
-    }
-
-    pub fn on_mouseout(mut self, handler: EventHandler) -> Self {
-        self.handlers.mouseout = Some(handler);
-        self
-    }
-
-    pub fn on_mouseover(mut self, handler: EventHandler) -> Self {
-        self.handlers.mouseover = Some(handler);
-        self
-    }
-
-    pub fn on_mouseup(mut self, handler: EventHandler) -> Self {
-        self.handlers.mouseup = Some(handler);
-        self
-    }
+    event_builder_methods!(
+        on_click,
+        on_click_shared,
+        set_click,
+        set_click_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_contextmenu,
+        on_contextmenu_shared,
+        set_contextmenu,
+        set_contextmenu_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_dblclick,
+        on_dblclick_shared,
+        set_dblclick,
+        set_dblclick_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_input,
+        on_input_shared,
+        set_input,
+        set_input_shared,
+        InputEventHandler,
+        (&str)
+    );
+    event_builder_methods!(
+        on_enter,
+        on_enter_shared,
+        set_enter,
+        set_enter_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mousedown,
+        on_mousedown_shared,
+        set_mousedown,
+        set_mousedown_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mouseenter,
+        on_mouseenter_shared,
+        set_mouseenter,
+        set_mouseenter_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mouseleave,
+        on_mouseleave_shared,
+        set_mouseleave,
+        set_mouseleave_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mousemove,
+        on_mousemove_shared,
+        set_mousemove,
+        set_mousemove_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mouseout,
+        on_mouseout_shared,
+        set_mouseout,
+        set_mouseout_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mouseover,
+        on_mouseover_shared,
+        set_mouseover,
+        set_mouseover_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mouseup,
+        on_mouseup_shared,
+        set_mouseup,
+        set_mouseup_shared,
+        EventHandler,
+        ()
+    );
 
     pub fn set_attribute(&mut self, name: impl Into<String>, value: impl Into<String>) {
         let name = name.into();

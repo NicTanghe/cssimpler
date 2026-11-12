@@ -1,5 +1,5 @@
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation};
@@ -15,16 +15,15 @@ const ACTION_CYCLE_VALUE: u64 = 1 << 3;
 const HUE_COUNT: usize = 6;
 const VALUE_COUNT: usize = 3;
 
-static ACTIONS: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GlassMode {
     Mica,
     Acrylic,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct GlassState {
+    actions: Arc<AtomicU64>,
     mode: GlassMode,
     hue: usize,
     value: usize,
@@ -33,6 +32,7 @@ struct GlassState {
 impl Default for GlassState {
     fn default() -> Self {
         Self {
+            actions: Arc::default(),
             mode: GlassMode::Acrylic,
             hue: 3,
             value: 0,
@@ -54,7 +54,7 @@ fn main() -> Result<()> {
 }
 
 fn update(state: &mut GlassState, _frame: FrameInfo) -> Invalidation {
-    let actions = ACTIONS.swap(0, Ordering::Relaxed);
+    let actions = state.actions.swap(0, Ordering::Relaxed);
     if actions == 0 {
         return Invalidation::Clean;
     }
@@ -83,15 +83,15 @@ fn build_ui(state: &GlassState) -> Node {
             <div id="app">
                 <section class="control-panel">
                     <div class="mode-switch">
-                        {mode_button("MICA", select_mica, state.mode == GlassMode::Mica)}
-                        {mode_button("ACRYLIC", select_acrylic, state.mode == GlassMode::Acrylic)}
+                        {mode_button("MICA", queue_action(&state.actions, ACTION_SELECT_MICA), state.mode == GlassMode::Mica)}
+                        {mode_button("ACRYLIC", queue_action(&state.actions, ACTION_SELECT_ACRYLIC), state.mode == GlassMode::Acrylic)}
                     </div>
 
                     <div class="picker-row">
-                        <button class="sv-picker" type="button" onclick={cycle_value}>
+                        <button class="sv-picker" type="button" onclick_shared={queue_action(&state.actions, ACTION_CYCLE_VALUE)}>
                             {add_class(ui! { <span class="sv-knob"></span> }, value_class(state.value))}
                         </button>
-                        <button class="hue-strip" type="button" onclick={cycle_hue}>
+                        <button class="hue-strip" type="button" onclick_shared={queue_action(&state.actions, ACTION_CYCLE_HUE)}>
                             {add_class(ui! { <span class="hue-knob"></span> }, hue_class(state.hue))}
                         </button>
                     </div>
@@ -106,9 +106,13 @@ fn build_ui(state: &GlassState) -> Node {
     )
 }
 
-fn mode_button(label: &'static str, handler: fn(), selected: bool) -> Node {
+fn mode_button(
+    label: &'static str,
+    handler: impl Fn() + Send + Sync + 'static,
+    selected: bool,
+) -> Node {
     let button = ui! {
-        <button class="mode-segment" type="button" onclick={handler}>
+        <button class="mode-segment" type="button" onclick_shared={handler}>
             {label}
         </button>
     };
@@ -168,20 +172,11 @@ fn hue_class(hue: usize) -> &'static str {
     }
 }
 
-fn select_mica() {
-    ACTIONS.fetch_or(ACTION_SELECT_MICA, Ordering::Relaxed);
-}
-
-fn select_acrylic() {
-    ACTIONS.fetch_or(ACTION_SELECT_ACRYLIC, Ordering::Relaxed);
-}
-
-fn cycle_hue() {
-    ACTIONS.fetch_or(ACTION_CYCLE_HUE, Ordering::Relaxed);
-}
-
-fn cycle_value() {
-    ACTIONS.fetch_or(ACTION_CYCLE_VALUE, Ordering::Relaxed);
+fn queue_action(actions: &Arc<AtomicU64>, action: u64) -> impl Fn() + Send + Sync + 'static {
+    let actions = Arc::clone(actions);
+    move || {
+        actions.fetch_or(action, Ordering::Relaxed);
+    }
 }
 
 fn stylesheet() -> &'static Stylesheet {
@@ -219,7 +214,9 @@ mod tests {
     #[test]
     fn glass_color_picker_actions_update_state() {
         let mut state = GlassState::default();
-        super::ACTIONS.store(ACTION_SELECT_MICA | ACTION_CYCLE_HUE, Ordering::Relaxed);
+        state
+            .actions
+            .store(ACTION_SELECT_MICA | ACTION_CYCLE_HUE, Ordering::Relaxed);
 
         let invalidation = update(
             &mut state,

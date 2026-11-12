@@ -1,3 +1,17 @@
+macro_rules! event_builder_methods {
+    ($method:ident, $shared_method:ident, $setter:ident, $shared_setter:ident, $handler:ty, ($($arg:ty),*)) => {
+        pub fn $method(mut self, handler: $handler) -> Self {
+            self.handlers.$setter(handler);
+            self
+        }
+
+        pub fn $shared_method(mut self, handler: impl Fn($($arg),*) + Send + Sync + 'static) -> Self {
+            self.handlers.$shared_setter(handler);
+            self
+        }
+    };
+}
+
 pub mod color;
 pub mod custom_properties;
 pub mod dom;
@@ -966,65 +980,102 @@ impl RenderNode {
         self
     }
 
-    pub fn on_click(mut self, handler: EventHandler) -> Self {
-        self.handlers.click = Some(handler);
-        self
-    }
-
-    pub fn on_contextmenu(mut self, handler: EventHandler) -> Self {
-        self.handlers.contextmenu = Some(handler);
-        self
-    }
-
-    pub fn on_dblclick(mut self, handler: EventHandler) -> Self {
-        self.handlers.dblclick = Some(handler);
-        self
-    }
-
-    pub fn on_enter(mut self, handler: EventHandler) -> Self {
-        self.handlers.enter = Some(handler);
-        self
-    }
-
-    pub fn on_input(mut self, handler: InputEventHandler) -> Self {
-        self.handlers.input = Some(handler);
-        self
-    }
-
-    pub fn on_mousedown(mut self, handler: EventHandler) -> Self {
-        self.handlers.mousedown = Some(handler);
-        self
-    }
-
-    pub fn on_mouseenter(mut self, handler: EventHandler) -> Self {
-        self.handlers.mouseenter = Some(handler);
-        self
-    }
-
-    pub fn on_mouseleave(mut self, handler: EventHandler) -> Self {
-        self.handlers.mouseleave = Some(handler);
-        self
-    }
-
-    pub fn on_mousemove(mut self, handler: EventHandler) -> Self {
-        self.handlers.mousemove = Some(handler);
-        self
-    }
-
-    pub fn on_mouseout(mut self, handler: EventHandler) -> Self {
-        self.handlers.mouseout = Some(handler);
-        self
-    }
-
-    pub fn on_mouseover(mut self, handler: EventHandler) -> Self {
-        self.handlers.mouseover = Some(handler);
-        self
-    }
-
-    pub fn on_mouseup(mut self, handler: EventHandler) -> Self {
-        self.handlers.mouseup = Some(handler);
-        self
-    }
+    event_builder_methods!(
+        on_click,
+        on_click_shared,
+        set_click,
+        set_click_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_contextmenu,
+        on_contextmenu_shared,
+        set_contextmenu,
+        set_contextmenu_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_dblclick,
+        on_dblclick_shared,
+        set_dblclick,
+        set_dblclick_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_input,
+        on_input_shared,
+        set_input,
+        set_input_shared,
+        InputEventHandler,
+        (&str)
+    );
+    event_builder_methods!(
+        on_enter,
+        on_enter_shared,
+        set_enter,
+        set_enter_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mousedown,
+        on_mousedown_shared,
+        set_mousedown,
+        set_mousedown_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mouseenter,
+        on_mouseenter_shared,
+        set_mouseenter,
+        set_mouseenter_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mouseleave,
+        on_mouseleave_shared,
+        set_mouseleave,
+        set_mouseleave_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mousemove,
+        on_mousemove_shared,
+        set_mousemove,
+        set_mousemove_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mouseout,
+        on_mouseout_shared,
+        set_mouseout,
+        set_mouseout_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mouseover,
+        on_mouseover_shared,
+        set_mouseover,
+        set_mouseover_shared,
+        EventHandler,
+        ()
+    );
+    event_builder_methods!(
+        on_mouseup,
+        on_mouseup_shared,
+        set_mouseup,
+        set_mouseup_shared,
+        EventHandler,
+        ()
+    );
 
     pub fn with_child(mut self, child: RenderNode) -> Self {
         self.children.push(child);

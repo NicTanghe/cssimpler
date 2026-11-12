@@ -405,7 +405,7 @@ fn push_item(
         element_path: node.element_path.clone(),
         content_inset: node.content_inset,
         scrollbars: node.scrollbars,
-        handlers: node.handlers,
+        handlers: node.handlers.clone(),
     });
 }
 

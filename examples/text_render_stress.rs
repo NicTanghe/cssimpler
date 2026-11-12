@@ -7,8 +7,8 @@ use cssimpler::renderer::{
 };
 use cssimpler::style::{Stylesheet, parse_stylesheet};
 use cssimpler::ui;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 const ACTION_GENERATE_TEXT: u64 = 1 << 0;
 const INITIAL_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -128,10 +128,9 @@ const CONNECTORS: &[&str] = &[
     "across the full pane",
 ];
 
-static ACTIONS: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Debug)]
 struct TextStressState {
+    actions: Arc<AtomicU64>,
     generation: u64,
     seed: u64,
     document: GeneratedDocument,
@@ -147,6 +146,7 @@ impl Default for TextStressState {
         let seed = INITIAL_SEED;
 
         Self {
+            actions: Arc::default(),
             generation,
             seed,
             document: generate_document(seed, generation),
@@ -192,7 +192,7 @@ fn update(state: &mut TextStressState, frame: FrameInfo) -> Refresh {
     state.renderer_stats = latest_frame_timing_stats();
     state.app_stats = latest_runtime_stats();
 
-    let actions = ACTIONS.swap(0, Ordering::Relaxed);
+    let actions = state.actions.swap(0, Ordering::Relaxed);
     if actions & ACTION_GENERATE_TEXT != 0 {
         state.regenerate();
         return Refresh::full(Invalidation::Layout);
@@ -216,10 +216,11 @@ fn build_ui(state: &TextStressState) -> Node {
 }
 
 fn build_hud(state: &TextStressState) -> Node {
+    let actions = Arc::clone(&state.actions);
     ui! {
         <section id="hud" class="hud">
             <div class="control-row">
-                <button class="generate-button" type="button" onclick={generate_random_text}>
+                <button class="generate-button" type="button" onclick_shared={move || { actions.fetch_or(ACTION_GENERATE_TEXT, Ordering::Relaxed); }}>
                     Generate random text
                 </button>
             </div>
@@ -318,10 +319,6 @@ fn text_block(tag: &str, class_name: &str, text: impl Into<String>) -> Node {
         .with_class(class_name)
         .with_child(Node::text(text.into()))
         .into()
-}
-
-fn generate_random_text() {
-    ACTIONS.fetch_or(ACTION_GENERATE_TEXT, Ordering::Relaxed);
 }
 
 fn stylesheet() -> &'static Stylesheet {
@@ -532,12 +529,11 @@ impl TextRng {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIONS, GeneratedDocument, Invalidation, Refresh, TextStressState, generate_document,
-        generate_random_text, update,
+        ACTION_GENERATE_TEXT, GeneratedDocument, Invalidation, Refresh, TextStressState,
+        generate_document, update,
     };
     use cssimpler::renderer::FrameInfo;
     use std::sync::atomic::Ordering;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
 
     #[test]
@@ -566,29 +562,25 @@ mod tests {
 
     #[test]
     fn update_regenerates_the_document_when_the_button_action_is_queued() {
-        let _guard = action_lock();
-        ACTIONS.store(0, Ordering::Relaxed);
         let mut state = TextStressState::default();
         let previous_seed = state.seed;
         let previous_title = state.document.title.clone();
 
-        generate_random_text();
+        state.actions.store(ACTION_GENERATE_TEXT, Ordering::Relaxed);
         let refresh = update(&mut state, frame(1));
 
         assert_eq!(refresh, Refresh::full(Invalidation::Layout));
         assert_ne!(state.seed, previous_seed);
         assert_ne!(state.document.title, previous_title);
         assert!(state.pending_perf_refresh);
-        assert_eq!(ACTIONS.load(Ordering::Relaxed), 0);
+        assert_eq!(state.actions.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn update_emits_a_follow_up_hud_refresh_for_perf_stats() {
-        let _guard = action_lock();
-        ACTIONS.store(0, Ordering::Relaxed);
         let mut state = TextStressState::default();
 
-        generate_random_text();
+        state.actions.store(ACTION_GENERATE_TEXT, Ordering::Relaxed);
         let _ = update(&mut state, frame(1));
         let refresh = update(&mut state, frame(2));
 
@@ -630,15 +622,6 @@ mod tests {
 
     fn count_words(value: &str) -> usize {
         value.split_whitespace().count()
-    }
-
-    fn action_lock() -> MutexGuard<'static, ()> {
-        static TEST_ACTION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-        TEST_ACTION_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("test action lock should not be poisoned")
     }
 
     fn frame(frame_index: u64) -> FrameInfo {

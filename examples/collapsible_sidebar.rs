@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use cssimpler::app::{App, Invalidation};
@@ -15,10 +15,9 @@ const INITIAL_CARD_COUNT: u64 = 4;
 const ACTION_TOGGLE_SIDEBAR: u64 = 1 << 0;
 const ACTION_ADD_CARD: u64 = 1 << 1;
 
-static ACTIONS: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Debug)]
 struct SidebarState {
+    actions: Arc<AtomicU64>,
     collapsed: bool,
     next_card_seed: u64,
     cards: Vec<QueueCard>,
@@ -31,6 +30,7 @@ impl Default for SidebarState {
             .collect::<Vec<_>>();
 
         Self {
+            actions: Arc::default(),
             collapsed: false,
             next_card_seed: INITIAL_CARD_COUNT,
             cards,
@@ -131,7 +131,7 @@ fn main() -> Result<()> {
 }
 
 fn update(state: &mut SidebarState, _frame: FrameInfo) -> Invalidation {
-    let actions = ACTIONS.swap(0, Ordering::Relaxed);
+    let actions = state.actions.swap(0, Ordering::Relaxed);
     if actions == 0 {
         return Invalidation::Clean;
     }
@@ -192,7 +192,7 @@ fn build_sidebar_header(state: &SidebarState) -> Node {
                 <p class="rail-badge">
                     UI
                 </p>
-                <button class="rail-toggle" onclick={toggle_sidebar}>
+                <button class="rail-toggle" onclick_shared={queue_action(&state.actions, ACTION_TOGGLE_SIDEBAR)}>
                     {">"}
                 </button>
             </div>
@@ -209,7 +209,7 @@ fn build_sidebar_header(state: &SidebarState) -> Node {
                     Collections
                 </h2>
             </div>
-            <button class="rail-toggle" onclick={toggle_sidebar}>
+            <button class="rail-toggle" onclick_shared={queue_action(&state.actions, ACTION_TOGGLE_SIDEBAR)}>
                 "<"
             </button>
         </div>
@@ -317,7 +317,7 @@ fn build_content(state: &SidebarState) -> Node {
                     Add a card, scroll the queue, or collapse the rail. The sidebar now uses the built-in scrollbar instead of the old fake thumb.
                 </p>
                 <div class="content-actions">
-                    <button class="primary-button content-button" onclick={queue_random_card}>
+                    <button class="primary-button content-button" onclick_shared={queue_action(&state.actions, ACTION_ADD_CARD)}>
                         Add random card
                     </button>
                 </div>
@@ -363,12 +363,11 @@ fn generate_card(seed: u64) -> QueueCard {
     }
 }
 
-fn toggle_sidebar() {
-    ACTIONS.fetch_or(ACTION_TOGGLE_SIDEBAR, Ordering::Relaxed);
-}
-
-fn queue_random_card() {
-    ACTIONS.fetch_or(ACTION_ADD_CARD, Ordering::Relaxed);
+fn queue_action(actions: &Arc<AtomicU64>, action: u64) -> impl Fn() + Send + Sync + 'static {
+    let actions = Arc::clone(actions);
+    move || {
+        actions.fetch_or(action, Ordering::Relaxed);
+    }
 }
 
 fn register_demo_fonts() {

@@ -215,7 +215,7 @@ impl RuntimeWorld {
                     attributes: element.attributes.clone(),
                     style: element.style.clone(),
                     children,
-                    handlers: element.handlers,
+                    handlers: element.handlers.clone(),
                 }))
             }
             RuntimeNodeKind::Text(text) => Some(Node::Text(text.clone())),
@@ -452,7 +452,7 @@ fn authored_from_node(node: &Node) -> RuntimeNodeKind {
             classes: element.classes.clone(),
             attributes: element.attributes.clone(),
             style: element.style.clone(),
-            handlers: element.handlers,
+            handlers: element.handlers.clone(),
         }),
         Node::Text(text) => RuntimeNodeKind::Text(text.clone()),
     }

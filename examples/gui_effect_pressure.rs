@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -52,10 +52,10 @@ const BASELINE_ANIMATED_TILE_WINDOW: usize = DEFAULT_ANIMATED_TILE_WINDOW + 1;
 const BASELINE_WARMUP_FRAMES: u32 = 30;
 const BASELINE_SAMPLE_FRAMES: u32 = 120;
 
-static ACTIONS: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct EffectStressState {
+    actions: Arc<AtomicU64>,
     frame_index: u64,
     last_frame_ms: u128,
     tile_count: usize,
@@ -80,6 +80,7 @@ pub struct EffectStressState {
 impl Default for EffectStressState {
     fn default() -> Self {
         Self {
+            actions: Arc::default(),
             frame_index: 0,
             last_frame_ms: 0,
             tile_count: DEFAULT_TILE_COUNT,
@@ -257,18 +258,19 @@ struct BaselineSummary {
 
 fn main() -> Result<()> {
     let config = WindowConfig::new("cssimpler / gui effect pressure", 1440, 960);
+    let mut state = EffectStressState::default();
     if baseline_autostart_requested() {
-        ACTIONS.fetch_or(ACTION_TOGGLE_BASELINE, Ordering::Relaxed);
+        start_baseline_harness(&mut state);
     }
 
-    App::new(EffectStressState::default(), stylesheet(), update, build_ui)
+    App::new(state, stylesheet(), update, build_ui)
         .with_continuous_updates(true)
         .run(config)
         .map_err(Into::into)
 }
 
 fn update(state: &mut EffectStressState, frame: FrameInfo) -> Refresh {
-    let actions = ACTIONS.swap(0, Ordering::Relaxed);
+    let actions = take_actions(state);
     let previous = state.clone();
     let invalidation = apply_frame(state, frame, actions);
     maybe_log_perf(state, actions);
@@ -623,18 +625,18 @@ fn build_metric_row(state: &EffectStressState) -> Node {
 fn build_control_row(state: &EffectStressState) -> Node {
     ui! {
         <div class="control-row">
-            {control_button("-8 tiles", remove_tiles, false)}
-            {control_button("+8 tiles", add_tiles, false)}
-            {control_button("+2 passes / tile", add_passes, false)}
-            {control_button("-1 live tile", remove_animated_tiles, false)}
-            {control_button("+1 live tile", add_animated_tiles, false)}
+            {control_button("-8 tiles", queue_action(&state.actions, ACTION_REMOVE_TILES), false)}
+            {control_button("+8 tiles", queue_action(&state.actions, ACTION_ADD_TILES), false)}
+            {control_button("+2 passes / tile", queue_action(&state.actions, ACTION_ADD_PASSES), false)}
+            {control_button("-1 live tile", queue_action(&state.actions, ACTION_REMOVE_ANIMATED_TILES), false)}
+            {control_button("+1 live tile", queue_action(&state.actions, ACTION_ADD_ANIMATED_TILES), false)}
             {control_button(
                 if state.animate {
                     "stop animation"
                 } else {
                     "start animation"
                 },
-                toggle_animation,
+                queue_action(&state.actions, ACTION_TOGGLE_ANIMATION),
                 state.animate,
             )}
             {control_button(
@@ -643,7 +645,7 @@ fn build_control_row(state: &EffectStressState) -> Node {
                 } else {
                     "start pulse"
                 },
-                toggle_pulse,
+                queue_action(&state.actions, ACTION_TOGGLE_PULSE),
                 state.pulse_layout,
             )}
             {control_button(
@@ -652,11 +654,11 @@ fn build_control_row(state: &EffectStressState) -> Node {
                 } else {
                     "run baseline"
                 },
-                toggle_baseline,
+                queue_action(&state.actions, ACTION_TOGGLE_BASELINE),
                 state.baseline_harness.is_some(),
             )}
-            {control_button("spike", spike, false)}
-            {control_button("reset", reset, false)}
+            {control_button("spike", queue_action(&state.actions, ACTION_SPIKE), false)}
+            {control_button("reset", queue_action(&state.actions, ACTION_RESET), false)}
         </div>
     }
 }
@@ -788,9 +790,9 @@ fn stat_chip(label: impl Into<String>, value: impl Into<String>) -> Node {
     }
 }
 
-fn control_button(label: &'static str, handler: fn(), active: bool) -> Node {
+fn control_button(label: &'static str, handler: impl Fn() + Send + Sync + 'static, active: bool) -> Node {
     let button = ui! {
-        <button class="control-button" type="button" onclick={handler}>
+        <button class="control-button" type="button" onclick_shared={handler}>
             {label}
         </button>
     };
@@ -1090,44 +1092,9 @@ fn fragment_tile_position_class(tile_index: usize) -> &'static str {
     }
 }
 
-fn add_tiles() {
-    ACTIONS.fetch_or(ACTION_ADD_TILES, Ordering::Relaxed);
-}
-
-fn remove_tiles() {
-    ACTIONS.fetch_or(ACTION_REMOVE_TILES, Ordering::Relaxed);
-}
-
-fn add_passes() {
-    ACTIONS.fetch_or(ACTION_ADD_PASSES, Ordering::Relaxed);
-}
-
-fn add_animated_tiles() {
-    ACTIONS.fetch_or(ACTION_ADD_ANIMATED_TILES, Ordering::Relaxed);
-}
-
-fn remove_animated_tiles() {
-    ACTIONS.fetch_or(ACTION_REMOVE_ANIMATED_TILES, Ordering::Relaxed);
-}
-
-fn toggle_animation() {
-    ACTIONS.fetch_or(ACTION_TOGGLE_ANIMATION, Ordering::Relaxed);
-}
-
-fn toggle_pulse() {
-    ACTIONS.fetch_or(ACTION_TOGGLE_PULSE, Ordering::Relaxed);
-}
-
-fn toggle_baseline() {
-    ACTIONS.fetch_or(ACTION_TOGGLE_BASELINE, Ordering::Relaxed);
-}
-
-fn spike() {
-    ACTIONS.fetch_or(ACTION_SPIKE, Ordering::Relaxed);
-}
-
-fn reset() {
-    ACTIONS.fetch_or(ACTION_RESET, Ordering::Relaxed);
+fn queue_action(actions: &Arc<AtomicU64>, action: u64) -> impl Fn() + Send + Sync + 'static {
+    let actions = Arc::clone(actions);
+    move || { actions.fetch_or(action, Ordering::Relaxed); }
 }
 
 pub fn stylesheet() -> &'static Stylesheet {
@@ -1139,8 +1106,8 @@ pub fn stylesheet() -> &'static Stylesheet {
     })
 }
 
-pub fn take_actions() -> u64 {
-    ACTIONS.swap(0, Ordering::Relaxed)
+pub fn take_actions(state: &EffectStressState) -> u64 {
+    state.actions.swap(0, Ordering::Relaxed)
 }
 
 fn active_tile_indices(state: &EffectStressState) -> Vec<usize> {

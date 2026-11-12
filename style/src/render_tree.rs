@@ -423,7 +423,7 @@ pub(crate) fn resolve_element_tree(
             text: String::new(),
             svg_scene: Some(resolved_svg.scene),
             element_path: element_path.clone(),
-            handlers: element.handlers,
+            handlers: element.handlers.clone(),
             children: Vec::new(),
         };
     }
@@ -487,7 +487,7 @@ pub(crate) fn resolve_element_tree(
             text: direct_text,
             svg_scene: None,
             element_path: element_path.clone(),
-            handlers: element.handlers,
+            handlers: element.handlers.clone(),
             children: Vec::new(),
         };
     }
@@ -542,7 +542,7 @@ pub(crate) fn resolve_element_tree(
         text: String::new(),
         svg_scene: None,
         element_path: element_path.clone(),
-        handlers: element.handlers,
+        handlers: element.handlers.clone(),
         children,
     }
 }
@@ -620,7 +620,7 @@ fn build_layout_tree(
         text: resolved.text.clone(),
         svg_scene: resolved.svg_scene.clone(),
         element_path: resolved.element_path.clone(),
-        handlers: resolved.handlers,
+        handlers: resolved.handlers.clone(),
         children,
     }
 }
@@ -1165,11 +1165,11 @@ fn text_child_style(parent_style: &Style) -> Style {
 }
 
 fn apply_layout_tree_handlers(node: RenderNode, tree: &LayoutTree) -> RenderNode {
-    node.with_handlers(tree.handlers)
+    node.with_handlers(tree.handlers.clone())
 }
 
 fn apply_resolved_handlers(node: RenderNode, resolved: &ResolvedElement) -> RenderNode {
-    node.with_handlers(resolved.handlers)
+    node.with_handlers(resolved.handlers.clone())
 }
 
 fn measure_text(
