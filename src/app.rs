@@ -849,9 +849,15 @@ where
 
     fn replace_scene(&mut self, scene: Vec<RenderNode>) {
         if let Some(active) = self.scene_transition.take() {
+            let mut active = active;
             if active.targets_match(&scene) {
                 self.cached_scene =
                     Some(self.cached_scene.take().unwrap_or_else(|| active.sample()));
+                self.scene_transition = Some(active);
+                return;
+            }
+            if active.update_unchanged_target(&scene) {
+                self.cached_scene = Some(active.sample());
                 self.scene_transition = Some(active);
                 return;
             }
@@ -1444,9 +1450,15 @@ where
 
     fn replace_scene(&mut self, scene: Vec<RenderNode>) {
         if let Some(active) = self.scene_transition.take() {
+            let mut active = active;
             if active.targets_match(&scene) {
                 self.cached_scene =
                     Some(self.cached_scene.take().unwrap_or_else(|| active.sample()));
+                self.scene_transition = Some(active);
+                return;
+            }
+            if active.update_unchanged_target(&scene) {
+                self.cached_scene = Some(active.sample());
                 self.scene_transition = Some(active);
                 return;
             }

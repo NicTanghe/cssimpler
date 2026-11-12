@@ -17,6 +17,7 @@ pub(crate) struct SceneTransition {
 
 #[derive(Clone, Debug, Default)]
 struct TransitionPlanNode {
+    from_index: Option<usize>,
     layout: Option<TransitionTimingPlan>,
     transform: Option<TransitionTimingPlan>,
     foreground: Option<TransitionTimingPlan>,
@@ -42,10 +43,6 @@ impl TransitionTimingPlan {
 
 impl SceneTransition {
     pub(crate) fn should_create(from: &[RenderNode], to: &[RenderNode]) -> bool {
-        if !scene_structures_match(from, to) {
-            return false;
-        }
-
         max_scene_transition_duration(from, to) > f32::EPSILON
     }
 
@@ -89,6 +86,50 @@ impl SceneTransition {
         scene_targets_match(&self.to, candidate)
     }
 
+    /// Keep the original clock when an unrelated scene update leaves all
+    /// surviving animated targets unchanged.
+    pub(crate) fn update_unchanged_target(&mut self, candidate: &[RenderNode]) -> bool {
+        let mut from = Vec::with_capacity(candidate.len());
+        let mut plans = Vec::with_capacity(candidate.len());
+        let matcher = SiblingMatcher::new(&self.to, candidate);
+        for (index, target) in candidate.iter().enumerate() {
+            let Some(old_index) = matcher.get(index) else {
+                from.push(target.clone());
+                plans.push(TransitionPlanNode::default());
+                continue;
+            };
+            let old_plan = &self.plans[old_index];
+            let Some(old_from) = old_plan.from_index.and_then(|i| self.from.get(i)) else {
+                if !render_node_target_matches(&self.to[old_index], target) {
+                    return false;
+                }
+                from.push(target.clone());
+                plans.push(TransitionPlanNode::default());
+                continue;
+            };
+            let Some((new_from, mut new_plan)) = rebase_plan(
+                old_from,
+                &self.to[old_index],
+                target,
+                old_plan,
+                false,
+                (0.0, 0.0),
+            ) else {
+                return false;
+            };
+            new_plan.from_index = Some(index);
+            from.push(new_from);
+            plans.push(new_plan);
+        }
+        if !plans.iter().any(|plan| plan.has_sampling_work) {
+            return false;
+        }
+        self.from = from;
+        self.to = candidate.to_vec();
+        self.plans = plans;
+        true
+    }
+
     pub(crate) fn elapsed(&self) -> Duration {
         Duration::from_secs_f32(self.elapsed_seconds)
     }
@@ -98,33 +139,179 @@ impl SceneTransition {
     }
 
     fn sample_into(&self, sampled: &mut [RenderNode]) {
-        for (((sampled_node, from), to), plan) in sampled
-            .iter_mut()
-            .zip(&self.from)
-            .zip(&self.to)
-            .zip(&self.plans)
-        {
-            sample_render_node_in_place(sampled_node, from, to, plan, self.elapsed_seconds, None);
+        for ((sampled_node, to), plan) in sampled.iter_mut().zip(&self.to).zip(&self.plans) {
+            if let Some(from) = plan.from_index.and_then(|index| self.from.get(index)) {
+                sample_render_node_in_place(
+                    sampled_node,
+                    from,
+                    to,
+                    plan,
+                    self.elapsed_seconds,
+                    None,
+                );
+            }
         }
     }
 }
 
-fn scene_structures_match(left: &[RenderNode], right: &[RenderNode]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| render_node_structure_matches(left, right))
+// Equal-length sibling lists retain the existing positional matching behavior.
+// When the length changes, match only unique IDs: anonymous elements may now
+// occupy different positions, so guessing could transfer a transition.
+struct SiblingMatcher<'a> {
+    from: &'a [RenderNode],
+    to: &'a [RenderNode],
+    // Build an index only for changed sibling lists. Duplicate IDs are unsafe
+    // to match and are represented by None.
+    ids: Option<std::collections::HashMap<&'a str, Option<usize>>>,
 }
 
-fn render_node_structure_matches(left: &RenderNode, right: &RenderNode) -> bool {
-    std::mem::discriminant(&left.kind) == std::mem::discriminant(&right.kind)
-        && left.children.len() == right.children.len()
-        && left
-            .children
-            .iter()
-            .zip(&right.children)
-            .all(|(left, right)| render_node_structure_matches(left, right))
+impl<'a> SiblingMatcher<'a> {
+    fn new(from: &'a [RenderNode], to: &'a [RenderNode]) -> Self {
+        let ids = (from.len() != to.len()).then(|| {
+            let mut ids = std::collections::HashMap::new();
+            for (index, node) in from.iter().enumerate() {
+                if let Some(id) = node.element_id.as_deref() {
+                    ids.entry(id)
+                        .and_modify(|entry| *entry = None)
+                        .or_insert(Some(index));
+                }
+            }
+            let mut target_ids = std::collections::HashSet::new();
+            for node in to {
+                if let Some(id) = node.element_id.as_deref() {
+                    if !target_ids.insert(id) {
+                        ids.insert(id, None);
+                    }
+                }
+            }
+            ids
+        });
+        Self { from, to, ids }
+    }
+
+    fn get(&self, index: usize) -> Option<usize> {
+        let target = &self.to[index];
+        let old_index = if let Some(ids) = &self.ids {
+            ids.get(target.element_id.as_deref()?).copied().flatten()?
+        } else {
+            index
+        };
+        let old = self.from.get(old_index)?;
+        (old.element_id == target.element_id
+            && std::mem::discriminant(&old.kind) == std::mem::discriminant(&target.kind))
+        .then_some(old_index)
+    }
+}
+
+fn rebase_plan(
+    from: &RenderNode,
+    old_target: &RenderNode,
+    new_target: &RenderNode,
+    plan: &TransitionPlanNode,
+    inherited_layout: bool,
+    parent_delta: (f32, f32),
+) -> Option<(RenderNode, TransitionPlanNode)> {
+    let dx = new_target.layout.x - old_target.layout.x;
+    let dy = new_target.layout.y - old_target.layout.y;
+    let local_layout_changed = (dx - parent_delta.0).abs() > 0.001
+        || (dy - parent_delta.1).abs() > 0.001
+        || old_target.layout.width != new_target.layout.width
+        || old_target.layout.height != new_target.layout.height;
+    let animates =
+        |property| first_transition_plan_for_property(&new_target.transitions, property).is_some();
+    if (local_layout_changed
+        && (plan.layout.is_some()
+            || inherited_layout
+            || first_layout_transition_plan(&new_target.transitions).is_some()))
+        || (old_target.style.transform != new_target.style.transform
+            && (plan.transform.is_some() || animates("transform")))
+        || (old_target.style.foreground != new_target.style.foreground
+            && (plan.foreground.is_some() || animates("color")))
+        || (old_target.style.background != new_target.style.background
+            && (plan.background.is_some()
+                || animates("background-color")
+                || animates("background")))
+        || (old_target.style.border.color != new_target.style.border.color
+            && (plan.border_color.is_some() || animates("border-color")))
+        || ((old_target.style.shadows != new_target.style.shadows
+            || old_target.style.inset_shadows != new_target.style.inset_shadows)
+            && (plan.box_shadow.is_some() || animates("box-shadow")))
+    {
+        return None;
+    }
+    // Clone one node at a time rather than recursively cloning the whole
+    // subtree at each level of the walk.
+    let mut rebased_from = RenderNode {
+        kind: from.kind.clone(),
+        layout: from.layout,
+        style: from.style.clone(),
+        transitions: from.transitions.clone(),
+        text_layout: from.text_layout.clone(),
+        text_edit: from.text_edit.clone(),
+        element_id: from.element_id.clone(),
+        element_path: from.element_path.clone(),
+        content_inset: from.content_inset,
+        scrollbars: from.scrollbars,
+        handlers: from.handlers.clone(),
+        children: Vec::with_capacity(new_target.children.len()),
+    };
+    rebased_from.layout.x += dx;
+    rebased_from.layout.y += dy;
+    let mut rebased = TransitionPlanNode {
+        from_index: plan.from_index,
+        layout: plan.layout,
+        transform: plan.transform,
+        foreground: plan.foreground,
+        background: plan.background,
+        border_color: plan.border_color,
+        box_shadow: plan.box_shadow,
+        has_sampling_work: false,
+        children: Vec::with_capacity(new_target.children.len()),
+    };
+    let inherited_layout = inherited_layout || plan.layout.is_some();
+    let matcher = SiblingMatcher::new(&old_target.children, &new_target.children);
+    for (index, child) in new_target.children.iter().enumerate() {
+        let old_index = matcher.get(index);
+        if let Some(old_index) = old_index {
+            if plan
+                .children
+                .get(old_index)
+                .is_some_and(|child_plan| child_plan.from_index.is_none())
+                && !render_node_target_matches(&old_target.children[old_index], child)
+            {
+                return None;
+            }
+        }
+        let pair = old_index.and_then(|old_index| {
+            let child_plan = plan.children.get(old_index)?;
+            let original = from.children.get(child_plan.from_index?)?;
+            Some((original, &old_target.children[old_index], child_plan))
+        });
+        if let Some((original, old_child, child_plan)) = pair {
+            let (child_from, mut child_plan) = rebase_plan(
+                original,
+                old_child,
+                child,
+                child_plan,
+                inherited_layout,
+                (dx, dy),
+            )?;
+            child_plan.from_index = Some(index);
+            rebased_from.children.push(child_from);
+            rebased.children.push(child_plan);
+        } else {
+            rebased_from.children.push(child.clone());
+            rebased.children.push(TransitionPlanNode::default());
+        }
+    }
+    rebased.has_sampling_work = rebased.layout.is_some()
+        || rebased.transform.is_some()
+        || rebased.foreground.is_some()
+        || rebased.background.is_some()
+        || rebased.border_color.is_some()
+        || rebased.box_shadow.is_some()
+        || rebased.children.iter().any(|child| child.has_sampling_work);
+    Some((rebased_from, rebased))
 }
 
 fn scene_targets_match(left: &[RenderNode], right: &[RenderNode]) -> bool {
@@ -137,6 +324,7 @@ fn scene_targets_match(left: &[RenderNode], right: &[RenderNode]) -> bool {
 
 fn render_node_target_matches(left: &RenderNode, right: &RenderNode) -> bool {
     left.kind == right.kind
+        && left.element_id == right.element_id
         && left.layout == right.layout
         && left.style == right.style
         && left.transitions == right.transitions
@@ -258,25 +446,28 @@ fn sample_render_node_in_place(
 
     sampled.text_edit = to.text_edit.clone();
 
-    for (((sampled_child, from_child), to_child), child_plan) in sampled
+    for ((sampled_child, to_child), child_plan) in sampled
         .children
         .iter_mut()
-        .zip(&from.children)
         .zip(&to.children)
         .zip(&plan.children)
     {
         if layout_progress.is_none() && !child_plan.has_sampling_work {
             continue;
         }
-
-        sample_render_node_in_place(
-            sampled_child,
-            from_child,
-            to_child,
-            child_plan,
-            elapsed_seconds,
-            layout_progress,
-        );
+        if let Some(from_child) = child_plan
+            .from_index
+            .and_then(|index| from.children.get(index))
+        {
+            sample_render_node_in_place(
+                sampled_child,
+                from_child,
+                to_child,
+                child_plan,
+                elapsed_seconds,
+                layout_progress,
+            );
+        }
     }
 }
 
@@ -285,11 +476,16 @@ fn build_scene_transition_plan(
     to: &[RenderNode],
 ) -> (Vec<TransitionPlanNode>, f32) {
     let mut max_duration = 0.0_f32;
-    let plans = from
+    let matcher = SiblingMatcher::new(from, to);
+    let plans = to
         .iter()
-        .zip(to)
-        .map(|(from, to)| {
-            let (plan, duration) = build_transition_plan_node(from, to);
+        .enumerate()
+        .map(|(index, target)| {
+            let Some(old_index) = matcher.get(index) else {
+                return TransitionPlanNode::default();
+            };
+            let (mut plan, duration) = build_transition_plan_node(&from[old_index], target);
+            plan.from_index = Some(old_index);
             max_duration = max_duration.max(duration);
             plan
         })
@@ -336,9 +532,16 @@ fn build_transition_plan_node(from: &RenderNode, to: &RenderNode) -> (Transition
         max_duration = max_duration.max(plan.end_time());
     }
 
-    let mut children = Vec::with_capacity(from.children.len());
-    for (from_child, to_child) in from.children.iter().zip(&to.children) {
-        let (child_plan, child_duration) = build_transition_plan_node(from_child, to_child);
+    let mut children = Vec::with_capacity(to.children.len());
+    let matcher = SiblingMatcher::new(&from.children, &to.children);
+    for (index, to_child) in to.children.iter().enumerate() {
+        let Some(old_index) = matcher.get(index) else {
+            children.push(TransitionPlanNode::default());
+            continue;
+        };
+        let (mut child_plan, child_duration) =
+            build_transition_plan_node(&from.children[old_index], to_child);
+        child_plan.from_index = Some(old_index);
         children.push(child_plan);
         max_duration = max_duration.max(child_duration);
     }
@@ -353,6 +556,7 @@ fn build_transition_plan_node(from: &RenderNode, to: &RenderNode) -> (Transition
 
     (
         TransitionPlanNode {
+            from_index: None,
             layout,
             transform,
             foreground,
@@ -831,6 +1035,42 @@ mod tests {
     };
 
     use super::SceneTransition;
+
+    #[test]
+    fn changed_siblings_match_unique_ids_but_not_ambiguous_nodes() {
+        let transition = color_transition(1.0, TransitionTimingFunction::Linear);
+        let make = |color, id: Option<&str>| {
+            let mut node = text_node(
+                LayoutBox::new(0.0, 0.0, 20.0, 20.0),
+                color,
+                transition.clone(),
+            );
+            node.element_id = id.map(str::to_string);
+            node
+        };
+        let old = vec![make(Color::BLACK, Some("animated"))];
+        let new = vec![
+            make(Color::WHITE, None),
+            make(Color::WHITE, Some("animated")),
+        ];
+        let mut transition =
+            SceneTransition::new(old, new).expect("identified node should transition");
+        let mut scene = transition.sample();
+        transition.advance(Duration::from_millis(500), &mut scene);
+        assert_eq!(scene[0].style.foreground, Color::WHITE);
+        assert_ne!(scene[1].style.foreground, Color::BLACK);
+        assert_ne!(scene[1].style.foreground, Color::WHITE);
+
+        let old = vec![make(Color::BLACK, None)];
+        let new = vec![make(Color::WHITE, None), make(Color::WHITE, None)];
+        assert!(SceneTransition::new(old, new).is_none());
+        let old = vec![make(Color::BLACK, Some("duplicate"))];
+        let new = vec![
+            make(Color::WHITE, Some("duplicate")),
+            make(Color::WHITE, Some("duplicate")),
+        ];
+        assert!(SceneTransition::new(old, new).is_none());
+    }
 
     #[test]
     fn scene_transition_interpolates_text_color() {
