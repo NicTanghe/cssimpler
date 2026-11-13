@@ -12,7 +12,7 @@ use cssimpler_core::{
 use softbuffer::Rect;
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{
     ElementState, Ime, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent,
 };
@@ -255,6 +255,9 @@ struct RuntimeApp<P> {
     occluded: bool,
     scale_factor: f64,
     modifiers: KeyboardModifiers,
+    ime_target: Option<ElementPath>,
+    ime_enabled: bool,
+    ime_composing: bool,
     mouse_position: Option<(f32, f32)>,
     native_resize_started: bool,
     system_pointer_yielded: bool,
@@ -309,6 +312,9 @@ where
             occluded: false,
             scale_factor: 1.0,
             modifiers: KeyboardModifiers::default(),
+            ime_target: None,
+            ime_enabled: false,
+            ime_composing: false,
             mouse_position: None,
             native_resize_started: false,
             system_pointer_yielded: false,
@@ -467,7 +473,7 @@ where
                 return;
             }
         };
-        window.set_ime_allowed(true);
+        window.set_ime_allowed(false);
         finish_window_setup(&window, &self.config);
         self.scale_factor = window.scale_factor();
         self.window_id = Some(window.id());
@@ -774,6 +780,7 @@ where
     }
 
     fn prepare_suspend(&mut self, event_loop: &ActiveEventLoop) {
+        self.reset_ime();
         self.suspended = true;
         #[cfg(feature = "gpu-viewport")]
         if let Some(gpu) = &mut self.gpu {
@@ -787,8 +794,12 @@ where
     }
 
     fn prepare_focus_change(&mut self, event_loop: &ActiveEventLoop, focused: bool) {
+        if !focused {
+            self.reset_ime();
+        }
         self.handle_engine_event(event_loop, EngineEvent::FocusChanged(focused));
         if focused {
+            self.request_immediate_redraw();
             return;
         }
         let _ = self.scrollbar_controller.cancel_middle_button_auto_scroll();
@@ -818,8 +829,50 @@ where
         }
     }
 
+    fn reset_ime(&mut self) {
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(false);
+        }
+        self.ime_target = None;
+        self.ime_enabled = false;
+        self.ime_composing = false;
+    }
+
+    fn sync_ime(&mut self, scene: &[RenderNode]) {
+        // A controlled value update can discard preedit without changing focus.
+        if self.ime_composing && !self.scene_provider.ime_composing() {
+            self.reset_ime();
+        }
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let target = window
+            .has_focus()
+            .then(|| self.scene_provider.ime_target())
+            .flatten();
+        if self.ime_target != target {
+            // Reset the OS composition when editing moves to another widget.
+            if self.ime_target.is_some() {
+                window.set_ime_allowed(false);
+            }
+            self.ime_enabled = false;
+            self.ime_composing = false;
+            window.set_ime_allowed(target.is_some());
+            self.ime_target = target;
+        }
+        if self.ime_enabled
+            && let Some(target) = &self.ime_target
+            && let Some(rect) = super::text_edit::ime_cursor_area(scene, target)
+        {
+            window.set_ime_cursor_area(
+                LogicalPosition::new(f64::from(rect.x), f64::from(rect.y)),
+                LogicalSize::new(f64::from(rect.width), f64::from(rect.height)),
+            );
+        }
+    }
+
     fn maybe_emit_text_commit(&mut self, event_loop: &ActiveEventLoop, text: &str) {
-        if text.is_empty() || text.chars().any(char::is_control) {
+        if self.ime_composing || text.is_empty() || text.chars().any(char::is_control) {
             return;
         }
         self.handle_engine_event(
@@ -1025,6 +1078,7 @@ where
         }
 
         frame_stats.scene_prep_us = duration_to_us(scene_prep_start.elapsed());
+        self.sync_ime(&scene);
         // Install/clear the macOS glass content view before attaching GPU layers.
         let native_glass = summarize_native_glass(&scene);
         self.sync_native_glass(native_glass);
@@ -1688,6 +1742,12 @@ where
                         modifiers: self.modifiers,
                     },
                 );
+                if button == WinitMouseButton::Left
+                    && state == ElementState::Pressed
+                    && self.ime_composing
+                {
+                    self.reset_ime();
+                }
                 // Preserve button edges even when press/release arrive before a redraw.
                 if !consumed || self.immediate_redraw {
                     self.draw_frame(event_loop);
@@ -1723,6 +1783,9 @@ where
                 is_synthetic: _,
                 ..
             } => {
+                if self.ime_composing {
+                    return;
+                }
                 let normalized = KeyboardEvent {
                     logical_key: normalize_logical_key(&event.logical_key),
                     physical_key: normalize_physical_key(event.physical_key),
@@ -1741,18 +1804,38 @@ where
                 self.handle_engine_event(event_loop, EngineEvent::Key(normalized));
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
+                self.ime_composing = false;
+                if !self.ime_enabled || self.ime_target.is_none() {
+                    return;
+                }
                 self.handle_engine_event(
                     event_loop,
                     EngineEvent::TextInput(TextInputEvent::Commit(text)),
                 );
             }
             WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
+                self.ime_composing = !text.is_empty();
+                if !self.ime_enabled || self.ime_target.is_none() {
+                    self.ime_composing = false;
+                    return;
+                }
                 self.handle_engine_event(
                     event_loop,
                     EngineEvent::TextInput(TextInputEvent::Preedit { text, cursor }),
                 );
             }
-            WindowEvent::Ime(Ime::Enabled) | WindowEvent::Ime(Ime::Disabled) => {}
+            WindowEvent::Ime(Ime::Enabled) => {
+                self.ime_enabled = self.ime_target.is_some();
+                self.request_immediate_redraw();
+            }
+            WindowEvent::Ime(Ime::Disabled) => {
+                self.ime_enabled = false;
+                self.ime_composing = false;
+                self.handle_engine_event(
+                    event_loop,
+                    EngineEvent::TextInput(TextInputEvent::Disabled),
+                );
+            }
             WindowEvent::RedrawRequested => {
                 self.draw_frame(event_loop);
             }

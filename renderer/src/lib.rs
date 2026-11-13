@@ -1285,6 +1285,16 @@ pub enum RedrawSchedule {
 }
 
 pub trait SceneProvider {
+    /// Focused editable input, used to enable IME and anchor its candidate window.
+    fn ime_target(&self) -> Option<ElementPath> {
+        None
+    }
+
+    /// Whether the focused input still owns a temporary preedit.
+    fn ime_composing(&self) -> bool {
+        false
+    }
+
     /// Transfer optional native GPU viewport registrations to the window runtime.
     #[cfg(feature = "gpu-viewport")]
     fn take_gpu_viewports(&mut self) -> gpu::GpuViewportRegistry {
@@ -5126,7 +5136,23 @@ fn draw_text_edit_decorations(
             edit.backgrounds.as_deref(),
             clip,
         );
-        return;
+        if edit.composition.is_none() {
+            return;
+        }
+    }
+
+    for underline in
+        text_edit::composition_underlines(layout, text, prepared_text_layout, &style.text, edit)
+    {
+        draw_rounded_rect(
+            buffer,
+            width,
+            height,
+            underline,
+            CornerRadius::ZERO,
+            style.foreground,
+            clip,
+        );
     }
 
     if let Some(caret) = edit.caret
@@ -5256,7 +5282,24 @@ fn draw_text_edit_decorations_transformed(
             matrix,
             clip_state,
         );
-        return;
+        if edit.composition.is_none() {
+            return;
+        }
+    }
+
+    for underline in
+        text_edit::composition_underlines(layout, text, prepared_text_layout, &style.text, edit)
+    {
+        draw_transformed_rounded_rect(
+            buffer,
+            width,
+            height,
+            underline,
+            CornerRadius::ZERO,
+            style.foreground,
+            matrix,
+            clip_state,
+        );
     }
 
     if let Some(caret) = edit.caret
@@ -7151,6 +7194,20 @@ fn node_visual_bounds(node: &RenderNode) -> Option<ClipRect> {
 
 fn node_own_visual_bounds_untransformed(node: &RenderNode) -> Option<ClipRect> {
     let mut bounds = non_empty_layout_clip(node.layout);
+    if let Some(edit) = &node.text_edit
+        && edit.composition.is_some()
+        && let RenderKind::Text(content) = &node.kind
+    {
+        for underline in text_edit::composition_underlines(
+            scrollbar::text_layout(node),
+            content,
+            node.text_layout.as_ref(),
+            &node.style.text,
+            edit,
+        ) {
+            bounds = union_optional_bounds(bounds, non_empty_layout_clip(underline));
+        }
+    }
     if let Some(edit) = &node.text_edit
         && let Some(selection) = &edit.selection
         && let RenderKind::Text(content) = &node.kind
@@ -9821,6 +9878,7 @@ mod tests {
                     ..VisualStyle::default()
                 })
                 .with_text_edit(TextEditDecoration {
+                    composition: None,
                     backgrounds: None,
                     caret: None,
                     selection: Some(TextSelectionRange {

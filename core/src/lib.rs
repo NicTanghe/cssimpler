@@ -424,6 +424,8 @@ pub struct TextSelectionBackground {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TextEditDecoration {
+    /// UTF-8 byte range of temporary IME text in the displayed (possibly masked) value.
+    pub composition: Option<std::ops::Range<usize>>,
     pub caret: Option<usize>,
     pub selection: Option<TextSelectionRange>,
     /// Prepared connected backdrop; None lets standalone text paint its own.
