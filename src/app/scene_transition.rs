@@ -86,6 +86,22 @@ impl SceneTransition {
         scene_targets_match(&self.to, candidate)
     }
 
+    /// Reuse the existing plan when only non-layout content changed. The
+    /// candidate becomes the new target without rebuilding the start tree.
+    pub(crate) fn replace_compatible_target(&mut self, candidate: &mut Vec<RenderNode>) -> bool {
+        if self.to.len() != candidate.len()
+            || !self
+                .to
+                .iter()
+                .zip(candidate.iter())
+                .all(|(old, new)| compatible_target(old, new))
+        {
+            return false;
+        }
+        self.to = std::mem::take(candidate);
+        true
+    }
+
     /// Keep the original clock when an unrelated scene update leaves all
     /// surviving animated targets unchanged.
     pub(crate) fn update_unchanged_target(&mut self, candidate: &[RenderNode]) -> bool {
@@ -316,6 +332,27 @@ fn rebase_plan(
         || rebased.box_shadow.is_some()
         || rebased.children.iter().any(|child| child.has_sampling_work);
     Some((rebased_from, rebased))
+}
+
+// Identical geometry, styles, identities and tree shape preserve every
+// existing plan and start index. Text contents and other non-layout metadata
+// may change; the freshly rendered target supplies those to the sampled scene.
+fn compatible_target(old: &RenderNode, new: &RenderNode) -> bool {
+    let same_kind = match (&old.kind, &new.kind) {
+        (crate::core::RenderKind::Text(_), crate::core::RenderKind::Text(_)) => true,
+        (left, right) => left == right,
+    };
+    same_kind
+        && old.element_id == new.element_id
+        && old.layout == new.layout
+        && old.style == new.style
+        && old.transitions == new.transitions
+        && old.children.len() == new.children.len()
+        && old
+            .children
+            .iter()
+            .zip(&new.children)
+            .all(|(left, right)| compatible_target(left, right))
 }
 
 fn scene_targets_match(left: &[RenderNode], right: &[RenderNode]) -> bool {
@@ -1074,6 +1111,55 @@ mod tests {
             make(Color::WHITE, Some("duplicate")),
         ];
         assert!(SceneTransition::new(old, new).is_none());
+    }
+
+    #[test]
+    fn compatible_text_update_preserves_original_timeline_and_falls_back_for_geometry() {
+        let style = layout_transition("width", 1.0, TransitionTimingFunction::Linear);
+        let make = |width| {
+            RenderNode::container(LayoutBox::new(0.0, 0.0, width, 40.0))
+                .with_transitions(style.clone())
+                .with_child(text_node(
+                    LayoutBox::new(10.0, 0.0, 50.0, 20.0),
+                    Color::BLACK,
+                    TransitionStyle::default(),
+                ))
+        };
+        let mut optimized = SceneTransition::new(vec![make(100.0)], vec![make(200.0)]).unwrap();
+        let mut reference = optimized.clone();
+        let mut initial = optimized.sample();
+        optimized.advance(Duration::from_millis(200), &mut initial);
+        let mut ref_initial = reference.sample();
+        reference.advance(Duration::from_millis(200), &mut ref_initial);
+        let mut candidate = optimized.target().to_vec();
+        candidate[0].children[0].kind = crate::core::RenderKind::Text("updated".into());
+        let mut fallback_candidate = candidate.clone();
+        assert!(optimized.replace_compatible_target(&mut candidate));
+        assert!(candidate.is_empty());
+        assert!(reference.update_unchanged_target(&fallback_candidate));
+        for elapsed in [0, 300, 500] {
+            let mut actual = optimized.sample();
+            let mut expected = reference.sample();
+            optimized.advance(Duration::from_millis(elapsed), &mut actual);
+            reference.advance(Duration::from_millis(elapsed), &mut expected);
+            assert!(super::scene_targets_match(&actual, &expected));
+        }
+        fallback_candidate[0].layout.width += 1.0;
+        assert!(!optimized.replace_compatible_target(&mut fallback_candidate));
+        assert_eq!(
+            fallback_candidate.len(),
+            1,
+            "failed fast path must retain the candidate"
+        );
+        let mut changed_style = optimized.target().to_vec();
+        changed_style[0].children[0].style.foreground = Color::WHITE;
+        assert!(!optimized.replace_compatible_target(&mut changed_style));
+        let mut changed_id = optimized.target().to_vec();
+        changed_id[0].children[0].element_id = Some("replacement".into());
+        assert!(!optimized.replace_compatible_target(&mut changed_id));
+        let mut changed_shape = optimized.target().to_vec();
+        changed_shape[0].children.clear();
+        assert!(!optimized.replace_compatible_target(&mut changed_shape));
     }
 
     #[test]

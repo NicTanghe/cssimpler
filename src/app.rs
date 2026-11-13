@@ -859,12 +859,17 @@ where
         self.cached_scene.as_deref_mut()
     }
 
-    fn replace_scene(&mut self, scene: Vec<RenderNode>) {
+    fn replace_scene(&mut self, mut scene: Vec<RenderNode>) {
         if let Some(active) = self.scene_transition.take() {
             let mut active = active;
             if active.targets_match(&scene) {
                 self.cached_scene =
                     Some(self.cached_scene.take().unwrap_or_else(|| active.sample()));
+                self.scene_transition = Some(active);
+                return;
+            }
+            if active.replace_compatible_target(&mut scene) {
+                self.cached_scene = Some(active.sample());
                 self.scene_transition = Some(active);
                 return;
             }
@@ -1470,12 +1475,17 @@ where
             .expect("fragment app scene should be cached after the first frame")
     }
 
-    fn replace_scene(&mut self, scene: Vec<RenderNode>) {
+    fn replace_scene(&mut self, mut scene: Vec<RenderNode>) {
         if let Some(active) = self.scene_transition.take() {
             let mut active = active;
             if active.targets_match(&scene) {
                 self.cached_scene =
                     Some(self.cached_scene.take().unwrap_or_else(|| active.sample()));
+                self.scene_transition = Some(active);
+                return;
+            }
+            if active.replace_compatible_target(&mut scene) {
+                self.cached_scene = Some(active.sample());
                 self.scene_transition = Some(active);
                 return;
             }
@@ -3117,6 +3127,76 @@ mod tests {
                 "fragment partial={partial} thumb stopped at {fragment_x}"
             );
         }
+    }
+
+    #[test]
+    fn content_updates_then_reversal_keep_transition_continuous() {
+        let sheet = parse_stylesheet(
+            "#root { width: 200px; height: 40px; position: relative; } \
+             #thumb { position: absolute; left: 3px; width: 16px; height: 16px; transition: left 160ms linear; } \
+             #root.hot #thumb { left: 27px; }",
+        ).unwrap();
+        fn view(state: &(bool, u32)) -> Node {
+            let mut root = Node::element("div").with_id("root");
+            if state.0 {
+                root = root.with_class("hot");
+            }
+            root.with_child(Node::element("div").with_id("thumb").into())
+                .with_child(
+                    Node::element("span")
+                        .with_id("status")
+                        .with_child(Node::text(format!("{}", state.1)))
+                        .into(),
+                )
+                .into()
+        }
+        fn update(state: &mut (bool, u32), frame: FrameInfo) -> Invalidation {
+            if frame.frame_index == 0 {
+                return Invalidation::Clean;
+            }
+            state.1 += 1;
+            if frame.frame_index == 1 || frame.frame_index == 5 {
+                state.0 = !state.0;
+                Invalidation::Layout
+            } else {
+                Invalidation::Paint
+            }
+        }
+        let mut app = App::new((false, 0), &sheet, update, view);
+        let mut fragments =
+            FragmentApp::new((false, 0), &sheet, update, [Fragment::new("root", view)]);
+        for i in 0..5 {
+            let frame = FrameInfo {
+                frame_index: i,
+                delta: Duration::from_millis(16),
+            };
+            app.frame(frame);
+            fragments.frame(frame);
+        }
+        let before = app.find_element_bounds_by_id("#thumb").unwrap().x;
+        let fragment_before = fragments.find_element_bounds_by_id("#thumb").unwrap().x;
+        assert!(before > 3.0 && before < 27.0);
+        let reversal = FrameInfo {
+            frame_index: 5,
+            delta: Duration::ZERO,
+        };
+        app.frame(reversal);
+        fragments.frame(reversal);
+        assert!((app.find_element_bounds_by_id("#thumb").unwrap().x - before).abs() < 0.01);
+        assert!(
+            (fragments.find_element_bounds_by_id("#thumb").unwrap().x - fragment_before).abs()
+                < 0.01
+        );
+        for i in 6..20 {
+            let frame = FrameInfo {
+                frame_index: i,
+                delta: Duration::from_millis(16),
+            };
+            app.frame(frame);
+            fragments.frame(frame);
+        }
+        assert!((app.find_element_bounds_by_id("#thumb").unwrap().x - 3.0).abs() < 0.01);
+        assert!((fragments.find_element_bounds_by_id("#thumb").unwrap().x - 3.0).abs() < 0.01);
     }
 
     #[test]
