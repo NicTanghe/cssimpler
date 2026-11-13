@@ -130,6 +130,10 @@ impl SceneTransition {
         true
     }
 
+    pub(crate) fn target(&self) -> &[RenderNode] {
+        &self.to
+    }
+
     pub(crate) fn elapsed(&self) -> Duration {
         Duration::from_secs_f32(self.elapsed_seconds)
     }

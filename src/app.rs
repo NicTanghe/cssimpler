@@ -706,7 +706,11 @@ where
                 self.viewport(),
                 root_render_mode(
                     dirty_flags,
-                    self.cached_scene.as_ref().and_then(|scene| scene.first()),
+                    self.scene_transition
+                        .as_ref()
+                        .map(SceneTransition::target)
+                        .or(self.cached_scene.as_deref())
+                        .and_then(|scene| scene.first()),
                 ),
                 stats,
             )
@@ -724,7 +728,12 @@ where
     }
 
     fn refresh_fragments(&mut self, ids: &[String], stats: &mut RuntimeStats) -> bool {
-        let Some(existing_scene) = self.cached_scene.as_ref() else {
+        let Some(existing_scene) = self
+            .scene_transition
+            .as_ref()
+            .map(SceneTransition::target)
+            .or(self.cached_scene.as_deref())
+        else {
             return false;
         };
         if existing_scene.len() != 1 {
@@ -810,10 +819,13 @@ where
             filtered.push((path, node));
         }
 
-        let mut scene = self
-            .cached_scene
-            .take()
-            .expect("app scene should be cached while refreshing fragments");
+        let mut scene = if let Some(transition) = self.scene_transition.as_ref() {
+            transition.target().to_vec()
+        } else {
+            self.cached_scene
+                .take()
+                .expect("app scene should be cached while refreshing fragments")
+        };
         for (path, node) in filtered {
             let Some(target) = find_render_node_mut(&mut scene[0], &path) else {
                 return false;
@@ -1362,8 +1374,10 @@ where
                     self.viewport(),
                     root_render_mode(
                         dirty_flags,
-                        self.cached_scene
+                        self.scene_transition
                             .as_ref()
+                            .map(SceneTransition::target)
+                            .or(self.cached_scene.as_deref())
                             .and_then(|scene| scene.get(index)),
                     ),
                     stats,
@@ -1378,7 +1392,12 @@ where
     }
 
     fn refresh_fragments(&mut self, ids: &[String], stats: &mut RuntimeStats) -> bool {
-        let Some(existing_scene) = self.cached_scene.as_ref() else {
+        let Some(existing_scene) = self
+            .scene_transition
+            .as_ref()
+            .map(SceneTransition::target)
+            .or(self.cached_scene.as_deref())
+        else {
             return false;
         };
         if existing_scene.len() != self.fragments.len() {
@@ -1420,10 +1439,13 @@ where
             ));
         }
 
-        let mut scene = self
-            .cached_scene
-            .take()
-            .expect("fragment app scene should be cached while refreshing fragments");
+        let mut scene = if let Some(transition) = self.scene_transition.as_ref() {
+            transition.target().to_vec()
+        } else {
+            self.cached_scene
+                .take()
+                .expect("fragment app scene should be cached while refreshing fragments")
+        };
         for (index, node) in replacements {
             scene[index] = node;
         }
@@ -3014,6 +3036,87 @@ mod tests {
         assert_ne!(second[0].style.foreground, Color::rgb(37, 99, 235));
         assert_eq!(third[0].style.foreground, Color::rgb(37, 99, 235));
         assert_eq!(fourth[0].style.foreground, Color::rgb(37, 99, 235));
+    }
+
+    #[test]
+    fn paint_refreshes_preserve_layout_transition_target_for_app_and_fragments() {
+        let stylesheet = parse_stylesheet(
+            "#root { width: 200px; height: 50px; position: relative; } \
+             #thumb { position: absolute; left: 3px; width: 16px; height: 16px; transition: left 160ms linear; } \
+             #root.hot #thumb { left: 27px; }",
+        ).unwrap();
+        fn view(state: &(bool, u32)) -> Node {
+            let mut root = Node::element("div").with_id("root");
+            if state.0 {
+                root = root.with_class("hot");
+            }
+            root.with_child(Node::element("div").with_id("thumb").into())
+                .with_child(
+                    Node::element("span")
+                        .with_id("status")
+                        .with_child(Node::text(format!("{}", state.1)))
+                        .into(),
+                )
+                .into()
+        }
+        for partial in [false, true] {
+            let mut app = App::new(
+                (false, 0),
+                &stylesheet,
+                move |state: &mut (bool, u32), frame: FrameInfo| {
+                    if frame.frame_index == 0 {
+                        return Refresh::clean();
+                    }
+                    state.1 += 1;
+                    if frame.frame_index == 1 {
+                        state.0 = true;
+                        Invalidation::Layout.into()
+                    } else if partial {
+                        Refresh::fragment("status", Invalidation::Paint)
+                    } else {
+                        Invalidation::Paint.into()
+                    }
+                },
+                view,
+            );
+            let mut fragments = FragmentApp::new(
+                (false, 0),
+                &stylesheet,
+                move |state: &mut (bool, u32), frame: FrameInfo| {
+                    if frame.frame_index == 0 {
+                        return Refresh::clean();
+                    }
+                    state.1 += 1;
+                    if frame.frame_index == 1 {
+                        state.0 = true;
+                        Invalidation::Layout.into()
+                    } else if partial {
+                        Refresh::fragment("root", Invalidation::Paint)
+                    } else {
+                        Invalidation::Paint.into()
+                    }
+                },
+                [Fragment::new("root", view)],
+            );
+            for i in 0..14 {
+                let frame = FrameInfo {
+                    frame_index: i,
+                    delta: Duration::from_millis(16),
+                };
+                app.frame(frame);
+                fragments.frame(frame);
+            }
+            let app_x = app.find_element_bounds_by_id("#thumb").unwrap().x;
+            let fragment_x = fragments.find_element_bounds_by_id("#thumb").unwrap().x;
+            assert!(
+                (app_x - 27.0).abs() < 0.01,
+                "app partial={partial} thumb stopped at {app_x}"
+            );
+            assert!(
+                (fragment_x - 27.0).abs() < 0.01,
+                "fragment partial={partial} thumb stopped at {fragment_x}"
+            );
+        }
     }
 
     #[test]
