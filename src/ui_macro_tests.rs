@@ -246,3 +246,101 @@ fn cached_layer_request_reaches_the_render_tree_without_inheriting_to_children()
     assert!(cssimpler_core::establishes_stacking_context(&rendered));
     assert!(!rendered.children[0].style.cache_layer);
 }
+
+fn native_curve_scene(end_x: f32) -> cssimpler_core::VectorScene {
+    use cssimpler_core::{
+        PathCommand::*, VectorPaint, VectorPath, VectorPoint as P, VectorScene, VectorViewBox,
+    };
+    VectorScene::new(
+        VectorViewBox::new(0., 0., 40., 40.),
+        vec![
+            VectorPath::new(
+                vec![
+                    MoveTo(P::new(4., 30.)),
+                    CubicTo {
+                        control1: P::new(4., 4.),
+                        control2: P::new(end_x, 4.),
+                        end: P::new(end_x, 30.),
+                    },
+                    Close,
+                ],
+                VectorPaint::default(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn native_vector_survives_runtime_and_paint_refresh_with_curves_intact() {
+    use cssimpler_core::{ElementPath, RenderKind, RuntimeSyncPolicy, RuntimeWorld};
+    let tree: Node = Node::vector(native_curve_scene(36.))
+        .with_id("native")
+        .into();
+    let mut world = RuntimeWorld::default();
+    world.sync_root(
+        0,
+        &tree,
+        RuntimeSyncPolicy::ForceRebuild,
+        cssimpler_core::RuntimeDirtyClass::Structure,
+    );
+    let changed: Node = Node::vector(native_curve_scene(24.))
+        .with_id("native")
+        .into();
+    world.sync_root(
+        0,
+        &changed,
+        RuntimeSyncPolicy::PreferPatch,
+        cssimpler_core::RuntimeDirtyClass::Paint,
+    );
+    let restored = world.root_as_node(0).unwrap();
+    let rendered =
+        cssimpler_style::build_render_tree(&restored, &cssimpler_style::Stylesheet::default());
+    assert_eq!(rendered.layout.width, 40.);
+    assert_eq!(rendered.element_path, Some(ElementPath::root(0)));
+    let RenderKind::Svg(svg) = rendered.kind else {
+        panic!("expected shared vector rendering leaf")
+    };
+    assert_eq!(svg.paths[0].geometry.commands.len(), 3);
+    assert_eq!(
+        svg.paths[0].geometry.commands[1],
+        native_curve_scene(24.).paths()[0].commands()[1]
+    );
+    assert!(svg.paths[0].geometry.contours.is_empty());
+}
+
+#[test]
+fn native_curves_paint_and_incremental_updates_match_full_redraw() {
+    use cssimpler_core::{Color, LayoutBox, RenderNode};
+    use cssimpler_renderer::render_to_buffer;
+    let previous = vec![RenderNode::vector(
+        LayoutBox::new(0., 0., 40., 40.),
+        native_curve_scene(36.),
+    )];
+    let next = vec![RenderNode::vector(
+        LayoutBox::new(0., 0., 40., 40.),
+        native_curve_scene(24.),
+    )];
+    let mut old = vec![0; 1600];
+    let mut new = old.clone();
+    render_to_buffer(&previous, &mut old, 40, 40, Color::WHITE);
+    render_to_buffer(&next, &mut new, 40, 40, Color::WHITE);
+    assert_ne!(old, new);
+    let mut incremental = old.clone();
+    cssimpler_renderer::render_scene_update(
+        &previous,
+        &next,
+        &mut incremental,
+        40,
+        40,
+        Color::WHITE,
+    );
+    assert!(
+        incremental == new,
+        "native curve damage should match full rendering"
+    );
+    // This point is inside the curve, whereas the endpoint-only chord is at y=30.
+    assert_ne!(old[15 * 40 + 20], old[0]);
+    assert_eq!(old[2 * 40 + 20], old[0]);
+}

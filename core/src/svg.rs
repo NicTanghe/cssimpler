@@ -91,6 +91,8 @@ pub struct SvgContour {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SvgPathGeometry {
+    /// Native commands, when nonempty, take precedence over flattened contours.
+    pub commands: Vec<crate::PathCommand>,
     pub contours: Vec<SvgContour>,
     pub bounds: Option<SvgBounds>,
 }
@@ -98,6 +100,7 @@ pub struct SvgPathGeometry {
 impl SvgPathGeometry {
     pub fn new(contours: Vec<SvgContour>) -> Self {
         Self {
+            commands: Vec::new(),
             bounds: svg_geometry_bounds(&contours),
             contours,
         }

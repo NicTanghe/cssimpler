@@ -408,6 +408,22 @@ pub(crate) fn resolve_element_tree(
         style.visual.raster_background.generation =
             cssimpler_core::images::image(source).map_or(0, |image| image.generation);
     }
+    if let Some(scene) = &element.vector_scene {
+        assert!(
+            element.children.is_empty(),
+            "native vector elements are leaves; use sibling overlays"
+        );
+        crate::svg::apply_svg_root_intrinsic_size(&mut style, scene.view_box);
+        return ResolvedElement {
+            element_id: element.id.clone(),
+            style,
+            text: String::new(),
+            svg_scene: Some(scene.clone()),
+            element_path: element_path.clone(),
+            handlers: element.handlers.clone(),
+            children: Vec::new(),
+        };
+    }
     if element.tag == "svg" {
         let resolved_svg = resolve_svg_root(
             element,

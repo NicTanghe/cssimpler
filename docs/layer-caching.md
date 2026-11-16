@@ -1,8 +1,10 @@
 # Using optional layer caching
 
-Use a cached layer for a mostly unchanged SVG or container that is expensive to
+Use a cached layer for a mostly unchanged native drawing or container that is expensive to
 repaint beneath changing controls or selection highlights. Caching is optional;
 tiny-skia SVG rendering works without it and needs no Cargo feature.
+
+For changing native paths and overlays, see [Caching dynamic native drawings](./native-vector-paths.md#caching-dynamic-native-drawings).
 
 ## 1. Enable caching on the static content
 
@@ -10,38 +12,38 @@ Call `with_cached_layer(true)` on an `ElementNode` while building your UI.
 For example, this function builds a cached board and a separate live overlay:
 
 ```rust
-use cssimpler::core::Node;
+use cssimpler::core::{
+    Color, Node, PathCommand::*, VectorError, VectorPaint, VectorPath,
+    VectorPoint as P, VectorScene, VectorViewBox,
+};
 
-fn build_board(handle_x: f32) -> Node {
-    let board = Node::element("svg")
+fn build_board(handle_x: f32) -> Result<Node, VectorError> {
+    let view_box = VectorViewBox::new(0.0, 0.0, 100.0, 100.0);
+    let outline = VectorPath::new(vec![
+        MoveTo(P::new(10.0, 10.0)), LineTo(P::new(90.0, 10.0)),
+        LineTo(P::new(80.0, 90.0)), LineTo(P::new(20.0, 90.0)), Close,
+    ], VectorPaint {
+        fill: Some(Color::rgb(200, 220, 240)),
+        stroke: Some(Color::rgb(30, 60, 90)),
+        stroke_width: 1.0,
+    })?;
+    let handle = VectorPath::new(vec![
+        MoveTo(P::new(handle_x - 2.0, 48.0)),
+        LineTo(P::new(handle_x + 2.0, 48.0)),
+        LineTo(P::new(handle_x + 2.0, 52.0)),
+        LineTo(P::new(handle_x - 2.0, 52.0)), Close,
+    ], VectorPaint { fill: Some(Color::rgb(239, 68, 68)), ..VectorPaint::default() })?;
+
+    let board = Node::vector(VectorScene::new(view_box, vec![outline])?)
         .with_class("board")
-        .with_attribute("viewBox", "0 0 100 100")
-        .with_cached_layer(true)
-        .with_child(
-            Node::element("path")
-                .with_attribute("d", "M 10 10 L 90 10 L 80 90 L 20 90 Z")
-                .with_attribute("fill", "#c8dcf0")
-                .with_attribute("stroke", "#1e3c5a")
-                .into(),
-        );
+        .with_cached_layer(true);
+    let overlay = Node::vector(VectorScene::new(view_box, vec![handle])?)
+        .with_class("overlay");
 
-    // This SVG is a sibling, so moving the handle leaves the board cache valid.
-    let overlay = Node::element("svg")
-        .with_class("overlay")
-        .with_attribute("viewBox", "0 0 100 100")
-        .with_child(
-            Node::element("circle")
-                .with_attribute("cx", handle_x.to_string())
-                .with_attribute("cy", "50")
-                .with_attribute("r", "2")
-                .with_attribute("fill", "#ef4444")
-                .into(),
-        );
-
-    Node::element("div")
+    Ok(Node::element("div")
         .with_class("pattern-editor")
         .with_children([board.into(), overlay.into()])
-        .into()
+        .into())
 }
 ```
 

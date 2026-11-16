@@ -175,6 +175,13 @@ impl Node {
         ElementNode::new(tag)
     }
 
+    /// A native vector leaf. CSS controls layout and outer visual style.
+    pub fn vector(scene: crate::VectorScene) -> ElementNode {
+        let mut element = ElementNode::new("vector");
+        element.vector_scene = Some(scene.into_render_scene());
+        element
+    }
+
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text(text.into())
     }
@@ -186,6 +193,7 @@ pub fn into_node(value: impl IntoNode) -> Node {
 
 #[derive(Clone, Debug)]
 pub struct ElementNode {
+    pub vector_scene: Option<crate::SvgScene>,
     pub tag: String,
     pub id: Option<String>,
     pub classes: Vec<String>,
@@ -198,6 +206,7 @@ pub struct ElementNode {
 impl ElementNode {
     pub fn new(tag: impl Into<String>) -> Self {
         Self {
+            vector_scene: None,
             tag: tag.into(),
             id: None,
             classes: Vec::new(),

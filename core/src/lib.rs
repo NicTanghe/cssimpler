@@ -24,6 +24,10 @@ pub mod runtime_ecs;
 pub mod scrollbar;
 pub mod stacking;
 pub mod svg;
+pub mod vector;
+pub use vector::{
+    PathCommand, VectorError, VectorPaint, VectorPath, VectorPoint, VectorScene, VectorViewBox,
+};
 pub mod transitions;
 
 use crate::fonts::{PreparedTextLayout, TextStyle};
@@ -937,6 +941,11 @@ impl RenderNode {
             handlers: EventHandlers::default(),
             children: Vec::new(),
         }
+    }
+
+    /// Construct a vector leaf without SVG markup or parsing.
+    pub fn vector(layout: LayoutBox, scene: VectorScene) -> Self {
+        Self::svg(layout, scene.into_render_scene())
     }
 
     pub fn with_style(mut self, style: VisualStyle) -> Self {

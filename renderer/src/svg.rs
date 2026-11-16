@@ -178,6 +178,23 @@ fn draw_svg_scene_with_matrix(
 
 fn build_svg_path(geometry: &SvgPathGeometry) -> Option<Path> {
     let mut builder = PathBuilder::new();
+    if !geometry.commands.is_empty() {
+        use cssimpler_core::PathCommand;
+        for command in &geometry.commands {
+            match *command {
+                PathCommand::MoveTo(p) => builder.move_to(p.x, p.y),
+                PathCommand::LineTo(p) => builder.line_to(p.x, p.y),
+                PathCommand::QuadTo { control: c, end: p } => builder.quad_to(c.x, c.y, p.x, p.y),
+                PathCommand::CubicTo {
+                    control1: a,
+                    control2: b,
+                    end: p,
+                } => builder.cubic_to(a.x, a.y, b.x, b.y, p.x, p.y),
+                PathCommand::Close => builder.close(),
+            }
+        }
+        return builder.finish();
+    }
     for contour in &geometry.contours {
         if contour.points.len() < 2 {
             continue;
