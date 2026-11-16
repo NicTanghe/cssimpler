@@ -1,7 +1,8 @@
 use crate::{RenderNode, ZIndex};
 
 pub fn establishes_stacking_context(node: &RenderNode) -> bool {
-    node.style.positioned && matches!(node.style.z_index, ZIndex::Integer(_))
+    node.style.cache_layer
+        || (node.style.positioned && matches!(node.style.z_index, ZIndex::Integer(_)))
 }
 
 pub fn stacking_context_level(node: &RenderNode) -> i32 {

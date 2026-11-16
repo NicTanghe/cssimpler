@@ -19,6 +19,8 @@ pub mod gpu;
 mod gradient;
 mod image;
 mod input;
+#[cfg(test)]
+mod layer_cache_tests;
 mod native_glass;
 mod runtime;
 mod scrollbar;
@@ -452,6 +454,9 @@ struct DirtyRenderJob {
 static FRAME_TIMING_STATS: OnceLock<Mutex<FrameTimingStats>> = OnceLock::new();
 static WORKER_BUFFER_POOL: OnceLock<Mutex<Vec<Vec<u32>>>> = OnceLock::new();
 static SUBTREE_SURFACE_CACHE: OnceLock<RwLock<SubtreeSurfaceCache>> = OnceLock::new();
+// A cold layer can be visited by several row-band workers at once. Build once,
+// bounding temporary raster memory as well as retained cache memory.
+static SUBTREE_SURFACE_BUILD_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 static SUBTREE_SURFACE_CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -474,6 +479,7 @@ struct SurfaceCacheEntry {
 
 #[derive(Default)]
 struct SubtreeSurfaceCache {
+    limits: LayerCacheLimits,
     next_use: u64,
     builds: usize,
     total_bytes: usize,
@@ -590,6 +596,70 @@ fn release_worker_buffers(buffers: Vec<Vec<u32>>) {
     trim_worker_buffer_pool_to_budget(&mut pool, MAX_WORKER_BUFFER_POOL_BYTES);
 }
 
+/// Memory limits shared by automatic promoted surfaces and explicit cached layers.
+/// These limits control retained pixels, not geometry or the renderer's buffer pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerCacheLimits {
+    pub total_bytes: usize,
+    pub layer_bytes: usize,
+}
+
+impl Default for LayerCacheLimits {
+    fn default() -> Self {
+        Self {
+            total_bytes: MAX_SUBTREE_SURFACE_CACHE_BYTES,
+            layer_bytes: MAX_PROMOTED_SURFACE_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayerCacheStats {
+    pub entries: usize,
+    pub bytes: usize,
+    pub builds: usize,
+}
+
+/// Set application-wide layer limits, evicting entries that exceed the new limits.
+/// Set either limit to zero to disable raster caching. Prefer setting once at startup.
+pub fn set_layer_cache_limits(limits: LayerCacheLimits) {
+    let mut cache = subtree_surface_cache()
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    cache.limits = LayerCacheLimits {
+        total_bytes: limits.total_bytes,
+        layer_bytes: limits.layer_bytes.min(limits.total_bytes),
+    };
+    let layer_bytes = cache.limits.layer_bytes;
+    cache
+        .surfaces
+        .retain(|_, entry| entry.byte_len <= layer_bytes);
+    cache.total_bytes = cache.surfaces.values().map(|entry| entry.byte_len).sum();
+    while cache.total_bytes > cache.limits.total_bytes {
+        evict_lru_subtree_surface_entry(&mut cache);
+    }
+}
+
+/// Release retained layer rasters. A later paint can rebuild eligible layers.
+pub fn clear_layer_cache() {
+    let mut cache = subtree_surface_cache()
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    cache.surfaces.clear();
+    cache.total_bytes = 0;
+}
+
+pub fn layer_cache_stats() -> LayerCacheStats {
+    let cache = subtree_surface_cache()
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    LayerCacheStats {
+        entries: cache.surfaces.len(),
+        bytes: cache.total_bytes,
+        builds: cache.builds,
+    }
+}
+
 fn subtree_surface_cache() -> &'static RwLock<SubtreeSurfaceCache> {
     SUBTREE_SURFACE_CACHE.get_or_init(|| RwLock::new(SubtreeSurfaceCache::default()))
 }
@@ -616,16 +686,16 @@ fn insert_subtree_surface_entry(
     surface: Arc<CachedSubtreeSurface>,
 ) -> bool {
     let byte_len = subtree_surface_byte_len(surface.as_ref());
-    if byte_len > MAX_SUBTREE_SURFACE_CACHE_BYTES {
+    if byte_len > cache.limits.total_bytes || byte_len > cache.limits.layer_bytes {
         return false;
     }
     while (!cache.surfaces.is_empty())
         && (cache.surfaces.len() >= MAX_SUBTREE_SURFACE_CACHE_ENTRIES
-            || cache.total_bytes.saturating_add(byte_len) > MAX_SUBTREE_SURFACE_CACHE_BYTES)
+            || cache.total_bytes.saturating_add(byte_len) > cache.limits.total_bytes)
     {
         evict_lru_subtree_surface_entry(cache);
     }
-    if cache.total_bytes.saturating_add(byte_len) > MAX_SUBTREE_SURFACE_CACHE_BYTES {
+    if cache.total_bytes.saturating_add(byte_len) > cache.limits.total_bytes {
         return false;
     }
 
@@ -657,6 +727,7 @@ fn evict_lru_subtree_surface_entry(cache: &mut SubtreeSurfaceCache) {
 
 fn neutralized_surface_root(node: &RenderNode) -> RenderNode {
     let mut node = node.clone();
+    node.style.cache_layer = false;
     node.style.transform = cssimpler_core::Transform2D::default();
     node.style.perspective = None;
     node.style.transform_style = TransformStyleMode::Flat;
@@ -825,13 +896,25 @@ fn cached_promoted_surface(
     let surface_root = neutralized_surface_root(node);
     let key = hash_surface_subtree(&surface_root);
     {
-        let cache = subtree_surface_cache()
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(entry) = cache.surfaces.get(&key) {
-            return Some(entry.surface.clone());
+        let mut cache = subtree_surface_cache()
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(surface) = cached_subtree_surface_entry(&mut cache, key) {
+            return Some(surface);
         }
     }
+    let _build_guard = SUBTREE_SURFACE_BUILD_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let limits = {
+        let mut cache = subtree_surface_cache()
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(surface) = cached_subtree_surface_entry(&mut cache, key) {
+            return Some(surface);
+        }
+        cache.limits
+    };
 
     let mut node_count = 0;
     let surface_bounds = cache_subtree_bounds(
@@ -849,8 +932,13 @@ fn cached_promoted_surface(
     }
     let surface_storage_bytes = promoted_surface_storage_bytes(surface_pixel_count);
     let temp_bytes = promoted_surface_temp_bytes(surface_pixel_count);
-    if surface_storage_bytes > MAX_PROMOTED_SURFACE_BYTES
-        || temp_bytes > MAX_PROMOTED_SURFACE_TEMP_BYTES
+    let layer_budget = if node.style.cache_layer {
+        limits.layer_bytes
+    } else {
+        limits.layer_bytes.min(MAX_PROMOTED_SURFACE_BYTES)
+    };
+    if surface_storage_bytes > layer_budget.min(limits.total_bytes)
+        || (!node.style.cache_layer && temp_bytes > MAX_PROMOTED_SURFACE_TEMP_BYTES)
     {
         return None;
     }
@@ -871,29 +959,31 @@ fn cached_promoted_surface(
     let mut black_buffer = buffers.pop().unwrap_or_default();
     black_buffer.fill(pack_rgb(Color::BLACK));
     white_buffer.fill(pack_rgb(Color::WHITE));
-    with_render_buffer_rows(BufferRows::full(), || {
-        draw_node_with_cached_bounds_internal(
-            &local_surface_root,
-            &local_surface_bounds,
-            &mut black_buffer,
-            surface_width,
-            surface_height,
-            local_clip,
-            Color::BLACK,
-            GlassRenderMode::Fallback,
-            false,
-        );
-        draw_node_with_cached_bounds_internal(
-            &local_surface_root,
-            &local_surface_bounds,
-            &mut white_buffer,
-            surface_width,
-            surface_height,
-            local_clip,
-            Color::WHITE,
-            GlassRenderMode::Fallback,
-            false,
-        );
+    with_render_alpha_target(None, || {
+        with_render_buffer_rows(BufferRows::full(), || {
+            draw_node_with_cached_bounds_internal(
+                &local_surface_root,
+                &local_surface_bounds,
+                &mut black_buffer,
+                surface_width,
+                surface_height,
+                local_clip,
+                Color::BLACK,
+                GlassRenderMode::Fallback,
+                false,
+            );
+            draw_node_with_cached_bounds_internal(
+                &local_surface_root,
+                &local_surface_bounds,
+                &mut white_buffer,
+                surface_width,
+                surface_height,
+                local_clip,
+                Color::WHITE,
+                GlassRenderMode::Fallback,
+                false,
+            );
+        })
     });
     let surface = extract_surface_from_mattes(
         &black_buffer,
@@ -964,9 +1054,11 @@ fn draw_cached_surface_transformed(
 }
 
 fn node_can_use_promoted_surface(node: &RenderNode, cached_bounds: &CachedSubtreeBounds) -> bool {
-    matches!(node.kind, RenderKind::Container)
+    (node.style.cache_layer
+        || (matches!(node.kind, RenderKind::Container)
+            && !node.style.transform.is_identity()
+            && !node.children.is_empty()))
         && node.style.native_material != NativeMaterial::Glass
-        && !node.style.transform.is_identity()
         && !node.style.transform.uses_depth()
         && node.style.perspective.is_none()
         && node.style.transform_style == TransformStyleMode::Flat
@@ -975,7 +1067,6 @@ fn node_can_use_promoted_surface(node: &RenderNode, cached_bounds: &CachedSubtre
         && !cached_bounds.subtree_uses_native_glass
         && !cached_bounds.subtree_uses_depth
         && node.scrollbars.is_none()
-        && !node.children.is_empty()
 }
 
 #[cfg(test)]
@@ -983,6 +1074,7 @@ fn clear_subtree_surface_cache_for_tests() {
     let mut cache = subtree_surface_cache()
         .write()
         .unwrap_or_else(|poison| poison.into_inner());
+    cache.limits = LayerCacheLimits::default();
     cache.next_use = 0;
     cache.builds = 0;
     cache.total_bytes = 0;
@@ -2909,7 +3001,8 @@ fn render_nodes_match_own_visuals_ignoring_projection(
 }
 
 fn visual_styles_match_ignoring_projection(left: &VisualStyle, right: &VisualStyle) -> bool {
-    left.background == right.background
+    left.cache_layer == right.cache_layer
+        && left.background == right.background
         && left.background_layers == right.background_layers
         && left.raster_background == right.raster_background
         && left.foreground == right.foreground
@@ -3609,6 +3702,25 @@ fn draw_node_contents_internal_impl(
             .and_then(|bounds| bounds.intersect(clip))
             .is_none()
     {
+        return;
+    }
+
+    if allow_surface_promotion
+        && node.style.cache_layer
+        && !node_requires_projected_path(node)
+        && !in_3d_context
+        && parent_perspective.is_none()
+        && node_can_use_promoted_surface(node, cached_bounds)
+        && let Some(surface) = cached_promoted_surface(node, width, height)
+    {
+        draw_cached_surface_transformed(
+            buffer,
+            width,
+            height,
+            surface.as_ref(),
+            AffineTransform::IDENTITY,
+            &ClipState::new(clip),
+        );
         return;
     }
 
