@@ -285,7 +285,7 @@ fn parse_view_box(value: &str) -> Result<SvgViewBox, String> {
     Ok(SvgViewBox::new(*min_x, *min_y, *width, *height))
 }
 
-fn apply_svg_root_intrinsic_size(style: &mut Style, view_box: SvgViewBox) {
+pub(crate) fn apply_svg_root_intrinsic_size(style: &mut Style, view_box: SvgViewBox) {
     if matches!(style.layout.taffy.size.width, Dimension::Auto) {
         style.layout.taffy.size.width = Dimension::Length(view_box.width.max(0.0));
     }

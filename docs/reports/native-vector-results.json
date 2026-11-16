@@ -1,0 +1,98 @@
+{
+  "metadata": {
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+    "cgroup_cpu_max": "200000 100000",
+    "example_sha256": "dd7922f437638729aa7fbe554e6dc90a03eecf84a1ed51d0b7718ae6add95031",
+    "method": "Three fresh processes per mode, alternating order; 20 iterations per stage; medians of per-process medians; same authored curves; no layer requests; peak RSS includes all stages.",
+    "build": "Cargo release profile, default features, repository SSE4.1/SSE4.2 flags on x86."
+  },
+  "summary": [
+    {
+      "mode": "svg",
+      "construct_ms": 0.0171,
+      "prepare_ms": 0.033,
+      "paint_ms": 17.3868,
+      "rss_before_paint_kib": 6052,
+      "rss_after_paint_kib": 6940,
+      "peak_rss_kib": 6940
+    },
+    {
+      "mode": "native",
+      "construct_ms": 0.0006,
+      "prepare_ms": 0.0031,
+      "paint_ms": 16.0041,
+      "rss_before_paint_kib": 5204,
+      "rss_after_paint_kib": 6216,
+      "peak_rss_kib": 6216
+    }
+  ],
+  "runs": [
+    {
+      "run": 1,
+      "mode": "native",
+      "frames": 20,
+      "construct_ms": 0.0006,
+      "prepare_ms": 0.0031,
+      "paint_ms": 16.0041,
+      "rss_before_paint_kib": 5268,
+      "rss_after_paint_kib": 6312,
+      "peak_rss_kib": 6312
+    },
+    {
+      "run": 1,
+      "mode": "svg",
+      "frames": 20,
+      "construct_ms": 0.0171,
+      "prepare_ms": 0.0333,
+      "paint_ms": 17.3868,
+      "rss_before_paint_kib": 6052,
+      "rss_after_paint_kib": 6940,
+      "peak_rss_kib": 6940
+    },
+    {
+      "run": 2,
+      "mode": "svg",
+      "frames": 20,
+      "construct_ms": 0.0171,
+      "prepare_ms": 0.033,
+      "paint_ms": 11.7573,
+      "rss_before_paint_kib": 6004,
+      "rss_after_paint_kib": 6896,
+      "peak_rss_kib": 6896
+    },
+    {
+      "run": 2,
+      "mode": "native",
+      "frames": 20,
+      "construct_ms": 0.0005,
+      "prepare_ms": 0.0031,
+      "paint_ms": 11.3051,
+      "rss_before_paint_kib": 5172,
+      "rss_after_paint_kib": 6216,
+      "peak_rss_kib": 6216
+    },
+    {
+      "run": 3,
+      "mode": "native",
+      "frames": 20,
+      "construct_ms": 0.0012,
+      "prepare_ms": 0.003,
+      "paint_ms": 16.0545,
+      "rss_before_paint_kib": 5204,
+      "rss_after_paint_kib": 6184,
+      "peak_rss_kib": 6184
+    },
+    {
+      "run": 3,
+      "mode": "svg",
+      "frames": 20,
+      "construct_ms": 0.0167,
+      "prepare_ms": 0.0328,
+      "paint_ms": 17.5133,
+      "rss_before_paint_kib": 6088,
+      "rss_after_paint_kib": 6980,
+      "peak_rss_kib": 6980
+    }
+  ]
+}

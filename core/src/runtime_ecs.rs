@@ -82,6 +82,7 @@ impl RuntimeViewport {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeElementData {
+    pub vector_scene: Option<crate::SvgScene>,
     pub tag: String,
     pub id: Option<String>,
     pub classes: Vec<String>,
@@ -209,6 +210,7 @@ impl RuntimeWorld {
                 }
 
                 Some(Node::Element(ElementNode {
+                    vector_scene: element.vector_scene.clone(),
                     tag: element.tag.clone(),
                     id: element.id.clone(),
                     classes: element.classes.clone(),
@@ -447,6 +449,7 @@ impl RuntimeWorld {
 fn authored_from_node(node: &Node) -> RuntimeNodeKind {
     match node {
         Node::Element(element) => RuntimeNodeKind::Element(RuntimeElementData {
+            vector_scene: element.vector_scene.clone(),
             tag: element.tag.clone(),
             id: element.id.clone(),
             classes: element.classes.clone(),
