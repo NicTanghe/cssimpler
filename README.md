@@ -161,6 +161,10 @@ app/       - entrypoint + render loop
 
 ## Rendering
 
+See [optional layer caching](docs/layer-caching.md) for enabling bounded caches,
+keeping overlays separate, and controlling RAM usage. The [SVG rendering report](docs/svg-rendering.md#measured-results)
+compares static rendering speed and RAM without caching.
+
 **Current**
 - CPU renderer  
 - Partial redraws  

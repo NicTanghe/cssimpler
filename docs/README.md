@@ -14,6 +14,7 @@ Current focus:
 
 The workspace now has the foundations through rendering, typography and font resolution, interaction, scoped invalidation, and renderer-side dirty-region diffing in place.
 
+- [Optional layer caching: usage guide](./layer-caching.md) — enable caches, separate overlays, choose RAM budgets, inspect usage, and disable caching.
 - [CPU 2D rendering and cached layers](./svg-rendering.md) — tiny-skia SVG coverage, opt-in board caches, memory budgets, overlays, and a headless benchmark.
 
 ## Planned extensions

@@ -36,6 +36,8 @@ apply. Antialiased edge pixels can differ from the old four-sample rasterizer.
 
 ## Opt-in layers for a 2D editor
 
+For a step-by-step setup with a live overlay, see [Using optional layer caching](./layer-caching.md).
+
 Use `ElementNode::with_cached_layer(true)` on a static board container or SVG.
 Low-level render-tree users have the same `RenderNode::with_cached_layer(true)`
 builder. Both set `VisualStyle::cache_layer`. For example:
