@@ -1,6 +1,12 @@
+use std::cell::RefCell;
+
+use tiny_skia::{
+    FillRule, LineCap, LineJoin, Mask, Path, PathBuilder, PathSegment, Point, Stroke, Transform,
+};
+
 use cssimpler_core::{
     GradientInterpolation, LinearRgba, SvgBounds, SvgLinearGradient, SvgPaintServerData,
-    SvgPathGeometry, SvgPathPaintSource, SvgPoint, SvgScene, SvgViewBox,
+    SvgPathGeometry, SvgPathPaintSource, SvgScene, SvgViewBox,
 };
 
 use super::{
@@ -15,7 +21,13 @@ use super::gradient::{
 
 use cssimpler_core::LayoutBox;
 
-const SVG_COVERAGE_SAMPLES: [(f32, f32); 4] =
+// Coverage only: no RGBA pixmap or cached scene layer. Fixed size even for huge SVGs.
+const COVERAGE_TILE_SIZE: usize = 256;
+thread_local! {
+    static COVERAGE_TILE: RefCell<Option<Mask>> = const { RefCell::new(None) };
+}
+
+const CLIP_COVERAGE_SAMPLES: [(f32, f32); 4] =
     [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
 
 struct PreparedSvgLinearGradient {
@@ -97,118 +109,286 @@ fn draw_svg_scene_with_matrix(
     let Some(inverse) = matrix.invert() else {
         return;
     };
-    let rows = current_render_buffer_rows();
-    let row_start = rows.start.min(height) as i32;
-    let row_end = rows.end.min(height) as i32;
-
     for path in &scene.paths {
         let Some(source_bounds) = path.bounds() else {
             continue;
         };
-        let Some(bounds) = transform_svg_bounds(source_bounds, matrix)
+        if transform_svg_bounds(source_bounds, matrix)
             .and_then(|bounds| bounds.intersect(clip_state.coarse))
-        else {
+            .is_none()
+        {
             continue;
-        };
-        let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
-            continue;
-        };
-
-        let fill = path
-            .paint
-            .fill
-            .as_ref()
-            .map(|paint| resolve_svg_paint_source(paint, scene))
-            .transpose();
-        let fill = match fill {
-            Ok(fill) => fill,
-            Err(message) => panic!("{message}"),
-        };
-        let stroke = if path.paint.stroke_width > f32::EPSILON {
-            let stroke = path
-                .paint
-                .stroke
-                .as_ref()
-                .map(|paint| resolve_svg_paint_source(paint, scene))
-                .transpose();
-            match stroke {
-                Ok(stroke) => stroke,
-                Err(message) => panic!("{message}"),
-            }
-        } else {
-            None
-        };
+        }
+        let fill = path.paint.fill.as_ref().map(|paint| {
+            resolve_svg_paint_source(paint, scene).unwrap_or_else(|message| panic!("{message}"))
+        });
+        let stroke = (path.paint.stroke_width > f32::EPSILON)
+            .then_some(path.paint.stroke.as_ref())
+            .flatten()
+            .map(|paint| {
+                resolve_svg_paint_source(paint, scene).unwrap_or_else(|message| panic!("{message}"))
+            });
         if fill.is_none() && stroke.is_none() {
             continue;
         }
-
-        for y in y0.max(row_start)..y1.min(row_end) {
-            let local_row_start = (y as usize - rows.start) * width;
-            for x in x0..x1 {
-                let mut fill_hits = 0_u8;
-                let mut stroke_hits = 0_u8;
-                for (sample_x, sample_y) in SVG_COVERAGE_SAMPLES {
-                    let screen_x = x as f32 + sample_x;
-                    let screen_y = y as f32 + sample_y;
-                    if !clip_state.contains(screen_x, screen_y) {
-                        continue;
-                    }
-
-                    let (source_x, source_y) = inverse.transform_point(screen_x, screen_y);
-                    if !source_x.is_finite() || !source_y.is_finite() {
-                        continue;
-                    }
-
-                    if fill.is_some() && point_in_svg_fill(&path.geometry, source_x, source_y) {
-                        fill_hits = fill_hits.saturating_add(1);
-                    }
-                    if stroke.is_some()
-                        && point_in_svg_stroke(
-                            &path.geometry,
-                            source_x,
-                            source_y,
-                            path.paint.stroke_width * 0.5,
-                        )
-                    {
-                        stroke_hits = stroke_hits.saturating_add(1);
-                    }
-                }
-
-                let index = local_row_start + x as usize;
-                let center_source = if fill_hits > 0 || stroke_hits > 0 {
-                    let (source_x, source_y) =
-                        inverse.transform_point(x as f32 + 0.5, y as f32 + 0.5);
-                    (source_x.is_finite() && source_y.is_finite()).then_some((source_x, source_y))
-                } else {
-                    None
-                };
-                if let (Some(fill), Some((source_x, source_y))) = (&fill, center_source)
-                    && fill_hits > 0
-                {
-                    blend_linear_over(
-                        buffer,
-                        index,
-                        with_coverage(
-                            fill.sample(source_x, source_y),
-                            fill_hits as f32 / SVG_COVERAGE_SAMPLES.len() as f32,
-                        ),
-                    );
-                }
-                if let (Some(stroke), Some((source_x, source_y))) = (&stroke, center_source)
-                    && stroke_hits > 0
-                {
-                    blend_linear_over(
-                        buffer,
-                        index,
-                        with_coverage(
-                            stroke.sample(source_x, source_y),
-                            stroke_hits as f32 / SVG_COVERAGE_SAMPLES.len() as f32,
-                        ),
-                    );
-                }
+        let Some(source_path) = build_svg_path(&path.geometry) else {
+            continue;
+        };
+        if let Some(fill) = fill
+            && let Some(screen_path) = project_svg_path(&source_path, matrix)
+        {
+            draw_svg_coverage(
+                buffer,
+                width,
+                height,
+                &screen_path,
+                &fill,
+                inverse,
+                clip_state,
+            );
+        }
+        if let Some(stroke) = stroke {
+            // The previous distance-to-segment rasterizer used round caps and joins.
+            // Stroke in source space so nonuniform scaling also scales the outline.
+            let stroke_style = Stroke {
+                width: path.paint.stroke_width,
+                line_cap: LineCap::Round,
+                line_join: LineJoin::Round,
+                ..Stroke::default()
+            };
+            let resolution_scale = (matrix.a.abs() + matrix.b.abs())
+                .max(matrix.c.abs() + matrix.d.abs())
+                .max(1.0);
+            if let Some(outline) = source_path.stroke(&stroke_style, resolution_scale)
+                && let Some(screen_path) = project_svg_path(&outline, matrix)
+            {
+                draw_svg_coverage(
+                    buffer,
+                    width,
+                    height,
+                    &screen_path,
+                    &stroke,
+                    inverse,
+                    clip_state,
+                );
             }
         }
     }
+}
+
+fn build_svg_path(geometry: &SvgPathGeometry) -> Option<Path> {
+    let mut builder = PathBuilder::new();
+    for contour in &geometry.contours {
+        if contour.points.len() < 2 {
+            continue;
+        }
+        if contour
+            .points
+            .iter()
+            .any(|p| !p.x.is_finite() || !p.y.is_finite())
+        {
+            return None;
+        }
+        let start = contour.points[0];
+        builder.move_to(start.x, start.y);
+        for point in &contour.points[1..] {
+            builder.line_to(point.x, point.y);
+        }
+        if contour.closed {
+            builder.close();
+        }
+    }
+    builder.finish()
+}
+
+fn project_svg_path(path: &Path, matrix: AffineTransform) -> Option<Path> {
+    if matrix.g == 0.0 && matrix.h == 0.0 && matrix.i == 1.0 {
+        return path.clone().transform(Transform::from_row(
+            matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f,
+        ));
+    }
+    // CSS perspective is a homography. tiny-skia accepts affine transforms only,
+    // so project lines and adaptively flatten the stroker's curved caps/joins.
+    let mut builder = PathBuilder::new();
+    let mut current = Point::from_xy(0.0, 0.0);
+    let mut start = current;
+    for segment in path.segments() {
+        match segment {
+            PathSegment::MoveTo(p) => {
+                let p_screen = project_point(p, matrix)?;
+                builder.move_to(p_screen.x, p_screen.y);
+                start = p;
+                current = p;
+            }
+            PathSegment::LineTo(p) => {
+                let p_screen = project_point(p, matrix)?;
+                builder.line_to(p_screen.x, p_screen.y);
+                current = p;
+            }
+            PathSegment::QuadTo(control, end) => {
+                project_curve(&mut builder, &[current, control, end], matrix, 0.0, 1.0, 0)?;
+                current = end;
+            }
+            PathSegment::CubicTo(c1, c2, end) => {
+                project_curve(&mut builder, &[current, c1, c2, end], matrix, 0.0, 1.0, 0)?;
+                current = end;
+            }
+            PathSegment::Close => {
+                builder.close();
+                current = start;
+            }
+        }
+    }
+    builder.finish()
+}
+
+fn project_point(point: Point, matrix: AffineTransform) -> Option<Point> {
+    let (x, y) = matrix.transform_point(point.x, point.y);
+    (x.is_finite() && y.is_finite()).then_some(Point::from_xy(x, y))
+}
+
+fn project_curve(
+    builder: &mut PathBuilder,
+    controls: &[Point],
+    matrix: AffineTransform,
+    t0: f32,
+    t1: f32,
+    depth: u8,
+) -> Option<()> {
+    let sample = |t: f32| {
+        let mut points = [Point::from_xy(0.0, 0.0); 4];
+        points[..controls.len()].copy_from_slice(controls);
+        for count in (1..controls.len()).rev() {
+            for i in 0..count {
+                points[i] = Point::from_xy(
+                    points[i].x * (1.0 - t) + points[i + 1].x * t,
+                    points[i].y * (1.0 - t) + points[i + 1].y * t,
+                );
+            }
+        }
+        project_point(points[0], matrix)
+    };
+    let start = sample(t0)?;
+    let end = sample(t1)?;
+    let mut flat = true;
+    for fraction in [0.25, 0.5, 0.75] {
+        let point = sample(t0 + (t1 - t0) * fraction)?;
+        let dx = point.x - (start.x + (end.x - start.x) * fraction);
+        let dy = point.y - (start.y + (end.y - start.y) * fraction);
+        flat &= dx * dx + dy * dy <= 0.0625; // quarter device pixel
+    }
+    if flat || depth >= 12 {
+        builder.line_to(end.x, end.y);
+    } else {
+        let mid = (t0 + t1) * 0.5;
+        project_curve(builder, controls, matrix, t0, mid, depth + 1)?;
+        project_curve(builder, controls, matrix, mid, t1, depth + 1)?;
+    }
+    Some(())
+}
+
+fn draw_svg_coverage(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    path: &Path,
+    paint: &SvgResolvedPaint,
+    inverse: AffineTransform,
+    clip_state: &ClipState,
+) {
+    let bounds = path.bounds();
+    let Some(bounds) = (ClipRect {
+        x0: bounds.left(),
+        y0: bounds.top(),
+        x1: bounds.right(),
+        y1: bounds.bottom(),
+    })
+    .intersect(clip_state.coarse) else {
+        return;
+    };
+    let Some((x0, y0, x1, y1)) = clip_pixel_bounds(bounds, width, height) else {
+        return;
+    };
+    let rows = current_render_buffer_rows();
+    let y0 = y0.max(rows.start.min(height) as i32);
+    let y1 = y1.min(rows.end.min(height) as i32);
+    if y0 >= y1 {
+        return;
+    }
+    COVERAGE_TILE.with_borrow_mut(|tile| {
+        let tile = tile.get_or_insert_with(|| {
+            Mask::new(COVERAGE_TILE_SIZE as u32, COVERAGE_TILE_SIZE as u32)
+                .expect("fixed SVG coverage tile dimensions are valid")
+        });
+        // Anchor tiles to device coordinates so dirty clips and worker bands
+        // rasterize identical edges, independent of where their slice starts.
+        let tile_size = COVERAGE_TILE_SIZE as i32;
+        for tile_y in ((y0 / tile_size) * tile_size..y1).step_by(COVERAGE_TILE_SIZE) {
+            let end_y = (tile_y + COVERAGE_TILE_SIZE as i32).min(y1);
+            for tile_x in ((x0 / tile_size) * tile_size..x1).step_by(COVERAGE_TILE_SIZE) {
+                let end_x = (tile_x + COVERAGE_TILE_SIZE as i32).min(x1);
+                tile.clear();
+                tile.fill_path(
+                    path,
+                    FillRule::Winding,
+                    true,
+                    Transform::from_translate(-(tile_x as f32), -(tile_y as f32)),
+                );
+                let tile_layout = LayoutBox::new(
+                    tile_x.max(x0) as f32,
+                    tile_y.max(y0) as f32,
+                    (end_x - tile_x.max(x0)) as f32,
+                    (end_y - tile_y.max(y0)) as f32,
+                );
+                let unclipped = clip_state.coarse.contains_rect(ClipRect {
+                    x0: tile_layout.x,
+                    y0: tile_layout.y,
+                    x1: end_x as f32,
+                    y1: end_y as f32,
+                }) && clip_state.is_unclipped_by_regions(tile_layout);
+                for y in tile_y.max(y0)..end_y {
+                    let local_row = (y as usize - rows.start) * width;
+                    let mask_row = (y - tile_y) as usize * COVERAGE_TILE_SIZE;
+                    for x in tile_x.max(x0)..end_x {
+                        let coverage = tile.data()[mask_row + (x - tile_x) as usize];
+                        if coverage == 0 {
+                            continue;
+                        }
+                        let clip_coverage = if unclipped {
+                            1.0
+                        } else {
+                            CLIP_COVERAGE_SAMPLES
+                                .iter()
+                                .filter(|&&(sx, sy)| {
+                                    clip_state.contains(x as f32 + sx, y as f32 + sy)
+                                })
+                                .count() as f32
+                                / CLIP_COVERAGE_SAMPLES.len() as f32
+                        };
+                        if clip_coverage == 0.0 {
+                            continue;
+                        }
+                        let color = match paint {
+                            SvgResolvedPaint::Color(color) => *color,
+                            SvgResolvedPaint::LinearGradient(_) => {
+                                let (sx, sy) =
+                                    inverse.transform_point(x as f32 + 0.5, y as f32 + 0.5);
+                                if !sx.is_finite() || !sy.is_finite() {
+                                    continue;
+                                }
+                                paint.sample(sx, sy)
+                            }
+                        };
+                        blend_linear_over(
+                            buffer,
+                            local_row + x as usize,
+                            with_coverage(color, f32::from(coverage) / 255.0 * clip_coverage),
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn resolve_svg_paint_source(
@@ -329,106 +509,6 @@ fn with_coverage(color: LinearRgba, coverage: f32) -> LinearRgba {
         a: (color.a * coverage).clamp(0.0, 1.0),
         ..color
     }
-}
-
-fn point_in_svg_fill(geometry: &SvgPathGeometry, x: f32, y: f32) -> bool {
-    let Some(bounds) = geometry.bounds else {
-        return false;
-    };
-    if x < bounds.min_x || x > bounds.max_x || y < bounds.min_y || y > bounds.max_y {
-        return false;
-    }
-
-    let point = SvgPoint::new(x, y);
-    let mut winding = 0_i32;
-    for contour in &geometry.contours {
-        if contour.points.len() < 2 {
-            continue;
-        }
-
-        for segment_index in 0..contour.points.len() {
-            let start = contour.points[segment_index];
-            let end = if segment_index + 1 < contour.points.len() {
-                contour.points[segment_index + 1]
-            } else {
-                contour.points[0]
-            };
-            if point_segment_distance_sq(point, start, end) <= 1e-4 {
-                return true;
-            }
-            if start.y <= y {
-                if end.y > y && is_left(start, end, point) > 0.0 {
-                    winding += 1;
-                }
-            } else if end.y <= y && is_left(start, end, point) < 0.0 {
-                winding -= 1;
-            }
-        }
-    }
-
-    winding != 0
-}
-
-fn point_in_svg_stroke(geometry: &SvgPathGeometry, x: f32, y: f32, half_width: f32) -> bool {
-    if half_width <= f32::EPSILON {
-        return false;
-    }
-
-    let Some(bounds) = geometry.bounds else {
-        return false;
-    };
-    let bounds = bounds.expand(half_width);
-    if x < bounds.min_x || x > bounds.max_x || y < bounds.min_y || y > bounds.max_y {
-        return false;
-    }
-
-    let threshold_sq = half_width * half_width;
-    let point = SvgPoint::new(x, y);
-    for contour in &geometry.contours {
-        if contour.points.len() < 2 {
-            continue;
-        }
-
-        for segment_index in 0..(contour.points.len() - 1) {
-            let start = contour.points[segment_index];
-            let end = contour.points[segment_index + 1];
-            if point_segment_distance_sq(point, start, end) <= threshold_sq {
-                return true;
-            }
-        }
-        if contour.closed {
-            let start = contour.points[contour.points.len() - 1];
-            let end = contour.points[0];
-            if point_segment_distance_sq(point, start, end) <= threshold_sq {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn is_left(start: SvgPoint, end: SvgPoint, point: SvgPoint) -> f32 {
-    (end.x - start.x) * (point.y - start.y) - (point.x - start.x) * (end.y - start.y)
-}
-
-fn point_segment_distance_sq(point: SvgPoint, start: SvgPoint, end: SvgPoint) -> f32 {
-    let dx = end.x - start.x;
-    let dy = end.y - start.y;
-    let length_sq = dx * dx + dy * dy;
-    if length_sq <= f32::EPSILON {
-        let px = point.x - start.x;
-        let py = point.y - start.y;
-        return px * px + py * py;
-    }
-
-    let t = (((point.x - start.x) * dx) + ((point.y - start.y) * dy)) / length_sq;
-    let t = t.clamp(0.0, 1.0);
-    let nearest_x = start.x + dx * t;
-    let nearest_y = start.y + dy * t;
-    let offset_x = point.x - nearest_x;
-    let offset_y = point.y - nearest_y;
-    offset_x * offset_x + offset_y * offset_y
 }
 
 #[cfg(test)]
@@ -585,6 +665,352 @@ mod tests {
             "right stroke sample should be green-dominant: {right:?}"
         );
         assert_eq!(buffer[2 * 10 + 5], pack_rgb(Color::WHITE));
+    }
+
+    fn polygon(points: &[(f32, f32)], closed: bool) -> SvgContour {
+        SvgContour {
+            points: points.iter().map(|&(x, y)| SvgPoint::new(x, y)).collect(),
+            closed,
+        }
+    }
+
+    fn test_scene(contours: Vec<SvgContour>, paint: SvgPathPaint, size: f32) -> SvgScene {
+        SvgScene::new(
+            SvgViewBox::new(0.0, 0.0, size, size),
+            vec![SvgPathInstance {
+                geometry: SvgPathGeometry::new(contours),
+                paint,
+            }],
+        )
+    }
+
+    #[test]
+    fn svg_nonzero_winding_preserves_holes_and_closes_open_fills() {
+        let scene = test_scene(
+            vec![
+                polygon(&[(2.0, 2.0), (22.0, 2.0), (22.0, 22.0), (2.0, 22.0)], false),
+                polygon(&[(8.0, 8.0), (8.0, 16.0), (16.0, 16.0), (16.0, 8.0)], true),
+            ],
+            SvgPathPaint::default(),
+            24.0,
+        );
+        let mut buffer = vec![pack_rgb(Color::WHITE); 24 * 24];
+        super::draw_svg_scene(
+            &mut buffer,
+            24,
+            24,
+            LayoutBox::new(0.0, 0.0, 24.0, 24.0),
+            &scene,
+            super::ClipRect::full(24.0, 24.0),
+        );
+        assert_eq!(buffer[5 * 24 + 5], pack_rgb(Color::BLACK));
+        assert_eq!(buffer[12 * 24 + 12], pack_rgb(Color::WHITE));
+        assert_eq!(buffer[12 * 24 + 2], pack_rgb(Color::BLACK));
+    }
+
+    #[test]
+    fn svg_open_strokes_have_round_caps_without_a_closing_segment() {
+        let scene = test_scene(
+            vec![polygon(&[(6.0, 6.0), (18.0, 6.0), (18.0, 18.0)], false)],
+            SvgPathPaint {
+                fill: None,
+                stroke: Some(SvgPathPaintSource::Color(Color::BLACK)),
+                stroke_width: 4.0,
+            },
+            24.0,
+        );
+        let mut buffer = vec![pack_rgb(Color::WHITE); 24 * 24];
+        super::draw_svg_scene(
+            &mut buffer,
+            24,
+            24,
+            LayoutBox::new(0.0, 0.0, 24.0, 24.0),
+            &scene,
+            super::ClipRect::full(24.0, 24.0),
+        );
+        assert_eq!(buffer[6 * 24 + 5], pack_rgb(Color::BLACK));
+        assert_eq!(buffer[18 * 24 + 18], pack_rgb(Color::BLACK));
+        assert_eq!(buffer[12 * 24 + 12], pack_rgb(Color::WHITE));
+    }
+
+    #[test]
+    fn svg_tiled_coverage_matches_one_mask_without_seams_or_stale_pixels() {
+        let (width, height) = (600, 360);
+        let mut actual = vec![pack_rgb(Color::WHITE); width * height];
+        let mut expected = actual.clone();
+        // The second path also checks that tile reuse clears previous coverage.
+        for (contour, color) in [
+            (
+                polygon(
+                    &[(1.2, 2.7), (598.8, 2.7), (598.8, 355.8), (1.2, 355.8)],
+                    true,
+                ),
+                Color::rgba(10, 40, 200, 180),
+            ),
+            (
+                polygon(
+                    &[(250.3, 12.8), (275.9, 12.8), (275.9, 300.1), (250.3, 300.1)],
+                    true,
+                ),
+                Color::rgba(200, 30, 10, 120),
+            ),
+        ] {
+            let source = super::build_svg_path(&SvgPathGeometry::new(vec![contour])).unwrap();
+            let paint = super::SvgResolvedPaint::Color(color.to_linear_rgba());
+            super::draw_svg_coverage(
+                &mut actual,
+                width,
+                height,
+                &source,
+                &paint,
+                super::AffineTransform::IDENTITY,
+                &super::ClipState::new(super::ClipRect::full(width as f32, height as f32)),
+            );
+            let mut reference = tiny_skia::Mask::new(width as u32, height as u32).unwrap();
+            reference.fill_path(
+                &source,
+                tiny_skia::FillRule::Winding,
+                true,
+                tiny_skia::Transform::identity(),
+            );
+            for (index, &coverage) in reference.data().iter().enumerate() {
+                if coverage > 0 {
+                    super::blend_linear_over(
+                        &mut expected,
+                        index,
+                        super::with_coverage(color.to_linear_rgba(), f32::from(coverage) / 255.0),
+                    );
+                }
+            }
+        }
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                actual,
+                expected,
+                "at ({}, {})",
+                index % width,
+                index / width
+            );
+        }
+    }
+
+    #[test]
+    fn svg_worker_rows_and_dirty_clip_match_full_paint() {
+        let scene = test_scene(
+            vec![polygon(&[(1.2, 2.7), (598.8, 350.4), (12.3, 355.8)], true)],
+            SvgPathPaint {
+                fill: Some(SvgPathPaintSource::Color(Color::BLACK)),
+                stroke: Some(SvgPathPaintSource::Color(Color::rgba(200, 40, 10, 120))),
+                stroke_width: 3.0,
+            },
+            600.0,
+        );
+        let layout = LayoutBox::new(0.0, 0.0, 600.0, 600.0);
+        let mut full = vec![pack_rgb(Color::WHITE); 600 * 360];
+        super::draw_svg_scene(
+            &mut full,
+            600,
+            360,
+            layout,
+            &scene,
+            super::ClipRect::full(600.0, 360.0),
+        );
+        let mut band = vec![pack_rgb(Color::WHITE); 600 * 20];
+        super::super::with_render_buffer_rows(super::super::BufferRows::new(250, 270), || {
+            super::draw_svg_scene(
+                &mut band,
+                600,
+                360,
+                layout,
+                &scene,
+                super::ClipRect {
+                    x0: 200.0,
+                    y0: 255.0,
+                    x1: 350.0,
+                    y1: 265.0,
+                },
+            );
+        });
+        for y in 250..270 {
+            for x in 0..600 {
+                let expected = if (200..350).contains(&x) && (255..265).contains(&y) {
+                    full[y * 600 + x]
+                } else {
+                    pack_rgb(Color::WHITE)
+                };
+                assert_eq!(band[(y - 250) * 600 + x], expected, "at ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn svg_nonuniform_transform_scales_stroke_outline_before_rasterization() {
+        let scene = test_scene(
+            vec![polygon(&[(4.0, 2.0), (4.0, 8.0)], false)],
+            SvgPathPaint {
+                fill: None,
+                stroke: Some(SvgPathPaintSource::Color(Color::BLACK)),
+                stroke_width: 2.0,
+            },
+            10.0,
+        );
+        let mut buffer = vec![pack_rgb(Color::WHITE); 40 * 40];
+        super::draw_svg_scene_transformed(
+            &mut buffer,
+            40,
+            40,
+            LayoutBox::new(0.0, 0.0, 10.0, 10.0),
+            &scene,
+            super::AffineTransform {
+                a: 3.0,
+                d: 2.0,
+                e: 5.0,
+                f: 3.0,
+                ..super::AffineTransform::IDENTITY
+            },
+            &super::ClipState::new(super::ClipRect::full(40.0, 40.0)),
+        );
+        assert_eq!(buffer[12 * 40 + 14], pack_rgb(Color::BLACK));
+        assert_eq!(buffer[12 * 40 + 19], pack_rgb(Color::BLACK));
+        assert_eq!(buffer[12 * 40 + 13], pack_rgb(Color::WHITE));
+        assert_eq!(buffer[12 * 40 + 20], pack_rgb(Color::WHITE));
+    }
+
+    #[test]
+    fn svg_perspective_and_rounded_clip_keep_fill_and_stroke_visible() {
+        let scene = test_scene(
+            vec![polygon(
+                &[(4.0, 4.0), (28.0, 4.0), (28.0, 28.0), (4.0, 28.0)],
+                true,
+            )],
+            SvgPathPaint {
+                fill: Some(SvgPathPaintSource::Color(Color::rgb(200, 20, 10))),
+                stroke: Some(SvgPathPaintSource::Color(Color::BLACK)),
+                stroke_width: 3.0,
+            },
+            32.0,
+        );
+        let mut buffer = vec![pack_rgb(Color::WHITE); 32 * 32];
+        let clip = super::ClipState::new(super::ClipRect::full(32.0, 32.0))
+            .push_layout_clip(
+                LayoutBox::new(0.0, 0.0, 32.0, 32.0),
+                cssimpler_core::CornerRadius::all(12.0),
+                super::AffineTransform::IDENTITY,
+            )
+            .unwrap();
+        super::draw_svg_scene_transformed(
+            &mut buffer,
+            32,
+            32,
+            LayoutBox::new(0.0, 0.0, 32.0, 32.0),
+            &scene,
+            super::AffineTransform {
+                g: 0.01,
+                ..super::AffineTransform::IDENTITY
+            },
+            &clip,
+        );
+        assert_eq!(buffer[12 * 32 + 12], pack_rgb(Color::rgb(200, 20, 10)));
+        assert_eq!(buffer[12 * 32 + 3], pack_rgb(Color::BLACK));
+        assert_eq!(buffer[2 * 32 + 2], pack_rgb(Color::WHITE));
+        assert_eq!(buffer[12 * 32 + 26], pack_rgb(Color::WHITE));
+    }
+
+    #[test]
+    fn svg_translucency_retains_linear_blending_and_separate_alpha_target() {
+        let color = Color::rgba(240, 10, 50, 128);
+        let scene = test_scene(
+            vec![polygon(
+                &[(1.0, 1.0), (7.0, 1.0), (7.0, 7.0), (1.0, 7.0)],
+                true,
+            )],
+            SvgPathPaint {
+                fill: Some(SvgPathPaintSource::Color(color)),
+                stroke: None,
+                stroke_width: 0.0,
+            },
+            8.0,
+        );
+        let mut buffer = vec![0; 64];
+        let mut alpha = vec![0; 64];
+        super::super::with_render_alpha_target(Some(&mut alpha), || {
+            super::draw_svg_scene(
+                &mut buffer,
+                8,
+                8,
+                LayoutBox::new(0.0, 0.0, 8.0, 8.0),
+                &scene,
+                super::ClipRect::full(8.0, 8.0),
+            );
+        });
+        assert_eq!(alpha[4 * 8 + 4], 128);
+        assert_eq!(unpack_rgb(buffer[4 * 8 + 4]), Color::rgb(240, 10, 50));
+        assert_eq!(alpha[0], 0);
+        let mut opaque = vec![pack_rgb(Color::WHITE); 64];
+        super::draw_svg_scene(
+            &mut opaque,
+            8,
+            8,
+            LayoutBox::new(0.0, 0.0, 8.0, 8.0),
+            &scene,
+            super::ClipRect::full(8.0, 8.0),
+        );
+        let blended = unpack_rgb(opaque[4 * 8 + 4]);
+        // Linear-light blending is much brighter than an sRGB byte average.
+        assert!(blended.g > 180 && blended.b > 180, "{blended:?}");
+    }
+
+    #[test]
+    fn svg_parallel_repaint_matches_serial_color_and_alpha() {
+        let mut svg = test_scene(
+            vec![polygon(&[(3.2, 2.7), (598.8, 350.4), (12.3, 355.8)], true)],
+            SvgPathPaint {
+                fill: Some(paint_server_ref("paint")),
+                stroke: Some(SvgPathPaintSource::Color(Color::rgba(10, 40, 200, 170))),
+                stroke_width: 3.5,
+            },
+            600.0,
+        );
+        svg.paint_servers.push(horizontal_gradient_server(
+            "paint",
+            Color::rgba(240, 30, 10, 100),
+            Color::rgba(10, 30, 240, 200),
+        ));
+        let scene = vec![RenderNode::svg(LayoutBox::new(0.0, 0.0, 600.0, 600.0), svg)];
+        let bounds = super::super::cache_scene_subtree_bounds(&scene);
+        let mut serial = vec![0; 600 * 360];
+        let mut parallel = serial.clone();
+        let mut serial_alpha = vec![0; serial.len()];
+        let mut parallel_alpha = serial_alpha.clone();
+        super::super::render_to_buffer_serial(
+            &scene,
+            &bounds.roots,
+            &mut serial,
+            600,
+            360,
+            Color::rgba(0, 0, 0, 0),
+            super::super::GlassRenderMode::Fallback,
+            Some(&mut serial_alpha),
+        );
+        super::super::render_to_buffer_parallel(
+            &scene,
+            &bounds,
+            &mut parallel,
+            600,
+            360,
+            Color::rgba(0, 0, 0, 0),
+            4,
+            super::super::GlassRenderMode::Fallback,
+            Some(&mut parallel_alpha),
+        );
+        assert!(
+            serial.iter().zip(&parallel).all(|(a, b)| a == b),
+            "serial and parallel colors differ"
+        );
+        assert!(
+            serial_alpha == parallel_alpha,
+            "serial and parallel alpha differ"
+        );
     }
 
     fn horizontal_gradient_server(id: &str, start: Color, end: Color) -> SvgPaintServer {

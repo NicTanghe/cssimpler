@@ -767,6 +767,9 @@ impl ZIndex {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisualStyle {
+    /// Request a reusable raster layer for this subtree. Defaults to false.
+    /// Layers share the renderer cache budget and create a stacking context.
+    pub cache_layer: bool,
     pub background: Option<Color>,
     pub background_layers: Vec<BackgroundLayer>,
     pub raster_background: images::RasterBackground,
@@ -796,6 +799,7 @@ pub struct VisualStyle {
 impl Default for VisualStyle {
     fn default() -> Self {
         Self {
+            cache_layer: false,
             background: None,
             background_layers: Vec::new(),
             raster_background: images::RasterBackground::default(),
@@ -937,6 +941,13 @@ impl RenderNode {
 
     pub fn with_style(mut self, style: VisualStyle) -> Self {
         self.style = style;
+        self
+    }
+
+    /// Cache this subtree's pixels when eligible and within the renderer budget.
+    /// Keep frequently changing overlays outside the cached subtree.
+    pub fn with_cached_layer(mut self, enabled: bool) -> Self {
+        self.style.cache_layer = enabled;
         self
     }
 

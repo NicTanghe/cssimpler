@@ -14,6 +14,8 @@ Current focus:
 
 The workspace now has the foundations through rendering, typography and font resolution, interaction, scoped invalidation, and renderer-side dirty-region diffing in place.
 
+- [CPU 2D rendering and cached layers](./svg-rendering.md) — tiny-skia SVG coverage, opt-in board caches, memory budgets, overlays, and a headless benchmark.
+
 ## Planned extensions
 
 - [Native GPU and USD viewport specsheet](./native-gpu-viewport-specsheet.md) — optional native `wgpu` surfaces and USD scene representation; implementation in progress.

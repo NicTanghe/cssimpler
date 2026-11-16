@@ -234,6 +234,13 @@ impl ElementNode {
         self
     }
 
+    /// Request a bounded renderer raster cache for this element's subtree.
+    /// Content/style changes invalidate it automatically; overlays should be siblings.
+    pub fn with_cached_layer(mut self, enabled: bool) -> Self {
+        self.style.visual.cache_layer = enabled;
+        self
+    }
+
     pub fn with_child(mut self, child: Node) -> Self {
         self.children.push(child);
         self

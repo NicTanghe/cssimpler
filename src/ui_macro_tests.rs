@@ -233,3 +233,16 @@ fn changing_handler_kind_replaces_the_previous_handler() {
     replaced.handlers.click().unwrap()();
     assert_eq!(count.load(Ordering::Relaxed), 2);
 }
+
+#[test]
+fn cached_layer_request_reaches_the_render_tree_without_inheriting_to_children() {
+    let tree = Node::element("div")
+        .with_cached_layer(true)
+        .with_child(Node::element("div").with_child(Node::text("board")).into())
+        .into();
+    let rendered =
+        cssimpler_style::build_render_tree(&tree, &cssimpler_style::Stylesheet::default());
+    assert!(rendered.style.cache_layer);
+    assert!(cssimpler_core::establishes_stacking_context(&rendered));
+    assert!(!rendered.children[0].style.cache_layer);
+}

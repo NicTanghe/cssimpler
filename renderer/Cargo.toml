@@ -13,6 +13,8 @@ cssimpler-core.workspace = true
 font8x8.workspace = true
 softbuffer.workspace = true
 winit.workspace = true
+# Only path rasterization; image decoding/PNG support is not needed.
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 wgpu = { version = "30.0", optional = true }
 pollster = { version = "0.4", optional = true }
 openusd = { version = "0.8", optional = true }
