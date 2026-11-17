@@ -256,7 +256,10 @@ pub(crate) fn cached_shadow_mask(
             break;
         }
 
-        in_flight = state.condvar.wait(in_flight).unwrap_or_else(|p| p.into_inner());
+        in_flight = state
+            .condvar
+            .wait(in_flight)
+            .unwrap_or_else(|p| p.into_inner());
     }
     drop(in_flight);
 

@@ -17,15 +17,10 @@ fn main() -> Result<()> {
         shared::start_baseline_harness(&mut state);
     }
 
-    FragmentApp::new(
-        state,
-        stylesheet(),
-        update,
-        fragments(),
-    )
-    .with_continuous_updates(true)
-    .run(config)
-    .map_err(Into::into)
+    FragmentApp::new(state, stylesheet(), update, fragments())
+        .with_continuous_updates(true)
+        .run(config)
+        .map_err(Into::into)
 }
 
 fn update(state: &mut shared::EffectStressState, frame: FrameInfo) -> Refresh {

@@ -3834,7 +3834,9 @@ mod tests {
             .with_child(Node::element("div").with_class("tall").into())
             .into();
         let scene = build_render_tree(&tree, &stylesheet);
-        let scrollbars = scene.scrollbars.expect("scrollbars should be attached for overflowing content");
+        let scrollbars = scene
+            .scrollbars
+            .expect("scrollbars should be attached for overflowing content");
 
         assert!(scrollbars.shows_vertical());
         assert_eq!(scrollbars.metrics.reserved_width, 8.0);

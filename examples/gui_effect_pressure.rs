@@ -1,5 +1,5 @@
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -51,7 +51,6 @@ const BASELINE_PASSES_PER_TILE: usize = DEFAULT_PASSES_PER_TILE + SPIKE_PASS_STE
 const BASELINE_ANIMATED_TILE_WINDOW: usize = DEFAULT_ANIMATED_TILE_WINDOW + 1;
 const BASELINE_WARMUP_FRAMES: u32 = 30;
 const BASELINE_SAMPLE_FRAMES: u32 = 120;
-
 
 #[derive(Clone, Debug)]
 pub struct EffectStressState {
@@ -790,7 +789,11 @@ fn stat_chip(label: impl Into<String>, value: impl Into<String>) -> Node {
     }
 }
 
-fn control_button(label: &'static str, handler: impl Fn() + Send + Sync + 'static, active: bool) -> Node {
+fn control_button(
+    label: &'static str,
+    handler: impl Fn() + Send + Sync + 'static,
+    active: bool,
+) -> Node {
     let button = ui! {
         <button class="control-button" type="button" onclick_shared={handler}>
             {label}
@@ -1094,7 +1097,9 @@ fn fragment_tile_position_class(tile_index: usize) -> &'static str {
 
 fn queue_action(actions: &Arc<AtomicU64>, action: u64) -> impl Fn() + Send + Sync + 'static {
     let actions = Arc::clone(actions);
-    move || { actions.fetch_or(action, Ordering::Relaxed); }
+    move || {
+        actions.fetch_or(action, Ordering::Relaxed);
+    }
 }
 
 pub fn stylesheet() -> &'static Stylesheet {
