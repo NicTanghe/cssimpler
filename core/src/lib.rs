@@ -25,9 +25,11 @@ pub mod scrollbar;
 pub mod stacking;
 pub mod svg;
 pub mod vector;
+pub mod vector_builder;
 pub use vector::{
     PathCommand, VectorError, VectorPaint, VectorPath, VectorPoint, VectorScene, VectorViewBox,
 };
+pub use vector_builder::VectorPathBuilder;
 pub mod transitions;
 
 use crate::fonts::{PreparedTextLayout, TextStyle};
