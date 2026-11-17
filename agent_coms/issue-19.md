@@ -133,3 +133,4 @@ view changes allocate nothing; uncached paint still dominates.
   cache-invalidation assertion: 10 passed, 0 failed.
 - Interactive `--interactive` window path compiled but not run (no display in
   this environment); headless demo and tests cover the behavior.
+- Follow-up commit `a4d9de8` rejects finite coordinate inputs whose f32 viewport mapping overflows to infinity (returns `None`).
