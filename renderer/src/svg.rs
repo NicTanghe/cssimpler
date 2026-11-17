@@ -1,4 +1,101 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
+
+use super::VectorFrameStats;
+
+static TIMING_REQUESTED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static COLLECTING: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) fn is_collecting() -> bool {
+    COLLECTING.with(Cell::get)
+}
+
+pub(super) fn with_collecting<R>(active: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COLLECTING.with(|value| value.set(self.0));
+        }
+    }
+    let previous = COLLECTING.with(|value| value.replace(active));
+    let _restore = Restore(previous);
+    f()
+}
+static TIMING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static LAYER_HITS: AtomicUsize = AtomicUsize::new(0);
+static LAYER_MISSES: AtomicUsize = AtomicUsize::new(0);
+static PATHS: AtomicUsize = AtomicUsize::new(0);
+static BUILD_US: AtomicU64 = AtomicU64::new(0);
+static STROKE_US: AtomicU64 = AtomicU64::new(0);
+static PROJECTION_US: AtomicU64 = AtomicU64::new(0);
+static COVERAGE_US: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn set_vector_timing_enabled(enabled: bool) {
+    TIMING_REQUESTED.store(enabled, Ordering::Relaxed);
+}
+
+pub(super) fn reset_frame_vector_stats() {
+    for counter in [&PATHS, &LAYER_HITS, &LAYER_MISSES] {
+        counter.store(0, Ordering::Relaxed);
+    }
+    for counter in [&BUILD_US, &STROKE_US, &PROJECTION_US, &COVERAGE_US] {
+        counter.store(0, Ordering::Relaxed);
+    }
+    TIMING_ACTIVE.store(TIMING_REQUESTED.load(Ordering::Relaxed), Ordering::Relaxed);
+    COLLECTING.with(|value| value.set(true));
+}
+
+pub(super) fn record_layer_lookup(hit: bool) {
+    if is_collecting() {
+        add(if hit { &LAYER_HITS } else { &LAYER_MISSES }, 1);
+    }
+}
+
+pub(super) fn frame_layer_lookups() -> (usize, usize) {
+    (
+        LAYER_HITS.load(Ordering::Relaxed),
+        LAYER_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+pub(super) fn take_frame_vector_stats() -> VectorFrameStats {
+    COLLECTING.with(|value| value.set(false));
+    VectorFrameStats {
+        paths_painted: PATHS.load(Ordering::Relaxed),
+        timings_enabled: TIMING_ACTIVE.load(Ordering::Relaxed),
+        path_build_work_us: usize::try_from(BUILD_US.load(Ordering::Relaxed) / 1_000)
+            .unwrap_or(usize::MAX),
+        stroke_work_us: usize::try_from(STROKE_US.load(Ordering::Relaxed) / 1_000)
+            .unwrap_or(usize::MAX),
+        projection_work_us: usize::try_from(PROJECTION_US.load(Ordering::Relaxed) / 1_000)
+            .unwrap_or(usize::MAX),
+        coverage_work_us: usize::try_from(COVERAGE_US.load(Ordering::Relaxed) / 1_000)
+            .unwrap_or(usize::MAX),
+    }
+}
+
+#[allow(deprecated)] // fetch_update is available on older supported toolchains.
+fn add(counter: &AtomicUsize, value: usize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(old.saturating_add(value))
+    });
+}
+
+#[allow(deprecated)]
+fn add_time(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(old.saturating_add(value))
+    });
+}
+
+fn elapsed_ns(start: Option<Instant>) -> u64 {
+    start
+        .map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
 
 use tiny_skia::{
     FillRule, LineCap, LineJoin, Mask, Path, PathBuilder, PathSegment, Point, Stroke, Transform,
@@ -109,6 +206,11 @@ fn draw_svg_scene_with_matrix(
     let Some(inverse) = matrix.invert() else {
         return;
     };
+    let collecting = is_collecting();
+    let timed = collecting && TIMING_ACTIVE.load(Ordering::Relaxed);
+    let mut paths_painted = 0usize;
+    let (mut build_ns, mut stroke_ns, mut projection_ns, mut coverage_ns) =
+        (0u64, 0u64, 0u64, 0u64);
     for path in &scene.paths {
         let Some(source_bounds) = path.bounds() else {
             continue;
@@ -131,12 +233,20 @@ fn draw_svg_scene_with_matrix(
         if fill.is_none() && stroke.is_none() {
             continue;
         }
-        let Some(source_path) = build_svg_path(&path.geometry) else {
+        paths_painted = paths_painted.saturating_add(1);
+        let start = timed.then(Instant::now);
+        let source_path = build_svg_path(&path.geometry);
+        build_ns = build_ns.saturating_add(elapsed_ns(start));
+        let Some(source_path) = source_path else {
             continue;
         };
-        if let Some(fill) = fill
-            && let Some(screen_path) = project_svg_path(&source_path, matrix)
-        {
+        let start = (timed && fill.is_some()).then(Instant::now);
+        let fill_path = fill
+            .as_ref()
+            .and_then(|_| project_svg_path(&source_path, matrix));
+        projection_ns = projection_ns.saturating_add(elapsed_ns(start));
+        if let (Some(fill), Some(screen_path)) = (fill, fill_path) {
+            let start = timed.then(Instant::now);
             draw_svg_coverage(
                 buffer,
                 width,
@@ -146,6 +256,7 @@ fn draw_svg_scene_with_matrix(
                 inverse,
                 clip_state,
             );
+            coverage_ns = coverage_ns.saturating_add(elapsed_ns(start));
         }
         if let Some(stroke) = stroke {
             // The previous distance-to-segment rasterizer used round caps and joins.
@@ -159,9 +270,14 @@ fn draw_svg_scene_with_matrix(
             let resolution_scale = (matrix.a.abs() + matrix.b.abs())
                 .max(matrix.c.abs() + matrix.d.abs())
                 .max(1.0);
-            if let Some(outline) = source_path.stroke(&stroke_style, resolution_scale)
-                && let Some(screen_path) = project_svg_path(&outline, matrix)
-            {
+            let start = timed.then(Instant::now);
+            let outline = source_path.stroke(&stroke_style, resolution_scale);
+            stroke_ns = stroke_ns.saturating_add(elapsed_ns(start));
+            let start = (timed && outline.is_some()).then(Instant::now);
+            let screen_path = outline.and_then(|outline| project_svg_path(&outline, matrix));
+            projection_ns = projection_ns.saturating_add(elapsed_ns(start));
+            if let Some(screen_path) = screen_path {
+                let start = timed.then(Instant::now);
                 draw_svg_coverage(
                     buffer,
                     width,
@@ -171,8 +287,18 @@ fn draw_svg_scene_with_matrix(
                     inverse,
                     clip_state,
                 );
+                coverage_ns = coverage_ns.saturating_add(elapsed_ns(start));
             }
         }
+    }
+    if collecting {
+        add(&PATHS, paths_painted);
+    }
+    if timed {
+        add_time(&BUILD_US, build_ns);
+        add_time(&STROKE_US, stroke_ns);
+        add_time(&PROJECTION_US, projection_ns);
+        add_time(&COVERAGE_US, coverage_ns);
     }
 }
 
@@ -538,6 +664,139 @@ mod tests {
     };
 
     use super::super::{pack_rgb, render_to_buffer, unpack_rgb};
+
+    #[test]
+    fn vector_counters_aggregate_workers_and_saturate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let counter = &counter;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        super::add(counter, 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(counter.load(Ordering::Relaxed), 4000);
+        super::add(&counter, usize::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+        let duration = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+        super::add_time(&duration, 2);
+        assert_eq!(duration.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn vector_scope_follows_jobs_and_restores_worker_state() {
+        let pool = super::super::WorkerPool::new(3);
+        super::with_collecting(true, || {
+            pool.scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| assert!(super::is_collecting()));
+                }
+            });
+            std::thread::scope(|scope| {
+                scope.spawn(|| assert!(!super::is_collecting()));
+            });
+        });
+        assert!(!super::is_collecting());
+        pool.scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| assert!(!super::is_collecting()));
+            }
+        });
+    }
+
+    // Run alone: manipulates the same process-wide diagnostics as window rendering.
+    #[test]
+    #[ignore = "manual instrumentation overhead measurement"]
+    fn vector_timing_overhead() {
+        let scene = test_scene(
+            vec![polygon(
+                &[(2.0, 2.0), (22.0, 2.0), (22.0, 22.0), (2.0, 22.0)],
+                true,
+            )],
+            SvgPathPaint::default(),
+            24.0,
+        );
+        let mut buffer = vec![pack_rgb(Color::WHITE); 24 * 24];
+        let mut samples = [0u128; 2];
+        for (index, enabled) in [false, true].into_iter().enumerate() {
+            super::set_vector_timing_enabled(enabled);
+            super::reset_frame_vector_stats();
+            let start = std::time::Instant::now();
+            for _ in 0..3000 {
+                super::draw_svg_scene(
+                    &mut buffer,
+                    24,
+                    24,
+                    LayoutBox::new(0.0, 0.0, 24.0, 24.0),
+                    &scene,
+                    super::ClipRect::full(24.0, 24.0),
+                );
+            }
+            samples[index] = start.elapsed().as_micros();
+            let stats = super::take_frame_vector_stats();
+            assert_eq!(stats.paths_painted, 3000);
+            assert_eq!(stats.timings_enabled, enabled);
+            if !enabled {
+                assert_eq!(stats.coverage_work_us, 0);
+            }
+            super::reset_frame_vector_stats();
+            assert_eq!(super::take_frame_vector_stats().paths_painted, 0);
+        }
+        super::set_vector_timing_enabled(false);
+        super::reset_frame_vector_stats();
+        let pool = super::super::WorkerPool::new(3);
+        pool.scope(|scope| {
+            for _ in 0..4 {
+                let scene = &scene;
+                scope.spawn(move || {
+                    let mut pixels = vec![0; 24 * 24];
+                    for _ in 0..100 {
+                        super::draw_svg_scene(
+                            &mut pixels,
+                            24,
+                            24,
+                            LayoutBox::new(0.0, 0.0, 24.0, 24.0),
+                            scene,
+                            super::ClipRect::full(24.0, 24.0),
+                        );
+                    }
+                });
+            }
+        });
+        // A simultaneous independent render is not part of the frame.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut pixels = vec![0; 24 * 24];
+                super::draw_svg_scene(
+                    &mut pixels,
+                    24,
+                    24,
+                    LayoutBox::new(0.0, 0.0, 24.0, 24.0),
+                    &scene,
+                    super::ClipRect::full(24.0, 24.0),
+                );
+            });
+        });
+        assert_eq!(super::take_frame_vector_stats().paths_painted, 400);
+        super::reset_frame_vector_stats();
+        super::draw_svg_scene(
+            &mut buffer,
+            24,
+            24,
+            LayoutBox::new(100.0, 100.0, 24.0, 24.0),
+            &scene,
+            super::ClipRect::full(24.0, 24.0),
+        );
+        assert_eq!(super::take_frame_vector_stats().paths_painted, 0);
+        eprintln!(
+            "3000 small paints: disabled={}us enabled={}us",
+            samples[0], samples[1]
+        );
+    }
 
     #[test]
     fn svg_fill_renders_inside_the_mapped_view_box() {

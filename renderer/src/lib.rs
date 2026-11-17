@@ -140,8 +140,33 @@ pub enum FramePaintReason {
     IncrementalDamage,
 }
 
+/// Vector work in the most recently completed window frame. Durations are sums
+/// of elapsed durations measured in paint jobs; parallel jobs may overlap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VectorFrameStats {
+    /// Path paint attempts after coarse clipping, counted once per job/band.
+    pub paths_painted: usize,
+    /// Whether the detailed durations were enabled for this frame.
+    pub timings_enabled: bool,
+    pub path_build_work_us: usize,
+    pub stroke_work_us: usize,
+    pub projection_work_us: usize,
+    /// Coverage rasterization and color blending, including clipping.
+    pub coverage_work_us: usize,
+}
+
+/// Enable detailed per-path timers for subsequent window frames. Disabled by default.
+pub fn set_vector_timing_enabled(enabled: bool) {
+    svg::set_vector_timing_enabled(enabled);
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameTimingStats {
+    pub vector: VectorFrameStats,
+    /// Promoted raster layer lookups found on first lookup during this frame.
+    pub layer_cache_hits: usize,
+    /// First lookups that missed, including layers that could not be cached.
+    pub layer_cache_misses: usize,
     pub frame_index: u64,
     pub frame_delta_us: u64,
     pub update_us: u64,
@@ -343,7 +368,9 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     where
         F: FnOnce() + Send + 'scope,
     {
-        let boxed: BoxedRenderTask<'scope> = Box::new(task);
+        let collecting = svg::is_collecting();
+        let boxed: BoxedRenderTask<'scope> =
+            Box::new(move || svg::with_collecting(collecting, task));
         let static_task: BoxedRenderTask<'static> = unsafe { std::mem::transmute(boxed) };
         self.tasks
             .lock()
@@ -615,8 +642,11 @@ impl Default for LayerCacheLimits {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayerCacheStats {
+    /// Currently retained raster entries.
     pub entries: usize,
+    /// Bytes in currently retained raster entries.
     pub bytes: usize,
+    /// Cumulative successful raster builds since process start; clearing does not reset it.
     pub builds: usize,
 }
 
@@ -900,8 +930,10 @@ fn cached_promoted_surface(
             .write()
             .unwrap_or_else(|p| p.into_inner());
         if let Some(surface) = cached_subtree_surface_entry(&mut cache, key) {
+            svg::record_layer_lookup(true);
             return Some(surface);
         }
+        svg::record_layer_lookup(false);
     }
     let _build_guard = SUBTREE_SURFACE_BUILD_LOCK
         .lock()

@@ -283,3 +283,55 @@ Prefer constructors for public structs. Direct `ElementNode`/`RuntimeElementData
 struct literals now need `vector_scene: None`; direct `SvgPathGeometry` literals
 need `commands: Vec::new()` for existing flattened geometry. Nonempty commands
 have precedence over contours. Existing constructors and SVG markup keep working.
+
+### Frame diagnostics
+
+`latest_frame_timing_stats()` returns a fixed-size snapshot of the last completed
+window frame. Enable detailed vector timing with `set_vector_timing_enabled(true)`
+before drawing; it is off by default. For a runnable example, use
+`cargo run --example native_vector_paths -- --diagnostics` and close the window.
+The reported `vector` values cover both native vector and SVG paths, since they
+share a renderer. An idle last frame has zero work, so inspect a frame that
+actually repainted when investigating a slow drawing.
+
+`paint_us` is elapsed frame painting time; `present_us` is CPU-side presentation
+elapsed time, not GPU execution. Vector `path_build_work_us` covers conversion
+from renderer geometry into a tiny-skia path, `stroke_work_us` covers stroke
+outline construction, `projection_work_us` covers screen projection, and
+`coverage_work_us` covers coverage and color blending. They are sums of elapsed
+measurements across jobs, including scheduler interruptions, not CPU-clock
+measurements or frame wall times. They can exceed `paint_us` when jobs overlap.
+They exclude application geometry creation and scene preparation. Measurements
+are accumulated at nanosecond resolution and reported in whole microseconds.
+
+`paths_painted` counts path paint attempts with paint and bounds surviving
+coarse clipping, per paint job or worker band; it is not a count of unique paths
+or guaranteed visible pixels. Full redraw counts all such attempts; incremental
+redraw counts only visited damage bands, possibly more than once per path.
+Clipped, unpainted, and invalid-bound paths are excluded. Cached raster layers
+can avoid path painting, while layer construction may paint a subtree more than
+once. Idle frames report zero counts and timings. Changing the timing switch
+applies at the next painted frame; disabled detailed durations are zero.
+
+`layer_cache_hits` and `layer_cache_misses` count first promoted-layer lookups
+within that frame, including misses that cannot produce an eligible layer. A
+concurrent build may satisfy a miss on its second lookup. `layer_cache_stats()`
+reports currently retained raster entries and bytes, and cumulative successful
+builds since process start; clearing the cache does not reset builds. Repeated
+misses and rising builds on otherwise unchanged artwork suggest investigating
+invalidation or cache limits. These values describe raster layers, not a
+prepared-geometry cache, and collecting them never allocates raster layers.
+
+As with the existing latest-frame API, the published snapshot is process-wide.
+Frame render jobs inherit the collection scope and are joined before publication;
+unrelated concurrent headless renders do not contribute. The window event loop
+serializes window frames. Snapshots contain no per-path names or history;
+counters saturate instead of wrapping.
+
+A local unoptimized test of 3,000 small 24×24 filled paths measured 2.115 s
+with detailed timers disabled and 2.224 s enabled. A second run measured
+0.907 s disabled and 0.793 s enabled, showing substantial run-to-run noise
+and no reliable overhead estimate on this shared machine. This narrow debug
+workload is not a general performance claim; the opt-in switch keeps per-path
+clock reads out of normal painting. Reproduce with
+`cargo test -p cssimpler-renderer vector_timing_overhead --lib -- --ignored --test-threads=1 --nocapture`.

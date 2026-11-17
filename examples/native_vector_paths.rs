@@ -1,11 +1,15 @@
 //! Run with `cargo run --example native_vector_paths -- --export work/curves.svg`.
+//! Pass `--diagnostics` to print the last completed frame after the window closes.
 use cssimpler::{
     app::{App, Invalidation},
     core::{
         Color, Node, PathCommand::*, VectorPaint, VectorPath, VectorPoint as P, VectorScene,
         VectorViewBox,
     },
-    renderer::{FrameInfo, WindowConfig},
+    renderer::{
+        FrameInfo, WindowConfig, latest_frame_timing_stats, layer_cache_stats,
+        set_vector_timing_enabled,
+    },
     style::parse_stylesheet,
 };
 
@@ -52,8 +56,23 @@ fn main() -> anyhow::Result<()> {
         std::fs::write(&pair[1], scene.to_svg())?;
         return Ok(());
     }
+    let diagnostics = args.iter().any(|arg| arg == "--diagnostics");
+    set_vector_timing_enabled(diagnostics);
     let css = parse_stylesheet("#artwork { width: 400px; height: 300px; }")?;
-    App::new(scene, &css, update, view)
-        .run(WindowConfig::new("Native vector curves", 440, 340))
-        .map_err(Into::into)
+    App::new(scene, &css, update, view).run(WindowConfig::new("Native vector curves", 440, 340))?;
+    if diagnostics {
+        let frame = latest_frame_timing_stats();
+        let layers = layer_cache_stats();
+        eprintln!(
+            "last frame: {:?}, vector: {:?}, layer hits/misses: {}/{}, retained: {} entries / {} bytes, total builds: {}",
+            frame.paint_mode,
+            frame.vector,
+            frame.layer_cache_hits,
+            frame.layer_cache_misses,
+            layers.entries,
+            layers.bytes,
+            layers.builds
+        );
+    }
+    Ok(())
 }
