@@ -75,16 +75,10 @@ fn independent_instances_share_geometry_but_not_paint_or_view_box() {
     assert_ne!(filled.paint(), stroked.paint());
 
     // Two scenes reusing one drawing with different view boxes and paints.
-    let scene_a = VectorScene::new(
-        VectorViewBox::new(0., 0., 100., 100.),
-        vec![filled.clone()],
-    )
-    .unwrap();
-    let scene_b = VectorScene::new(
-        VectorViewBox::new(8., 8., 50., 50.),
-        vec![stroked.clone()],
-    )
-    .unwrap();
+    let scene_a =
+        VectorScene::new(VectorViewBox::new(0., 0., 100., 100.), vec![filled.clone()]).unwrap();
+    let scene_b =
+        VectorScene::new(VectorViewBox::new(8., 8., 50., 50.), vec![stroked.clone()]).unwrap();
     let mut render_a = scene_a.into_render_scene();
     let render_b = scene_b.into_render_scene();
     assert!(
@@ -128,8 +122,7 @@ fn independent_instances_share_geometry_but_not_paint_or_view_box() {
     // per path; only command storage is shared).
     render_a.paths[0].paint.fill = Some(SvgPathPaintSource::Color(Color::rgb(0, 255, 0)));
     assert_ne!(
-        render_a.paths[0].paint,
-        render_b.paths[0].paint,
+        render_a.paths[0].paint, render_b.paths[0].paint,
         "paint updates must stay per instance"
     );
     assert!(
@@ -159,7 +152,12 @@ fn runtime_paint_patch_and_geometry_replacement_track_identity() {
     let RenderKind::Svg(scene) = &rendered.kind else {
         panic!("expected native vector leaf")
     };
-    assert!(scene.paths[0].geometry.commands.shares_storage_with(&original));
+    assert!(
+        scene.paths[0]
+            .geometry
+            .commands
+            .shares_storage_with(&original)
+    );
 
     // Paint-only patch: geometry storage is retained, paint changes.
     let Node::Element(element) = &mut node else {
@@ -179,7 +177,12 @@ fn runtime_paint_patch_and_geometry_replacement_track_identity() {
     let RenderKind::Svg(scene) = &rendered.kind else {
         panic!("expected native vector leaf")
     };
-    assert!(scene.paths[0].geometry.commands.shares_storage_with(&original));
+    assert!(
+        scene.paths[0]
+            .geometry
+            .commands
+            .shares_storage_with(&original)
+    );
     assert_eq!(
         scene.paths[0].paint.fill,
         Some(SvgPathPaintSource::Color(Color::rgb(0, 0, 255)))
@@ -213,7 +216,12 @@ fn runtime_paint_patch_and_geometry_replacement_track_identity() {
             .commands
             .shares_storage_with(&replacement)
     );
-    assert!(!scene.paths[0].geometry.commands.shares_storage_with(&original));
+    assert!(
+        !scene.paths[0]
+            .geometry
+            .commands
+            .shares_storage_with(&original)
+    );
     let bounds = scene.paths[0].bounds().unwrap();
     assert_eq!((bounds.min_x, bounds.min_y), (40., 40.));
     assert_eq!((bounds.max_x, bounds.max_y), (60., 60.));
@@ -269,9 +277,7 @@ fn style_and_layout_rebuild_reuses_geometry() {
         "#art { width: 32px; height: 32px; transform: translate(4px, 2px); background: #102030; }",
     )
     .unwrap();
-    let node: Node = Node::vector(scene.clone())
-        .with_id("art")
-        .into();
+    let node: Node = Node::vector(scene.clone()).with_id("art").into();
     let render = build_render_tree_in_viewport(&node, &stylesheet, 64, 64);
     let RenderKind::Svg(rendered_scene) = &render.kind else {
         panic!("expected native vector leaf")

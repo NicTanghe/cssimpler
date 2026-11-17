@@ -401,7 +401,9 @@ fn main() {
         step = step.wrapping_add(1);
         let step = black_box(step);
         let node = match scenario {
-            Scenario::SmallIcon | Scenario::Curves => styled_node(scenario.base_node(&mutable_paths)),
+            Scenario::SmallIcon | Scenario::Curves => {
+                styled_node(scenario.base_node(&mutable_paths))
+            }
             Scenario::TransformUpdate => styled_node(scenario.transform_node(&scene, step)),
             Scenario::PaintUpdate => styled_node(scenario.paint_node(&scene, step)),
             Scenario::RepeatedEdits => styled_node(scenario.edit_node(&mut mutable_paths, step)),

@@ -77,13 +77,12 @@ pub use self::input::{
     KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers, PointerButton, PointerPosition,
     ScrollDelta, TextInputEvent, ViewportEvent,
 };
-pub use self::svg_preparation::{
-    VectorPreparationStats, reset_vector_preparation_stats,
-    set_vector_preparation_probe_enabled, vector_preparation_probe_enabled,
-    vector_preparation_stats,
-};
 pub(crate) use self::softbuffer_dither::{
     to_softbuffer_rgb_blue_noise, to_softbuffer_rgb_blue_noise_with_alpha,
+};
+pub use self::svg_preparation::{
+    VectorPreparationStats, reset_vector_preparation_stats, set_vector_preparation_probe_enabled,
+    vector_preparation_probe_enabled, vector_preparation_stats,
 };
 #[cfg(test)]
 use self::{
