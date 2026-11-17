@@ -226,7 +226,7 @@ app/       - entrypoint + render loop
 ## Rendering
 
 Use [native vector paths](docs/native-vector-paths.md) to draw typed Bézier commands
-without SVG strings, and export the original curves as SVG.
+without SVG strings, and export the original curves as SVG. The [native pan and zoom guide](docs/native-pan-zoom.md) shows how to retain geometry while changing the view.
 
 See [optional layer caching](docs/layer-caching.md) for enabling bounded caches,
 keeping overlays separate, and controlling RAM usage. The [SVG rendering report](docs/svg-rendering.md#measured-results)

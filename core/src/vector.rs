@@ -416,3 +416,206 @@ mod tests {
         assert!(VectorScene::new(VectorViewBox::new(0., 0., 0., 10.), vec![]).is_err());
     }
 }
+
+/// Uniform document-to-viewport transform for a native vector drawing.
+///
+/// Coordinates are logical pixels relative to the vector element's content box;
+/// CSS transforms and device scaling are applied by the renderer afterwards.
+/// Keep the authored scene separately for export. Apply [`Self::view_box`] to
+/// its render scene, and clip the element with an overflow-hidden parent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VectorView {
+    scale: f32,
+    translation: VectorPoint,
+    min_scale: f32,
+    max_scale: f32,
+}
+
+impl VectorView {
+    /// Create an identity view with inclusive, positive finite zoom limits.
+    pub fn new(min_scale: f32, max_scale: f32) -> Result<Self, VectorError> {
+        if !min_scale.is_finite()
+            || !max_scale.is_finite()
+            || min_scale <= 0.0
+            || min_scale > 1.0
+            || max_scale < 1.0
+            || max_scale < min_scale
+        {
+            return Err(VectorError(
+                "zoom limits must be finite, positive, and contain 1",
+            ));
+        }
+        Ok(Self {
+            scale: 1.0,
+            translation: VectorPoint::new(0.0, 0.0),
+            min_scale,
+            max_scale,
+        })
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+    pub fn translation(&self) -> VectorPoint {
+        self.translation
+    }
+
+    /// Map document coordinates to element-local logical pixels.
+    pub fn to_viewport(&self, point: VectorPoint) -> Option<VectorPoint> {
+        finite_point(VectorPoint::new(
+            point.x * self.scale + self.translation.x,
+            point.y * self.scale + self.translation.y,
+        ))
+    }
+
+    /// Map element-local logical pixels back to document coordinates.
+    pub fn to_document(&self, point: VectorPoint) -> Option<VectorPoint> {
+        finite_point(VectorPoint::new(
+            (point.x - self.translation.x) / self.scale,
+            (point.y - self.translation.y) / self.scale,
+        ))
+    }
+
+    /// Translate in element-local logical pixels. Invalid or overflowing input is rejected.
+    pub fn pan(&mut self, delta: VectorPoint) -> Result<(), VectorError> {
+        let translation = finite_point(VectorPoint::new(
+            self.translation.x + delta.x,
+            self.translation.y + delta.y,
+        ))
+        .ok_or(VectorError("pan must remain finite"))?;
+        self.translation = translation;
+        Ok(())
+    }
+
+    /// Multiply zoom, clamped to the configured limits, keeping `anchor` fixed.
+    /// Invalid factors, anchors, and overflowing results leave the view unchanged.
+    pub fn zoom_at(&mut self, factor: f32, anchor: VectorPoint) -> Result<(), VectorError> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(VectorError("zoom factor must be finite and positive"));
+        }
+        let document = self
+            .to_document(anchor)
+            .ok_or(VectorError("invalid zoom anchor"))?;
+        // Compute in f64 so large finite factors clamp instead of overflowing.
+        let scale = ((self.scale as f64 * factor as f64)
+            .clamp(self.min_scale as f64, self.max_scale as f64)) as f32;
+        let translation = finite_point(VectorPoint::new(
+            anchor.x - document.x * scale,
+            anchor.y - document.y * scale,
+        ))
+        .ok_or(VectorError("zoom must remain finite"))?;
+        self.scale = scale;
+        self.translation = translation;
+        Ok(())
+    }
+
+    /// Return the renderer's view box for a viewport of this logical size.
+    /// The supplied size must match the vector element's content box. Resizing
+    /// preserves the scale and translation rather than fitting the document.
+    pub fn view_box(&self, width: f32, height: f32) -> Result<VectorViewBox, VectorError> {
+        let origin = self
+            .to_document(VectorPoint::new(0.0, 0.0))
+            .ok_or(VectorError("view origin must be finite"))?;
+        let w = width / self.scale;
+        let h = height / self.scale;
+        if !width.is_finite()
+            || !height.is_finite()
+            || !w.is_finite()
+            || !h.is_finite()
+            || w <= f32::EPSILON
+            || h <= f32::EPSILON
+        {
+            return Err(VectorError(
+                "viewport dimensions must produce a finite, non-singular view box",
+            ));
+        }
+        Ok(VectorViewBox::new(origin.x, origin.y, w, h))
+    }
+}
+
+fn finite_point(point: VectorPoint) -> Option<VectorPoint> {
+    (point.x.is_finite() && point.y.is_finite()).then_some(point)
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+    fn near(a: f32, b: f32) {
+        assert!((a - b).abs() < 0.002, "{a} != {b}");
+    }
+    #[test]
+    fn anchored_zoom_pan_and_inverse() {
+        let mut view = VectorView::new(0.1, 10.0).unwrap();
+        let anchor = VectorPoint::new(23.0, 71.0);
+        view.pan(VectorPoint::new(12.0, -7.0)).unwrap();
+        let document = view.to_document(anchor).unwrap();
+        for _ in 0..100 {
+            view.zoom_at(1.01, anchor).unwrap();
+            let at = view.to_viewport(document).unwrap();
+            near(at.x, anchor.x);
+            near(at.y, anchor.y);
+        }
+        let mapped = view
+            .to_document(view.to_viewport(document).unwrap())
+            .unwrap();
+        near(mapped.x, document.x);
+        near(mapped.y, document.y);
+        let vb = view.view_box(200.0, 100.0).unwrap();
+        near((document.x - vb.min_x) * 200.0 / vb.width, anchor.x);
+        near((document.y - vb.min_y) * 100.0 / vb.height, anchor.y);
+    }
+    #[test]
+    fn view_changes_retain_geometry_and_export() {
+        let path = VectorPath::new(
+            vec![
+                PathCommand::MoveTo(VectorPoint::new(1.0, 2.0)),
+                PathCommand::CubicTo {
+                    control1: VectorPoint::new(3.0, 4.0),
+                    control2: VectorPoint::new(5.0, 6.0),
+                    end: VectorPoint::new(7.0, 8.0),
+                },
+            ],
+            VectorPaint::default(),
+        )
+        .unwrap();
+        let authored =
+            VectorScene::new(VectorViewBox::new(0.0, 0.0, 100.0, 100.0), vec![path]).unwrap();
+        let svg = authored.to_svg();
+        let mut render = authored.clone().into_render_scene();
+        let mut view = VectorView::new(0.1, 10.0).unwrap();
+        for i in 0..1000 {
+            view.pan(VectorPoint::new(if i % 2 == 0 { 1.0 } else { -1.0 }, 0.0))
+                .unwrap();
+            view.zoom_at(
+                if i % 2 == 0 { 1.01 } else { 1.0 / 1.01 },
+                VectorPoint::new(50.0, 50.0),
+            )
+            .unwrap();
+            render.view_box = view.view_box(100.0, 100.0).unwrap();
+            assert!(
+                render.paths[0]
+                    .geometry
+                    .commands
+                    .shares_storage_with(authored.paths()[0].geometry())
+            );
+        }
+        assert_eq!(authored.to_svg(), svg);
+    }
+    #[test]
+    fn invalid_operations_are_atomic_and_zoom_is_clamped() {
+        assert!(VectorView::new(0.0, 2.0).is_err());
+        assert!(VectorView::new(0.1, f32::INFINITY).is_err());
+        let mut view = VectorView::new(0.25, 4.0).unwrap();
+        let original = view;
+        assert!(view.zoom_at(0.0, VectorPoint::new(1.0, 2.0)).is_err());
+        assert!(view.zoom_at(2.0, VectorPoint::new(f32::NAN, 2.0)).is_err());
+        assert!(view.pan(VectorPoint::new(f32::INFINITY, 0.0)).is_err());
+        assert_eq!(view, original);
+        assert!(view.view_box(0.0, 100.0).is_err());
+        view.zoom_at(f32::MAX, VectorPoint::new(0.0, 0.0)).unwrap();
+        assert_eq!(view.scale(), 4.0);
+        view.zoom_at(f32::MIN_POSITIVE, VectorPoint::new(0.0, 0.0))
+            .unwrap();
+        assert_eq!(view.scale(), 0.25);
+    }
+}

@@ -27,7 +27,7 @@ pub mod svg;
 pub mod vector;
 pub use vector::{
     PathCommand, VectorError, VectorGeometry, VectorPaint, VectorPath, VectorPoint, VectorScene,
-    VectorViewBox,
+    VectorView, VectorViewBox,
 };
 pub mod transitions;
 

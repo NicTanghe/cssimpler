@@ -861,6 +861,73 @@ mod tests {
     }
 
     #[test]
+    fn native_view_uses_dirty_clip_and_device_scale() {
+        use cssimpler_core::{
+            PathCommand, VectorPaint, VectorPath, VectorPoint, VectorScene, VectorView,
+            VectorViewBox,
+        };
+        let path = VectorPath::new(
+            vec![
+                PathCommand::MoveTo(VectorPoint::new(4.0, 4.0)),
+                PathCommand::CubicTo {
+                    control1: VectorPoint::new(8.0, 0.0),
+                    control2: VectorPoint::new(16.0, 20.0),
+                    end: VectorPoint::new(20.0, 4.0),
+                },
+                PathCommand::LineTo(VectorPoint::new(20.0, 20.0)),
+                PathCommand::Close,
+            ],
+            VectorPaint::default(),
+        )
+        .unwrap();
+        let authored =
+            VectorScene::new(VectorViewBox::new(0.0, 0.0, 32.0, 32.0), vec![path]).unwrap();
+        let svg = authored.to_svg();
+        let mut scene = authored.clone().into_render_scene();
+        let mut view = VectorView::new(0.25, 8.0).unwrap();
+        view.pan(VectorPoint::new(3.0, -2.0)).unwrap();
+        view.zoom_at(2.0, VectorPoint::new(12.0, 12.0)).unwrap();
+        scene.view_box = view.view_box(32.0, 32.0).unwrap();
+        let mut full = vec![pack_rgb(Color::WHITE); 64 * 64];
+        super::draw_svg_scene(
+            &mut full,
+            64,
+            64,
+            LayoutBox::new(0.0, 0.0, 64.0, 64.0),
+            &scene,
+            super::ClipRect::full(64.0, 64.0),
+        );
+        let mut clipped = vec![pack_rgb(Color::WHITE); 64 * 64];
+        super::draw_svg_scene(
+            &mut clipped,
+            64,
+            64,
+            LayoutBox::new(0.0, 0.0, 64.0, 64.0),
+            &scene,
+            super::ClipRect {
+                x0: 10.0,
+                y0: 12.0,
+                x1: 40.0,
+                y1: 42.0,
+            },
+        );
+        assert!(full.iter().any(|p| *p != pack_rgb(Color::WHITE)));
+        for y in 0..64 {
+            for x in 0..64 {
+                assert_eq!(
+                    clipped[y * 64 + x],
+                    if (10..40).contains(&x) && (12..42).contains(&y) {
+                        full[y * 64 + x]
+                    } else {
+                        pack_rgb(Color::WHITE)
+                    }
+                );
+            }
+        }
+        assert_eq!(authored.to_svg(), svg);
+    }
+
+    #[test]
     fn svg_nonuniform_transform_scales_stroke_outline_before_rasterization() {
         let scene = test_scene(
             vec![polygon(&[(4.0, 2.0), (4.0, 8.0)], false)],
