@@ -309,6 +309,29 @@ fn json_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Fixed, allocation-free ALU workload used to normalize timings against the
+/// speed this process actually received from the (possibly shared, thermally
+/// throttled or E-core-scheduled) machine. Returns the best wall time in ms of
+/// three calibration runs; callers divide measured phases by it.
+fn calibrate() -> f64 {
+    let run = || {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let start = Instant::now();
+        for _ in 0..2_000_000u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+        }
+        black_box(seed);
+        start.elapsed().as_secs_f64() * 1000.0
+    };
+    let mut best = f64::INFINITY;
+    for _ in 0..3 {
+        best = best.min(run());
+    }
+    best
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| {
@@ -341,6 +364,8 @@ fn main() {
         .max(1.0) as usize;
 
     let rss_before = rss_kib();
+    let calibration_ms = calibrate();
+    let normalized = |sample: &Sample| sample.median_ms / calibration_ms;
 
     let construct = measure(3, iterations, || {
         black_box(scenario.base_node(&paths));
@@ -393,35 +418,40 @@ fn main() {
     let peak = peak_rss_kib();
     let optional = |value: Option<u64>| value.map_or("null".to_string(), |value| value.to_string());
     println!(
-        "{{\"scenario\":\"{}\",\"label\":\"{}\",\"cached_layers\":false,\"frames\":{},\"width\":{},\"height\":{},\
-\"construct_ms\":{:.5},\"construct_min_ms\":{:.5},\"construct_max_ms\":{:.5},\"construct_allocs\":{:.2},\"construct_bytes\":{:.0},\
-\"prepare_ms\":{:.5},\"prepare_min_ms\":{:.5},\"prepare_max_ms\":{:.5},\"prepare_allocs\":{:.2},\"prepare_bytes\":{:.0},\
-\"paint_ms\":{:.5},\"paint_min_ms\":{:.5},\"paint_max_ms\":{:.5},\"paint_allocs\":{:.2},\"paint_bytes\":{:.0},\
-\"update_ms\":{:.5},\"update_min_ms\":{:.5},\"update_max_ms\":{:.5},\"update_allocs\":{:.2},\"update_bytes\":{:.0},\
+        "{{\"scenario\":\"{}\",\"label\":\"{}\",\"cached_layers\":false,\"frames\":{},\"width\":{},\"height\":{},\"calibration_ms\":{:.5},\
+\"construct_ms\":{:.5},\"construct_min_ms\":{:.5},\"construct_max_ms\":{:.5},\"construct_norm\":{:.6},\"construct_allocs\":{:.2},\"construct_bytes\":{:.0},\
+\"prepare_ms\":{:.5},\"prepare_min_ms\":{:.5},\"prepare_max_ms\":{:.5},\"prepare_norm\":{:.6},\"prepare_allocs\":{:.2},\"prepare_bytes\":{:.0},\
+\"paint_ms\":{:.5},\"paint_min_ms\":{:.5},\"paint_max_ms\":{:.5},\"paint_norm\":{:.6},\"paint_allocs\":{:.2},\"paint_bytes\":{:.0},\
+\"update_ms\":{:.5},\"update_min_ms\":{:.5},\"update_max_ms\":{:.5},\"update_norm\":{:.6},\"update_allocs\":{:.2},\"update_bytes\":{:.0},\
 \"rss_before_kib\":{},\"rss_after_kib\":{},\"peak_rss_kib\":{}}}",
         scenario.name(),
         json_escape(label),
         iterations,
         width,
         height,
+        calibration_ms,
         construct.median_ms,
         construct.min_ms,
         construct.max_ms,
+        normalized(&construct),
         construct.allocs_per_op,
         construct.bytes_per_op,
         prepare.median_ms,
         prepare.min_ms,
         prepare.max_ms,
+        normalized(&prepare),
         prepare.allocs_per_op,
         prepare.bytes_per_op,
         paint.median_ms,
         paint.min_ms,
         paint.max_ms,
+        normalized(&paint),
         paint.allocs_per_op,
         paint.bytes_per_op,
         update.median_ms,
         update.min_ms,
         update.max_ms,
+        normalized(&update),
         update.allocs_per_op,
         update.bytes_per_op,
         optional(rss_before),

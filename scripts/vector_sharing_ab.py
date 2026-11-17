@@ -153,7 +153,9 @@ def main():
         fields = []
         for sample in baseline_samples:
             for key in sample:
-                if key not in IGNORED_FIELDS and key not in fields:
+                if key in IGNORED_FIELDS or key.endswith(("_min_ms", "_max_ms")):
+                    continue
+                if key not in fields:
                     fields.append(key)
         for field in fields:
             baseline_values = [
