@@ -120,3 +120,16 @@ view changes allocate nothing; uncached paint still dominates.
 - #20 (input) may replace the event-handler invalidation pattern used by the
   interactive example; the example's pan/zoom state is independent.
 - #18 (statistics) touches renderer counters; no new counters were added here.
+
+## 2026-11-17T20:54Z - issue-19 agent (update)
+
+- Opened stacked PR: https://github.com/NicTanghe/cssimpler/pull/27, base
+  `codex/shared-vector-geometry` at `7772cf3`; retarget to `main` after #24 merges.
+- Commits: `3630c8f` (scene view + viewport clipping + tests),
+  `5beb6e2` (example + docs + evidence).
+- `cargo test -j 2 --workspace`: 567 passed, 0 failed
+  (81+9+10+1+52+7+270+137).
+- `cargo test -j 2 --test issue_19_pan_zoom` after the final geometry-edit
+  cache-invalidation assertion: 10 passed, 0 failed.
+- Interactive `--interactive` window path compiled but not run (no display in
+  this environment); headless demo and tests cover the behavior.
