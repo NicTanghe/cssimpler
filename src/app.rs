@@ -408,6 +408,7 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     text_inputs: NativeTextInputs,
     render_mode: RenderMode,
     continuous_updates: bool,
+    input_redraw_policy: renderer::InputRedrawPolicy,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
     scene_transition: Option<SceneTransition>,
@@ -485,6 +486,7 @@ where
             text_inputs: NativeTextInputs::default(),
             render_mode: RenderMode::OnInvalidation,
             continuous_updates: false,
+            input_redraw_policy: renderer::InputRedrawPolicy::Immediate,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
             scene_transition: None,
@@ -563,6 +565,21 @@ where
     /// still reusing clean scenes in [`RenderMode::OnInvalidation`].
     pub fn with_continuous_updates(mut self, enabled: bool) -> Self {
         self.continuous_updates = enabled;
+        self
+    }
+
+    /// Opt in to frame-aligned pointer input scheduling. Every raw pointer
+    /// event still reaches [`App::handle_engine_event`]; only the paints that
+    /// pointer motion and wheel input request are coalesced to one per frame.
+    /// Press, release, click, keyboard, text, and focus handling stay immediate.
+    /// Combine this with [`crate::frame_drag::FrameAlignedDrag`] to consume the
+    /// latest drag state once per displayed frame.
+    pub fn with_frame_aligned_input(mut self, enabled: bool) -> Self {
+        self.input_redraw_policy = if enabled {
+            renderer::InputRedrawPolicy::FrameAligned
+        } else {
+            renderer::InputRedrawPolicy::Immediate
+        };
         self
     }
 
@@ -1106,6 +1123,10 @@ where
         App::handle_engine_event(self, event)
     }
 
+    fn input_redraw_policy(&self) -> renderer::InputRedrawPolicy {
+        self.input_redraw_policy
+    }
+
     fn redraw_schedule(&self) -> renderer::RedrawSchedule {
         if self.continuous_updates || matches!(self.render_mode, RenderMode::EveryFrame) {
             renderer::RedrawSchedule::EveryFrame
@@ -1142,6 +1163,7 @@ pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     text_inputs: NativeTextInputs,
     render_mode: RenderMode,
     continuous_updates: bool,
+    input_redraw_policy: renderer::InputRedrawPolicy,
     pending_refresh: Refresh,
     cached_scene: Option<Vec<RenderNode>>,
     scene_transition: Option<SceneTransition>,
@@ -1174,6 +1196,7 @@ where
             text_inputs: NativeTextInputs::default(),
             render_mode: RenderMode::OnInvalidation,
             continuous_updates: false,
+            input_redraw_policy: renderer::InputRedrawPolicy::Immediate,
             pending_refresh: Refresh::full(Invalidation::Structure),
             cached_scene: None,
             scene_transition: None,
@@ -1248,6 +1271,21 @@ where
     /// still reusing clean scenes in [`RenderMode::OnInvalidation`].
     pub fn with_continuous_updates(mut self, enabled: bool) -> Self {
         self.continuous_updates = enabled;
+        self
+    }
+
+    /// Opt in to frame-aligned pointer input scheduling. Every raw pointer
+    /// event still reaches [`App::handle_engine_event`]; only the paints that
+    /// pointer motion and wheel input request are coalesced to one per frame.
+    /// Press, release, click, keyboard, text, and focus handling stay immediate.
+    /// Combine this with [`crate::frame_drag::FrameAlignedDrag`] to consume the
+    /// latest drag state once per displayed frame.
+    pub fn with_frame_aligned_input(mut self, enabled: bool) -> Self {
+        self.input_redraw_policy = if enabled {
+            renderer::InputRedrawPolicy::FrameAligned
+        } else {
+            renderer::InputRedrawPolicy::Immediate
+        };
         self
     }
 
@@ -1709,6 +1747,10 @@ where
 
     fn handle_engine_event(&mut self, event: &EngineEvent) -> bool {
         FragmentApp::handle_engine_event(self, event)
+    }
+
+    fn input_redraw_policy(&self) -> renderer::InputRedrawPolicy {
+        self.input_redraw_policy
     }
 
     fn redraw_schedule(&self) -> renderer::RedrawSchedule {
