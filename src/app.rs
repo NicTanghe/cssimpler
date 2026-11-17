@@ -1,9 +1,10 @@
 mod input;
 mod scene_transition;
 
+use crate::actions::{ActionQueue, ActionSource};
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -402,6 +403,7 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     stylesheet: &'a Stylesheet,
     update: Update,
     view: View,
+    action_source: Option<Arc<dyn ActionSource>>,
     runtime_world: RuntimeWorld,
     text_inputs: NativeTextInputs,
     render_mode: RenderMode,
@@ -413,6 +415,54 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     #[cfg(feature = "gpu-viewport")]
     gpu_viewports: renderer::gpu::GpuViewportRegistry,
     signal: PhantomData<Signal>,
+}
+
+impl<'a, State: 'a> App<'a, State, (), ()> {
+    /// Construct an app with a typed action inbox. The update receives one FIFO
+    /// batch per invocation, before the view is built. Every nonempty batch requests a
+    /// structural refresh, even if update returns Clean. `App::new` remains the
+    /// option for applications requiring explicit, fine-grained refresh control.
+    pub fn with_actions<M, Update, View, Signal>(
+        state: State,
+        stylesheet: &'a Stylesheet,
+        mut update: Update,
+        mut view: View,
+    ) -> App<
+        'a,
+        State,
+        impl FnMut(&mut State, FrameInfo) -> Refresh + 'a,
+        impl FnMut(&State) -> Node + 'a,
+        Refresh,
+    >
+    where
+        M: Send + 'static,
+        Update: FnMut(&mut State, &[M], FrameInfo) -> Signal + 'a,
+        View: FnMut(&State, &ActionQueue<M>) -> Node + 'a,
+        Signal: Into<Refresh>,
+    {
+        let queue = ActionQueue::new();
+        let consumer = queue.clone();
+        let source: Arc<dyn ActionSource> = Arc::new(queue.clone());
+        let mut batch = Vec::new();
+        let mut app = App::new(
+            state,
+            stylesheet,
+            move |state: &mut State, frame| {
+                consumer.drain_into(&mut batch);
+                let had_actions = !batch.is_empty();
+                let refresh = update(state, &batch, frame).into();
+                batch.clear();
+                if had_actions {
+                    refresh.merge(Invalidation::Structure.into())
+                } else {
+                    refresh
+                }
+            },
+            move |state: &State| view(state, &queue),
+        );
+        app.action_source = Some(source);
+        app
+    }
 }
 
 impl<'a, State, Update, View, Signal> App<'a, State, Update, View, Signal>
@@ -430,6 +480,7 @@ where
             stylesheet,
             update,
             view,
+            action_source: None,
             runtime_world: RuntimeWorld::default(),
             text_inputs: NativeTextInputs::default(),
             render_mode: RenderMode::OnInvalidation,
@@ -516,7 +567,10 @@ where
     }
 
     pub fn needs_redraw(&self) -> bool {
-        self.cached_scene.is_none()
+        self.action_source
+            .as_ref()
+            .is_some_and(|source| source.has_pending())
+            || self.cached_scene.is_none()
             || self.pending_refresh.needs_rerender()
             || self.scene_transition.is_some()
     }
@@ -972,6 +1026,12 @@ where
     View: FnMut(&State) -> Node,
     Signal: Into<Refresh>,
 {
+    fn install_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
+        if let Some(source) = &self.action_source {
+            source.install_wake(wake);
+        }
+    }
+
     fn can_close(&mut self) -> bool {
         let result = self
             .close_handler
