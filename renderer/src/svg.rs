@@ -5,8 +5,8 @@ use tiny_skia::{
 };
 
 use cssimpler_core::{
-    GradientInterpolation, LinearRgba, SvgBounds, SvgLinearGradient, SvgPaintServerData,
-    SvgPathGeometry, SvgPathPaintSource, SvgScene, SvgViewBox,
+    CornerRadius, GradientInterpolation, LinearRgba, SvgBounds, SvgLinearGradient,
+    SvgPaintServerData, SvgPathGeometry, SvgPathPaintSource, SvgScene, SvgViewBox,
 };
 
 use super::{
@@ -70,10 +70,23 @@ pub(crate) fn draw_svg_scene(
     scene: &SvgScene,
     clip: ClipRect,
 ) {
-    let Some(matrix) = svg_view_box_matrix(layout, scene.view_box) else {
+    let Some(matrix) = svg_view_box_matrix(layout, scene) else {
         return;
     };
-    draw_svg_scene_with_matrix(buffer, width, height, scene, matrix, &ClipState::new(clip));
+    let clip_state = ClipState::new(clip);
+    if scene.view.is_some() {
+        // A scene with a viewport view is clipped to the element's layout box.
+        // `matrix` maps document coordinates, so clip with the untransformed
+        // layout box in this non-CSS-transformed path.
+        let Some(clipped) =
+            clip_state.push_layout_clip(layout, CornerRadius::ZERO, AffineTransform::IDENTITY)
+        else {
+            return;
+        };
+        draw_svg_scene_with_matrix(buffer, width, height, scene, matrix, &clipped);
+    } else {
+        draw_svg_scene_with_matrix(buffer, width, height, scene, matrix, &clip_state);
+    }
 }
 
 pub(crate) fn draw_svg_scene_transformed(
@@ -85,17 +98,20 @@ pub(crate) fn draw_svg_scene_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
-    let Some(view_matrix) = svg_view_box_matrix(layout, scene.view_box) else {
+    let Some(view_matrix) = svg_view_box_matrix(layout, scene) else {
         return;
     };
-    draw_svg_scene_with_matrix(
-        buffer,
-        width,
-        height,
-        scene,
-        matrix.multiply(view_matrix),
-        clip_state,
-    );
+    let full_matrix = matrix.multiply(view_matrix);
+    if scene.view.is_some() {
+        // `matrix` is the existing CSS/layout transform of this node; push the
+        // viewport clip through it so clipping composes with CSS as before.
+        let Some(clipped) = clip_state.push_layout_clip(layout, CornerRadius::ZERO, matrix) else {
+            return;
+        };
+        draw_svg_scene_with_matrix(buffer, width, height, scene, full_matrix, &clipped);
+    } else {
+        draw_svg_scene_with_matrix(buffer, width, height, scene, full_matrix, clip_state);
+    }
 }
 
 fn draw_svg_scene_with_matrix(
@@ -477,7 +493,8 @@ fn prepare_svg_linear_gradient(
     }
 }
 
-fn svg_view_box_matrix(layout: LayoutBox, view_box: SvgViewBox) -> Option<AffineTransform> {
+fn svg_view_box_matrix(layout: LayoutBox, scene: &SvgScene) -> Option<AffineTransform> {
+    let view_box = scene.view_box;
     if layout.width <= f32::EPSILON
         || layout.height <= f32::EPSILON
         || view_box.width <= f32::EPSILON
@@ -488,11 +505,26 @@ fn svg_view_box_matrix(layout: LayoutBox, view_box: SvgViewBox) -> Option<Affine
 
     let scale_x = layout.width / view_box.width;
     let scale_y = layout.height / view_box.height;
-    Some(
-        AffineTransform::translate(layout.x, layout.y)
-            .multiply(scale_matrix(scale_x, scale_y))
-            .multiply(AffineTransform::translate(-view_box.min_x, -view_box.min_y)),
-    )
+    let mut matrix = AffineTransform::translate(layout.x, layout.y)
+        .multiply(scale_matrix(scale_x, scale_y))
+        .multiply(AffineTransform::translate(-view_box.min_x, -view_box.min_y));
+    if let Some(view) = scene.view {
+        // Document -> viewBox coordinates, applied before the layout/viewBox
+        // map. `VectorView` guarantees a finite positive zoom, so this composes
+        // without introducing a singular matrix.
+        matrix = matrix.multiply(AffineTransform {
+            a: view.zoom(),
+            b: 0.0,
+            c: 0.0,
+            d: view.zoom(),
+            e: view.offset().x,
+            f: view.offset().y,
+            g: 0.0,
+            h: 0.0,
+            i: 1.0,
+        });
+    }
+    Some(matrix)
 }
 
 fn scale_matrix(scale_x: f32, scale_y: f32) -> AffineTransform {

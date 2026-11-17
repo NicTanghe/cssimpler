@@ -1,7 +1,7 @@
 //! Backend-independent vector commands, native elements, and SVG export.
 use crate::{
-    Color, SvgBounds, SvgPathGeometry, SvgPathInstance, SvgPathPaint, SvgPathPaintSource, SvgPoint,
-    SvgScene, SvgViewBox,
+    Color, LayoutBox, SvgBounds, SvgPathGeometry, SvgPathInstance, SvgPathPaint,
+    SvgPathPaintSource, SvgPoint, SvgScene, SvgViewBox,
 };
 use std::{
     error::Error,
@@ -72,6 +72,236 @@ impl fmt::Display for VectorError {
     }
 }
 impl Error for VectorError {}
+
+/// A small document-to-view transform for a native vector scene.
+///
+/// A scene can carry one of these as an optional viewport view. It maps authored
+/// document coordinates into the scene's viewBox coordinate space:
+///
+/// ```text
+/// view = document * zoom + offset
+/// ```
+///
+/// Panning and zooming only replace this value (plus the scene's copy of it);
+/// authored commands, their bounds, and the exported SVG are untouched. The
+/// renderer composes the view with the existing layout/viewBox map and any CSS
+/// transform, then rasterizes the original curves for the resulting matrix.
+///
+/// Construction rejects non-finite values and non-positive zooms. Finite zooms
+/// are clamped to [`VectorView::MIN_ZOOM`]..=[`VectorView::MAX_ZOOM`], so a view
+/// handled through these helpers can never be singular.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VectorView {
+    zoom: f32,
+    offset_x: f32,
+    offset_y: f32,
+}
+
+impl VectorView {
+    /// Untransformed view: document coordinates map 1:1 into the viewBox.
+    pub const IDENTITY: Self = Self {
+        zoom: 1.0,
+        offset_x: 0.0,
+        offset_y: 0.0,
+    };
+    /// Smallest accepted zoom (1/64). Smaller requests are clamped.
+    pub const MIN_ZOOM: f32 = 1.0 / 64.0;
+    /// Largest accepted zoom (64). Larger requests are clamped.
+    pub const MAX_ZOOM: f32 = 64.0;
+
+    pub const fn identity() -> Self {
+        Self::IDENTITY
+    }
+
+    /// Validate and clamp a view. Non-finite zooms/offsets are rejected; a finite
+    /// positive zoom outside the practical limits is clamped, not rejected.
+    pub fn new(zoom: f32, offset: VectorPoint) -> Result<Self, VectorError> {
+        if !zoom.is_finite() || zoom <= 0.0 {
+            return Err(VectorError("view zoom must be finite and positive"));
+        }
+        if !offset.x.is_finite() || !offset.y.is_finite() {
+            return Err(VectorError("view offset must be finite"));
+        }
+        Ok(Self {
+            zoom: zoom.clamp(Self::MIN_ZOOM, Self::MAX_ZOOM),
+            offset_x: offset.x,
+            offset_y: offset.y,
+        })
+    }
+
+    /// View at the given zoom with a zero offset.
+    pub fn from_zoom(zoom: f32) -> Result<Self, VectorError> {
+        Self::new(zoom, VectorPoint::new(0.0, 0.0))
+    }
+
+    pub fn zoom(self) -> f32 {
+        self.zoom
+    }
+
+    pub fn offset(self) -> VectorPoint {
+        VectorPoint::new(self.offset_x, self.offset_y)
+    }
+
+    pub fn is_identity(self) -> bool {
+        self == Self::IDENTITY
+    }
+
+    /// Map an authored document point into viewBox coordinates.
+    pub fn document_to_view(self, point: VectorPoint) -> VectorPoint {
+        VectorPoint::new(
+            point.x * self.zoom + self.offset_x,
+            point.y * self.zoom + self.offset_y,
+        )
+    }
+
+    /// Inverse of [`Self::document_to_view`]. Valid by construction because a
+    /// `VectorView` always has a finite positive zoom.
+    pub fn view_to_document(self, point: VectorPoint) -> VectorPoint {
+        VectorPoint::new(
+            (point.x - self.offset_x) / self.zoom,
+            (point.y - self.offset_y) / self.zoom,
+        )
+    }
+
+    /// Map an authored document point to viewport (logical layout/CSS pixel)
+    /// coordinates for a scene laid out inside `layout`.
+    ///
+    /// Returns `None` when the layout or viewBox is non-finite or has a
+    /// non-positive size; those are the only degenerate inputs, because the view
+    /// itself is always invertible.
+    pub fn document_to_viewport(
+        self,
+        view_box: VectorViewBox,
+        layout: LayoutBox,
+        point: VectorPoint,
+    ) -> Option<VectorPoint> {
+        let (scale_x, scale_y) = viewport_scales(view_box, layout)?;
+        let view = self.document_to_view(point);
+        Some(VectorPoint::new(
+            layout.x + (view.x - view_box.min_x) * scale_x,
+            layout.y + (view.y - view_box.min_y) * scale_y,
+        ))
+    }
+
+    /// Convert a pointer position back into authored drawing coordinates.
+    ///
+    /// Returns `None` for degenerate layouts/viewBoxes (same conditions as
+    /// [`Self::document_to_viewport`]).
+    pub fn viewport_to_document(
+        self,
+        view_box: VectorViewBox,
+        layout: LayoutBox,
+        point: VectorPoint,
+    ) -> Option<VectorPoint> {
+        let (scale_x, scale_y) = viewport_scales(view_box, layout)?;
+        let view = VectorPoint::new(
+            view_box.min_x + (point.x - layout.x) / scale_x,
+            view_box.min_y + (point.y - layout.y) / scale_y,
+        );
+        let document = self.view_to_document(view);
+        (document.x.is_finite() && document.y.is_finite()).then_some(document)
+    }
+
+    /// Zoom by `factor` while keeping `document_anchor` under the same view
+    /// coordinate. The resulting zoom is clamped to the practical limits, so the
+    /// anchor stays fixed even at a limit.
+    pub fn zoomed_about(
+        self,
+        document_anchor: VectorPoint,
+        factor: f32,
+    ) -> Result<Self, VectorError> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(VectorError("view zoom factor must be finite and positive"));
+        }
+        let view_anchor = self.document_to_view(document_anchor);
+        let zoom = (self.zoom * factor).clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+        Self::new(
+            zoom,
+            VectorPoint::new(
+                view_anchor.x - document_anchor.x * zoom,
+                view_anchor.y - document_anchor.y * zoom,
+            ),
+        )
+    }
+
+    /// Zoom around a pointer position in viewport coordinates. The document
+    /// point currently under the pointer stays under the pointer.
+    pub fn zoomed_about_viewport_point(
+        self,
+        view_box: VectorViewBox,
+        layout: LayoutBox,
+        viewport_point: VectorPoint,
+        factor: f32,
+    ) -> Result<Self, VectorError> {
+        let Some(anchor) = self.viewport_to_document(view_box, layout, viewport_point) else {
+            return Err(VectorError(
+                "view needs a finite layout and viewBox with positive size",
+            ));
+        };
+        self.zoomed_about(anchor, factor)
+    }
+
+    /// Pan by a viewport-space delta (for example a pointer drag). The content
+    /// follows the pointer: a positive `dx` moves the drawing right.
+    pub fn panned_by_viewport_delta(
+        self,
+        view_box: VectorViewBox,
+        layout: LayoutBox,
+        dx: f32,
+        dy: f32,
+    ) -> Result<Self, VectorError> {
+        if !dx.is_finite() || !dy.is_finite() {
+            return Err(VectorError("view pan delta must be finite"));
+        }
+        let (scale_x, scale_y) = viewport_scales(view_box, layout).ok_or(VectorError(
+            "view needs a finite layout and viewBox with positive size",
+        ))?;
+        Self::new(
+            self.zoom,
+            VectorPoint::new(self.offset_x + dx / scale_x, self.offset_y + dy / scale_y),
+        )
+    }
+
+    /// Translate the view by a delta in viewBox units.
+    pub fn translated_by_view(self, dx: f32, dy: f32) -> Result<Self, VectorError> {
+        if !dx.is_finite() || !dy.is_finite() {
+            return Err(VectorError("view translation must be finite"));
+        }
+        Self::new(
+            self.zoom,
+            VectorPoint::new(self.offset_x + dx, self.offset_y + dy),
+        )
+    }
+}
+
+impl Default for VectorView {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+fn viewport_scales(view_box: VectorViewBox, layout: LayoutBox) -> Option<(f32, f32)> {
+    let finite = |value: f32| value.is_finite();
+    if layout.width <= f32::EPSILON
+        || layout.height <= f32::EPSILON
+        || view_box.width <= f32::EPSILON
+        || view_box.height <= f32::EPSILON
+        || !finite(layout.x)
+        || !finite(layout.y)
+        || !finite(layout.width)
+        || !finite(layout.height)
+        || !finite(view_box.min_x)
+        || !finite(view_box.min_y)
+        || !finite(view_box.width)
+        || !finite(view_box.height)
+    {
+        return None;
+    }
+    let scale_x = layout.width / view_box.width;
+    let scale_y = layout.height / view_box.height;
+    (scale_x.is_finite() && scale_y.is_finite() && scale_x > 0.0 && scale_y > 0.0)
+        .then_some((scale_x, scale_y))
+}
 
 /// Immutable authored commands and their conservative control-point bounds.
 /// Clones share storage. Construct a replacement to edit geometry.
@@ -219,6 +449,7 @@ impl VectorPath {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorScene {
     view_box: VectorViewBox,
+    view: Option<VectorView>,
     paths: Vec<VectorPath>,
 }
 impl VectorScene {
@@ -238,16 +469,36 @@ impl VectorScene {
                 "viewBox must be finite with positive dimensions",
             ));
         }
-        Ok(Self { view_box, paths })
+        Ok(Self {
+            view_box,
+            view: None,
+            paths,
+        })
     }
     pub fn view_box(&self) -> VectorViewBox {
         self.view_box
+    }
+    /// The optional viewport view. Changing it never rebuilds or copies paths.
+    pub fn view(&self) -> Option<VectorView> {
+        self.view
+    }
+    /// Attach a viewport view. The scene keeps the same authored paths.
+    pub fn with_view(mut self, view: VectorView) -> Self {
+        self.view = Some(view);
+        self
+    }
+    /// Replace or clear the viewport view in place; this is O(1) and does not
+    /// touch geometry. Prefer this over rebuilding a scene for view-only changes.
+    pub fn set_view(&mut self, view: Option<VectorView>) {
+        self.view = view;
     }
     pub fn paths(&self) -> &[VectorPath] {
         &self.paths
     }
     /// Export a standalone SVG using numeric user coordinates (default SVG units are px).
     /// The current paint subset uses nonzero fills and round stroke caps/joins.
+    /// Any viewport view is deliberately omitted: export always writes authored,
+    /// untransformed document geometry.
     pub fn to_svg(&self) -> String {
         fn paint(out: &mut String, name: &str, color: Option<Color>) {
             match color {
@@ -278,8 +529,10 @@ impl VectorScene {
         out
     }
     /// Bridge into the shared renderer pipeline; no SVG strings are produced or parsed.
+    /// The optional viewport view travels with the scene as render state; path
+    /// geometry is moved (handles), not copied or rebuilt.
     pub fn into_render_scene(self) -> SvgScene {
-        SvgScene::new(
+        let mut scene = SvgScene::new(
             self.view_box,
             self.paths
                 .into_iter()
@@ -296,7 +549,9 @@ impl VectorScene {
                     },
                 })
                 .collect(),
-        )
+        );
+        scene.set_view(self.view);
+        scene
     }
 }
 

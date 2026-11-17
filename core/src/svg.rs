@@ -191,6 +191,14 @@ impl SvgPathInstance {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SvgScene {
     pub view_box: SvgViewBox,
+    /// Optional viewport view.
+    ///
+    /// `None` keeps the legacy scene behavior: authored coordinates map through
+    /// the viewBox only and content may paint outside the element's layout box.
+    /// `Some(view)` maps authored coordinates through the small document-to-view
+    /// transform and clips drawing to the element's layout box, which is the
+    /// viewport. Parsed SVG scenes keep `None`.
+    pub view: Option<crate::VectorView>,
     pub paint_servers: Vec<SvgPaintServer>,
     pub paths: Vec<SvgPathInstance>,
     pub bounds: Option<SvgBounds>,
@@ -212,10 +220,23 @@ impl SvgScene {
             .reduce(SvgBounds::union);
         Self {
             view_box,
+            view: None,
             paint_servers,
             paths,
             bounds,
         }
+    }
+
+    /// Attach a viewport view. The view is a small transform description; the
+    /// authored paths and bounds are not modified.
+    pub fn with_view(mut self, view: crate::VectorView) -> Self {
+        self.view = Some(view);
+        self
+    }
+
+    /// Replace or clear the viewport view without touching authored geometry.
+    pub fn set_view(&mut self, view: Option<crate::VectorView>) {
+        self.view = view;
     }
 }
 
