@@ -3,9 +3,12 @@
 ## 2026-11-17 21:05 UTC - agent/issue-22-prepared-geometry-cache
 
 Status: investigation complete; **decision is no cache** (documented no-change
-outcome). Branch is stacked on `codex/shared-vector-geometry` at `7772cf3` so it
-can reuse `VectorGeometry::identity()`/`bounds()`; PR base is that branch and
-should be retargeted to `main` after PR #24 merges. No edits to
+outcome). Branch `agent/issue-22-prepared-geometry-cache` is stacked on
+`codex/shared-vector-geometry` at `7772cf3` so it can reuse
+`VectorGeometry::identity()`/`bounds()`; PR
+[#29](https://github.com/NicTanghe/cssimpler/pull/29) targets that branch and
+must be retargeted to `main` after PR #24 merges. Head at recording time:
+`65e7b807711dc485121909205cb528000032ea3b`. No edits to
 `FrameTimingStats`/`VectorFrameStats` or the `--diagnostics` example (owned by
 PR #23 / issue #18).
 
