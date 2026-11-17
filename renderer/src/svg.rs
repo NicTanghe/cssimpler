@@ -4,7 +4,11 @@ use std::time::Instant;
 
 use super::VectorFrameStats;
 
+/// Process-wide opt-in for the detailed per-path clocks. A frame start copies
+/// this into `TIMING_ACTIVE`, so changing it never affects a frame in progress.
 static TIMING_REQUESTED: AtomicBool = AtomicBool::new(false);
+// Whether the calling thread is currently painting a frame whose work counts
+// should be collected. Worker tasks inherit it through `Scope::spawn`.
 thread_local! {
     static COLLECTING: Cell<bool> = const { Cell::new(false) };
 }
@@ -24,24 +28,30 @@ pub(super) fn with_collecting<R>(active: bool, f: impl FnOnce() -> R) -> R {
     let _restore = Restore(previous);
     f()
 }
+
+/// Detailed clocks are active for the frame currently being painted.
 static TIMING_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Per-frame work counts. Reset at frame start and published once after the
+/// frame's paint jobs have been joined, so the snapshot is consistent.
+static PATHS_PAINTED: AtomicUsize = AtomicUsize::new(0);
 static LAYER_HITS: AtomicUsize = AtomicUsize::new(0);
 static LAYER_MISSES: AtomicUsize = AtomicUsize::new(0);
-static PATHS: AtomicUsize = AtomicUsize::new(0);
-static BUILD_US: AtomicU64 = AtomicU64::new(0);
-static STROKE_US: AtomicU64 = AtomicU64::new(0);
-static PROJECTION_US: AtomicU64 = AtomicU64::new(0);
-static COVERAGE_US: AtomicU64 = AtomicU64::new(0);
+/// Per-frame durations, accumulated in nanoseconds by paint jobs. Sums can
+/// overlap across workers; they are not wall time.
+static PATH_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+static STROKE_NS: AtomicU64 = AtomicU64::new(0);
+static PROJECTION_NS: AtomicU64 = AtomicU64::new(0);
+static COVERAGE_NS: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn set_vector_timing_enabled(enabled: bool) {
     TIMING_REQUESTED.store(enabled, Ordering::Relaxed);
 }
 
 pub(super) fn reset_frame_vector_stats() {
-    for counter in [&PATHS, &LAYER_HITS, &LAYER_MISSES] {
+    for counter in [&PATHS_PAINTED, &LAYER_HITS, &LAYER_MISSES] {
         counter.store(0, Ordering::Relaxed);
     }
-    for counter in [&BUILD_US, &STROKE_US, &PROJECTION_US, &COVERAGE_US] {
+    for counter in [&PATH_BUILD_NS, &STROKE_NS, &PROJECTION_NS, &COVERAGE_NS] {
         counter.store(0, Ordering::Relaxed);
     }
     TIMING_ACTIVE.store(TIMING_REQUESTED.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -64,20 +74,24 @@ pub(super) fn frame_layer_lookups() -> (usize, usize) {
 pub(super) fn take_frame_vector_stats() -> VectorFrameStats {
     COLLECTING.with(|value| value.set(false));
     VectorFrameStats {
-        paths_painted: PATHS.load(Ordering::Relaxed),
+        paths_painted: PATHS_PAINTED.load(Ordering::Relaxed),
         timings_enabled: TIMING_ACTIVE.load(Ordering::Relaxed),
-        path_build_work_us: usize::try_from(BUILD_US.load(Ordering::Relaxed) / 1_000)
-            .unwrap_or(usize::MAX),
-        stroke_work_us: usize::try_from(STROKE_US.load(Ordering::Relaxed) / 1_000)
-            .unwrap_or(usize::MAX),
-        projection_work_us: usize::try_from(PROJECTION_US.load(Ordering::Relaxed) / 1_000)
-            .unwrap_or(usize::MAX),
-        coverage_work_us: usize::try_from(COVERAGE_US.load(Ordering::Relaxed) / 1_000)
-            .unwrap_or(usize::MAX),
+        path_build_work_us: ns_to_us(PATH_BUILD_NS.load(Ordering::Relaxed)),
+        stroke_work_us: ns_to_us(STROKE_NS.load(Ordering::Relaxed)),
+        projection_work_us: ns_to_us(PROJECTION_NS.load(Ordering::Relaxed)),
+        coverage_work_us: ns_to_us(COVERAGE_NS.load(Ordering::Relaxed)),
     }
 }
 
-#[allow(deprecated)] // fetch_update is available on older supported toolchains.
+/// Nanoseconds to whole microseconds, saturating rather than wrapping.
+fn ns_to_us(nanoseconds: u64) -> usize {
+    usize::try_from(nanoseconds / 1_000).unwrap_or(usize::MAX)
+}
+
+/// Saturating so diagnostic counters cannot wrap on very long frames.
+// `fetch_update` is deprecated in newer nightlies in favour of `try_update`, but
+// it remains available on older supported toolchains; keep it for compatibility.
+#[allow(deprecated)]
 fn add(counter: &AtomicUsize, value: usize) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
         Some(old.saturating_add(value))
@@ -292,13 +306,13 @@ fn draw_svg_scene_with_matrix(
         }
     }
     if collecting {
-        add(&PATHS, paths_painted);
+        add(&PATHS_PAINTED, paths_painted);
     }
     if timed {
-        add_time(&BUILD_US, build_ns);
-        add_time(&STROKE_US, stroke_ns);
-        add_time(&PROJECTION_US, projection_ns);
-        add_time(&COVERAGE_US, coverage_ns);
+        add_time(&PATH_BUILD_NS, build_ns);
+        add_time(&STROKE_NS, stroke_ns);
+        add_time(&PROJECTION_NS, projection_ns);
+        add_time(&COVERAGE_NS, coverage_ns);
     }
 }
 
@@ -711,10 +725,119 @@ mod tests {
     static VECTOR_STATS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    #[ignore = "manual instrumentation overhead measurement"]
-    fn vector_timing_overhead() {
+    fn vector_timing_switch_is_sampled_at_frame_start() {
         let _guard = VECTOR_STATS_TEST_LOCK.lock().unwrap();
-        let scene = test_scene(
+        super::set_vector_timing_enabled(true);
+        super::reset_frame_vector_stats();
+        // Toggling mid-frame must not change the frame already in progress.
+        super::set_vector_timing_enabled(false);
+        assert!(super::take_frame_vector_stats().timings_enabled);
+
+        super::reset_frame_vector_stats();
+        super::set_vector_timing_enabled(true);
+        assert!(!super::take_frame_vector_stats().timings_enabled);
+        super::set_vector_timing_enabled(false);
+    }
+
+    /// Instrumentation overhead harness (ignored by default; release build).
+    ///
+    /// Compares three collection modes on the same buffers and scene:
+    /// `off` (no frame collection), `counters` (default frame diagnostics:
+    /// work counts only), and `timers` (opt-in detailed clocks).
+    #[test]
+    #[ignore = "manual release-mode instrumentation overhead measurement"]
+    fn vector_timing_overhead() {
+        const ROUNDS: usize = 5;
+        const TINY_PAINTS: usize = 3000;
+        const MIXED_PAINTS: usize = 100;
+        const MIXED_PATHS: usize = 16;
+
+        #[derive(Clone, Copy, Debug)]
+        #[repr(usize)]
+        enum Mode {
+            Off = 0,
+            Counters = 1,
+            Timers = 2,
+        }
+
+        fn timed_paints(
+            scene: &SvgScene,
+            buffer: &mut [u32],
+            width: usize,
+            height: usize,
+            layout: LayoutBox,
+            paints: usize,
+        ) -> u128 {
+            let start = std::time::Instant::now();
+            for _ in 0..paints {
+                super::draw_svg_scene(
+                    buffer,
+                    width,
+                    height,
+                    layout,
+                    scene,
+                    super::ClipRect::full(width as f32, height as f32),
+                );
+            }
+            start.elapsed().as_micros()
+        }
+
+        fn measure(
+            mode: Mode,
+            scene: &SvgScene,
+            buffer: &mut [u32],
+            width: usize,
+            height: usize,
+            layout: LayoutBox,
+            paints: usize,
+            paths_per_paint: usize,
+        ) -> u128 {
+            match mode {
+                Mode::Off => super::with_collecting(false, || {
+                    super::set_vector_timing_enabled(false);
+                    timed_paints(scene, buffer, width, height, layout, paints)
+                }),
+                Mode::Counters | Mode::Timers => {
+                    let enabled = matches!(mode, Mode::Timers);
+                    super::set_vector_timing_enabled(enabled);
+                    super::reset_frame_vector_stats();
+                    let micros = timed_paints(scene, buffer, width, height, layout, paints);
+                    let stats = super::take_frame_vector_stats();
+                    assert_eq!(stats.timings_enabled, enabled);
+                    assert_eq!(stats.paths_painted, paints.saturating_mul(paths_per_paint));
+                    if enabled {
+                        assert!(stats.coverage_work_us > 0 || stats.path_build_work_us > 0);
+                    } else {
+                        assert_eq!(stats.coverage_work_us, 0);
+                    }
+                    micros
+                }
+            }
+        }
+
+        fn median(samples: &mut [u128]) -> u128 {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        fn report(name: &str, paints: usize, samples: &mut [Vec<u128>; 3]) {
+            let off = median(&mut samples[0]);
+            let counters = median(&mut samples[1]);
+            let timers = median(&mut samples[2]);
+            let counters_delta = (counters as f64 / off.max(1) as f64 - 1.0) * 100.0;
+            let timers_delta = (timers as f64 / counters.max(1) as f64 - 1.0) * 100.0;
+            eprintln!(
+                "{name} paints={paints} (us, {ROUNDS} rounds)\n  \
+                 off={off} samples={:?}\n  counters={counters} samples={:?}\n  \
+                 timers={timers} samples={:?}\n  \
+                 counters-vs-off={counters_delta:+.1}% timers-vs-counters={timers_delta:+.1}%",
+                samples[0], samples[1], samples[2]
+            );
+        }
+
+        let _guard = VECTOR_STATS_TEST_LOCK.lock().unwrap();
+
+        let tiny = test_scene(
             vec![polygon(
                 &[(2.0, 2.0), (22.0, 2.0), (22.0, 22.0), (2.0, 22.0)],
                 true,
@@ -722,37 +845,96 @@ mod tests {
             SvgPathPaint::default(),
             24.0,
         );
-        let mut buffer = vec![pack_rgb(Color::WHITE); 24 * 24];
-        let mut samples = [0u128; 2];
-        for (index, enabled) in [false, true].into_iter().enumerate() {
-            super::set_vector_timing_enabled(enabled);
-            super::reset_frame_vector_stats();
-            let start = std::time::Instant::now();
-            for _ in 0..3000 {
-                super::draw_svg_scene(
-                    &mut buffer,
-                    24,
-                    24,
-                    LayoutBox::new(0.0, 0.0, 24.0, 24.0),
-                    &scene,
-                    super::ClipRect::full(24.0, 24.0),
-                );
-            }
-            samples[index] = start.elapsed().as_micros();
-            let stats = super::take_frame_vector_stats();
-            assert_eq!(stats.paths_painted, 3000);
-            assert_eq!(stats.timings_enabled, enabled);
-            if !enabled {
-                assert_eq!(stats.coverage_work_us, 0);
-            }
-            super::reset_frame_vector_stats();
-            assert_eq!(super::take_frame_vector_stats().paths_painted, 0);
+        let tiny_layout = LayoutBox::new(0.0, 0.0, 24.0, 24.0);
+        let mut tiny_buffer = vec![pack_rgb(Color::WHITE); 24 * 24];
+
+        let mut mixed_paths = Vec::new();
+        for index in 0..MIXED_PATHS {
+            let x = 20.0 + (index % 4) as f32 * 90.0;
+            let y = 20.0 + (index / 4) as f32 * 65.0;
+            mixed_paths.push(SvgPathInstance {
+                geometry: SvgPathGeometry::new(vec![polygon(
+                    &[
+                        (x, y),
+                        (x + 70.0, y + 10.0),
+                        (x + 55.0, y + 50.0),
+                        (x + 10.0, y + 45.0),
+                    ],
+                    true,
+                )]),
+                paint: SvgPathPaint {
+                    stroke: Some(SvgPathPaintSource::Color(Color::rgb(20, 40, 80))),
+                    stroke_width: 1.5,
+                    ..SvgPathPaint::default()
+                },
+            });
         }
+        let mixed = SvgScene::new(SvgViewBox::new(0.0, 0.0, 400.0, 300.0), mixed_paths);
+        let mixed_layout = LayoutBox::new(0.0, 0.0, 400.0, 300.0);
+        let mut mixed_buffer = vec![pack_rgb(Color::WHITE); 400 * 300];
+
+        // Warm up every mode before sampling to page in buffers and caches.
+        for mode in [Mode::Off, Mode::Counters, Mode::Timers] {
+            measure(
+                mode,
+                &tiny,
+                &mut tiny_buffer,
+                24,
+                24,
+                tiny_layout,
+                TINY_PAINTS / 10,
+                1,
+            );
+            measure(
+                mode,
+                &mixed,
+                &mut mixed_buffer,
+                400,
+                300,
+                mixed_layout,
+                MIXED_PAINTS / 10,
+                MIXED_PATHS,
+            );
+        }
+
+        let mut tiny_samples: [Vec<u128>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut mixed_samples: [Vec<u128>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let modes = [Mode::Off, Mode::Counters, Mode::Timers];
+        for round in 0..ROUNDS {
+            // Alternate order between rounds so slow drift cannot favor a mode.
+            let order: [Mode; 3] = if round % 2 == 0 {
+                modes
+            } else {
+                [Mode::Timers, Mode::Counters, Mode::Off]
+            };
+            for mode in order {
+                let index = mode as usize;
+                tiny_samples[index].push(measure(
+                    mode,
+                    &tiny,
+                    &mut tiny_buffer,
+                    24,
+                    24,
+                    tiny_layout,
+                    TINY_PAINTS,
+                    1,
+                ));
+                mixed_samples[index].push(measure(
+                    mode,
+                    &mixed,
+                    &mut mixed_buffer,
+                    400,
+                    300,
+                    mixed_layout,
+                    MIXED_PAINTS,
+                    MIXED_PATHS,
+                ));
+            }
+        }
+
         super::set_vector_timing_enabled(false);
-        eprintln!(
-            "3000 small paints: disabled={}us enabled={}us",
-            samples[0], samples[1]
-        );
+        report("tiny-filled-paths", TINY_PAINTS, &mut tiny_samples);
+        report("mixed-16-path-scene", MIXED_PAINTS, &mut mixed_samples);
     }
 
     #[test]
@@ -772,27 +954,9 @@ mod tests {
         super::record_layer_lookup(true);
         super::record_layer_lookup(false);
         let pool = super::super::WorkerPool::new(3);
-        pool.scope(|scope| {
-            for _ in 0..4 {
-                let scene = &scene;
-                scope.spawn(move || {
-                    let mut pixels = vec![0; 24 * 24];
-                    for _ in 0..100 {
-                        super::draw_svg_scene(
-                            &mut pixels,
-                            24,
-                            24,
-                            LayoutBox::new(0.0, 0.0, 24.0, 24.0),
-                            scene,
-                            super::ClipRect::full(24.0, 24.0),
-                        );
-                    }
-                });
-            }
-        });
-        // A simultaneous independent render is not part of the frame.
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
+        // An unrelated render on another thread must not contribute.
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
                 let mut pixels = vec![0; 24 * 24];
                 super::draw_svg_scene(
                     &mut pixels,
@@ -803,9 +967,30 @@ mod tests {
                     super::ClipRect::full(24.0, 24.0),
                 );
             });
+            pool.scope(|scope| {
+                for _ in 0..4 {
+                    let scene = &scene;
+                    scope.spawn(move || {
+                        let mut pixels = vec![0; 24 * 24];
+                        for _ in 0..100 {
+                            super::draw_svg_scene(
+                                &mut pixels,
+                                24,
+                                24,
+                                LayoutBox::new(0.0, 0.0, 24.0, 24.0),
+                                scene,
+                                super::ClipRect::full(24.0, 24.0),
+                            );
+                        }
+                        for _ in 0..10 {
+                            super::record_layer_lookup(true);
+                        }
+                    });
+                }
+            });
         });
         let stats = super::take_frame_vector_stats();
-        assert_eq!(super::frame_layer_lookups(), (1, 1));
+        assert_eq!(super::frame_layer_lookups(), (41, 1));
         assert_eq!(stats.paths_painted, 400);
         assert!(!stats.timings_enabled);
         assert_eq!(stats.path_build_work_us, 0);

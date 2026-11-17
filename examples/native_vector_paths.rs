@@ -7,7 +7,7 @@ use cssimpler::{
         VectorViewBox,
     },
     renderer::{
-        FrameInfo, WindowConfig, latest_frame_timing_stats, layer_cache_stats,
+        FrameInfo, FramePaintMode, WindowConfig, latest_frame_timing_stats, layer_cache_stats,
         set_vector_timing_enabled,
     },
     style::parse_stylesheet,
@@ -64,15 +64,39 @@ fn main() -> anyhow::Result<()> {
         let frame = latest_frame_timing_stats();
         let layers = layer_cache_stats();
         eprintln!(
-            "last frame: {:?}, vector: {:?}, layer hits/misses: {}/{}, retained: {} entries / {} bytes, total builds: {}",
+            "last frame: mode={:?} reason={:?} paint={}us present={}us workers={}",
             frame.paint_mode,
-            frame.vector,
+            frame.paint_reason,
+            frame.paint_us,
+            frame.present_us,
+            frame.render_workers
+        );
+        eprintln!(
+            "vector: paths_painted={} build={}us stroke={}us projection={}us coverage={}us timers={}",
+            frame.vector.paths_painted,
+            frame.vector.path_build_work_us,
+            frame.vector.stroke_work_us,
+            frame.vector.projection_work_us,
+            frame.vector.coverage_work_us,
+            frame.vector.timings_enabled
+        );
+        eprintln!(
+            "layer cache: hits/misses={}/{} this frame; retained {} entries / {} bytes; cumulative builds={}",
             frame.layer_cache_hits,
             frame.layer_cache_misses,
             layers.entries,
             layers.bytes,
             layers.builds
         );
+        if frame.paint_mode == FramePaintMode::Idle {
+            eprintln!(
+                "note: the last frame was idle, so its vector counts are zero; interact with the window and close it after a repaint."
+            );
+        } else if frame.layer_cache_misses > 0 {
+            eprintln!(
+                "note: layer misses with a rising build count on unchanged artwork point at invalidation or cache limits; see docs/vector-diagnostics.md."
+            );
+        }
     }
     Ok(())
 }

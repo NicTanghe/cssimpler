@@ -140,32 +140,54 @@ pub enum FramePaintReason {
     IncrementalDamage,
 }
 
-/// Vector work in the most recently completed window frame. Durations are sums
-/// of elapsed durations measured in paint jobs; parallel jobs may overlap.
+/// Vector work in the most recently completed window frame.
+///
+/// Duration fields are sums of elapsed measurements taken inside paint jobs.
+/// Parallel jobs and dirty bands may overlap, so these values are not wall time
+/// and their total can exceed `FrameTimingStats::paint_us`. They exclude
+/// application geometry construction and scene preparation, are reported in
+/// whole microseconds, and saturate instead of wrapping. They are zero unless
+/// `timings_enabled` is true for the frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VectorFrameStats {
-    /// Path paint attempts after coarse clipping, counted once per job/band.
+    /// Path paint attempts that survived bounds and coarse clipping, counted
+    /// once per paint job or dirty band. This is not a count of unique paths,
+    /// is not a guarantee of visible pixels, and includes attempts whose
+    /// geometry fails to convert.
     pub paths_painted: usize,
-    /// Whether the detailed durations were enabled for this frame.
+    /// Whether the detailed duration fields were measured for this frame. The
+    /// switch is sampled when the frame starts painting and is off by default.
     pub timings_enabled: bool,
+    /// Renderer geometry to tiny-skia path conversion; excludes application
+    /// vector construction.
     pub path_build_work_us: usize,
+    /// Stroke outline construction in source space.
     pub stroke_work_us: usize,
+    /// Source-to-screen path projection for fills and strokes.
     pub projection_work_us: usize,
     /// Coverage rasterization and color blending, including clipping.
     pub coverage_work_us: usize,
 }
 
-/// Enable detailed per-path timers for subsequent window frames. Disabled by default.
+/// Enable or disable the detailed per-path vector clocks for subsequent window
+/// frames. Disabled by default. The switch is process-wide and is sampled when
+/// a frame begins painting, so it does not affect a frame already in progress.
+/// Cheap work counts such as `paths_painted` and raster-layer hit/miss counts
+/// are collected whether or not this is enabled.
 pub fn set_vector_timing_enabled(enabled: bool) {
     svg::set_vector_timing_enabled(enabled);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameTimingStats {
+    /// Last-completed-frame vector work; see [`VectorFrameStats`].
     pub vector: VectorFrameStats,
-    /// Promoted raster layer lookups found on first lookup during this frame.
+    /// First promoted raster-layer lookups in the frame that hit the cache.
+    /// A second lookup repeated after waiting on another build is not counted.
     pub layer_cache_hits: usize,
-    /// First lookups that missed, including layers that could not be cached.
+    /// First lookups that missed during the frame, including layers that could
+    /// not be cached; retained entries and cumulative builds are in
+    /// [`layer_cache_stats`].
     pub layer_cache_misses: usize,
     pub frame_index: u64,
     pub frame_delta_us: u64,
