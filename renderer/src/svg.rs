@@ -708,10 +708,12 @@ mod tests {
         });
     }
 
-    // Run alone: manipulates the same process-wide diagnostics as window rendering.
+    static VECTOR_STATS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     #[ignore = "manual instrumentation overhead measurement"]
     fn vector_timing_overhead() {
+        let _guard = VECTOR_STATS_TEST_LOCK.lock().unwrap();
         let scene = test_scene(
             vec![polygon(
                 &[(2.0, 2.0), (22.0, 2.0), (22.0, 22.0), (2.0, 22.0)],
@@ -747,6 +749,25 @@ mod tests {
             assert_eq!(super::take_frame_vector_stats().paths_painted, 0);
         }
         super::set_vector_timing_enabled(false);
+        eprintln!(
+            "3000 small paints: disabled={}us enabled={}us",
+            samples[0], samples[1]
+        );
+    }
+
+    #[test]
+    fn vector_frame_counts_reset_and_exclude_unrelated_renders() {
+        let _guard = VECTOR_STATS_TEST_LOCK.lock().unwrap();
+        let scene = test_scene(
+            vec![polygon(
+                &[(2.0, 2.0), (22.0, 2.0), (22.0, 22.0), (2.0, 22.0)],
+                true,
+            )],
+            SvgPathPaint::default(),
+            24.0,
+        );
+        let mut buffer = vec![pack_rgb(Color::WHITE); 24 * 24];
+        super::set_vector_timing_enabled(false);
         super::reset_frame_vector_stats();
         let pool = super::super::WorkerPool::new(3);
         pool.scope(|scope| {
@@ -781,7 +802,13 @@ mod tests {
                 );
             });
         });
-        assert_eq!(super::take_frame_vector_stats().paths_painted, 400);
+        let stats = super::take_frame_vector_stats();
+        assert_eq!(stats.paths_painted, 400);
+        assert!(!stats.timings_enabled);
+        assert_eq!(stats.path_build_work_us, 0);
+        assert_eq!(stats.stroke_work_us, 0);
+        assert_eq!(stats.projection_work_us, 0);
+        assert_eq!(stats.coverage_work_us, 0);
         super::reset_frame_vector_stats();
         super::draw_svg_scene(
             &mut buffer,
@@ -792,10 +819,6 @@ mod tests {
             super::ClipRect::full(24.0, 24.0),
         );
         assert_eq!(super::take_frame_vector_stats().paths_painted, 0);
-        eprintln!(
-            "3000 small paints: disabled={}us enabled={}us",
-            samples[0], samples[1]
-        );
     }
 
     #[test]
