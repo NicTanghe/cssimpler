@@ -125,6 +125,8 @@ use super::{
     transform::{AffineTransform, ClipState, transform_clip_rect},
 };
 
+use super::svg_preparation::{self, Stage};
+
 use super::gradient::{
     PreparedResolvedGradient, ResolvedGradientStop, prepare_resolved_gradient,
     sample_prepared_gradient,
@@ -264,19 +266,24 @@ fn draw_svg_scene_with_matrix(
             continue;
         }
         paths_painted = paths_painted.saturating_add(1);
-        let start = timed.then(Instant::now);
+        let start = svg_preparation::stage_start();
+        let build_start = timed.then(Instant::now);
         let source_path = build_svg_path(&path.geometry);
-        build_ns = build_ns.saturating_add(elapsed_ns(start));
+        svg_preparation::record(Stage::PathBuild, start);
+        build_ns = build_ns.saturating_add(elapsed_ns(build_start));
+        svg_preparation::count_path();
         let Some(source_path) = source_path else {
             continue;
         };
-        let start = (timed && fill.is_some()).then(Instant::now);
+        let start = svg_preparation::stage_start();
+        let projection_start = (timed && fill.is_some()).then(Instant::now);
         let fill_path = fill
             .as_ref()
             .and_then(|_| project_svg_path(&source_path, matrix));
-        projection_ns = projection_ns.saturating_add(elapsed_ns(start));
+        svg_preparation::record(Stage::Projection, start);
+        projection_ns = projection_ns.saturating_add(elapsed_ns(projection_start));
         if let (Some(fill), Some(screen_path)) = (fill, fill_path) {
-            let start = timed.then(Instant::now);
+            let coverage_start = timed.then(Instant::now);
             draw_svg_coverage(
                 buffer,
                 width,
@@ -286,7 +293,7 @@ fn draw_svg_scene_with_matrix(
                 inverse,
                 clip_state,
             );
-            coverage_ns = coverage_ns.saturating_add(elapsed_ns(start));
+            coverage_ns = coverage_ns.saturating_add(elapsed_ns(coverage_start));
         }
         if let Some(stroke) = stroke {
             // The previous distance-to-segment rasterizer used round caps and joins.
@@ -300,24 +307,31 @@ fn draw_svg_scene_with_matrix(
             let resolution_scale = (matrix.a.abs() + matrix.b.abs())
                 .max(matrix.c.abs() + matrix.d.abs())
                 .max(1.0);
-            let start = timed.then(Instant::now);
+            let start = svg_preparation::stage_start();
+            let stroke_start = timed.then(Instant::now);
             let outline = source_path.stroke(&stroke_style, resolution_scale);
-            stroke_ns = stroke_ns.saturating_add(elapsed_ns(start));
-            let start = (timed && outline.is_some()).then(Instant::now);
-            let screen_path = outline.and_then(|outline| project_svg_path(&outline, matrix));
-            projection_ns = projection_ns.saturating_add(elapsed_ns(start));
-            if let Some(screen_path) = screen_path {
-                let start = timed.then(Instant::now);
-                draw_svg_coverage(
-                    buffer,
-                    width,
-                    height,
-                    &screen_path,
-                    &stroke,
-                    inverse,
-                    clip_state,
-                );
-                coverage_ns = coverage_ns.saturating_add(elapsed_ns(start));
+            svg_preparation::record(Stage::StrokePrep, start);
+            stroke_ns = stroke_ns.saturating_add(elapsed_ns(stroke_start));
+            if let Some(outline) = outline {
+                svg_preparation::count_stroke_outline();
+                let start = svg_preparation::stage_start();
+                let projection_start = timed.then(Instant::now);
+                let screen_path = project_svg_path(&outline, matrix);
+                svg_preparation::record(Stage::Projection, start);
+                projection_ns = projection_ns.saturating_add(elapsed_ns(projection_start));
+                if let Some(screen_path) = screen_path {
+                    let coverage_start = timed.then(Instant::now);
+                    draw_svg_coverage(
+                        buffer,
+                        width,
+                        height,
+                        &screen_path,
+                        &stroke,
+                        inverse,
+                        clip_state,
+                    );
+                    coverage_ns = coverage_ns.saturating_add(elapsed_ns(coverage_start));
+                }
             }
         }
     }
@@ -500,6 +514,7 @@ fn draw_svg_coverage(
             let end_y = (tile_y + COVERAGE_TILE_SIZE as i32).min(y1);
             for tile_x in ((x0 / tile_size) * tile_size..x1).step_by(COVERAGE_TILE_SIZE) {
                 let end_x = (tile_x + COVERAGE_TILE_SIZE as i32).min(x1);
+                let raster_start = svg_preparation::stage_start();
                 tile.clear();
                 tile.fill_path(
                     path,
@@ -507,6 +522,9 @@ fn draw_svg_coverage(
                     true,
                     Transform::from_translate(-(tile_x as f32), -(tile_y as f32)),
                 );
+                svg_preparation::record(Stage::CoverageRaster, raster_start);
+                svg_preparation::count_coverage_tile();
+                let blend_start = svg_preparation::stage_start();
                 let tile_layout = LayoutBox::new(
                     tile_x.max(x0) as f32,
                     tile_y.max(y0) as f32,
@@ -559,6 +577,7 @@ fn draw_svg_coverage(
                         );
                     }
                 }
+                svg_preparation::record(Stage::CoverageBlend, blend_start);
             }
         }
     });
