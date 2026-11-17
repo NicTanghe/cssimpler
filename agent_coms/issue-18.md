@@ -91,3 +91,51 @@ default. Raw run output: `/tmp/issue18-overhead-runs.txt` (machine-local).
 - `docs/native-vector-paths.md` was left untouched to avoid conflicting with
   #17's appended section; diagnostics docs live in `docs/vector-diagnostics.md`
   with an index link from `docs/README.md`.
+
+## 2026-11-17T20:32Z - issue-18 agent (resume after host reboot)
+
+Committed and pushed `789333a` ("Clarify vector diagnostics boundaries and measure
+overhead") to `codex/vector-diagnostics`, then added the scripted example mode
+below. No code in the measured renderer paths changed after the overhead runs
+(only doc comments and example/doc edits), so the recorded release medians still
+apply to this revision.
+
+### Scripted example validation (no manual window interaction)
+
+`App::with_exit_when` made the example runnable non-interactively. `--frames N`
+now shifts the artwork by one pixel on each scripted frame (so every counted
+frame paints), exits after N frames, and then prints the snapshot. Without
+`--frames` the example keeps its previous interactive behaviour.
+
+```
+cargo build -j 2 --example native_vector_paths
+./target/debug/examples/native_vector_paths --diagnostics --frames 3
+# exit 0, stderr:
+# last frame: mode=Incremental reason=IncrementalDamage paint=25997us present=13094us workers=8
+# vector: paths_painted=17 build=34us stroke=128us projection=31us coverage=143012us timers=true
+# layer cache: hits/misses=0/0 this frame; retained 0 entries / 0 bytes; cumulative builds=0
+```
+
+That run is debug-profile and on the loaded shared machine; it is evidence that
+the plumbing publishes a painted frame, not a performance claim. It also shows
+the documented boundary in practice: summed `coverage_work_us` across 8 workers
+(143012us) is not the 25997us frame wall time.
+
+`./target/debug/examples/native_vector_paths --export /tmp/issue18-curves.svg`
+still exits 0 and writes the same SVG export path.
+
+### Validation rerun after reboot
+
+```
+cargo check --workspace -j 2                          # ok (only pre-existing warnings)
+cargo check -j 2 --example native_vector_paths -p cssimpler  # ok
+cargo test -j 2 -p cssimpler-renderer --lib vector_   # 4 passed, 1 ignored
+cargo test -j 2 -p cssimpler --test issue_18_vector_diagnostics  # 2 passed
+cargo test -j 2 -p cssimpler-renderer --lib           # 273 passed, 1 ignored
+```
+
+### Remaining
+
+- Full `cargo test --workspace` still not run (renderer lib + focused tests run).
+- Overhead numbers come from the loaded shared host; they are recorded with load
+  average and raw per-run data so they can be reproduced.

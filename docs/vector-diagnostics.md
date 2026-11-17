@@ -102,6 +102,14 @@ runnable example prints the snapshot after the window closes:
 cargo run --example native_vector_paths -- --diagnostics
 ```
 
+For scripted, non-interactive runs add `--frames N`: the example shifts the
+artwork slightly on every frame so each frame paints, exits after `N` frames,
+and then prints the snapshot. For example:
+
+```sh
+cargo run --example native_vector_paths -- --diagnostics --frames 3
+```
+
 When interpreting a slow frame, first confirm `paint_mode` is not idle and look
 at `paint_us` with `render_workers`/`dirty_jobs`. Then compare
 `coverage_work_us` (rasterization and blending) with `path_build_work_us`,

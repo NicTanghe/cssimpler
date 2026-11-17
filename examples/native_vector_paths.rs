@@ -1,5 +1,8 @@
 //! Run with `cargo run --example native_vector_paths -- --export work/curves.svg`.
 //! Pass `--diagnostics` to print the last completed frame after the window closes.
+//! Add `--frames N` to exit automatically after N repaints, for scripted runs.
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use cssimpler::{
     app::{App, Invalidation},
     core::{
@@ -13,23 +16,24 @@ use cssimpler::{
     style::parse_stylesheet,
 };
 
-fn artwork() -> VectorScene {
+fn artwork(offset_x: f32) -> VectorScene {
+    let point = |x: f32, y: f32| P::new(x + offset_x, y);
     VectorScene::new(
         VectorViewBox::new(0., 0., 400., 300.),
         vec![
             VectorPath::new(
                 vec![
-                    MoveTo(P::new(40., 240.)),
+                    MoveTo(point(40., 240.)),
                     CubicTo {
-                        control1: P::new(20., 30.),
-                        control2: P::new(260., 10.),
-                        end: P::new(350., 100.),
+                        control1: point(20., 30.),
+                        control2: point(260., 10.),
+                        end: point(350., 100.),
                     },
                     QuadTo {
-                        control: P::new(390., 260.),
-                        end: P::new(250., 250.),
+                        control: point(390., 260.),
+                        end: point(250., 250.),
                     },
-                    LineTo(P::new(40., 240.)),
+                    LineTo(point(40., 240.)),
                     Close,
                 ],
                 VectorPaint {
@@ -43,23 +47,42 @@ fn artwork() -> VectorScene {
     )
     .unwrap()
 }
-fn update(_: &mut VectorScene, _: FrameInfo) -> Invalidation {
-    Invalidation::Clean
+static FRAMES_PAINTED: AtomicU32 = AtomicU32::new(0);
+static EXIT_AFTER_FRAMES: AtomicU32 = AtomicU32::new(0);
+
+fn update(scene: &mut VectorScene, frame: FrameInfo) -> Invalidation {
+    if EXIT_AFTER_FRAMES.load(Ordering::Relaxed) == 0 {
+        return Invalidation::Clean;
+    }
+    FRAMES_PAINTED.fetch_add(1, Ordering::Relaxed);
+    // Scripted runs shift the artwork so every counted frame actually paints.
+    *scene = artwork((frame.frame_index % 2) as f32);
+    Invalidation::Paint
+}
+
+fn exit_after_requested_frames(_: &VectorScene) -> bool {
+    let limit = EXIT_AFTER_FRAMES.load(Ordering::Relaxed);
+    limit > 0 && FRAMES_PAINTED.load(Ordering::Relaxed) >= limit
 }
 fn view(scene: &VectorScene) -> Node {
     Node::vector(scene.clone()).with_id("artwork").into()
 }
 fn main() -> anyhow::Result<()> {
-    let scene = artwork();
+    let scene = artwork(0.0);
     let args = std::env::args().collect::<Vec<_>>();
     if let Some(pair) = args.windows(2).find(|pair| pair[0] == "--export") {
         std::fs::write(&pair[1], scene.to_svg())?;
         return Ok(());
     }
     let diagnostics = args.iter().any(|arg| arg == "--diagnostics");
+    if let Some(pair) = args.windows(2).find(|pair| pair[0] == "--frames") {
+        EXIT_AFTER_FRAMES.store(pair[1].parse().unwrap_or(0), Ordering::Relaxed);
+    }
     set_vector_timing_enabled(diagnostics);
     let css = parse_stylesheet("#artwork { width: 400px; height: 300px; }")?;
-    App::new(scene, &css, update, view).run(WindowConfig::new("Native vector curves", 440, 340))?;
+    App::new(scene, &css, update, view)
+        .with_exit_when(exit_after_requested_frames)
+        .run(WindowConfig::new("Native vector curves", 440, 340))?;
     if diagnostics {
         let frame = latest_frame_timing_stats();
         let layers = layer_cache_stats();
