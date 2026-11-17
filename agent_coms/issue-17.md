@@ -105,8 +105,10 @@ Raw: `docs/reports/issue-17-vector-sharing-bench.md{,.jsonl}`,
 - `cargo test --test vector_sharing` (1 passed).
 - `cargo test -p cssimpler-renderer native_shared_geometry_cache_invalidates_paint_and_replacement --lib`
   (1 passed).
-- Full `cargo test --workspace` not run (slow on this machine, and focused
-  suites cover the touched code); state that in the PR.
+- `cargo test -j 2 --workspace --no-fail-fast` (557 passed, 0 failed: 81 root,
+  9 `issue_17_shared_geometry`, 1 `vector_sharing`, 52 core, 7 macro, 270
+  renderer, 137 style; doc-tests 0). Run after the focused suites above; all
+  passed.
 
 ### Open items / caveats
 
@@ -115,4 +117,4 @@ Raw: `docs/reports/issue-17-vector-sharing-bench.md{,.jsonl}`,
   deterministic allocation counts are the reliable part. A quiet re-run is
   only needed if reviewers distrust the timing direction; the allocation
   evidence does not depend on load.
-- Full-workspace tests were skipped due to time/machine load.
+- Full-workspace tests were run after the focused suites (557 passed, 0 failed).
