@@ -142,7 +142,8 @@ unbounded queue intended for UI commands. For explicit fragment refreshes or
 application-managed batching, use `ActionQueue::drain_into` with `App::new`;
 that standalone path leaves invalidation and runtime wakeup wiring to the caller.
 
-Run the complete example with `cargo run --example actions`.
+Follow the [typed UI actions instructions](docs/typed-ui-actions.md) for a complete
+setup and migration guide. Run the example with `cargo run --example actions`.
 
 ---
 
