@@ -89,11 +89,58 @@ clone its handle into their registrations. Stages stay on the event-loop thread.
 
 The current renderer supports visible `UsdGeomMesh` polygon cages with convex
 faces, world transforms, a constant `displayColor`, time-sampled points/topology,
-perspective/orthographic authored cameras, and Y-up/Z-up orbit views. It generates
-flat normals and uses built-in studio shading. It does not yet evaluate subdivision,
-skinning, arbitrary material networks, textures, authored lighting, or production
-PBR. Material and lighting data remain in the USD stage for later rendering support.
+perspective/orthographic authored cameras, and Y-up/Z-up orbit views. It uses
+normals from the mesh's `normals` attribute when a value is available at the
+selected evaluation time; otherwise it keeps the existing flat-face fallback.
+Authored normals are transformed with the inverse transpose and normalized before
+being uploaded as shading normals. It uses built-in studio shading. It does not
+yet evaluate subdivision, skinning, arbitrary material networks, textures,
+authored lighting, or production PBR. Material and lighting data remain in the
+USD stage for later rendering support.
 Concave faces and malformed topology return errors instead of incorrect geometry.
+
+### Authored mesh normals
+
+Normal indexing follows USD interpolation metadata, including across polygon
+fan triangulation:
+
+| `interpolation` | Required values | Value used for each emitted corner |
+| --- | --- | --- |
+| `constant` | One | The same normal everywhere |
+| `uniform` | One per face | The source face's normal |
+| `vertex` | One per point | Indexed by the source point index |
+| `varying` | One per point | Indexed by the source point index for this polygon-cage renderer |
+| `faceVarying` | One per face corner | Indexed by the original flat face-corner offset |
+
+When interpolation metadata is absent, normals use `vertex`. For example, this
+attribute fragment supplies normals for a four-point mesh:
+
+```usda
+normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+    interpolation = "vertex"
+)
+```
+
+Authored normals can differ from geometric face normals: smooth vertex normals
+are retained, and face-varying normals preserve distinct normals at shared points.
+The existing shader interpolates normals over triangles and renormalizes them for
+studio lighting. Nonuniform scale, shear, and rotation use the world transform's
+inverse transpose; translation does not affect their direction. Non-unit input
+vectors are normalized, including very large or small finite magnitudes.
+
+The renderer reads normals at the same selected time as points and topology.
+Changing authored normals through the shared USD stage invalidates derived mesh
+vertices through the existing stage revision tracking; changing evaluation time
+also reevaluates normals. USD resolves the time samples before normalization.
+
+A missing value at the selected time uses generated flat face normals. An authored
+value with a wrong count, unsupported interpolation, zero/nonfinite direction, or
+singular normal transform returns an error with the mesh path. It does not
+silently replace malformed authored normals with flat shading. This support is
+for `Mesh.normals`; indexed `primvars:normals` and normal-map textures are not
+evaluated by this path.
+
+### Cameras and viewport composition
 
 Orbit cameras live in a viewport-owned in-memory USD stage and do not modify the
 source asset. `UsdRenderer::control()` provides view-local animation-time control
