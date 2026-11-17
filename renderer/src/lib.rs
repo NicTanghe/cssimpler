@@ -72,8 +72,9 @@ pub(crate) use self::color::{
     u10_to_u8_channel, unpack_alpha8, unpack_linear_rgb, unpack_rgb, unpack_rgb10,
 };
 pub use self::input::{
-    ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
-    PointerButton, PointerPosition, ScrollDelta, TextInputEvent, ViewportEvent,
+    ButtonState, EngineEvent, FrameInputCadence, InputRedrawDecision, InputRedrawPolicy,
+    KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers, PointerButton, PointerPosition,
+    ScrollDelta, TextInputEvent, ViewportEvent,
 };
 pub(crate) use self::softbuffer_dither::{
     to_softbuffer_rgb_blue_noise, to_softbuffer_rgb_blue_noise_with_alpha,
@@ -140,8 +141,55 @@ pub enum FramePaintReason {
     IncrementalDamage,
 }
 
+/// Vector work in the most recently completed window frame.
+///
+/// Duration fields are sums of elapsed measurements taken inside paint jobs.
+/// Parallel jobs and dirty bands may overlap, so these values are not wall time
+/// and their total can exceed `FrameTimingStats::paint_us`. They exclude
+/// application geometry construction and scene preparation, are reported in
+/// whole microseconds, and saturate instead of wrapping. They are zero unless
+/// `timings_enabled` is true for the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VectorFrameStats {
+    /// Path paint attempts that survived bounds and coarse clipping, counted
+    /// once per paint job or dirty band. This is not a count of unique paths,
+    /// is not a guarantee of visible pixels, and includes attempts whose
+    /// geometry fails to convert.
+    pub paths_painted: usize,
+    /// Whether the detailed duration fields were measured for this frame. The
+    /// switch is sampled when the frame starts painting and is off by default.
+    pub timings_enabled: bool,
+    /// Renderer geometry to tiny-skia path conversion; excludes application
+    /// vector construction.
+    pub path_build_work_us: usize,
+    /// Stroke outline construction in source space.
+    pub stroke_work_us: usize,
+    /// Source-to-screen path projection for fills and strokes.
+    pub projection_work_us: usize,
+    /// Coverage rasterization and color blending, including clipping.
+    pub coverage_work_us: usize,
+}
+
+/// Enable or disable the detailed per-path vector clocks for subsequent window
+/// frames. Disabled by default. The switch is process-wide and is sampled when
+/// a frame begins painting, so it does not affect a frame already in progress.
+/// Cheap work counts such as `paths_painted` and raster-layer hit/miss counts
+/// are collected whether or not this is enabled.
+pub fn set_vector_timing_enabled(enabled: bool) {
+    svg::set_vector_timing_enabled(enabled);
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameTimingStats {
+    /// Last-completed-frame vector work; see [`VectorFrameStats`].
+    pub vector: VectorFrameStats,
+    /// First promoted raster-layer lookups in the frame that hit the cache.
+    /// A second lookup repeated after waiting on another build is not counted.
+    pub layer_cache_hits: usize,
+    /// First lookups that missed during the frame, including layers that could
+    /// not be cached; retained entries and cumulative builds are in
+    /// [`layer_cache_stats`].
+    pub layer_cache_misses: usize,
     pub frame_index: u64,
     pub frame_delta_us: u64,
     pub update_us: u64,
@@ -343,7 +391,9 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     where
         F: FnOnce() + Send + 'scope,
     {
-        let boxed: BoxedRenderTask<'scope> = Box::new(task);
+        let collecting = svg::is_collecting();
+        let boxed: BoxedRenderTask<'scope> =
+            Box::new(move || svg::with_collecting(collecting, task));
         let static_task: BoxedRenderTask<'static> = unsafe { std::mem::transmute(boxed) };
         self.tasks
             .lock()
@@ -615,8 +665,11 @@ impl Default for LayerCacheLimits {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayerCacheStats {
+    /// Currently retained raster entries.
     pub entries: usize,
+    /// Bytes in currently retained raster entries.
     pub bytes: usize,
+    /// Cumulative successful raster builds since process start; clearing does not reset it.
     pub builds: usize,
 }
 
@@ -900,8 +953,10 @@ fn cached_promoted_surface(
             .write()
             .unwrap_or_else(|p| p.into_inner());
         if let Some(surface) = cached_subtree_surface_entry(&mut cache, key) {
+            svg::record_layer_lookup(true);
             return Some(surface);
         }
+        svg::record_layer_lookup(false);
     }
     let _build_guard = SUBTREE_SURFACE_BUILD_LOCK
         .lock()
@@ -1434,6 +1489,13 @@ pub trait SceneProvider {
 
     fn redraw_schedule(&self) -> RedrawSchedule {
         RedrawSchedule::OnInvalidation
+    }
+
+    /// Opt in to coalescing pointer-motion and wheel paints to the frame cadence.
+    /// Raw events still reach [`SceneProvider::handle_engine_event`] immediately;
+    /// only the paints they request are delayed to the next frame boundary.
+    fn input_redraw_policy(&self) -> InputRedrawPolicy {
+        InputRedrawPolicy::Immediate
     }
 
     fn needs_redraw(&self) -> bool {
