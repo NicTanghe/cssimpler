@@ -1377,6 +1377,9 @@ pub enum RedrawSchedule {
 }
 
 pub trait SceneProvider {
+    /// Install a thread-safe callback that wakes an idle runtime for new work.
+    fn install_wake(&mut self, _wake: std::sync::Arc<dyn Fn() + Send + Sync>) {}
+
     /// Transfer optional native GPU viewport registrations to the window runtime.
     #[cfg(feature = "gpu-viewport")]
     fn take_gpu_viewports(&mut self) -> gpu::GpuViewportRegistry {

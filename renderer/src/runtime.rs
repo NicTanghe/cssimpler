@@ -39,13 +39,12 @@ use super::{
     to_softbuffer_rgb_blue_noise_with_alpha,
 };
 
-#[cfg(feature = "gpu-viewport")]
 #[derive(Clone, Copy, Debug)]
 enum RuntimeEvent {
+    ActionsPending,
+    #[cfg(feature = "gpu-viewport")]
     GpuRedraw,
 }
-#[cfg(not(feature = "gpu-viewport"))]
-type RuntimeEvent = ();
 
 const DEFAULT_NATIVE_GLASS_TINT: Color = Color::rgba(245, 250, 255, 128);
 static SYSTEM_DRAG_OVERRIDE: AtomicBool = AtomicBool::new(false);
@@ -176,6 +175,10 @@ where
         .map_err(RendererError::from)?;
     let context = Context::new(event_loop.owned_display_handle()).map_err(RendererError::from)?;
     let mut app = RuntimeApp::new(config, scene_provider, context);
+    let proxy = event_loop.create_proxy();
+    app.scene_provider.install_wake(Arc::new(move || {
+        let _ = proxy.send_event(RuntimeEvent::ActionsPending);
+    }));
     #[cfg(feature = "gpu-viewport")]
     {
         let gpu = super::gpu::runtime::GpuRuntime::new(app.scene_provider.take_gpu_viewports())?;
@@ -1413,6 +1416,15 @@ impl<P> ApplicationHandler<RuntimeEvent> for RuntimeApp<P>
 where
     P: SceneProvider,
 {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: RuntimeEvent) {
+        match event {
+            RuntimeEvent::ActionsPending => self.request_redraw_if_possible(),
+            // GPU redraws are serviced independently in about_to_wait.
+            #[cfg(feature = "gpu-viewport")]
+            RuntimeEvent::GpuRedraw => {}
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.suspended = false;
         self.create_window(event_loop);

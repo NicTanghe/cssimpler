@@ -1,6 +1,8 @@
 extern crate self as cssimpler;
 
+pub mod actions;
 pub mod app;
+pub use actions::ActionQueue;
 
 pub use cssimpler_core as core;
 pub use cssimpler_core::fonts;

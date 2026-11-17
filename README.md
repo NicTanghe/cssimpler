@@ -83,6 +83,69 @@ Dynamic theming = changing variables. Nothing more.
 
 ---
 
+## Typed UI actions
+
+Use `App::with_actions` to send button clicks and payloads to your update function
+without application-owned atomics, bit flags, or mutexes:
+
+```rust
+use cssimpler::{ActionQueue, app::{App, Invalidation}, renderer::WindowConfig,
+    style::parse_stylesheet, ui};
+
+#[derive(Clone)]
+enum Action { Increment, SetCount(u64) }
+
+fn main() -> anyhow::Result<()> {
+    let sheet = parse_stylesheet("button { padding: 12px; }")?;
+    App::with_actions(
+        0_u64, &sheet,
+        |count, actions: &[Action], _frame| {
+            for action in actions {
+                match action {
+                    Action::Increment => *count += 1,
+                    Action::SetCount(value) => *count = *value,
+                }
+            }
+            Invalidation::Clean
+        },
+        |count, actions: &ActionQueue<Action>| ui! {
+            <div>
+                <p>{format!("Count: {count}")}</p>
+                <button onclick_shared={actions.emit(Action::Increment)}>Increment</button>
+                <button onclick_shared={actions.emit(Action::SetCount(0))}>Reset</button>
+            </div>
+        },
+    ).run(WindowConfig::new("Actions", 480, 240))?;
+    Ok(())
+}
+```
+
+The update receives actions in enqueue order, including repeated clicks, followed
+by a structural view refresh for each nonempty batch. Actions enqueued during an
+update are processed in the next update. The callback still runs on frames with
+an empty batch, so simulation updates can use `with_continuous_updates(true)` as
+before. `App::new` and existing applications keep their current behavior.
+
+Clone the queue to send actions from other callbacks or worker threads; `push`
+wakes an idle window when the queue becomes nonempty. `emit` creates a reusable
+no-argument handler and requires a cloneable, thread-safe action. `emit_with`
+converts a handler argument into an action, for example
+`actions.emit_with(Action::SetCount)`. Sending with `push` or `emit_with` does not
+require actions to implement `Clone` or `Sync`; `Send + 'static` is sufficient.
+
+The dependency-free queue uses `Arc<Mutex<Vec<Action>>>` and swaps two reusable
+buffers, processing actions outside the lock. After both buffers have enough
+capacity, batching needs no further buffer allocations. Growing batches and
+payloads such as `String` can still allocate. This trades some overhead relative
+to a bitmask for typed payloads, FIFO ordering, and no 64-action ceiling. It is an
+unbounded queue intended for UI commands. For explicit fragment refreshes or
+application-managed batching, use `ActionQueue::drain_into` with `App::new`;
+that standalone path leaves invalidation and runtime wakeup wiring to the caller.
+
+Run the complete example with `cargo run --example actions`.
+
+---
+
 ## Counter Button Example
 
 If you do want a button, it can stay simple too:
