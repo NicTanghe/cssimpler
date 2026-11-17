@@ -1,7 +1,7 @@
 //! Integration tests for issue #21: fluent native vector path builder.
 use cssimpler::core::{
-    Color, Node, PathCommand, PathCommand::*, VectorPaint, VectorPath, VectorPoint as P,
-    VectorScene, VectorViewBox,
+    Color, Node, PathCommand, PathCommand::*, VectorPaint, VectorPath, VectorPathBuilder,
+    VectorPoint as P, VectorScene, VectorViewBox,
 };
 
 fn authored_commands() -> Vec<PathCommand> {
@@ -237,6 +237,11 @@ fn invalid_input_returns_errors_instead_of_panicking() {
 
 #[test]
 fn command_buffer_is_reserved_and_moved_without_copying() {
+    let reserved = VectorPathBuilder::with_capacity(4);
+    assert!(reserved.capacity() >= 4);
+    assert_eq!(reserved.paint(), VectorPaint::default());
+    assert_eq!(VectorPathBuilder::default(), VectorPathBuilder::new());
+
     let mut builder = VectorPath::builder().reserve(8);
     assert!(builder.capacity() >= 8);
     assert!(builder.is_empty());
