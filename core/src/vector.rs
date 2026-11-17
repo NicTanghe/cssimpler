@@ -177,10 +177,11 @@ impl VectorView {
     ) -> Option<VectorPoint> {
         let (scale_x, scale_y) = viewport_scales(view_box, layout)?;
         let view = self.document_to_view(point);
-        Some(VectorPoint::new(
+        let viewport = VectorPoint::new(
             layout.x + (view.x - view_box.min_x) * scale_x,
             layout.y + (view.y - view_box.min_y) * scale_y,
-        ))
+        );
+        (viewport.x.is_finite() && viewport.y.is_finite()).then_some(viewport)
     }
 
     /// Convert a pointer position back into authored drawing coordinates.

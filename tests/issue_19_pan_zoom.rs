@@ -333,6 +333,18 @@ fn invalid_and_degenerate_view_inputs_are_rejected() {
         )
         .is_err()
     );
+    // A finite but extreme document coordinate that overflows the f32 mapping
+    // is rejected rather than producing an infinite pointer position.
+    assert!(
+        VectorView::from_zoom(VectorView::MAX_ZOOM)
+            .unwrap()
+            .document_to_viewport(
+                VectorViewBox::new(0.0, 0.0, 10.0, 10.0),
+                LayoutBox::new(0.0, 0.0, 10.0, 10.0),
+                VectorPoint::new(f32::MAX, 1.0),
+            )
+            .is_none()
+    );
     assert!(VectorView::default().is_identity());
 }
 
