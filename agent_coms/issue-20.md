@@ -97,3 +97,13 @@ Raw run log: `target/issue20-release-runs.txt` (git-ignored build dir; 5 runs pl
 - No overlap with #19/#21/#22 in `renderer/src/runtime.rs`,
   `renderer/src/input.rs`, or `src/app.rs` according to their current branch file
   lists.
+
+### Delivered
+
+- Commits: `aa11d1c` (code, tests, example), `a2767ec` (docs + this file).
+- PR: https://github.com/NicTanghe/cssimpler/pull/28 (base `main`, head
+  `agent/issue-20-frame-aligned-drag`, ready for review, mergeable, no required
+  checks configured).
+- Full workspace lib tests were run serially and all pass:
+  92 + 49 + 7 + 272 + 137 passed, 0 failed. Logs: `target/ws-lib-tests.log`,
+  release replay: `target/issue20-release-runs.txt` (git-ignored).
