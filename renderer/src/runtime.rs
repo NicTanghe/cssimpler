@@ -1093,6 +1093,7 @@ where
             )
         {
             let paint_start = Instant::now();
+            crate::svg::reset_frame_vector_stats();
             crate::shadow::reset_frame_shadow_stats();
             crate::fonts::reset_frame_text_stats();
             crate::global_worker_pool().reset_frame_stats();
@@ -1137,6 +1138,9 @@ where
                 )
             };
             frame_stats.paint_us = duration_to_us(paint_start.elapsed());
+            frame_stats.vector = crate::svg::take_frame_vector_stats();
+            (frame_stats.layer_cache_hits, frame_stats.layer_cache_misses) =
+                crate::svg::frame_layer_lookups();
             frame_stats.render_workers = paint_stats.workers;
             frame_stats.dirty_regions = paint_stats.dirty_regions;
             frame_stats.dirty_jobs = paint_stats.dirty_jobs;
