@@ -83,5 +83,5 @@ were); renderer/style tests are untouched by this change.
 
 ### PR
 
-Branch pushed as `agent/issue-21-vector-builder`; one PR opened against `main`
-(see session report).
+PR: https://github.com/NicTanghe/cssimpler/pull/26 (base `main`, ready for review,
+`Closes #21`). Branch: `agent/issue-21-vector-builder`.
