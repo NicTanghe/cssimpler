@@ -1,4 +1,5 @@
 mod clipboard;
+mod number;
 mod selection;
 
 use clipboard::TextClipboard;
@@ -29,6 +30,7 @@ struct ActiveInputDrag {
     path: ElementPath,
     anchor: usize,
     password: bool,
+    number: Option<number::NumberDrag>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,9 +85,19 @@ impl NativeTextInputs {
         let selection_cleared = self.document_selection.reconcile(scene, runtime_world);
         let before = self.focused_value();
         let changed = match event {
-            EngineEvent::PointerMoved { position, .. } => {
+            EngineEvent::PointerMoved {
+                position,
+                modifiers,
+            } => {
                 self.pointer_position = Some(*position);
-                let input = self.update_drag_selection(scene);
+                let input = if let Some(drag) = self.active_drag.as_mut()
+                    && let Some(number) = drag.number.as_mut()
+                    && let Some(state) = self.states.get_mut(&drag.key)
+                {
+                    number.update(position.y, modifiers.shift, state)
+                } else {
+                    self.update_drag_selection(scene)
+                };
                 let document = self.document_selection.update(scene, *position);
                 input || document
             }
@@ -369,6 +381,7 @@ impl NativeTextInputs {
             path,
             anchor,
             password: is_password_input(element),
+            number: number::NumberDrag::new(element, position.y, &state.value),
         });
 
         changed
@@ -771,9 +784,11 @@ impl NativeTextInputState {
 
 fn is_native_text_input(element: &ElementNode) -> bool {
     element.tag.eq_ignore_ascii_case("input")
-        && element
-            .attribute("type")
-            .is_none_or(|t| t.eq_ignore_ascii_case("text") || t.eq_ignore_ascii_case("password"))
+        && element.attribute("type").is_none_or(|t| {
+            t.eq_ignore_ascii_case("text")
+                || t.eq_ignore_ascii_case("password")
+                || t.eq_ignore_ascii_case("number")
+        })
 }
 
 fn is_editable_text_input(element: &ElementNode) -> bool {

@@ -132,6 +132,14 @@ anything. Use `onclick_shared` for closures that capture state (and
 `oninput_shared` for captured input handlers). For more complex
 state, keep it in a struct and share only what the handlers need.
 
+Native `<input type="number">` fields support click-to-type editing and vertical
+dragging: drag up to increase or down to decrease, with one step per four logical
+pixels. Hold Shift while dragging for 10× steps. Dragging respects `step` (default
+`1`), `min`, and `max`; `step="any"` uses `1` for dragging. A small movement
+threshold keeps ordinary clicks available for caret placement and typing. Number
+fields use the same `oninput` handlers, selection shortcuts, and Tab navigation as
+text fields; `disabled` and `readonly` prevent editing and dragging.
+
 ---
 
 
