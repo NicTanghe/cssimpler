@@ -29,6 +29,7 @@ mod shadow;
 mod shapes;
 mod softbuffer_dither;
 mod svg;
+pub use svg::hit_test_vector_scene;
 mod svg_preparation;
 mod text_edit;
 pub use selection_geometry::prepare_text_selection_backgrounds;

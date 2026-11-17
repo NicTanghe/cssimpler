@@ -132,7 +132,7 @@ use super::gradient::{
     sample_prepared_gradient,
 };
 
-use cssimpler_core::LayoutBox;
+use cssimpler_core::{LayoutBox, PathCommand, VectorPoint, VectorScene, VectorView};
 
 // Coverage only: no RGBA pixmap or cached scene layer. Fixed size even for huge SVGs.
 const COVERAGE_TILE_SIZE: usize = 256;
@@ -183,7 +183,7 @@ pub(crate) fn draw_svg_scene(
     scene: &SvgScene,
     clip: ClipRect,
 ) {
-    let Some(matrix) = svg_view_box_matrix(layout, scene) else {
+    let Some(matrix) = svg_view_box_matrix(layout, scene.view_box, scene.view) else {
         return;
     };
     let clip_state = ClipState::new(clip);
@@ -211,7 +211,7 @@ pub(crate) fn draw_svg_scene_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
-    let Some(view_matrix) = svg_view_box_matrix(layout, scene) else {
+    let Some(view_matrix) = svg_view_box_matrix(layout, scene.view_box, scene.view) else {
         return;
     };
     let full_matrix = matrix.multiply(view_matrix);
@@ -296,20 +296,9 @@ fn draw_svg_scene_with_matrix(
             coverage_ns = coverage_ns.saturating_add(elapsed_ns(coverage_start));
         }
         if let Some(stroke) = stroke {
-            // The previous distance-to-segment rasterizer used round caps and joins.
-            // Stroke in source space so nonuniform scaling also scales the outline.
-            let stroke_style = Stroke {
-                width: path.paint.stroke_width,
-                line_cap: LineCap::Round,
-                line_join: LineJoin::Round,
-                ..Stroke::default()
-            };
-            let resolution_scale = (matrix.a.abs() + matrix.b.abs())
-                .max(matrix.c.abs() + matrix.d.abs())
-                .max(1.0);
             let start = svg_preparation::stage_start();
             let stroke_start = timed.then(Instant::now);
-            let outline = source_path.stroke(&stroke_style, resolution_scale);
+            let outline = stroke_svg_path(&source_path, path.paint.stroke_width, matrix);
             svg_preparation::record(Stage::StrokePrep, start);
             stroke_ns = stroke_ns.saturating_add(elapsed_ns(stroke_start));
             if let Some(outline) = outline {
@@ -347,24 +336,10 @@ fn draw_svg_scene_with_matrix(
 }
 
 fn build_svg_path(geometry: &SvgPathGeometry) -> Option<Path> {
-    let mut builder = PathBuilder::new();
     if !geometry.commands.is_empty() {
-        use cssimpler_core::PathCommand;
-        for command in &geometry.commands {
-            match *command {
-                PathCommand::MoveTo(p) => builder.move_to(p.x, p.y),
-                PathCommand::LineTo(p) => builder.line_to(p.x, p.y),
-                PathCommand::QuadTo { control: c, end: p } => builder.quad_to(c.x, c.y, p.x, p.y),
-                PathCommand::CubicTo {
-                    control1: a,
-                    control2: b,
-                    end: p,
-                } => builder.cubic_to(a.x, a.y, b.x, b.y, p.x, p.y),
-                PathCommand::Close => builder.close(),
-            }
-        }
-        return builder.finish();
+        return build_vector_path(&geometry.commands);
     }
+    let mut builder = PathBuilder::new();
     for contour in &geometry.contours {
         if contour.points.len() < 2 {
             continue;
@@ -386,6 +361,136 @@ fn build_svg_path(geometry: &SvgPathGeometry) -> Option<Path> {
         }
     }
     builder.finish()
+}
+
+fn build_vector_path(commands: &[PathCommand]) -> Option<Path> {
+    let mut builder = PathBuilder::new();
+    for command in commands {
+        match *command {
+            PathCommand::MoveTo(p) => builder.move_to(p.x, p.y),
+            PathCommand::LineTo(p) => builder.line_to(p.x, p.y),
+            PathCommand::QuadTo { control: c, end: p } => builder.quad_to(c.x, c.y, p.x, p.y),
+            PathCommand::CubicTo {
+                control1: a,
+                control2: b,
+                end: p,
+            } => builder.cubic_to(a.x, a.y, b.x, b.y, p.x, p.y),
+            PathCommand::Close => builder.close(),
+        }
+    }
+    builder.finish()
+}
+
+fn round_stroke(width: f32) -> Stroke {
+    Stroke {
+        width,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Stroke::default()
+    }
+}
+
+fn stroke_svg_path(path: &Path, width: f32, matrix: AffineTransform) -> Option<Path> {
+    let resolution_scale = (matrix.a.abs() + matrix.b.abs())
+        .max(matrix.c.abs() + matrix.d.abs())
+        .max(1.0);
+    // Stroke in document space so a nonuniform viewBox scales the outline too.
+    path.stroke(&round_stroke(width), resolution_scale)
+}
+
+/// Find the topmost painted native path at a pointer position.
+///
+/// `layout` and `pointer` use logical layout pixels before CSS transforms.
+/// The query is clipped to `layout` and includes the scene's viewBox, pan and
+/// zoom. `stroke_tolerance` adds a distance in logical pixels around strokes.
+/// Use zero for a query against the authored stroke width. Fills use the
+/// nonzero winding rule, including implicit closure of open subpaths.
+///
+/// Returns an index into [`VectorScene::paths`], or `None` for a miss or
+/// invalid input. Fully transparent paint is skipped. There is no retained
+/// picking state. Applications with transformed or clipped ancestors can
+/// apply their input transforms and clipping before calling this function.
+pub fn hit_test_vector_scene(
+    scene: &VectorScene,
+    layout: LayoutBox,
+    pointer: VectorPoint,
+    stroke_tolerance: f32,
+) -> Option<usize> {
+    let tolerance_width = 2.0 * stroke_tolerance;
+    if !tolerance_width.is_finite()
+        || stroke_tolerance < 0.0
+        || !(layout.x..layout.x + layout.width).contains(&pointer.x)
+        || !(layout.y..layout.y + layout.height).contains(&pointer.y)
+    {
+        return None;
+    }
+    let matrix = svg_view_box_matrix(layout, scene.view_box(), scene.view())?;
+    if ![matrix.a, matrix.d, matrix.e, matrix.f]
+        .into_iter()
+        .all(f32::is_finite)
+    {
+        return None;
+    }
+    matrix.invert()?;
+    // Test the pointer at the center of a single coverage sample.
+    let sample_matrix =
+        AffineTransform::translate(0.5 - pointer.x, 0.5 - pointer.y).multiply(matrix);
+    let mut sample = None;
+
+    scene
+        .paths()
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, path)| {
+            let paint = path.paint();
+            let fill = paint.fill.is_some_and(|color| color.a != 0);
+            let stroke =
+                paint.stroke.is_some_and(|color| color.a != 0) && paint.stroke_width > f32::EPSILON;
+            if !fill && !stroke {
+                return None;
+            }
+            let mut bounds = path.geometry().bounds()?;
+            let tolerance = if stroke {
+                bounds = bounds.expand(paint.stroke_width * 0.5);
+                stroke_tolerance
+            } else {
+                0.0
+            };
+            // The view has independent positive X/Y scales and no rotation.
+            if pointer.x < bounds.min_x * matrix.a + matrix.e - tolerance
+                || pointer.x > bounds.max_x * matrix.a + matrix.e + tolerance
+                || pointer.y < bounds.min_y * matrix.d + matrix.f - tolerance
+                || pointer.y > bounds.max_y * matrix.d + matrix.f + tolerance
+            {
+                return None;
+            }
+
+            let source = build_vector_path(path.commands())?;
+            let sample = sample.get_or_insert_with(|| Mask::new(1, 1).expect("valid sample size"));
+            let mut contains = |path: &Path| {
+                sample.clear();
+                sample.fill_path(path, FillRule::Winding, false, Transform::identity());
+                sample.data()[0] != 0
+            };
+            if fill && project_svg_path(&source, sample_matrix).is_some_and(|fill| contains(&fill))
+            {
+                return Some(index);
+            }
+            if stroke {
+                let outline = stroke_svg_path(&source, paint.stroke_width, matrix)?;
+                let projected = project_svg_path(&outline, sample_matrix)?;
+                if contains(&projected)
+                    || (stroke_tolerance > 0.0
+                        && projected
+                            .stroke(&round_stroke(tolerance_width), 1.0)
+                            .is_some_and(|band| contains(&band)))
+                {
+                    return Some(index);
+                }
+            }
+            None
+        })
 }
 
 fn project_svg_path(path: &Path, matrix: AffineTransform) -> Option<Path> {
@@ -652,8 +757,11 @@ fn prepare_svg_linear_gradient(
     }
 }
 
-fn svg_view_box_matrix(layout: LayoutBox, scene: &SvgScene) -> Option<AffineTransform> {
-    let view_box = scene.view_box;
+fn svg_view_box_matrix(
+    layout: LayoutBox,
+    view_box: SvgViewBox,
+    view: Option<VectorView>,
+) -> Option<AffineTransform> {
     if layout.width <= f32::EPSILON
         || layout.height <= f32::EPSILON
         || view_box.width <= f32::EPSILON
@@ -667,7 +775,7 @@ fn svg_view_box_matrix(layout: LayoutBox, scene: &SvgScene) -> Option<AffineTran
     let mut matrix = AffineTransform::translate(layout.x, layout.y)
         .multiply(scale_matrix(scale_x, scale_y))
         .multiply(AffineTransform::translate(-view_box.min_x, -view_box.min_y));
-    if let Some(view) = scene.view {
+    if let Some(view) = view {
         // Document -> viewBox coordinates, applied before the layout/viewBox
         // map. `VectorView` guarantees a finite positive zoom, so this composes
         // without introducing a singular matrix.
