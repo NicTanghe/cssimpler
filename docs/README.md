@@ -16,6 +16,7 @@ The workspace now has the foundations through rendering, typography and font res
 
 - [Optional layer caching: usage guide](./layer-caching.md) — enable caches, separate overlays, choose RAM budgets, inspect usage, and disable caching.
 - [Native vector paths and SVG export](./native-vector-paths.md) — typed curves, native UI elements, export, and a construction/rendering comparison.
+- [Fluent vector path builder](./vector-builder.md) — chain typed commands and paint into the same validated `VectorPath`, with allocation notes and when to use direct construction.
 - [CPU 2D rendering and cached layers](./svg-rendering.md) — tiny-skia SVG coverage, opt-in board caches, memory budgets, overlays, and a headless benchmark.
 - [Native vector frame diagnostics](./vector-diagnostics.md) — last-frame work counts, opt-in detailed timers, layer-cache hits/misses, and how to read slow frames.
 
