@@ -1,12 +1,123 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
+
+use super::VectorFrameStats;
+
+/// Process-wide opt-in for the detailed per-path clocks. A frame start copies
+/// this into `TIMING_ACTIVE`, so changing it never affects a frame in progress.
+static TIMING_REQUESTED: AtomicBool = AtomicBool::new(false);
+// Whether the calling thread is currently painting a frame whose work counts
+// should be collected. Worker tasks inherit it through `Scope::spawn`.
+thread_local! {
+    static COLLECTING: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) fn is_collecting() -> bool {
+    COLLECTING.with(Cell::get)
+}
+
+pub(super) fn with_collecting<R>(active: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COLLECTING.with(|value| value.set(self.0));
+        }
+    }
+    let previous = COLLECTING.with(|value| value.replace(active));
+    let _restore = Restore(previous);
+    f()
+}
+
+/// Detailed clocks are active for the frame currently being painted.
+static TIMING_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Per-frame work counts. Reset at frame start and published once after the
+/// frame's paint jobs have been joined, so the snapshot is consistent.
+static PATHS_PAINTED: AtomicUsize = AtomicUsize::new(0);
+static LAYER_HITS: AtomicUsize = AtomicUsize::new(0);
+static LAYER_MISSES: AtomicUsize = AtomicUsize::new(0);
+/// Per-frame durations, accumulated in nanoseconds by paint jobs. Sums can
+/// overlap across workers; they are not wall time.
+static PATH_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+static STROKE_NS: AtomicU64 = AtomicU64::new(0);
+static PROJECTION_NS: AtomicU64 = AtomicU64::new(0);
+static COVERAGE_NS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn set_vector_timing_enabled(enabled: bool) {
+    TIMING_REQUESTED.store(enabled, Ordering::Relaxed);
+}
+
+pub(super) fn reset_frame_vector_stats() {
+    for counter in [&PATHS_PAINTED, &LAYER_HITS, &LAYER_MISSES] {
+        counter.store(0, Ordering::Relaxed);
+    }
+    for counter in [&PATH_BUILD_NS, &STROKE_NS, &PROJECTION_NS, &COVERAGE_NS] {
+        counter.store(0, Ordering::Relaxed);
+    }
+    TIMING_ACTIVE.store(TIMING_REQUESTED.load(Ordering::Relaxed), Ordering::Relaxed);
+    COLLECTING.with(|value| value.set(true));
+}
+
+pub(super) fn record_layer_lookup(hit: bool) {
+    if is_collecting() {
+        add(if hit { &LAYER_HITS } else { &LAYER_MISSES }, 1);
+    }
+}
+
+pub(super) fn frame_layer_lookups() -> (usize, usize) {
+    (
+        LAYER_HITS.load(Ordering::Relaxed),
+        LAYER_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+pub(super) fn take_frame_vector_stats() -> VectorFrameStats {
+    COLLECTING.with(|value| value.set(false));
+    VectorFrameStats {
+        paths_painted: PATHS_PAINTED.load(Ordering::Relaxed),
+        timings_enabled: TIMING_ACTIVE.load(Ordering::Relaxed),
+        path_build_work_us: ns_to_us(PATH_BUILD_NS.load(Ordering::Relaxed)),
+        stroke_work_us: ns_to_us(STROKE_NS.load(Ordering::Relaxed)),
+        projection_work_us: ns_to_us(PROJECTION_NS.load(Ordering::Relaxed)),
+        coverage_work_us: ns_to_us(COVERAGE_NS.load(Ordering::Relaxed)),
+    }
+}
+
+/// Nanoseconds to whole microseconds, saturating rather than wrapping.
+fn ns_to_us(nanoseconds: u64) -> usize {
+    usize::try_from(nanoseconds / 1_000).unwrap_or(usize::MAX)
+}
+
+/// Saturating so diagnostic counters cannot wrap on very long frames.
+// `fetch_update` is deprecated in newer nightlies in favour of `try_update`, but
+// it remains available on older supported toolchains; keep it for compatibility.
+#[allow(deprecated)]
+fn add(counter: &AtomicUsize, value: usize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(old.saturating_add(value))
+    });
+}
+
+#[allow(deprecated)]
+fn add_time(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(old.saturating_add(value))
+    });
+}
+
+fn elapsed_ns(start: Option<Instant>) -> u64 {
+    start
+        .map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
 
 use tiny_skia::{
     FillRule, LineCap, LineJoin, Mask, Path, PathBuilder, PathSegment, Point, Stroke, Transform,
 };
 
 use cssimpler_core::{
-    GradientInterpolation, LinearRgba, SvgBounds, SvgLinearGradient, SvgPaintServerData,
-    SvgPathGeometry, SvgPathPaintSource, SvgScene, SvgViewBox,
+    CornerRadius, GradientInterpolation, LinearRgba, SvgBounds, SvgLinearGradient,
+    SvgPaintServerData, SvgPathGeometry, SvgPathPaintSource, SvgScene, SvgViewBox,
 };
 
 use super::{
@@ -72,10 +183,23 @@ pub(crate) fn draw_svg_scene(
     scene: &SvgScene,
     clip: ClipRect,
 ) {
-    let Some(matrix) = svg_view_box_matrix(layout, scene.view_box) else {
+    let Some(matrix) = svg_view_box_matrix(layout, scene) else {
         return;
     };
-    draw_svg_scene_with_matrix(buffer, width, height, scene, matrix, &ClipState::new(clip));
+    let clip_state = ClipState::new(clip);
+    if scene.view.is_some() {
+        // A scene with a viewport view is clipped to the element's layout box.
+        // `matrix` maps document coordinates, so clip with the untransformed
+        // layout box in this non-CSS-transformed path.
+        let Some(clipped) =
+            clip_state.push_layout_clip(layout, CornerRadius::ZERO, AffineTransform::IDENTITY)
+        else {
+            return;
+        };
+        draw_svg_scene_with_matrix(buffer, width, height, scene, matrix, &clipped);
+    } else {
+        draw_svg_scene_with_matrix(buffer, width, height, scene, matrix, &clip_state);
+    }
 }
 
 pub(crate) fn draw_svg_scene_transformed(
@@ -87,17 +211,20 @@ pub(crate) fn draw_svg_scene_transformed(
     matrix: AffineTransform,
     clip_state: &ClipState,
 ) {
-    let Some(view_matrix) = svg_view_box_matrix(layout, scene.view_box) else {
+    let Some(view_matrix) = svg_view_box_matrix(layout, scene) else {
         return;
     };
-    draw_svg_scene_with_matrix(
-        buffer,
-        width,
-        height,
-        scene,
-        matrix.multiply(view_matrix),
-        clip_state,
-    );
+    let full_matrix = matrix.multiply(view_matrix);
+    if scene.view.is_some() {
+        // `matrix` is the existing CSS/layout transform of this node; push the
+        // viewport clip through it so clipping composes with CSS as before.
+        let Some(clipped) = clip_state.push_layout_clip(layout, CornerRadius::ZERO, matrix) else {
+            return;
+        };
+        draw_svg_scene_with_matrix(buffer, width, height, scene, full_matrix, &clipped);
+    } else {
+        draw_svg_scene_with_matrix(buffer, width, height, scene, full_matrix, clip_state);
+    }
 }
 
 fn draw_svg_scene_with_matrix(
@@ -111,6 +238,11 @@ fn draw_svg_scene_with_matrix(
     let Some(inverse) = matrix.invert() else {
         return;
     };
+    let collecting = is_collecting();
+    let timed = collecting && TIMING_ACTIVE.load(Ordering::Relaxed);
+    let mut paths_painted = 0usize;
+    let (mut build_ns, mut stroke_ns, mut projection_ns, mut coverage_ns) =
+        (0u64, 0u64, 0u64, 0u64);
     for path in &scene.paths {
         let Some(source_bounds) = path.bounds() else {
             continue;
@@ -133,28 +265,35 @@ fn draw_svg_scene_with_matrix(
         if fill.is_none() && stroke.is_none() {
             continue;
         }
+        paths_painted = paths_painted.saturating_add(1);
         let start = svg_preparation::stage_start();
+        let build_start = timed.then(Instant::now);
         let source_path = build_svg_path(&path.geometry);
         svg_preparation::record(Stage::PathBuild, start);
+        build_ns = build_ns.saturating_add(elapsed_ns(build_start));
+        svg_preparation::count_path();
         let Some(source_path) = source_path else {
             continue;
         };
-        svg_preparation::count_path();
-        if let Some(fill) = fill {
-            let start = svg_preparation::stage_start();
-            let screen_path = project_svg_path(&source_path, matrix);
-            svg_preparation::record(Stage::Projection, start);
-            if let Some(screen_path) = screen_path {
-                draw_svg_coverage(
-                    buffer,
-                    width,
-                    height,
-                    &screen_path,
-                    &fill,
-                    inverse,
-                    clip_state,
-                );
-            }
+        let start = svg_preparation::stage_start();
+        let projection_start = (timed && fill.is_some()).then(Instant::now);
+        let fill_path = fill
+            .as_ref()
+            .and_then(|_| project_svg_path(&source_path, matrix));
+        svg_preparation::record(Stage::Projection, start);
+        projection_ns = projection_ns.saturating_add(elapsed_ns(projection_start));
+        if let (Some(fill), Some(screen_path)) = (fill, fill_path) {
+            let coverage_start = timed.then(Instant::now);
+            draw_svg_coverage(
+                buffer,
+                width,
+                height,
+                &screen_path,
+                &fill,
+                inverse,
+                clip_state,
+            );
+            coverage_ns = coverage_ns.saturating_add(elapsed_ns(coverage_start));
         }
         if let Some(stroke) = stroke {
             // The previous distance-to-segment rasterizer used round caps and joins.
@@ -169,14 +308,19 @@ fn draw_svg_scene_with_matrix(
                 .max(matrix.c.abs() + matrix.d.abs())
                 .max(1.0);
             let start = svg_preparation::stage_start();
+            let stroke_start = timed.then(Instant::now);
             let outline = source_path.stroke(&stroke_style, resolution_scale);
             svg_preparation::record(Stage::StrokePrep, start);
+            stroke_ns = stroke_ns.saturating_add(elapsed_ns(stroke_start));
             if let Some(outline) = outline {
                 svg_preparation::count_stroke_outline();
                 let start = svg_preparation::stage_start();
+                let projection_start = timed.then(Instant::now);
                 let screen_path = project_svg_path(&outline, matrix);
                 svg_preparation::record(Stage::Projection, start);
+                projection_ns = projection_ns.saturating_add(elapsed_ns(projection_start));
                 if let Some(screen_path) = screen_path {
+                    let coverage_start = timed.then(Instant::now);
                     draw_svg_coverage(
                         buffer,
                         width,
@@ -186,9 +330,19 @@ fn draw_svg_scene_with_matrix(
                         inverse,
                         clip_state,
                     );
+                    coverage_ns = coverage_ns.saturating_add(elapsed_ns(coverage_start));
                 }
             }
         }
+    }
+    if collecting {
+        add(&PATHS_PAINTED, paths_painted);
+    }
+    if timed {
+        add_time(&PATH_BUILD_NS, build_ns);
+        add_time(&STROKE_NS, stroke_ns);
+        add_time(&PROJECTION_NS, projection_ns);
+        add_time(&COVERAGE_NS, coverage_ns);
     }
 }
 
@@ -498,7 +652,8 @@ fn prepare_svg_linear_gradient(
     }
 }
 
-fn svg_view_box_matrix(layout: LayoutBox, view_box: SvgViewBox) -> Option<AffineTransform> {
+fn svg_view_box_matrix(layout: LayoutBox, scene: &SvgScene) -> Option<AffineTransform> {
+    let view_box = scene.view_box;
     if layout.width <= f32::EPSILON
         || layout.height <= f32::EPSILON
         || view_box.width <= f32::EPSILON
@@ -509,11 +664,26 @@ fn svg_view_box_matrix(layout: LayoutBox, view_box: SvgViewBox) -> Option<Affine
 
     let scale_x = layout.width / view_box.width;
     let scale_y = layout.height / view_box.height;
-    Some(
-        AffineTransform::translate(layout.x, layout.y)
-            .multiply(scale_matrix(scale_x, scale_y))
-            .multiply(AffineTransform::translate(-view_box.min_x, -view_box.min_y)),
-    )
+    let mut matrix = AffineTransform::translate(layout.x, layout.y)
+        .multiply(scale_matrix(scale_x, scale_y))
+        .multiply(AffineTransform::translate(-view_box.min_x, -view_box.min_y));
+    if let Some(view) = scene.view {
+        // Document -> viewBox coordinates, applied before the layout/viewBox
+        // map. `VectorView` guarantees a finite positive zoom, so this composes
+        // without introducing a singular matrix.
+        matrix = matrix.multiply(AffineTransform {
+            a: view.zoom(),
+            b: 0.0,
+            c: 0.0,
+            d: view.zoom(),
+            e: view.offset().x,
+            f: view.offset().y,
+            g: 0.0,
+            h: 0.0,
+            i: 1.0,
+        });
+    }
+    Some(matrix)
 }
 
 fn scale_matrix(scale_x: f32, scale_y: f32) -> AffineTransform {
@@ -559,6 +729,337 @@ mod tests {
     };
 
     use super::super::{pack_rgb, render_to_buffer, unpack_rgb};
+
+    #[test]
+    fn vector_counters_aggregate_workers_and_saturate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let counter = &counter;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        super::add(counter, 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(counter.load(Ordering::Relaxed), 4000);
+        super::add(&counter, usize::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+        let duration = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+        super::add_time(&duration, 2);
+        assert_eq!(duration.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn vector_scope_follows_jobs_and_restores_worker_state() {
+        let pool = super::super::WorkerPool::new(3);
+        super::with_collecting(true, || {
+            pool.scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| assert!(super::is_collecting()));
+                }
+            });
+            std::thread::scope(|scope| {
+                scope.spawn(|| assert!(!super::is_collecting()));
+            });
+        });
+        assert!(!super::is_collecting());
+        pool.scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| assert!(!super::is_collecting()));
+            }
+        });
+    }
+
+    static VECTOR_STATS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn vector_timing_switch_is_sampled_at_frame_start() {
+        let _guard = VECTOR_STATS_TEST_LOCK.lock().unwrap();
+        super::set_vector_timing_enabled(true);
+        super::reset_frame_vector_stats();
+        // Toggling mid-frame must not change the frame already in progress.
+        super::set_vector_timing_enabled(false);
+        assert!(super::take_frame_vector_stats().timings_enabled);
+
+        super::reset_frame_vector_stats();
+        super::set_vector_timing_enabled(true);
+        assert!(!super::take_frame_vector_stats().timings_enabled);
+        super::set_vector_timing_enabled(false);
+    }
+
+    /// Instrumentation overhead harness (ignored by default; release build).
+    ///
+    /// Compares three collection modes on the same buffers and scene:
+    /// `off` (no frame collection), `counters` (default frame diagnostics:
+    /// work counts only), and `timers` (opt-in detailed clocks).
+    #[test]
+    #[ignore = "manual release-mode instrumentation overhead measurement"]
+    fn vector_timing_overhead() {
+        const ROUNDS: usize = 5;
+        const TINY_PAINTS: usize = 3000;
+        const MIXED_PAINTS: usize = 100;
+        const MIXED_PATHS: usize = 16;
+
+        #[derive(Clone, Copy, Debug)]
+        #[repr(usize)]
+        enum Mode {
+            Off = 0,
+            Counters = 1,
+            Timers = 2,
+        }
+
+        fn timed_paints(
+            scene: &SvgScene,
+            buffer: &mut [u32],
+            width: usize,
+            height: usize,
+            layout: LayoutBox,
+            paints: usize,
+        ) -> u128 {
+            let start = std::time::Instant::now();
+            for _ in 0..paints {
+                super::draw_svg_scene(
+                    buffer,
+                    width,
+                    height,
+                    layout,
+                    scene,
+                    super::ClipRect::full(width as f32, height as f32),
+                );
+            }
+            start.elapsed().as_micros()
+        }
+
+        fn measure(
+            mode: Mode,
+            scene: &SvgScene,
+            buffer: &mut [u32],
+            width: usize,
+            height: usize,
+            layout: LayoutBox,
+            paints: usize,
+            paths_per_paint: usize,
+        ) -> u128 {
+            match mode {
+                Mode::Off => super::with_collecting(false, || {
+                    super::set_vector_timing_enabled(false);
+                    timed_paints(scene, buffer, width, height, layout, paints)
+                }),
+                Mode::Counters | Mode::Timers => {
+                    let enabled = matches!(mode, Mode::Timers);
+                    super::set_vector_timing_enabled(enabled);
+                    super::reset_frame_vector_stats();
+                    let micros = timed_paints(scene, buffer, width, height, layout, paints);
+                    let stats = super::take_frame_vector_stats();
+                    assert_eq!(stats.timings_enabled, enabled);
+                    assert_eq!(stats.paths_painted, paints.saturating_mul(paths_per_paint));
+                    if enabled {
+                        assert!(stats.coverage_work_us > 0 || stats.path_build_work_us > 0);
+                    } else {
+                        assert_eq!(stats.coverage_work_us, 0);
+                    }
+                    micros
+                }
+            }
+        }
+
+        fn median(samples: &mut [u128]) -> u128 {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        fn report(name: &str, paints: usize, samples: &mut [Vec<u128>; 3]) {
+            let off = median(&mut samples[0]);
+            let counters = median(&mut samples[1]);
+            let timers = median(&mut samples[2]);
+            let counters_delta = (counters as f64 / off.max(1) as f64 - 1.0) * 100.0;
+            let timers_delta = (timers as f64 / counters.max(1) as f64 - 1.0) * 100.0;
+            eprintln!(
+                "{name} paints={paints} (us, {ROUNDS} rounds)\n  \
+                 off={off} samples={:?}\n  counters={counters} samples={:?}\n  \
+                 timers={timers} samples={:?}\n  \
+                 counters-vs-off={counters_delta:+.1}% timers-vs-counters={timers_delta:+.1}%",
+                samples[0], samples[1], samples[2]
+            );
+        }
+
+        let _guard = VECTOR_STATS_TEST_LOCK.lock().unwrap();
+
+        let tiny = test_scene(
+            vec![polygon(
+                &[(2.0, 2.0), (22.0, 2.0), (22.0, 22.0), (2.0, 22.0)],
+                true,
+            )],
+            SvgPathPaint::default(),
+            24.0,
+        );
+        let tiny_layout = LayoutBox::new(0.0, 0.0, 24.0, 24.0);
+        let mut tiny_buffer = vec![pack_rgb(Color::WHITE); 24 * 24];
+
+        let mut mixed_paths = Vec::new();
+        for index in 0..MIXED_PATHS {
+            let x = 20.0 + (index % 4) as f32 * 90.0;
+            let y = 20.0 + (index / 4) as f32 * 65.0;
+            mixed_paths.push(SvgPathInstance {
+                geometry: SvgPathGeometry::new(vec![polygon(
+                    &[
+                        (x, y),
+                        (x + 70.0, y + 10.0),
+                        (x + 55.0, y + 50.0),
+                        (x + 10.0, y + 45.0),
+                    ],
+                    true,
+                )]),
+                paint: SvgPathPaint {
+                    stroke: Some(SvgPathPaintSource::Color(Color::rgb(20, 40, 80))),
+                    stroke_width: 1.5,
+                    ..SvgPathPaint::default()
+                },
+            });
+        }
+        let mixed = SvgScene::new(SvgViewBox::new(0.0, 0.0, 400.0, 300.0), mixed_paths);
+        let mixed_layout = LayoutBox::new(0.0, 0.0, 400.0, 300.0);
+        let mut mixed_buffer = vec![pack_rgb(Color::WHITE); 400 * 300];
+
+        // Warm up every mode before sampling to page in buffers and caches.
+        for mode in [Mode::Off, Mode::Counters, Mode::Timers] {
+            measure(
+                mode,
+                &tiny,
+                &mut tiny_buffer,
+                24,
+                24,
+                tiny_layout,
+                TINY_PAINTS / 10,
+                1,
+            );
+            measure(
+                mode,
+                &mixed,
+                &mut mixed_buffer,
+                400,
+                300,
+                mixed_layout,
+                MIXED_PAINTS / 10,
+                MIXED_PATHS,
+            );
+        }
+
+        let mut tiny_samples: [Vec<u128>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut mixed_samples: [Vec<u128>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let modes = [Mode::Off, Mode::Counters, Mode::Timers];
+        for round in 0..ROUNDS {
+            // Alternate order between rounds so slow drift cannot favor a mode.
+            let order: [Mode; 3] = if round % 2 == 0 {
+                modes
+            } else {
+                [Mode::Timers, Mode::Counters, Mode::Off]
+            };
+            for mode in order {
+                let index = mode as usize;
+                tiny_samples[index].push(measure(
+                    mode,
+                    &tiny,
+                    &mut tiny_buffer,
+                    24,
+                    24,
+                    tiny_layout,
+                    TINY_PAINTS,
+                    1,
+                ));
+                mixed_samples[index].push(measure(
+                    mode,
+                    &mixed,
+                    &mut mixed_buffer,
+                    400,
+                    300,
+                    mixed_layout,
+                    MIXED_PAINTS,
+                    MIXED_PATHS,
+                ));
+            }
+        }
+
+        super::set_vector_timing_enabled(false);
+        report("tiny-filled-paths", TINY_PAINTS, &mut tiny_samples);
+        report("mixed-16-path-scene", MIXED_PAINTS, &mut mixed_samples);
+    }
+
+    #[test]
+    fn vector_frame_counts_reset_and_exclude_unrelated_renders() {
+        let _guard = VECTOR_STATS_TEST_LOCK.lock().unwrap();
+        let scene = test_scene(
+            vec![polygon(
+                &[(2.0, 2.0), (22.0, 2.0), (22.0, 22.0), (2.0, 22.0)],
+                true,
+            )],
+            SvgPathPaint::default(),
+            24.0,
+        );
+        let mut buffer = vec![pack_rgb(Color::WHITE); 24 * 24];
+        super::set_vector_timing_enabled(false);
+        super::reset_frame_vector_stats();
+        super::record_layer_lookup(true);
+        super::record_layer_lookup(false);
+        let pool = super::super::WorkerPool::new(3);
+        // An unrelated render on another thread must not contribute.
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                let mut pixels = vec![0; 24 * 24];
+                super::draw_svg_scene(
+                    &mut pixels,
+                    24,
+                    24,
+                    LayoutBox::new(0.0, 0.0, 24.0, 24.0),
+                    &scene,
+                    super::ClipRect::full(24.0, 24.0),
+                );
+            });
+            pool.scope(|scope| {
+                for _ in 0..4 {
+                    let scene = &scene;
+                    scope.spawn(move || {
+                        let mut pixels = vec![0; 24 * 24];
+                        for _ in 0..100 {
+                            super::draw_svg_scene(
+                                &mut pixels,
+                                24,
+                                24,
+                                LayoutBox::new(0.0, 0.0, 24.0, 24.0),
+                                scene,
+                                super::ClipRect::full(24.0, 24.0),
+                            );
+                        }
+                        for _ in 0..10 {
+                            super::record_layer_lookup(true);
+                        }
+                    });
+                }
+            });
+        });
+        let stats = super::take_frame_vector_stats();
+        assert_eq!(super::frame_layer_lookups(), (41, 1));
+        assert_eq!(stats.paths_painted, 400);
+        assert!(!stats.timings_enabled);
+        assert_eq!(stats.path_build_work_us, 0);
+        assert_eq!(stats.stroke_work_us, 0);
+        assert_eq!(stats.projection_work_us, 0);
+        assert_eq!(stats.coverage_work_us, 0);
+        super::reset_frame_vector_stats();
+        super::draw_svg_scene(
+            &mut buffer,
+            24,
+            24,
+            LayoutBox::new(100.0, 100.0, 24.0, 24.0),
+            &scene,
+            super::ClipRect::full(24.0, 24.0),
+        );
+        assert_eq!(super::take_frame_vector_stats().paths_painted, 0);
+        assert_eq!(super::frame_layer_lookups(), (0, 0));
+    }
 
     #[test]
     fn svg_fill_renders_inside_the_mapped_view_box() {

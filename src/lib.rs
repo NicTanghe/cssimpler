@@ -2,6 +2,7 @@ extern crate self as cssimpler;
 
 pub mod actions;
 pub mod app;
+pub mod frame_drag;
 pub use actions::ActionQueue;
 
 pub use cssimpler_core as core;
