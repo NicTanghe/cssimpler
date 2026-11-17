@@ -28,7 +28,7 @@ pub mod vector;
 pub mod vector_builder;
 pub use vector::{
     PathCommand, VectorError, VectorGeometry, VectorPaint, VectorPath, VectorPoint, VectorScene,
-    VectorViewBox,
+    VectorView, VectorViewBox,
 };
 pub use vector_builder::VectorPathBuilder;
 pub mod transitions;
