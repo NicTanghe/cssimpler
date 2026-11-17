@@ -23,8 +23,9 @@ use winit::keyboard::{
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowAttributes, WindowId};
 
 use crate::input::{
-    ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
-    PointerButton, PointerPosition, ScrollDelta, TextInputEvent, ViewportEvent,
+    ButtonState, EngineEvent, FrameInputCadence, InputRedrawDecision, InputRedrawPolicy,
+    KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers, PointerButton, PointerPosition,
+    ScrollDelta, TextInputEvent, ViewportEvent,
 };
 
 use super::{
@@ -265,6 +266,7 @@ struct RuntimeApp<P> {
     #[cfg(windows)]
     touch_window: Option<super::touch_window::Gesture>,
     pending_wheel: Option<(f32, f32)>,
+    input_cadence: FrameInputCadence,
     left_down: bool,
     right_down: bool,
     middle_down: bool,
@@ -319,6 +321,7 @@ where
             #[cfg(windows)]
             touch_window: None,
             pending_wheel: None,
+            input_cadence: FrameInputCadence::new(),
             left_down: false,
             right_down: false,
             middle_down: false,
@@ -355,7 +358,20 @@ where
         }
         if !self.can_draw() {
             self.next_redraw_at = None;
+            self.input_cadence.clear_deadline();
             event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        // A frame-aligned provider deferred pointer input to the next frame
+        // boundary. Wake exactly then even when the provider is otherwise idle.
+        let now = Instant::now();
+        if self.input_cadence.take_due(now) {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            self.request_redraw_if_possible();
+            return;
+        }
+        if let Some(deadline) = self.input_cadence.deadline() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             return;
         }
         if self.wants_continuous_redraw() {
@@ -410,6 +426,35 @@ where
 
     fn request_immediate_redraw(&mut self) {
         self.immediate_redraw = true;
+    }
+
+    fn pointer_redraw_is_coalesced(&self) -> bool {
+        matches!(
+            self.scene_provider.input_redraw_policy(),
+            InputRedrawPolicy::FrameAligned
+        )
+    }
+
+    /// Request a paint for pointer motion or wheel input. Frame-aligned
+    /// providers receive every raw event immediately but at most one paint per
+    /// frame interval; other providers keep the immediate per-event behavior.
+    fn request_pointer_redraw(&mut self) {
+        if !self.pointer_redraw_is_coalesced() {
+            self.request_immediate_redraw();
+            return;
+        }
+        match self
+            .input_cadence
+            .schedule(Instant::now(), self.config.frame_time)
+        {
+            InputRedrawDecision::Immediate => {
+                self.request_immediate_redraw();
+            }
+            InputRedrawDecision::WaitUntil(_) => {
+                // `about_to_wait` services the deferred deadline. Leaving
+                // `immediate_redraw` unset is what coalesces the paint.
+            }
+        }
     }
 
     fn request_redraw_if_possible(&mut self) {
@@ -539,10 +584,18 @@ where
                 return false;
             }
         }
+        let coalesced_pointer_event = matches!(
+            &event,
+            EngineEvent::PointerMoved { .. } | EngineEvent::Scroll { .. }
+        );
         #[cfg(feature = "gpu-viewport")]
         {
             if self.scene_provider.handle_application_event(&event) {
-                self.request_immediate_redraw();
+                if coalesced_pointer_event {
+                    self.request_pointer_redraw();
+                } else {
+                    self.request_immediate_redraw();
+                }
                 return true;
             }
             if self.gpu.as_mut().is_some_and(|gpu| gpu.event(&event)) {
@@ -564,14 +617,22 @@ where
                 return true;
             }
             if self.scene_provider.handle_ui_event(&event) {
-                self.request_immediate_redraw();
+                if coalesced_pointer_event {
+                    self.request_pointer_redraw();
+                } else {
+                    self.request_immediate_redraw();
+                }
                 return true;
             }
             return false;
         }
         #[cfg(not(feature = "gpu-viewport"))]
         if self.scene_provider.handle_engine_event(&event) {
-            self.request_immediate_redraw();
+            if coalesced_pointer_event {
+                self.request_pointer_redraw();
+            } else {
+                self.request_immediate_redraw();
+            }
             true
         } else {
             false
@@ -765,6 +826,7 @@ where
         self.mouse_position = None;
         self.native_resize_started = false;
         self.pending_wheel = None;
+        self.input_cadence.clear_deadline();
         self.left_down = false;
         self.right_down = false;
         self.middle_down = false;
@@ -849,6 +911,7 @@ where
 
         let frame_begin = Instant::now();
         let now = Instant::now();
+        self.input_cadence.observe_frame(now);
         let delta = self
             .last_frame_at
             .map(|previous| now.saturating_duration_since(previous))
@@ -1543,7 +1606,7 @@ where
                     if let Some((x, y)) = update.scroll {
                         self.accumulate_wheel(ScrollDelta::Pixels { x, y });
                     }
-                    self.request_immediate_redraw();
+                    self.request_pointer_redraw();
                     // Observe both edges even when a quick tap starts and ends
                     // before the platform delivers the next redraw notification.
                     if update.press || update.release {
@@ -1600,7 +1663,7 @@ where
                     },
                 );
                 if !consumed {
-                    self.request_immediate_redraw();
+                    self.request_pointer_redraw();
                 }
             }
             WindowEvent::CursorLeft { .. } if !self.touch.ignore_mouse(Instant::now()) => {
@@ -1731,7 +1794,7 @@ where
                     },
                 );
                 if !consumed {
-                    self.request_immediate_redraw();
+                    self.request_pointer_redraw();
                 }
             }
             WindowEvent::KeyboardInput {

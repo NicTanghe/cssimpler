@@ -72,8 +72,9 @@ pub(crate) use self::color::{
     u10_to_u8_channel, unpack_alpha8, unpack_linear_rgb, unpack_rgb, unpack_rgb10,
 };
 pub use self::input::{
-    ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
-    PointerButton, PointerPosition, ScrollDelta, TextInputEvent, ViewportEvent,
+    ButtonState, EngineEvent, FrameInputCadence, InputRedrawDecision, InputRedrawPolicy,
+    KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers, PointerButton, PointerPosition,
+    ScrollDelta, TextInputEvent, ViewportEvent,
 };
 pub(crate) use self::softbuffer_dither::{
     to_softbuffer_rgb_blue_noise, to_softbuffer_rgb_blue_noise_with_alpha,
@@ -1488,6 +1489,13 @@ pub trait SceneProvider {
 
     fn redraw_schedule(&self) -> RedrawSchedule {
         RedrawSchedule::OnInvalidation
+    }
+
+    /// Opt in to coalescing pointer-motion and wheel paints to the frame cadence.
+    /// Raw events still reach [`SceneProvider::handle_engine_event`] immediately;
+    /// only the paints they request are delayed to the next frame boundary.
+    fn input_redraw_policy(&self) -> InputRedrawPolicy {
+        InputRedrawPolicy::Immediate
     }
 
     fn needs_redraw(&self) -> bool {
