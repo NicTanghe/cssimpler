@@ -1,5 +1,7 @@
 # cssimpler
 
+[![CI](https://github.com/NicTanghe/cssimpler/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NicTanghe/cssimpler/actions/workflows/ci.yml)
+
 > A Rust UI library that brings things back to **HTML + CSS** — nothing more.
 
 No signals.  
