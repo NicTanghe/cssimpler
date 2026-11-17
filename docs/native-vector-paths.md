@@ -102,6 +102,39 @@ dimensions, path data, colors, alpha, and stroke settings. Curves keep their
 control points; numbers use Rust's round-tripping `f32` representation rather
 than a fixed decimal rounding rule.
 
+Use `write_svg` for file export to stream the same SVG bytes directly to a
+buffered writer. It writes path commands incrementally and returns any I/O
+error. Flush the buffer before reporting that the export succeeded.
+
+```rust
+use cssimpler::core::VectorScene;
+use std::{
+    fs::File,
+    io::{self, BufWriter, Write},
+    path::Path,
+};
+
+fn export_svg(scene: &VectorScene, destination: &Path) -> io::Result<()> {
+    let mut file = BufWriter::new(File::create(destination)?);
+    scene.write_svg(&mut file)?;
+    file.flush()
+}
+```
+
+A release benchmark exported 200,000 instances of one shared curved path
+to a 97,600,095-byte SVG. Peak process RSS fell from **98.6 MiB** with
+`to_svg()` and a file write to **5.6 MiB** with `write_svg()` and a
+buffered file. These are medians of five fresh processes per mode on Linux
+x86-64, using `VmHWM`. The two files were byte-for-byte identical in every run.
+
+```sh
+cargo build --release --locked -p cssimpler-core --example vector_svg_export_bench
+benchmark_dir=$(mktemp -d)
+target/release/examples/vector_svg_export_bench string "$benchmark_dir/string.svg"
+target/release/examples/vector_svg_export_bench buffered "$benchmark_dir/buffered.svg"
+cmp "$benchmark_dir/string.svg" "$benchmark_dir/buffered.svg"
+```
+
 SVG sizes use numeric user units (default SVG units are pixels). Exporting a
 physical drawing in millimetres requires your application to choose and convert
 the coordinate system accordingly. This exports the scene, not the entire UI:

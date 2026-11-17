@@ -1,7 +1,11 @@
 //! Run with `cargo run --example native_vector_paths -- --export work/curves.svg`.
 //! Pass `--diagnostics` to print the last completed frame after the window closes.
 //! Add `--frames N` to exit automatically after N repaints, for scripted runs.
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use cssimpler::{
     app::{App, Invalidation},
@@ -71,7 +75,9 @@ fn main() -> anyhow::Result<()> {
     let scene = artwork(0.0);
     let args = std::env::args().collect::<Vec<_>>();
     if let Some(pair) = args.windows(2).find(|pair| pair[0] == "--export") {
-        std::fs::write(&pair[1], scene.to_svg())?;
+        let mut file = BufWriter::new(File::create(&pair[1])?);
+        scene.write_svg(&mut file)?;
+        file.flush()?;
         return Ok(());
     }
     let diagnostics = args.iter().any(|arg| arg == "--diagnostics");
