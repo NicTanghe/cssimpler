@@ -57,7 +57,9 @@ than wrap.
   summed across workers; that sum is not wall time. The snapshot is published
   once the frame's paint jobs have been joined, so it is consistent. Collection
   is scoped to the frame's jobs; an unrelated concurrent headless render does
-  not contribute. The window event loop serializes window frames.
+  not contribute. The window event loop serializes window frames. The snapshot
+  store and counters are process-wide, as with the existing latest-frame API,
+  so run one window event loop at a time when reading them.
 
 There is no prepared-geometry cache in the renderer yet, so no
 prepared-geometry hit/miss counts are reported. `paths_painted` and the work
