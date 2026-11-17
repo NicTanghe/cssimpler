@@ -330,8 +330,9 @@ counters saturate instead of wrapping.
 
 A local unoptimized test of 3,000 small 24×24 filled paths measured 2.115 s
 with detailed timers disabled and 2.224 s enabled. A second run measured
-0.907 s disabled and 0.793 s enabled, showing substantial run-to-run noise
-and no reliable overhead estimate on this shared machine. This narrow debug
+0.907 s disabled and 0.793 s enabled; an isolated-target run measured 0.758 s
+and 0.765 s respectively. The variation prevents a reliable overhead estimate
+on this shared machine. This narrow debug
 workload is not a general performance claim; the opt-in switch keeps per-path
 clock reads out of normal painting. Reproduce with
 `cargo test -p cssimpler-renderer vector_timing_overhead --lib -- --ignored --test-threads=1 --nocapture`.
