@@ -323,6 +323,14 @@ requested bytes using the system allocator. It reports process RSS from
 benchmark. Run it in a release build with `cargo run --release -p cssimpler-core
 --example vector_clone_measure`.
 
+A release run of this workload on Linux, using baseline revision `6d49b79`
+and this change, counted 10,001 allocation calls requesting 280,400,000 bytes
+before sharing and one allocation requesting 240,000 bytes after sharing. The
+count includes the vector holding the cloned paths; it does not include creation
+of the original path. This is a clone-heavy microbenchmark, not a prediction for
+all applications. Concurrent builds were active, so timings and RSS are not
+reported as a controlled comparison.
+
 A comparable before/after measurement of construction, preparation and painting
 with pixel-layer caching disabled has not yet been completed. In particular,
 clone savings do not establish a painting speedup. The existing
