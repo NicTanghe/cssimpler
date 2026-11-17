@@ -195,6 +195,7 @@ fn decorate_run(
             && matches!(&node.kind, RenderKind::Text(text) if text == &run.text)
         {
             node.text_edit = Some(TextEditDecoration {
+                composition: None,
                 backgrounds: None,
                 caret: None,
                 selection: Some(TextSelectionRange {

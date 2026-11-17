@@ -42,6 +42,7 @@ fn selection_preserves_original_text_pixels() {
                     .chain(std::iter::once([0, text.len()].as_slice()))
                 {
                     let selected = node.clone().with_text_edit(TextEditDecoration {
+                        composition: None,
                         backgrounds: None,
                         caret: None,
                         selection: Some(TextSelectionRange {

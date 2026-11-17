@@ -1,5 +1,8 @@
 # cssimpler workspace
 
+- [todo: OS support sheet, remaining features, and optimisations](../todo.md)
+- [IME test lab: automated replay and native verification](./ime-testing.md)
+
 Current focus:
 
 - `src/app.rs` owns the explicit application loop for Epic G: state, invalidation, scoped refresh, and DOM rerender policy.

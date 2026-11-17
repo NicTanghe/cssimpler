@@ -45,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 })
                 .with_text_edit(TextEditDecoration {
+                    composition: None,
                     caret: None,
                     backgrounds: None,
                     selection: Some(TextSelectionRange {

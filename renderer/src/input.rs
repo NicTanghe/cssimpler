@@ -94,6 +94,8 @@ pub struct KeyboardEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextInputEvent {
     Commit(String),
+    /// The OS ended the IME session; discard any uncommitted composition.
+    Disabled,
     Preedit {
         text: String,
         cursor: Option<(usize, usize)>,

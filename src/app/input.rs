@@ -21,6 +21,13 @@ struct NativeTextInputState {
     value: String,
     cursor: usize,
     selection_anchor: Option<usize>,
+    composition: Option<Composition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Composition {
+    text: String,
+    cursor: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +67,7 @@ impl NativeTextInputs {
         let autofocus = inputs.iter().rev().find(|(_, _, autofocus)| *autofocus);
         if let Some((key, path, _)) = autofocus {
             if self.autofocus_keys.get(&root_index) != Some(key) {
+                self.cancel_composition();
                 self.focused = Some(FocusedInput {
                     key: key.clone(),
                     path: path.clone(),
@@ -81,6 +89,10 @@ impl NativeTextInputs {
         runtime_world: &RuntimeWorld,
     ) -> bool {
         let selection_cleared = self.document_selection.reconcile(scene, runtime_world);
+        // The OS owns editing/navigation keys while a preedit is active.
+        if self.is_composing() && matches!(event, EngineEvent::Key(_)) {
+            return true;
+        }
         let before = self.focused_value();
         let changed = match event {
             EngineEvent::PointerMoved { position, .. } => {
@@ -100,6 +112,7 @@ impl NativeTextInputs {
                 state: ButtonState::Pressed,
                 modifiers,
             } => {
+                let cancelled = self.cancel_composition();
                 let cleared = self.document_selection.clear();
                 let input = self.focus_input_at_pointer(scene, runtime_world, modifiers.shift);
                 let document = if self.focused.is_none() {
@@ -108,7 +121,7 @@ impl NativeTextInputs {
                 } else {
                     false
                 };
-                cleared || input || document
+                cancelled || cleared || input || document
             }
             EngineEvent::PointerButton {
                 button: PointerButton::Primary,
@@ -119,7 +132,10 @@ impl NativeTextInputs {
                 self.finish_drag_selection()
             }
             EngineEvent::TextInput(TextInputEvent::Commit(text)) => self.insert_focused_text(text),
-            EngineEvent::TextInput(TextInputEvent::Preedit { .. }) => false,
+            EngineEvent::TextInput(TextInputEvent::Preedit { text, cursor }) => {
+                self.update_composition(text, *cursor)
+            }
+            EngineEvent::TextInput(TextInputEvent::Disabled) => self.cancel_composition(),
             EngineEvent::Key(event)
                 if event.state == ButtonState::Pressed
                     && event.logical_key == KeyIdentity::Named("Tab".into()) =>
@@ -144,7 +160,7 @@ impl NativeTextInputs {
             EngineEvent::FocusChanged(false) | EngineEvent::Suspended => {
                 self.active_drag = None;
                 self.document_selection.finish();
-                false
+                self.cancel_composition()
             }
             _ => false,
         };
@@ -173,12 +189,14 @@ impl NativeTextInputs {
                                 cursor: initial_value.len(),
                                 value: initial_value,
                                 selection_anchor: None,
+                                composition: None,
                             });
                     if is_controlled {
                         let authored_value =
                             element.attribute("value").unwrap_or_default().to_string();
                         if state.value != authored_value {
                             state.value = authored_value;
+                            state.composition = None;
                         }
                     }
                     state.normalize_selection();
@@ -195,9 +213,10 @@ impl NativeTextInputs {
 
                     element.set_attribute("value", state.value.clone());
                     element.children.clear();
-                    if !state.value.is_empty() {
+                    let preview = state.preview_value();
+                    if !preview.is_empty() {
                         element.children.push(Node::Text(display_value(
-                            &state.value,
+                            &preview,
                             is_password_input(&element),
                         )));
                     }
@@ -338,6 +357,7 @@ impl NativeTextInputs {
                 cursor: fallback_cursor,
                 value: initial_value,
                 selection_anchor: None,
+                composition: None,
             });
         let cursor = caret_index_from_pointer_or_value(
             Some(scene),
@@ -415,6 +435,7 @@ impl NativeTextInputs {
     }
 
     pub(super) fn clear_focus(&mut self) -> bool {
+        self.cancel_composition();
         self.active_drag = None;
         let Some(focused) = self.focused.take() else {
             return false;
@@ -425,6 +446,39 @@ impl NativeTextInputs {
         true
     }
 
+    pub(super) fn is_composing(&self) -> bool {
+        self.focused
+            .as_ref()
+            .and_then(|focused| self.states.get(&focused.key))
+            .is_some_and(|state| state.composition.is_some())
+    }
+
+    pub(super) fn ime_target(&self) -> Option<ElementPath> {
+        self.focused.as_ref().map(|focused| focused.path.clone())
+    }
+
+    fn cancel_composition(&mut self) -> bool {
+        self.with_focused_state_mut(|state| state.composition.take().is_some())
+    }
+
+    fn update_composition(&mut self, text: &str, cursor: Option<(usize, usize)>) -> bool {
+        self.active_drag = None;
+        self.with_focused_state_mut(|state| {
+            let next = (!text.is_empty()).then(|| Composition {
+                text: text.to_owned(),
+                cursor: cursor.map(|(start, end)| {
+                    (
+                        clamp_to_char_boundary(text, start),
+                        clamp_to_char_boundary(text, end),
+                    )
+                }),
+            });
+            let changed = state.composition != next;
+            state.composition = next;
+            changed
+        })
+    }
+
     fn insert_focused_text(&mut self, text: &str) -> bool {
         let Some(focused) = self.focused.clone() else {
             return false;
@@ -432,12 +486,13 @@ impl NativeTextInputs {
         let Some(state) = self.states.get_mut(&focused.key) else {
             return false;
         };
+        let cancelled = state.composition.take().is_some();
         let text = text
             .chars()
             .filter(|character| !character.is_control())
             .collect::<String>();
         if text.is_empty() {
-            return false;
+            return cancelled;
         }
 
         if let Some((start, end)) = state.selection_range() {
@@ -507,6 +562,7 @@ impl NativeTextInputs {
             (None, false) => 0,
         };
         let (key, path, _) = &inputs[next];
+        self.cancel_composition();
         self.active_drag = None;
         self.focused = Some(FocusedInput {
             key: key.clone(),
@@ -737,6 +793,20 @@ fn cache_authored_roots(
 }
 
 impl NativeTextInputState {
+    fn replacement_range(&self) -> (usize, usize) {
+        self.selection_range().unwrap_or((self.cursor, self.cursor))
+    }
+
+    fn preview_value(&self) -> std::borrow::Cow<'_, str> {
+        let Some(composition) = &self.composition else {
+            return std::borrow::Cow::Borrowed(&self.value);
+        };
+        let mut value = self.value.clone();
+        let (start, end) = self.replacement_range();
+        value.replace_range(start..end, &composition.text);
+        std::borrow::Cow::Owned(value)
+    }
+
     fn normalize_selection(&mut self) {
         self.cursor = clamp_to_char_boundary(&self.value, self.cursor);
         self.selection_anchor = self
@@ -869,13 +939,32 @@ fn text_edit_decoration(
     password: bool,
     selection_style: crate::core::TextSelectionStyle,
 ) -> TextEditDecoration {
+    let preview = state.preview_value();
     let display_index = |index| {
         if password {
-            state.value[..index].chars().count()
+            preview[..index].chars().count()
         } else {
             index
         }
     };
+    if let Some(composition) = &state.composition {
+        let (start, _) = state.replacement_range();
+        let selection = composition.cursor.and_then(|(anchor, cursor)| {
+            (anchor != cursor).then(|| TextSelectionRange {
+                start: display_index(start + anchor.min(cursor)),
+                end: display_index(start + anchor.max(cursor)),
+                style: selection_style,
+            })
+        });
+        return TextEditDecoration {
+            composition: Some(display_index(start)..display_index(start + composition.text.len())),
+            backgrounds: None,
+            caret: composition
+                .cursor
+                .map(|(_, cursor)| display_index(start + cursor)),
+            selection,
+        };
+    }
     let selection = state
         .selection_range()
         .map(|(start, end)| TextSelectionRange {
@@ -885,6 +974,7 @@ fn text_edit_decoration(
         });
 
     TextEditDecoration {
+        composition: None,
         backgrounds: None,
         caret: selection.is_none().then_some(display_index(state.cursor)),
         selection,
@@ -1336,6 +1426,7 @@ mod tests {
         inputs.states.insert(
             shared_key.clone(),
             NativeTextInputState {
+                composition: None,
                 value: "hello".to_string(),
                 cursor: 4,
                 selection_anchor: Some(1),
@@ -1393,6 +1484,7 @@ mod tests {
         inputs.states.insert(
             "id:field".to_string(),
             NativeTextInputState {
+                composition: None,
                 value: "hello".to_string(),
                 cursor: 3,
                 selection_anchor: None,
@@ -1408,6 +1500,7 @@ mod tests {
         assert_eq!(
             find_render_node_at_path(&scene, &path).and_then(|node| node.text_edit.as_ref()),
             Some(&TextEditDecoration {
+                composition: None,
                 backgrounds: None,
                 caret: Some(3),
                 selection: None,
@@ -1673,3 +1766,5 @@ mod tests {
 
 #[cfg(test)]
 mod editing_tests;
+#[cfg(test)]
+mod ime_tests;

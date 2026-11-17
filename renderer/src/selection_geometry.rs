@@ -497,6 +497,7 @@ mod tests {
                     ..Default::default()
                 })
                 .with_text_edit(TextEditDecoration {
+                    composition: None,
                     caret: None,
                     backgrounds: None,
                     selection: Some(TextSelectionRange {

@@ -1,7 +1,7 @@
 use super::*;
 use crate::core::{LayoutBox, RuntimeDirtyClass, RuntimeSyncPolicy};
 
-fn key(value: &str, command: bool, shift: bool) -> EngineEvent {
+pub(super) fn key(value: &str, command: bool, shift: bool) -> EngineEvent {
     let mut modifiers = crate::renderer::KeyboardModifiers {
         shift,
         ..Default::default()
@@ -25,7 +25,7 @@ fn key(value: &str, command: bool, shift: bool) -> EngineEvent {
     })
 }
 
-fn fixture(password: bool) -> (NativeTextInputs, RuntimeWorld) {
+pub(super) fn fixture(password: bool) -> (NativeTextInputs, RuntimeWorld) {
     let root: Node = Node::element("input")
         .with_id("edit")
         .with_attribute("type", if password { "password" } else { "text" })
