@@ -122,6 +122,7 @@ use cssimpler_core::{
 
 use super::{
     ClipRect, blend_linear_over, clip_pixel_bounds, current_render_buffer_rows,
+    fill_current_alpha_span, pack_linear_rgb,
     transform::{AffineTransform, ClipState, transform_clip_rect},
 };
 
@@ -502,6 +503,11 @@ fn draw_svg_coverage(
     if y0 >= y1 {
         return;
     }
+    let opaque_pixel = match paint {
+        SvgResolvedPaint::Color(color) if color.a == 1.0 => Some(pack_linear_rgb(*color)),
+        _ => None,
+    };
+    let write_alpha = opaque_pixel.is_some() && super::render_alpha_target_active();
     COVERAGE_TILE.with_borrow_mut(|tile| {
         let tile = tile.get_or_insert_with(|| {
             Mask::new(COVERAGE_TILE_SIZE as u32, COVERAGE_TILE_SIZE as u32)
@@ -537,11 +543,30 @@ fn draw_svg_coverage(
                     x1: end_x as f32,
                     y1: end_y as f32,
                 }) && clip_state.is_unclipped_by_regions(tile_layout);
+                let start_x = tile_x.max(x0);
+                let opaque_pixel = opaque_pixel.filter(|_| unclipped);
                 for y in tile_y.max(y0)..end_y {
                     let local_row = (y as usize - rows.start) * width;
                     let mask_row = (y - tile_y) as usize * COVERAGE_TILE_SIZE;
-                    for x in tile_x.max(x0)..end_x {
-                        let coverage = tile.data()[mask_row + (x - tile_x) as usize];
+                    let mut remaining = &tile.data()[mask_row + (start_x - tile_x) as usize
+                        ..mask_row + (end_x - tile_x) as usize];
+                    let mut x = start_x;
+                    while let Some((&coverage, rest)) = remaining.split_first() {
+                        let index = local_row + x as usize;
+                        if let Some(pixel) = opaque_pixel.filter(|_| coverage == u8::MAX) {
+                            let run =
+                                1 + rest.iter().take_while(|&&value| value == u8::MAX).count();
+                            buffer[index..index + run].fill(pixel);
+                            if write_alpha {
+                                fill_current_alpha_span(index, run, u8::MAX);
+                            }
+                            remaining = &remaining[run..];
+                            x += run as i32;
+                            continue;
+                        }
+                        remaining = rest;
+                        let sample_x = x;
+                        x += 1;
                         if coverage == 0 {
                             continue;
                         }
@@ -551,7 +576,7 @@ fn draw_svg_coverage(
                             CLIP_COVERAGE_SAMPLES
                                 .iter()
                                 .filter(|&&(sx, sy)| {
-                                    clip_state.contains(x as f32 + sx, y as f32 + sy)
+                                    clip_state.contains(sample_x as f32 + sx, y as f32 + sy)
                                 })
                                 .count() as f32
                                 / CLIP_COVERAGE_SAMPLES.len() as f32
@@ -563,7 +588,7 @@ fn draw_svg_coverage(
                             SvgResolvedPaint::Color(color) => *color,
                             SvgResolvedPaint::LinearGradient(_) => {
                                 let (sx, sy) =
-                                    inverse.transform_point(x as f32 + 0.5, y as f32 + 0.5);
+                                    inverse.transform_point(sample_x as f32 + 0.5, y as f32 + 0.5);
                                 if !sx.is_finite() || !sy.is_finite() {
                                     continue;
                                 }
@@ -572,7 +597,7 @@ fn draw_svg_coverage(
                         };
                         blend_linear_over(
                             buffer,
-                            local_row + x as usize,
+                            index,
                             with_coverage(color, f32::from(coverage) / 255.0 * clip_coverage),
                         );
                     }
@@ -1500,6 +1525,48 @@ mod tests {
     }
 
     #[test]
+    fn opaque_svg_fill_writes_color_and_alpha_without_erasing_antialiased_edges() {
+        let color = Color::rgb(192, 57, 112);
+        let scene = test_scene(
+            vec![polygon(
+                &[(1.25, 1.25), (6.75, 1.25), (6.75, 6.75), (1.25, 6.75)],
+                true,
+            )],
+            SvgPathPaint {
+                fill: Some(SvgPathPaintSource::Color(color)),
+                stroke: None,
+                stroke_width: 0.0,
+            },
+            8.0,
+        );
+        let background = pack_rgb(Color::rgb(20, 40, 60));
+        let mut buffer = vec![background; 64];
+        let mut alpha = vec![80; 64];
+        super::super::with_render_alpha_target(Some(&mut alpha), || {
+            super::draw_svg_scene(
+                &mut buffer,
+                8,
+                8,
+                LayoutBox::new(0.0, 0.0, 8.0, 8.0),
+                &scene,
+                super::ClipRect::full(8.0, 8.0),
+            );
+        });
+        assert_eq!(
+            &buffer[4 * 8 + 2..4 * 8 + 6],
+            &[super::pack_linear_rgb(color.to_linear_rgba()); 4]
+        );
+        assert_eq!(&alpha[4 * 8 + 2..4 * 8 + 6], &[255; 4]);
+        assert!((80..255).contains(&alpha[4 * 8 + 1]));
+        assert_ne!(
+            buffer[4 * 8 + 1],
+            super::pack_linear_rgb(color.to_linear_rgba())
+        );
+        assert_eq!(buffer[4 * 8], background);
+        assert_eq!(alpha[4 * 8], 80);
+    }
+
+    #[test]
     fn svg_parallel_repaint_matches_serial_color_and_alpha() {
         let mut svg = test_scene(
             vec![polygon(&[(3.2, 2.7), (598.8, 350.4), (12.3, 355.8)], true)],
@@ -1515,6 +1582,10 @@ mod tests {
             Color::rgba(240, 30, 10, 100),
             Color::rgba(10, 30, 240, 200),
         ));
+        let mut opaque = svg.paths[0].clone();
+        opaque.paint.fill = Some(SvgPathPaintSource::Color(Color::rgb(30, 40, 50)));
+        opaque.paint.stroke = None;
+        svg.paths.insert(0, opaque);
         let scene = vec![RenderNode::svg(LayoutBox::new(0.0, 0.0, 600.0, 600.0), svg)];
         let bounds = super::super::cache_scene_subtree_bounds(&scene);
         let mut serial = vec![0; 600 * 360];
