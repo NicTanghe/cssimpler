@@ -313,3 +313,19 @@ Prefer constructors for public structs. Direct `ElementNode`/`RuntimeElementData
 struct literals now need `vector_scene: None`; direct `SvgPathGeometry` literals
 need `commands: Vec::new()` for existing flattened geometry. Nonempty commands
 have precedence over contours. Existing constructors and SVG markup keep working.
+
+## Shared geometry measurement
+
+The reproducible Linux-only `core/examples/vector_clone_measure.rs` keeps 10,000
+clones of one 1,000-command native path alive and counts allocation calls and
+requested bytes using the system allocator. It reports process RSS from
+`/proc/self/status`. This isolates retained clone storage; it is not a frame-rate
+benchmark. Run it in a release build with `cargo run --release -p cssimpler-core
+--example vector_clone_measure`.
+
+A comparable before/after measurement of construction, preparation and painting
+with pixel-layer caching disabled has not yet been completed. In particular,
+clone savings do not establish a painting speedup. The existing
+`native_vector_bench` example runs without requesting cached layers and can be
+used to make that comparison on the same machine with both revisions built from
+known sources and without concurrent workloads.
