@@ -15,6 +15,7 @@ Current focus:
 The workspace now has the foundations through rendering, typography and font resolution, interaction, scoped invalidation, and renderer-side dirty-region diffing in place.
 
 - [Optional layer caching: usage guide](./layer-caching.md) — enable caches, separate overlays, choose RAM budgets, inspect usage, and disable caching.
+- [Frame-aligned drag updates](./frame-aligned-drag.md) — opt-in latest-state drag coalescing, bounded pending state, and frame scheduling.
 - [Native vector paths and SVG export](./native-vector-paths.md) — typed curves, native UI elements, export, and a construction/rendering comparison.
 - [CPU 2D rendering and cached layers](./svg-rendering.md) — tiny-skia SVG coverage, opt-in board caches, memory budgets, overlays, and a headless benchmark.
 
