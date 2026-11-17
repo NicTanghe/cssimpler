@@ -769,6 +769,8 @@ mod tests {
         let mut buffer = vec![pack_rgb(Color::WHITE); 24 * 24];
         super::set_vector_timing_enabled(false);
         super::reset_frame_vector_stats();
+        super::record_layer_lookup(true);
+        super::record_layer_lookup(false);
         let pool = super::super::WorkerPool::new(3);
         pool.scope(|scope| {
             for _ in 0..4 {
@@ -803,6 +805,7 @@ mod tests {
             });
         });
         let stats = super::take_frame_vector_stats();
+        assert_eq!(super::frame_layer_lookups(), (1, 1));
         assert_eq!(stats.paths_painted, 400);
         assert!(!stats.timings_enabled);
         assert_eq!(stats.path_build_work_us, 0);
@@ -819,6 +822,7 @@ mod tests {
             super::ClipRect::full(24.0, 24.0),
         );
         assert_eq!(super::take_frame_vector_stats().paths_painted, 0);
+        assert_eq!(super::frame_layer_lookups(), (0, 0));
     }
 
     #[test]
