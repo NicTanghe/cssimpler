@@ -2,10 +2,11 @@
 pub use openusd::usd::Stage;
 
 use super::*;
-use glam::{Mat4, Vec3};
+use glam::{DVec3, Mat4, Vec3};
 use openusd::{gf, sdf, usd as scene};
 use openusd_schemas::geom::{
-    self, CameraSchema, GprimSchema, ImageableExt, MeshSchema, PointBasedSchema, XformableExt,
+    self, AttributeMetadata, CameraSchema, GprimSchema, ImageableExt, MeshSchema, PointBasedSchema,
+    XformableExt,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -708,6 +709,60 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
             .ok_or_else(|| error(format!("{path}: missing faceVertexIndices")))?;
         let prim = stage.prim(&path).map_err(error)?;
         let world = xforms.local_to_world_transform(&prim).map_err(error)?;
+        let normals_attr = mesh.normals_attr();
+        let authored_normals = normals_attr
+            .get_at::<Vec<gf::Vec3f>>(time)
+            .map_err(|e| error(format!("{path}: cannot read normals: {e}")))?;
+        let interpolation = normals_attr.interpolation().map_err(error)?;
+        // USD normals default to vertex interpolation when metadata is absent.
+        let interpolation = interpolation.as_deref().unwrap_or("vertex");
+        let authored_normals = if let Some(normals) = authored_normals {
+            let expected = match interpolation {
+                "constant" => 1,
+                "uniform" => counts.len(),
+                "vertex" | "varying" => points.len(),
+                "faceVarying" => indices.len(),
+                other => {
+                    return Err(error(format!(
+                        "{path}: unsupported normals interpolation {other}"
+                    )));
+                }
+            };
+            if normals.len() != expected {
+                return Err(error(format!(
+                    "{path}: normals count {} does not match {interpolation} count {expected}",
+                    normals.len()
+                )));
+            }
+            let inverse = world.inverse().ok_or_else(|| {
+                error(format!(
+                    "{path}: cannot transform normals through a singular transform"
+                ))
+            })?;
+            let m = inverse.0;
+            Some(
+                normals
+                    .into_iter()
+                    .map(|n| {
+                        // Gf uses row vectors: multiply by the inverse transpose.
+                        let n = DVec3::new(
+                            f64::from(n.x) * m[0] + f64::from(n.y) * m[1] + f64::from(n.z) * m[2],
+                            f64::from(n.x) * m[4] + f64::from(n.y) * m[5] + f64::from(n.z) * m[6],
+                            f64::from(n.x) * m[8] + f64::from(n.y) * m[9] + f64::from(n.z) * m[10],
+                        );
+                        let scale = n.abs().max_element();
+                        if !n.is_finite() || scale == 0.0 {
+                            return Err(error(format!("{path}: invalid authored normal")));
+                        }
+                        // Scale before taking a length: valid f32 normals can be
+                        // too large/small to normalize safely in f32 arithmetic.
+                        Ok((n / scale).normalize().as_vec3())
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
         let points: Vec<Vec3> = points
             .into_iter()
             .map(|p| {
@@ -724,7 +779,7 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
             .map(|v| [v.x, v.y, v.z])
             .unwrap_or([0.62, 0.68, 0.78]);
         let mut offset = 0usize;
-        for count in counts {
+        for (face_index, count) in counts.into_iter().enumerate() {
             if count < 3 {
                 return Err(error(format!("{path}: face has fewer than three vertices")));
             }
@@ -758,7 +813,18 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                 }
             }
             for i in 1..polygon.len() - 1 {
-                for p in [polygon[0], polygon[i], polygon[i + 1]] {
+                for corner in [0, i, i + 1] {
+                    let p = polygon[corner];
+                    let shading_normal = authored_normals.as_ref().map_or(normal, |normals| {
+                        let index = match interpolation {
+                            "constant" => 0,
+                            "uniform" => face_index,
+                            "vertex" | "varying" => face[corner] as usize,
+                            "faceVarying" => offset + corner,
+                            _ => unreachable!(), // Validated above.
+                        };
+                        normals[index]
+                    });
                     if !p.is_finite() {
                         return Err(error(format!("{path}: non-finite point")));
                     }
@@ -766,7 +832,7 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                     cache.maximum = cache.maximum.max(p);
                     cache.vertices.push(Vertex {
                         position: p.to_array(),
-                        normal: normal.to_array(),
+                        normal: shading_normal.to_array(),
                         color,
                     });
                 }
@@ -915,6 +981,309 @@ mod tests {
             .unwrap();
         stage
     }
+    #[test]
+    fn authored_normals_follow_usd_interpolation_and_fan_corners() {
+        for (mode, values, expected) in [
+            ("constant", vec![[1., 0., 0.]], vec![0, 0, 0, 0, 0, 0]),
+            ("uniform", vec![[1., 0., 0.]], vec![0, 0, 0, 0, 0, 0]),
+            (
+                "vertex",
+                vec![[1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [-1., 0., 0.]],
+                vec![2, 3, 0, 2, 0, 1],
+            ),
+            (
+                "varying",
+                vec![[1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [-1., 0., 0.]],
+                vec![2, 3, 0, 2, 0, 1],
+            ),
+            (
+                "faceVarying",
+                vec![[1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [-1., 0., 0.]],
+                vec![0, 1, 2, 0, 2, 3],
+            ),
+        ] {
+            let stage = triangle();
+            let mesh = geom::Mesh::get(&stage, "/Cloth").unwrap().unwrap();
+            mesh.points_attr()
+                .set(vec![
+                    gf::vec3f(0., 0., 0.),
+                    gf::vec3f(1., 0., 0.),
+                    gf::vec3f(1., 1., 0.),
+                    gf::vec3f(0., 1., 0.),
+                ])
+                .unwrap();
+            mesh.face_vertex_counts_attr().set(vec![4_i32]).unwrap();
+            mesh.face_vertex_indices_attr()
+                .set(vec![2_i32, 3, 0, 1])
+                .unwrap();
+            let normals = mesh.create_normals_attr().unwrap();
+            normals
+                .clone()
+                .set_interpolation(openusd::tf::Token::new(mode))
+                .unwrap();
+            normals
+                .set(
+                    values
+                        .iter()
+                        .map(|v| gf::vec3f(v[0], v[1], v[2]))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let cache = extract_meshes(&stage, None).unwrap();
+            for (vertex, index) in cache.vertices.iter().zip(expected) {
+                assert_eq!(vertex.normal, values[index], "{mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn missing_normals_generate_face_normals_but_invalid_authored_normals_fail() {
+        let stage = triangle();
+        let cache = extract_meshes(&stage, None).unwrap();
+        assert!(cache.vertices.iter().all(|v| v.normal == [0., 0., 1.]));
+        let mesh = geom::Mesh::get(&stage, "/Cloth").unwrap().unwrap();
+        let normals = mesh.create_normals_attr().unwrap();
+        normals.clone().set(vec![gf::vec3f(1., 0., 0.)]).unwrap();
+        assert!(
+            extract_meshes(&stage, None).is_err(),
+            "default interpolation is vertex"
+        );
+        normals.set(vec![gf::vec3f(0., 0., 0.); 3]).unwrap();
+        assert!(extract_meshes(&stage, None).is_err());
+    }
+
+    #[test]
+    fn authored_normals_use_inverse_transpose_and_selected_time() {
+        let stage = triangle();
+        let mesh = geom::Mesh::get(&stage, "/Cloth").unwrap().unwrap();
+        mesh.clone().set_scale(gf::vec3f(2., 1., 1.)).unwrap();
+        let normals = mesh.create_normals_attr().unwrap();
+        normals.clone().set(vec![gf::vec3f(1., 1., 0.); 3]).unwrap();
+        let cache = extract_meshes(&stage, None).unwrap();
+        let expected = Vec3::new(0.5, 1., 0.).normalize();
+        assert!((Vec3::from_array(cache.vertices[0].normal) - expected).length() < 1e-6);
+        normals
+            .set_at(vec![gf::vec3f(0., 0., 1.); 3], scene::TimeCode::new(1.0))
+            .unwrap();
+        let cache = extract_meshes(&stage, Some(scene::TimeCode::new(1.0))).unwrap();
+        assert_eq!(cache.vertices[0].normal, [0., 0., 1.]);
+    }
+
+    #[test]
+    fn normals_are_read_from_an_authored_usda_file() {
+        let path = std::env::temp_dir().join(format!(
+            "cssimpler-authored-normals-{}.usda",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"#usda 1.0
+
+def Mesh "Cloth" {
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+    int[] faceVertexCounts = [3]
+    int[] faceVertexIndices = [0, 1, 2]
+    normal3f[] normals = [(0, 1, 0)] (
+        interpolation = "constant"
+    )
+}
+"#,
+        )
+        .unwrap();
+        let stage = Stage::builder()
+            .schema_registry(openusd_schemas::schema_registry())
+            .open(path.to_str().unwrap())
+            .unwrap();
+        let result = extract_meshes(&stage, None);
+        drop(stage);
+        std::fs::remove_file(path).unwrap();
+        let cache = result.unwrap();
+        assert_eq!(cache.vertices.len(), 3);
+        // The authored direction differs from the geometric +Z face normal.
+        assert!(cache.vertices.iter().all(|v| v.normal == [0., 1., 0.]));
+    }
+
+    #[test]
+    fn authored_normal_indices_follow_multiple_faces() {
+        let directions = [
+            [1., 0., 0.],
+            [0., 1., 0.],
+            [0., 0., 1.],
+            [-1., 0., 0.],
+            [0., -1., 0.],
+            [0., 0., -1.],
+        ];
+        for mode in ["constant", "uniform", "vertex", "varying", "faceVarying"] {
+            let stage = triangle();
+            let mesh = geom::Mesh::get(&stage, "/Cloth").unwrap().unwrap();
+            mesh.points_attr()
+                .set(vec![
+                    gf::vec3f(0., 0., 0.),
+                    gf::vec3f(1., 0., 0.),
+                    gf::vec3f(1., 1., 0.),
+                    gf::vec3f(0., 1., 0.),
+                ])
+                .unwrap();
+            mesh.face_vertex_counts_attr().set(vec![3_i32, 3]).unwrap();
+            mesh.face_vertex_indices_attr()
+                .set(vec![2_i32, 0, 1, 0, 2, 3])
+                .unwrap();
+            let (count, expected) = match mode {
+                "constant" => (1, vec![0; 6]),
+                "uniform" => (2, vec![0, 0, 0, 1, 1, 1]),
+                "vertex" | "varying" => (4, vec![2, 0, 1, 0, 2, 3]),
+                _ => (6, vec![0, 1, 2, 3, 4, 5]),
+            };
+            let normals = mesh.create_normals_attr().unwrap();
+            normals
+                .clone()
+                .set_interpolation(openusd::tf::Token::new(mode))
+                .unwrap();
+            normals
+                .set(
+                    directions[..count]
+                        .iter()
+                        .map(|v| gf::vec3f(v[0], v[1], v[2]))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let cache = extract_meshes(&stage, None).unwrap();
+            assert_eq!(cache.vertices.len(), 6);
+            for (v, i) in cache.vertices.iter().zip(expected) {
+                assert_eq!(v.normal, directions[i], "{mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn normal_transform_handles_shear_and_ignores_translation() {
+        let stage = triangle();
+        let mesh = geom::Mesh::get(&stage, "/Cloth").unwrap().unwrap();
+        mesh.create_normals_attr()
+            .unwrap()
+            .set(vec![gf::vec3f(1., 0., 1.); 3])
+            .unwrap();
+        mesh.set_transform(gf::Matrix4d([
+            2., 0., 1., 0., 1., 3., 0., 0., 0., 0., 4., 0., 10., 20., 30., 1.,
+        ]))
+        .unwrap();
+        // Solve A*n' = n for the row-vector point transform; then normalize.
+        let expected = Vec3::new(0.375, -0.125, 0.25).normalize();
+        let cache = extract_meshes(&stage, None).unwrap();
+        for v in cache.vertices {
+            assert!((Vec3::from_array(v.normal) - expected).length() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn authored_normal_magnitudes_normalize_without_overflow_or_underflow() {
+        for magnitude in [f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)] {
+            let stage = triangle();
+            let mesh = geom::Mesh::get(&stage, "/Cloth").unwrap().unwrap();
+            mesh.create_normals_attr()
+                .unwrap()
+                .set(vec![gf::vec3f(magnitude, magnitude, 0.); 3])
+                .unwrap();
+            let cache = extract_meshes(&stage, None).unwrap();
+            let expected = Vec3::new(1., 1., 0.).normalize();
+            for v in cache.vertices {
+                let n = Vec3::from_array(v.normal);
+                assert!(
+                    n.is_finite() && (n - expected).length() < 1e-6,
+                    "{magnitude}: {n:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_authored_normals_never_silently_use_flat_shading() {
+        for (mode, values, message) in [
+            (
+                "faceVarying",
+                vec![gf::vec3f(1., 0., 0.); 2],
+                "normals count",
+            ),
+            (
+                "unexpected",
+                vec![gf::vec3f(1., 0., 0.); 3],
+                "unsupported normals interpolation",
+            ),
+            (
+                "vertex",
+                vec![gf::vec3f(f32::NAN, 0., 0.); 3],
+                "invalid authored normal",
+            ),
+            (
+                "vertex",
+                vec![gf::vec3f(f32::INFINITY, 0., 0.); 3],
+                "invalid authored normal",
+            ),
+            (
+                "vertex",
+                vec![gf::vec3f(0., 0., 0.); 3],
+                "invalid authored normal",
+            ),
+        ] {
+            let stage = triangle();
+            let mesh = geom::Mesh::get(&stage, "/Cloth").unwrap().unwrap();
+            let normals = mesh.create_normals_attr().unwrap();
+            normals
+                .clone()
+                .set_interpolation(openusd::tf::Token::new(mode))
+                .unwrap();
+            normals.set(values).unwrap();
+            let message_actual = extract_meshes(&stage, None)
+                .err()
+                .expect("bad normals should fail")
+                .to_string();
+            assert!(
+                message_actual.contains("/Cloth") && message_actual.contains(message),
+                "{message_actual}"
+            );
+        }
+        let stage = triangle();
+        let mesh = geom::Mesh::get(&stage, "/Cloth").unwrap().unwrap();
+        mesh.create_normals_attr()
+            .unwrap()
+            .set(vec![gf::vec3f(0., 0., 1.); 3])
+            .unwrap();
+        mesh.set_scale(gf::vec3f(0., 1., 1.)).unwrap();
+        assert!(
+            extract_meshes(&stage, None)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("singular")
+        );
+    }
+
+    #[test]
+    fn normal_only_edits_invalidate_derived_geometry_and_time_samples_are_normalized() {
+        let scene = UsdScene::from_stage(triangle()).unwrap();
+        let mesh = geom::Mesh::get(scene.stage(), "/Cloth").unwrap().unwrap();
+        let normals = mesh.create_normals_attr().unwrap();
+        normals.clone().set(vec![gf::vec3f(1., 0., 0.); 3]).unwrap();
+        let before = extract_meshes(scene.stage(), None).unwrap();
+        let revision = scene.revision.get();
+        normals.clone().set(vec![gf::vec3f(0., 1., 0.); 3]).unwrap();
+        assert!(scene.revision.get() > revision);
+        let after = extract_meshes(scene.stage(), None).unwrap();
+        assert_eq!(before.vertices[0].position, after.vertices[0].position);
+        assert_eq!(before.vertices[0].normal, [1., 0., 0.]);
+        assert_eq!(after.vertices[0].normal, [0., 1., 0.]);
+        normals
+            .clone()
+            .set_at(vec![gf::vec3f(1., 0., 0.); 3], scene::TimeCode::new(1.))
+            .unwrap();
+        normals
+            .set_at(vec![gf::vec3f(0., 1., 0.); 3], scene::TimeCode::new(3.))
+            .unwrap();
+        let sampled = extract_meshes(scene.stage(), Some(scene::TimeCode::new(2.))).unwrap();
+        let expected = Vec3::new(1., 1., 0.).normalize();
+        assert!((Vec3::from_array(sampled.vertices[0].normal) - expected).length() < 1e-6);
+    }
+
     #[test]
     fn mesh_edits_keep_usd_identity_and_update_derived_vertices() {
         let scene = UsdScene::from_stage(triangle()).unwrap();
