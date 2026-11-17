@@ -14,6 +14,8 @@ use super::{
     transform::{AffineTransform, ClipState, transform_clip_rect},
 };
 
+use super::svg_preparation::{self, Stage};
+
 use super::gradient::{
     PreparedResolvedGradient, ResolvedGradientStop, prepare_resolved_gradient,
     sample_prepared_gradient,
@@ -131,21 +133,28 @@ fn draw_svg_scene_with_matrix(
         if fill.is_none() && stroke.is_none() {
             continue;
         }
-        let Some(source_path) = build_svg_path(&path.geometry) else {
+        let start = svg_preparation::stage_start();
+        let source_path = build_svg_path(&path.geometry);
+        svg_preparation::record(Stage::PathBuild, start);
+        let Some(source_path) = source_path else {
             continue;
         };
-        if let Some(fill) = fill
-            && let Some(screen_path) = project_svg_path(&source_path, matrix)
-        {
-            draw_svg_coverage(
-                buffer,
-                width,
-                height,
-                &screen_path,
-                &fill,
-                inverse,
-                clip_state,
-            );
+        svg_preparation::count_path();
+        if let Some(fill) = fill {
+            let start = svg_preparation::stage_start();
+            let screen_path = project_svg_path(&source_path, matrix);
+            svg_preparation::record(Stage::Projection, start);
+            if let Some(screen_path) = screen_path {
+                draw_svg_coverage(
+                    buffer,
+                    width,
+                    height,
+                    &screen_path,
+                    &fill,
+                    inverse,
+                    clip_state,
+                );
+            }
         }
         if let Some(stroke) = stroke {
             // The previous distance-to-segment rasterizer used round caps and joins.
@@ -159,18 +168,25 @@ fn draw_svg_scene_with_matrix(
             let resolution_scale = (matrix.a.abs() + matrix.b.abs())
                 .max(matrix.c.abs() + matrix.d.abs())
                 .max(1.0);
-            if let Some(outline) = source_path.stroke(&stroke_style, resolution_scale)
-                && let Some(screen_path) = project_svg_path(&outline, matrix)
-            {
-                draw_svg_coverage(
-                    buffer,
-                    width,
-                    height,
-                    &screen_path,
-                    &stroke,
-                    inverse,
-                    clip_state,
-                );
+            let start = svg_preparation::stage_start();
+            let outline = source_path.stroke(&stroke_style, resolution_scale);
+            svg_preparation::record(Stage::StrokePrep, start);
+            if let Some(outline) = outline {
+                svg_preparation::count_stroke_outline();
+                let start = svg_preparation::stage_start();
+                let screen_path = project_svg_path(&outline, matrix);
+                svg_preparation::record(Stage::Projection, start);
+                if let Some(screen_path) = screen_path {
+                    draw_svg_coverage(
+                        buffer,
+                        width,
+                        height,
+                        &screen_path,
+                        &stroke,
+                        inverse,
+                        clip_state,
+                    );
+                }
             }
         }
     }
@@ -344,6 +360,7 @@ fn draw_svg_coverage(
             let end_y = (tile_y + COVERAGE_TILE_SIZE as i32).min(y1);
             for tile_x in ((x0 / tile_size) * tile_size..x1).step_by(COVERAGE_TILE_SIZE) {
                 let end_x = (tile_x + COVERAGE_TILE_SIZE as i32).min(x1);
+                let raster_start = svg_preparation::stage_start();
                 tile.clear();
                 tile.fill_path(
                     path,
@@ -351,6 +368,9 @@ fn draw_svg_coverage(
                     true,
                     Transform::from_translate(-(tile_x as f32), -(tile_y as f32)),
                 );
+                svg_preparation::record(Stage::CoverageRaster, raster_start);
+                svg_preparation::count_coverage_tile();
+                let blend_start = svg_preparation::stage_start();
                 let tile_layout = LayoutBox::new(
                     tile_x.max(x0) as f32,
                     tile_y.max(y0) as f32,
@@ -403,6 +423,7 @@ fn draw_svg_coverage(
                         );
                     }
                 }
+                svg_preparation::record(Stage::CoverageBlend, blend_start);
             }
         }
     });

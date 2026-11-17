@@ -29,6 +29,7 @@ mod shadow;
 mod shapes;
 mod softbuffer_dither;
 mod svg;
+mod svg_preparation;
 mod text_edit;
 pub use selection_geometry::prepare_text_selection_backgrounds;
 mod touch;
@@ -74,6 +75,11 @@ pub(crate) use self::color::{
 pub use self::input::{
     ButtonState, EngineEvent, KeyIdentity, KeyLocation, KeyboardEvent, KeyboardModifiers,
     PointerButton, PointerPosition, ScrollDelta, TextInputEvent, ViewportEvent,
+};
+pub use self::svg_preparation::{
+    VectorPreparationStats, reset_vector_preparation_stats,
+    set_vector_preparation_probe_enabled, vector_preparation_probe_enabled,
+    vector_preparation_stats,
 };
 pub(crate) use self::softbuffer_dither::{
     to_softbuffer_rgb_blue_noise, to_softbuffer_rgb_blue_noise_with_alpha,
