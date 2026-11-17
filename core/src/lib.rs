@@ -26,7 +26,8 @@ pub mod stacking;
 pub mod svg;
 pub mod vector;
 pub use vector::{
-    PathCommand, VectorError, VectorPaint, VectorPath, VectorPoint, VectorScene, VectorViewBox,
+    PathCommand, VectorError, VectorGeometry, VectorPaint, VectorPath, VectorPoint, VectorScene,
+    VectorViewBox,
 };
 pub mod transitions;
 

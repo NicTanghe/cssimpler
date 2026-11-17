@@ -64,6 +64,36 @@ style resolution. `VectorScene::into_render_scene()` bridges to the existing
 `SvgScene` representation without serialization. The SVG type names in that
 bridge describe shared renderer storage, not a parsing step.
 
+## Geometry ownership and edits
+
+Each `VectorPath` owns a lightweight `VectorGeometry` handle. It keeps the
+validated authored commands and their conservative bounds together. Cloning a
+path or scene, rebuilding a native element, runtime round-trips, and building
+render trees clone this handle, not the command buffer. Paint remains independent
+on each path and each scene has its own viewBox. To reuse one drawing with a
+different paint, pass `path.geometry().clone()` to
+`VectorPath::from_geometry(geometry, paint)`; `VectorPath::new(commands, paint)`
+continues to work. Construct replacement geometry with `VectorGeometry::new`
+when editing commands, then build a replacement path or scene. Once no owners
+remain, its command buffer is released; there is no geometry registry or new
+pixel cache.
+
+`VectorGeometry::identity()` is an automatic process-local, lifetime-stable
+identity used for invalidation, not a persisted content hash. Clones keep the
+identity; constructing new geometry gives it a new identity even if the commands
+are identical. Retain the handle across rebuilds to enable cache reuse. Debug
+output for native geometry contains this identity rather than formatting all
+commands, so layer-cache key generation does not repeatedly serialize geometry.
+Paint, layout and viewBox remain part of that key. Legacy SVG contour storage and
+its content-based invalidation are unchanged.
+
+Lower-level users constructing `SvgPathGeometry` with a struct literal should
+replace a `Vec<PathCommand>` `commands` field with `VectorGeometry::new(commands)?`
+(or `VectorGeometry::default()` for no native commands) and set `bounds` from
+`commands.bounds()`. The field dereferences to a read-only command slice; mutate
+by replacing the handle and updating bounds together. Prefer `VectorPath` and
+`VectorScene` for validated native construction.
+
 ## Export SVG
 
 `VectorPath::to_svg_path_data()` writes the original M/L/Q/C/Z commands.

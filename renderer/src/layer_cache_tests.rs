@@ -237,3 +237,46 @@ fn cached_board_survives_incremental_overlay_damage() {
     assert_eq!(stats.mode, FramePaintMode::Incremental);
     assert_eq!(layer_cache_stats().builds, 1);
 }
+
+#[test]
+fn native_shared_geometry_cache_invalidates_paint_and_replacement() {
+    use cssimpler_core::{
+        PathCommand, SvgPathPaintSource, VectorPaint, VectorPath, VectorPoint, VectorScene,
+        VectorViewBox,
+    };
+    let _guard = lock_subtree_surface_cache_for_tests();
+    clear_subtree_surface_cache_for_tests();
+    let path = |right| {
+        VectorPath::new(
+            vec![
+                PathCommand::MoveTo(VectorPoint::new(8., 8.)),
+                PathCommand::LineTo(VectorPoint::new(right, 8.)),
+                PathCommand::LineTo(VectorPoint::new(right, 56.)),
+                PathCommand::LineTo(VectorPoint::new(8., 56.)),
+                PathCommand::Close,
+            ],
+            VectorPaint::default(),
+        )
+        .unwrap()
+    };
+    let scene = VectorScene::new(VectorViewBox::new(0., 0., 64., 64.), vec![path(56.)]).unwrap();
+    let mut node =
+        RenderNode::vector(LayoutBox::new(0., 0., 64., 64.), scene).with_cached_layer(true);
+    let mut pixels = vec![0; 64 * 64];
+    render_to_buffer(&[node.clone()], &mut pixels, 64, 64, Color::WHITE);
+    render_to_buffer(&[node.clone()], &mut pixels, 64, 64, Color::WHITE);
+    assert_eq!(layer_cache_stats().builds, 1);
+    if let RenderKind::Svg(scene) = &mut node.kind {
+        scene.paths[0].paint.fill = Some(SvgPathPaintSource::Color(Color::rgb(255, 0, 0)));
+    }
+    render_to_buffer(&[node.clone()], &mut pixels, 64, 64, Color::WHITE);
+    assert_eq!(layer_cache_stats().builds, 2);
+    assert_eq!(pixels[20 * 64 + 40], pack_rgb(Color::rgb(255, 0, 0)));
+    if let RenderKind::Svg(scene) = &mut node.kind {
+        scene.paths[0].geometry.commands = path(30.).geometry().clone();
+        scene.paths[0].geometry.bounds = scene.paths[0].geometry.commands.bounds();
+    }
+    render_to_buffer(&[node], &mut pixels, 64, 64, Color::WHITE);
+    assert_eq!(layer_cache_stats().builds, 3);
+    assert_eq!(pixels[20 * 64 + 40], pack_rgb(Color::WHITE));
+}

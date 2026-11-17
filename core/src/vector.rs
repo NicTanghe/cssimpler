@@ -6,6 +6,11 @@ use crate::{
 use std::{
     error::Error,
     fmt::{self, Write},
+    ops::Deref,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 pub type VectorPoint = SvgPoint;
@@ -68,16 +73,18 @@ impl fmt::Display for VectorError {
 }
 impl Error for VectorError {}
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct VectorPath {
+/// Immutable authored commands and their conservative control-point bounds.
+/// Clones share storage. Construct a replacement to edit geometry.
+#[derive(Clone)]
+pub struct VectorGeometry(Arc<GeometryData>);
+struct GeometryData {
     commands: Vec<PathCommand>,
-    paint: VectorPaint,
+    bounds: Option<SvgBounds>,
+    identity: u64,
 }
-impl VectorPath {
-    pub fn new(commands: Vec<PathCommand>, paint: VectorPaint) -> Result<Self, VectorError> {
-        if !paint.stroke_width.is_finite() || paint.stroke_width < 0.0 {
-            return Err(VectorError("stroke width must be finite and nonnegative"));
-        }
+static NEXT_GEOMETRY_ID: AtomicU64 = AtomicU64::new(1);
+impl VectorGeometry {
+    pub fn new(commands: Vec<PathCommand>) -> Result<Self, VectorError> {
         let mut started = false;
         for command in &commands {
             if command
@@ -92,10 +99,90 @@ impl VectorPath {
                 return Err(VectorError("a contour must start with MoveTo"));
             }
         }
-        Ok(Self { commands, paint })
+        let bounds = commands
+            .iter()
+            .flat_map(PathCommand::points)
+            .map(|p| SvgBounds::new(p.x, p.y, p.x, p.y))
+            .reduce(SvgBounds::union);
+        #[allow(deprecated)] // `try_update` is not available on older supported toolchains.
+        let identity = NEXT_GEOMETRY_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("vector geometry identity exhausted");
+        Ok(Self(Arc::new(GeometryData {
+            commands,
+            bounds,
+            identity,
+        })))
     }
     pub fn commands(&self) -> &[PathCommand] {
-        &self.commands
+        &self.0.commands
+    }
+    pub fn bounds(&self) -> Option<SvgBounds> {
+        self.0.bounds
+    }
+    /// Process-local identity, stable for the lifetime of this geometry and its clones.
+    pub fn identity(&self) -> u64 {
+        self.0.identity
+    }
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Default for VectorGeometry {
+    fn default() -> Self {
+        static EMPTY: OnceLock<VectorGeometry> = OnceLock::new();
+        EMPTY.get_or_init(|| Self::new(Vec::new()).unwrap()).clone()
+    }
+}
+impl Deref for VectorGeometry {
+    type Target = [PathCommand];
+    fn deref(&self) -> &Self::Target {
+        self.commands()
+    }
+}
+impl<'a> IntoIterator for &'a VectorGeometry {
+    type Item = &'a PathCommand;
+    type IntoIter = std::slice::Iter<'a, PathCommand>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.commands().iter()
+    }
+}
+impl PartialEq for VectorGeometry {
+    fn eq(&self, other: &Self) -> bool {
+        self.shares_storage_with(other) || self.commands() == other.commands()
+    }
+}
+impl fmt::Debug for VectorGeometry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VectorGeometry")
+            .field("identity", &self.identity())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorPath {
+    geometry: VectorGeometry,
+    paint: VectorPaint,
+}
+impl VectorPath {
+    pub fn new(commands: Vec<PathCommand>, paint: VectorPaint) -> Result<Self, VectorError> {
+        Self::from_geometry(VectorGeometry::new(commands)?, paint)
+    }
+    pub fn from_geometry(
+        geometry: VectorGeometry,
+        paint: VectorPaint,
+    ) -> Result<Self, VectorError> {
+        if !paint.stroke_width.is_finite() || paint.stroke_width < 0.0 {
+            return Err(VectorError("stroke width must be finite and nonnegative"));
+        }
+        Ok(Self { geometry, paint })
+    }
+    pub fn geometry(&self) -> &VectorGeometry {
+        &self.geometry
+    }
+    pub fn commands(&self) -> &[PathCommand] {
+        self.geometry.commands()
     }
     pub fn paint(&self) -> VectorPaint {
         self.paint
@@ -103,7 +190,7 @@ impl VectorPath {
     /// Serialize authored commands without flattening curves or rounding coordinates.
     pub fn to_svg_path_data(&self) -> String {
         let mut d = String::new();
-        for c in &self.commands {
+        for c in &self.geometry {
             if !d.is_empty() {
                 d.push(' ');
             }
@@ -193,25 +280,17 @@ impl VectorScene {
             self.view_box,
             self.paths
                 .into_iter()
-                .map(|p| {
-                    let bounds = p
-                        .commands
-                        .iter()
-                        .flat_map(PathCommand::points)
-                        .map(|p| SvgBounds::new(p.x, p.y, p.x, p.y))
-                        .reduce(SvgBounds::union);
-                    SvgPathInstance {
-                        geometry: SvgPathGeometry {
-                            contours: vec![],
-                            commands: p.commands,
-                            bounds,
-                        },
-                        paint: SvgPathPaint {
-                            fill: p.paint.fill.map(SvgPathPaintSource::Color),
-                            stroke: p.paint.stroke.map(SvgPathPaintSource::Color),
-                            stroke_width: p.paint.stroke_width,
-                        },
-                    }
+                .map(|p| SvgPathInstance {
+                    geometry: SvgPathGeometry {
+                        contours: vec![],
+                        bounds: p.geometry.bounds(),
+                        commands: p.geometry,
+                    },
+                    paint: SvgPathPaint {
+                        fill: p.paint.fill.map(SvgPathPaintSource::Color),
+                        stroke: p.paint.stroke.map(SvgPathPaintSource::Color),
+                        stroke_width: p.paint.stroke_width,
+                    },
                 })
                 .collect(),
         )
@@ -253,9 +332,67 @@ mod tests {
         let svg = scene.to_svg();
         assert!(svg.contains("fill=\"none\" stroke=\"#010203\" stroke-opacity=\"0.5019608\""));
         let render = scene.into_render_scene();
-        assert_eq!(render.paths[0].geometry.commands, commands);
+        assert_eq!(render.paths[0].geometry.commands.commands(), commands);
         let bounds = render.bounds.unwrap();
         assert!(bounds.min_x <= -10. && bounds.max_y >= 100.);
+    }
+    #[test]
+    fn legacy_svg_empty_commands_are_canonical() {
+        let a = SvgPathGeometry::new(vec![]);
+        let b = SvgPathGeometry::new(vec![]);
+        assert!(a.commands.shares_storage_with(&b.commands));
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+    #[test]
+    fn shared_instances_keep_paint_and_release_replaced_geometry() {
+        let geometry = VectorGeometry::new(vec![
+            PathCommand::MoveTo(VectorPoint::new(1., 2.)),
+            PathCommand::QuadTo {
+                control: VectorPoint::new(5., 9.),
+                end: VectorPoint::new(3., 4.),
+            },
+        ])
+        .unwrap();
+        let weak = Arc::downgrade(&geometry.0);
+        let first = VectorPath::from_geometry(geometry.clone(), VectorPaint::default()).unwrap();
+        let second = VectorPath::from_geometry(
+            geometry.clone(),
+            VectorPaint {
+                fill: None,
+                stroke: Some(Color::BLACK),
+                stroke_width: 4.,
+            },
+        )
+        .unwrap();
+        let scene = VectorScene::new(
+            VectorViewBox::new(0., 0., 10., 10.),
+            vec![first.clone(), second.clone()],
+        )
+        .unwrap();
+        let svg = scene.to_svg();
+        assert!(svg.contains("Q 5 9 3 4"));
+        assert!(svg.contains("fill=\"none\""));
+        let render = scene.into_render_scene();
+        assert!(
+            render.paths[0]
+                .geometry
+                .commands
+                .shares_storage_with(&geometry)
+        );
+        assert!(
+            render.paths[1]
+                .geometry
+                .commands
+                .shares_storage_with(&geometry)
+        );
+        assert_ne!(render.paths[0].paint, render.paths[1].paint);
+        assert_ne!(render.paths[0].bounds(), render.paths[1].bounds());
+        let replacement =
+            VectorGeometry::new(vec![PathCommand::MoveTo(VectorPoint::new(8., 9.))]).unwrap();
+        assert_ne!(geometry.identity(), replacement.identity());
+        assert_ne!(geometry.bounds(), replacement.bounds());
+        drop((geometry, first, second, render));
+        assert!(weak.upgrade().is_none());
     }
     #[test]
     fn invalid_geometry_and_metrics_are_rejected() {
