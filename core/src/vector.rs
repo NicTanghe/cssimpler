@@ -154,8 +154,11 @@ impl PartialEq for VectorGeometry {
 }
 impl fmt::Debug for VectorGeometry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Deliberately omit the command slice: cache keys include this Debug
+        // output, and the retained identity is enough to invalidate on edits.
         f.debug_struct("VectorGeometry")
             .field("identity", &self.identity())
+            .field("commands", &self.commands().len())
             .finish()
     }
 }
@@ -393,6 +396,34 @@ mod tests {
         assert_ne!(geometry.bounds(), replacement.bounds());
         drop((geometry, first, second, render));
         assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn repeated_revisions_release_old_geometry() {
+        let mut current = VectorGeometry::new(vec![
+            PathCommand::MoveTo(VectorPoint::new(0., 0.)),
+            PathCommand::LineTo(VectorPoint::new(1., 1.)),
+        ])
+        .unwrap();
+        let mut replaced = Vec::new();
+        let mut identities = std::collections::HashSet::new();
+        identities.insert(current.identity());
+        for step in 0..64 {
+            replaced.push(Arc::downgrade(&current.0));
+            let next = VectorGeometry::new(vec![
+                PathCommand::MoveTo(VectorPoint::new(step as f32, 0.)),
+                PathCommand::LineTo(VectorPoint::new(step as f32 + 1., 1.)),
+            ])
+            .unwrap();
+            assert!(identities.insert(next.identity()), "identity must be fresh");
+            current = next;
+        }
+        for weak in replaced {
+            assert!(
+                weak.upgrade().is_none(),
+                "replaced geometry must be released, not retained by a registry"
+            );
+        }
+        assert_eq!(Arc::strong_count(&current.0), 1);
     }
     #[test]
     fn invalid_geometry_and_metrics_are_rejected() {
