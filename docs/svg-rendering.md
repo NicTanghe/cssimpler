@@ -113,6 +113,9 @@ do not acquire cached layers by default.
 
 ## Static SVG performance comparison
 
+The [opaque-fill benchmark](./reports/opaque-vector-fills.md) measures the current
+solid-fill optimization for static SVG and native vector scenes.
+
 The headless benchmark constructs ordinary SVG scenes once and forces full
 repaints of that unchanged scene. It does not request cached layers. Both
 revisions compile the **exact same benchmark source**:

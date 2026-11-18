@@ -1,4 +1,4 @@
-//! Uncached static comparison. --mode native|svg --frames 20
+//! Uncached static comparison. --mode native|svg --scene opaque|mixed --frames 20
 use cssimpler::{
     core::{
         Color, Node, PathCommand::*, VectorPaint, VectorPath, VectorPoint as P, VectorScene,
@@ -7,8 +7,12 @@ use cssimpler::{
     renderer::render_to_buffer,
     style::{Stylesheet, build_render_tree},
 };
-use std::{hint::black_box, time::Instant};
-fn paths() -> Vec<VectorPath> {
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    hint::black_box,
+    time::Instant,
+};
+fn paths(mixed: bool) -> Vec<VectorPath> {
     (0..12)
         .map(|i| {
             let x = 20. + (i % 4) as f32 * 230.;
@@ -29,7 +33,11 @@ fn paths() -> Vec<VectorPath> {
                     Close,
                 ],
                 VectorPaint {
-                    fill: Some(Color::rgb(200, 220, 240)),
+                    fill: Some(if mixed && i % 2 == 0 {
+                        Color::rgba(200, 220, 240, 128)
+                    } else {
+                        Color::rgb(200, 220, 240)
+                    }),
                     stroke: Some(Color::rgb(30, 60, 90)),
                     stroke_width: 2.,
                 },
@@ -48,9 +56,13 @@ fn build(paths: &[VectorPath], native: bool) -> Node {
         Node::element("svg")
             .with_attribute("viewBox", "0 0 960 640")
             .with_children(paths.iter().map(|p| {
+                let fill = p.paint().fill.unwrap();
                 Node::element("path")
                     .with_attribute("d", p.to_svg_path_data())
-                    .with_attribute("fill", "#c8dcf0")
+                    .with_attribute(
+                        "fill",
+                        format!("#{:02x}{:02x}{:02x}{:02x}", fill.r, fill.g, fill.b, fill.a),
+                    )
                     .with_attribute("stroke", "#1e3c5a")
                     .with_attribute("stroke-width", "2")
                     .into()
@@ -100,7 +112,9 @@ fn main() {
         .parse::<usize>()
         .unwrap()
         .max(1);
-    let source = paths();
+    let workload = arg("--scene").unwrap_or("opaque");
+    assert!(matches!(workload, "opaque" | "mixed"));
+    let source = paths(workload == "mixed");
     let native = mode == "native";
     let construct_ms = measure(frames, || {
         black_box(build(&source, native));
@@ -119,8 +133,11 @@ fn main() {
         render_to_buffer(black_box(&scene), &mut pixels, 960, 640, Color::WHITE);
         black_box(&pixels);
     });
+    let mut checksum = DefaultHasher::new();
+    pixels.hash(&mut checksum);
     println!(
-        "{{\"mode\":\"{mode}\",\"frames\":{frames},\"construct_ms\":{construct_ms:.4},\"prepare_ms\":{prepare_ms:.4},\"paint_ms\":{paint_ms:.4},\"rss_before_paint_kib\":{},\"rss_after_paint_kib\":{},\"peak_rss_kib\":{}}}",
+        "{{\"mode\":\"{mode}\",\"scene\":\"{workload}\",\"checksum\":\"{:016x}\",\"frames\":{frames},\"construct_ms\":{construct_ms:.4},\"prepare_ms\":{prepare_ms:.4},\"paint_ms\":{paint_ms:.4},\"rss_before_paint_kib\":{},\"rss_after_paint_kib\":{},\"peak_rss_kib\":{}}}",
+        checksum.finish(),
         json(rss_before),
         json(mem("VmRSS:")),
         json(mem("VmHWM:"))
