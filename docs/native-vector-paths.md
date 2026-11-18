@@ -64,6 +64,49 @@ style resolution. `VectorScene::into_render_scene()` bridges to the existing
 `SvgScene` representation without serialization. The SVG type names in that
 bridge describe shared renderer storage, not a parsing step.
 
+## Pick a path under the pointer
+
+Pass the same scene and layout used to draw the board. The returned index
+refers to the topmost painted path in `scene.paths()`. An app can use it
+to update hover on pointer movement or selection on click.
+
+```rust
+use cssimpler::{
+    core::{LayoutBox, VectorPoint, VectorScene},
+    renderer::hit_test_vector_scene,
+};
+
+fn path_under_pointer(
+    scene: &VectorScene,
+    layout: LayoutBox,
+    pointer_x: f32,
+    pointer_y: f32,
+) -> Option<usize> {
+    hit_test_vector_scene(scene, layout, VectorPoint::new(pointer_x, pointer_y), 3.0)
+}
+```
+
+The pointer and layout use logical layout pixels. The query includes the
+viewBox and the scene’s pan and zoom, clips to the supplied layout, and skips
+fully transparent paint. If a CSS transform or ancestor clip affects the
+board, apply its inverse transform to the pointer or check the ancestor clip
+before calling. The last argument adds a radius in logical pixels around the
+painted stroke. Use zero to pick using the authored width. Fills use nonzero
+winding, including holes and the implicit closure of open subpaths.
+
+Picking scans in reverse paint order and checks the shared geometry bounds.
+It prepares paths only for nearby candidates and uses a one-pixel mask for
+the winding test. The scene stores no picking index or cached outlines.
+
+In a release benchmark of 10,000 disjoint filled paths, the median was
+0.59 µs when the topmost path hit, 64.38 µs when the bottommost path hit,
+and 64.87 µs when all bounds missed (Linux x86-64, Intel Xeon Platinum
+8370C). Dense overlapping bounds can make more geometry tests necessary.
+
+```sh
+cargo run --release --locked --example vector_hit_test_bench
+```
+
 ## Geometry ownership and edits
 
 Each `VectorPath` owns a lightweight `VectorGeometry` handle. It keeps the
