@@ -5,14 +5,23 @@ CPU-rendered UI. Default builds retain the existing CPU-only path and do not
 include the GPU or USD dependencies.
 
 Native backends use Windows DirectComposition visuals, macOS Metal sublayers,
-or Linux X11 child windows.
+Linux X11 child windows or Linux Wayland subsurfaces. On Linux the host follows
+winit's backend for the parent window.
 These are separate presentation surfaces above the parent UI, sharing one GPU device.
 Transparent pixels reveal CSSimpler's background; the CPU UI is not uploaded to
 the GPU. X11 transparency uses an ARGB visual and automatic X Composite
 redirection; X Shape 1.1 keeps input on the parent window. Transparent X11 views
-require X Composite 0.4 and an ARGB visual. Native Wayland embedding
-is still pending and returns an explicit unsupported-platform error when a
-visible viewport is registered. On Wayland desktops with XWayland, use:
+require X Composite 0.4 and an ARGB visual.
+
+On Wayland each viewport is a desynchronized `wl_subsurface` of the parent
+surface, created on winit's connection with a separate event queue. An empty
+input region keeps input on the parent, and the compositor blends premultiplied
+buffer alpha itself. Positions apply with the parent's next commit, which follows
+the GPU sync in the same frame. `wp_viewporter` maps the physical swapchain to
+logical units, so scaled outputs (including fractional scales) require it; every
+mainstream compositor provides it. Hiding destroys the subsurface role, which
+unmaps the view without touching wgpu's buffers. To force the X11 path through
+XWayland instead, use:
 
 ```sh
 env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET cargo run --features gpu-viewport --example usd_glass_cube

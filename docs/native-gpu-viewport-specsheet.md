@@ -1,7 +1,7 @@
 # Native GPU and USD viewport specsheet
 
 Date: 2026-11-09  
-Status: **Implementation in progress — experimental Windows, macOS and X11 backends**
+Status: **Implementation in progress — experimental Windows, macOS, X11 and Wayland backends**
 
 This document records the agreed target and acceptance criteria. Implementation
 has started behind the optional feature; the complete cross-platform target is
@@ -17,7 +17,8 @@ Current progress (2026-11-09):
   X Composite redirection for ARGB output. macOS uses input-transparent Metal
   sublayers coordinated with native glass. Apple GPUs use memoryless 4× MSAA
   and a direct resolve; other adapters use the bounded-memory Linux strip path.
-  The Wayland native host remains pending.
+  Linux Wayland uses desynchronized subsurfaces on winit's connection with a
+  guest event queue, empty input regions and `wp_viewporter` scaling.
 - The initial USD backend renders mesh cages with flat studio shading and USD
   cameras. USD materials and lights remain canonical stage data; evaluating their
   shading and lighting is still pending. Orbit cameras currently use a separate

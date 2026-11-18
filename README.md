@@ -249,9 +249,9 @@ compares static rendering speed and RAM without caching.
 
 Enable the opt-in `gpu-viewport` feature to embed GPU-rendered USD scenes in the
 CPU-rendered UI. Native viewports use DirectComposition on Windows, Metal on
-macOS, and X11 on Linux. The USD examples support orbit/zoom controls,
+macOS, and X11 or Wayland subsurfaces on Linux. The USD examples support orbit/zoom controls,
 on-demand rendering, transparent composition over native glass, and 4× MSAA
-when supported by the GPU. Native Wayland embedding is still pending.
+when supported by the GPU.
 
 ```toml
 [dependencies]
