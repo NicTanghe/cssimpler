@@ -5,7 +5,8 @@ use crate::{
 };
 use std::{
     error::Error,
-    fmt::{self, Write},
+    fmt,
+    io::{self, Write},
     ops::Deref,
     sync::{
         Arc, OnceLock,
@@ -423,27 +424,32 @@ impl VectorPath {
     }
     /// Serialize authored commands without flattening curves or rounding coordinates.
     pub fn to_svg_path_data(&self) -> String {
-        let mut d = String::new();
-        for c in &self.geometry {
-            if !d.is_empty() {
-                d.push(' ');
+        let mut bytes = Vec::new();
+        self.write_svg_path_data(&mut bytes)
+            .expect("writing to a Vec cannot fail");
+        String::from_utf8(bytes).expect("SVG path data is UTF-8")
+    }
+
+    fn write_svg_path_data(&self, writer: &mut impl Write) -> io::Result<()> {
+        for (index, c) in self.commands().iter().enumerate() {
+            if index != 0 {
+                writer.write_all(b" ")?;
             }
             match c {
-                PathCommand::MoveTo(p) => write!(d, "M {} {}", p.x, p.y),
-                PathCommand::LineTo(p) => write!(d, "L {} {}", p.x, p.y),
+                PathCommand::MoveTo(p) => write!(writer, "M {} {}", p.x, p.y),
+                PathCommand::LineTo(p) => write!(writer, "L {} {}", p.x, p.y),
                 PathCommand::QuadTo { control: c, end: p } => {
-                    write!(d, "Q {} {} {} {}", c.x, c.y, p.x, p.y)
+                    write!(writer, "Q {} {} {} {}", c.x, c.y, p.x, p.y)
                 }
                 PathCommand::CubicTo {
                     control1: a,
                     control2: b,
                     end: p,
-                } => write!(d, "C {} {} {} {} {} {}", a.x, a.y, b.x, b.y, p.x, p.y),
-                PathCommand::Close => write!(d, "Z"),
-            }
-            .expect("writing to a String cannot fail");
+                } => write!(writer, "C {} {} {} {} {} {}", a.x, a.y, b.x, b.y, p.x, p.y),
+                PathCommand::Close => write!(writer, "Z"),
+            }?;
         }
-        d
+        Ok(())
     }
 }
 
@@ -496,16 +502,26 @@ impl VectorScene {
     pub fn paths(&self) -> &[VectorPath] {
         &self.paths
     }
-    /// Export a standalone SVG using numeric user coordinates (default SVG units are px).
-    /// The current paint subset uses nonzero fills and round stroke caps/joins.
-    /// Any viewport view is deliberately omitted: export always writes authored,
-    /// untransformed document geometry.
+    /// Export a standalone SVG string. See [`Self::write_svg`] for the format.
     pub fn to_svg(&self) -> String {
-        fn paint(out: &mut String, name: &str, color: Option<Color>) {
+        let mut bytes = Vec::new();
+        self.write_svg(&mut bytes)
+            .expect("writing to a Vec cannot fail");
+        String::from_utf8(bytes).expect("SVG is UTF-8")
+    }
+
+    /// Stream a standalone SVG using numeric user coordinates (default SVG units are px).
+    /// The current paint subset uses nonzero fills and round stroke caps/joins.
+    /// The SVG contains authored document geometry. The viewport view is omitted.
+    ///
+    /// Use a buffered writer for files. Write errors are returned immediately.
+    /// The caller controls flushing and may receive a partial document on error.
+    pub fn write_svg(&self, mut writer: impl Write) -> io::Result<()> {
+        fn paint(writer: &mut impl Write, name: &str, color: Option<Color>) -> io::Result<()> {
             match color {
-                None => write!(out, " {name}=\"none\""),
+                None => write!(writer, " {name}=\"none\""),
                 Some(c) => write!(
-                    out,
+                    writer,
                     " {name}=\"#{:02x}{:02x}{:02x}\" {name}-opacity=\"{}\"",
                     c.r,
                     c.g,
@@ -513,21 +529,27 @@ impl VectorScene {
                     f32::from(c.a) / 255.0
                 ),
             }
-            .unwrap();
         }
+
         let v = self.view_box;
-        let mut out = format!(
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"{} {} {} {}\">\n",
+        writeln!(
+            writer,
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"{} {} {} {}\">",
             v.width, v.height, v.min_x, v.min_y, v.width, v.height
-        );
+        )?;
         for path in &self.paths {
-            write!(out, "  <path d=\"{}\"", path.to_svg_path_data()).unwrap();
-            paint(&mut out, "fill", path.paint.fill);
-            paint(&mut out, "stroke", path.paint.stroke);
-            writeln!(out," stroke-width=\"{}\" fill-rule=\"nonzero\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",path.paint.stroke_width).unwrap();
+            writer.write_all(b"  <path d=\"")?;
+            path.write_svg_path_data(&mut writer)?;
+            writer.write_all(b"\"")?;
+            paint(&mut writer, "fill", path.paint.fill)?;
+            paint(&mut writer, "stroke", path.paint.stroke)?;
+            writeln!(
+                writer,
+                " stroke-width=\"{}\" fill-rule=\"nonzero\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+                path.paint.stroke_width
+            )?;
         }
-        out.push_str("</svg>\n");
-        out
+        writer.write_all(b"</svg>\n")
     }
     /// Bridge into the shared renderer pipeline; no SVG strings are produced or parsed.
     /// The optional viewport view travels with the scene as render state; path
@@ -572,6 +594,7 @@ mod tests {
                 control: VectorPoint::new(95., 20.),
                 end: VectorPoint::new(99., 30.),
             },
+            PathCommand::LineTo(VectorPoint::new(10., 40.)),
             PathCommand::Close,
         ];
         let path = VectorPath::new(
@@ -585,16 +608,63 @@ mod tests {
         .unwrap();
         assert_eq!(
             path.to_svg_path_data(),
-            "M 0.12345679 2 C -10 100 80 -40 90 10 Q 95 20 99 30 Z"
+            "M 0.12345679 2 C -10 100 80 -40 90 10 Q 95 20 99 30 L 10 40 Z"
         );
         let scene = VectorScene::new(VectorViewBox::new(0., 0., 100., 100.), vec![path]).unwrap();
-        let svg = scene.to_svg();
-        assert!(svg.contains("fill=\"none\" stroke=\"#010203\" stroke-opacity=\"0.5019608\""));
+        let expected = concat!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\" viewBox=\"0 0 100 100\">\n",
+            "  <path d=\"M 0.12345679 2 C -10 100 80 -40 90 10 Q 95 20 99 30 L 10 40 Z\"",
+            " fill=\"none\" stroke=\"#010203\" stroke-opacity=\"0.5019608\"",
+            " stroke-width=\"2\" fill-rule=\"nonzero\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n",
+            "</svg>\n",
+        );
+        assert_eq!(scene.to_svg(), expected);
+        let mut output = Vec::new();
+        scene
+            .clone()
+            .with_view(VectorView::new(2., VectorPoint::new(4., 5.)).unwrap())
+            .write_svg(&mut output)
+            .unwrap();
+        assert_eq!(output, expected.as_bytes());
         let render = scene.into_render_scene();
         assert_eq!(render.paths[0].geometry.commands.commands(), commands);
         let bounds = render.bounds.unwrap();
         assert!(bounds.min_x <= -10. && bounds.max_y >= 100.);
     }
+    #[test]
+    fn streaming_export_propagates_writer_failure_after_partial_write() {
+        struct LimitedWriter(usize);
+
+        impl Write for LimitedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                }
+                let written = self.0.min(bytes.len()).min(3);
+                self.0 -= written;
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let path = VectorPath::new(
+            vec![
+                PathCommand::MoveTo(VectorPoint::new(0., 0.)),
+                PathCommand::LineTo(VectorPoint::new(10., 10.)),
+            ],
+            VectorPaint::default(),
+        )
+        .unwrap();
+        let scene = VectorScene::new(VectorViewBox::new(0., 0., 10., 10.), vec![path]).unwrap();
+        let mut writer = LimitedWriter(105);
+        let error = scene.write_svg(&mut writer).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(writer.0, 0);
+    }
+
     #[test]
     fn legacy_svg_empty_commands_are_canonical() {
         let a = SvgPathGeometry::new(vec![]);
