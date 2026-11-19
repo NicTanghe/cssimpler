@@ -54,9 +54,7 @@ impl NativeHost {
                 window.window.get(),
             ),
             _ => {
-                return Err(error(
-                    "Linux GPU viewports currently require X11; unset WAYLAND_DISPLAY and WAYLAND_SOCKET to use XWayland",
-                ));
+                return Err(error("expected an X11 parent window"));
             }
         };
         // SAFETY: parent retains the display. This wrapper neither owns the connection nor polls events.

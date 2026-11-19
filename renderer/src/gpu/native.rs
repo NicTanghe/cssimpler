@@ -7,10 +7,13 @@ use winit::{event_loop::ActiveEventLoop, window::Window};
 pub(super) use win32::NativeHost;
 
 #[cfg(target_os = "linux")]
+#[path = "native/wayland.rs"]
+mod wayland;
+#[cfg(target_os = "linux")]
 #[path = "native/x11.rs"]
 mod x11;
 #[cfg(target_os = "linux")]
-pub(super) use x11::NativeHost;
+pub(super) use linux::NativeHost;
 
 #[cfg(target_os = "macos")]
 #[path = "native/macos.rs"]
@@ -130,6 +133,57 @@ mod win32 {
     impl Drop for NativeHost {
         fn drop(&mut self) {
             self.hide();
+        }
+    }
+}
+
+/// Linux picks the host matching winit's display backend for the parent window.
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::*;
+    use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+
+    pub(crate) enum NativeHost {
+        X11(x11::NativeHost),
+        Wayland(wayland::NativeHost),
+    }
+
+    impl NativeHost {
+        pub fn new(
+            event_loop: &ActiveEventLoop,
+            parent: Arc<Window>,
+            transparent: bool,
+        ) -> Result<Self> {
+            match parent.display_handle().map_err(error)?.as_raw() {
+                RawDisplayHandle::Wayland(_) => {
+                    wayland::NativeHost::new(event_loop, parent, transparent).map(Self::Wayland)
+                }
+                _ => x11::NativeHost::new(event_loop, parent, transparent).map(Self::X11),
+            }
+        }
+        pub fn target(&self) -> Result<wgpu::SurfaceTargetUnsafe> {
+            match self {
+                Self::X11(host) => host.target(),
+                Self::Wayland(host) => host.target(),
+            }
+        }
+        pub fn place(&self, origin: [i32; 2], size: [u32; 2]) -> Result<()> {
+            match self {
+                Self::X11(host) => host.place(origin, size),
+                Self::Wayland(host) => host.place(origin, size),
+            }
+        }
+        pub fn hide(&self) {
+            match self {
+                Self::X11(host) => host.hide(),
+                Self::Wayland(host) => host.hide(),
+            }
+        }
+        pub fn commit(&self) -> Result<()> {
+            match self {
+                Self::X11(host) => host.commit(),
+                Self::Wayland(host) => host.commit(),
+            }
         }
     }
 }
