@@ -80,6 +80,68 @@ Both registration methods are available on `App` and `FragmentApp`. A custom
 factories also receive that handle and the shared GPU context. On-demand redraw
 is the default; GPU-only frames do not invoke the CPU scene preparation path.
 
+## Wireframe
+
+`UsdRenderer::set_wireframe` sets the default mode for every mesh, and
+`set_model_wireframe` overrides it for one mesh prim:
+
+| `WireframeMode` | Edges drawn | Occlusion |
+| --- | --- | --- |
+| `Off` | none | — |
+| `Edges` | every polygon-cage edge | hidden behind the surface |
+| `Silhouette` | silhouette and open-boundary edges | hidden behind the surface |
+| `Overlay` | every polygon-cage edge | drawn through the surface |
+
+Edges come from the authored polygon cage rather than the fan triangulation, so
+quad meshes do not show a diagonal per face. Each edge is stroked as a
+screen-space band centred on it: the band covers both adjacent faces, and at a
+silhouette it extends onto the background, so it is visible on both sides of
+the mesh. Line and point primitives ignore fixed-function depth bias, so the
+pass nudges the stroke toward the camera in clip space instead.
+
+`WireframeStyle` sets the band width in physical pixels and its colours. The
+band is split in half: `core` fills the middle and `outline` fills the outer
+quarter either side. Equal colours therefore give a solid band, and different
+colours give an outline on both sides of a lighter core. The default is a solid
+2px black band.
+
+```rust,ignore
+use cssimpler::renderer::gpu::usd::{
+    UsdRenderer, Wireframe, WireframeMode, WireframeStyle,
+};
+
+// Viewport default: silhouette strokes, 4px, light core with black edges.
+renderer.set_wireframe_default(Wireframe {
+    mode: WireframeMode::Silhouette,
+    style: WireframeStyle {
+        core: [0.10, 0.10, 0.10],
+        outline: [0.0, 0.0, 0.0],
+        width_px: 4.0,
+    },
+});
+
+// Override one mesh, addressed by its USD prim path. Unprefixed models keep
+// the viewport default.
+renderer.set_model_wireframe(
+    "/World/Preview",
+    Wireframe {
+        mode: WireframeMode::Off,
+        ..Default::default()
+    },
+);
+```
+
+Modes, widths and colours are resolved per edge from a model array indexed by
+the owning mesh, so one draw call covers the whole cage and a mesh can be
+stroked differently from its neighbours. `UsdRenderer::models` lists the mesh
+prim paths in the order used as the model id. Changing any wireframe setting
+wakes an on-demand viewport, so a click can drive it without a continuous
+redraw schedule. Enabling wireframe does not re-upload mesh vertices: unique
+edges are collected during mesh extraction and drawn from a storage buffer, and
+the stroke pipeline binds no vertex buffer at all. The `usd_viewport` example
+shows per-model controls plus viewport-wide defaults; `usd_glass_cube` shows the
+same controls in a toolbar.
+
 ## USD and the initial rendering subset
 
 The native Rust `openusd` stage is the authoritative representation of geometry,

@@ -10,6 +10,7 @@ use openusd_schemas::geom::{
 };
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashMap, hash_map::Entry},
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -18,6 +19,8 @@ use wgpu::util::DeviceExt;
 mod aa;
 #[cfg(test)]
 mod aa_tests;
+#[cfg(test)]
+mod wireframe_tests;
 
 /// An orbit viewer or a camera authored in the USD stage.
 #[derive(Clone, Debug, Default)]
@@ -25,6 +28,83 @@ pub enum UsdCameraMode {
     #[default]
     Orbit,
     Authored(String),
+}
+
+/// How the polygon cage is drawn over the shaded surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WireframeMode {
+    /// Shaded surface only.
+    #[default]
+    Off,
+    /// Every polygon-cage edge, occluded by the surface.
+    Edges,
+    /// Silhouette and open-boundary edges only, occluded by the surface.
+    Silhouette,
+    /// Every polygon-cage edge drawn through the surface.
+    Overlay,
+}
+
+impl WireframeMode {
+    /// Cycle order used by the example toggle buttons.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Edges,
+            Self::Edges => Self::Silhouette,
+            Self::Silhouette => Self::Overlay,
+            Self::Overlay => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Edges => "edges",
+            Self::Silhouette => "silhouette",
+            Self::Overlay => "overlay",
+        }
+    }
+
+    /// Parse the value accepted by `--wireframe=` in the examples.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "off" => Some(Self::Off),
+            "edges" => Some(Self::Edges),
+            "silhouette" => Some(Self::Silhouette),
+            "overlay" => Some(Self::Overlay),
+            _ => None,
+        }
+    }
+}
+
+/// Stroke appearance. The band is centred on each edge, so it is visible on
+/// both sides of a silhouette; equal `core` and `outline` produce a solid band.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WireframeStyle {
+    /// Linear-RGB colour of the stroke interior.
+    pub core: [f32; 3],
+    /// Linear-RGB colour of the band either side of the core.
+    pub outline: [f32; 3],
+    /// Total band width in physical pixels.
+    pub width_px: f32,
+}
+
+impl Default for WireframeStyle {
+    fn default() -> Self {
+        // A solid 2px black band straddles the edge, half on each side.
+        Self {
+            core: [0.0, 0.0, 0.0],
+            outline: [0.0, 0.0, 0.0],
+            width_px: 2.0,
+        }
+    }
+}
+
+/// Wireframe selection for one mesh, or the viewport default when a mesh has no
+/// override.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Wireframe {
+    pub mode: WireframeMode,
+    pub style: WireframeStyle,
 }
 
 /// A cheap, event-thread-only shared USD stage. No second scene graph is created.
@@ -140,6 +220,40 @@ struct CameraUniform {
     viewport: [f32; 4],
 }
 
+/// One unique polygon-cage edge. `adjacency[0]` counts the adjacent faces that
+/// contributed a normal; fewer than two is an open boundary edge.
+/// `adjacency[1]` is the model that owns the edge.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct EdgeRecord {
+    a: [f32; 4],
+    b: [f32; 4],
+    n0: [f32; 4],
+    n1: [f32; 4],
+    adjacency: [u32; 4],
+}
+
+impl EdgeRecord {
+    const ZERO: Self = Self {
+        a: [0.0; 4],
+        b: [0.0; 4],
+        n0: [0.0; 4],
+        n1: [0.0; 4],
+        adjacency: [0; 4],
+    };
+}
+
+/// Matches `ModelWire` in `usd.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ModelWire {
+    core: [f32; 4],
+    outline: [f32; 4],
+    width_px: f32,
+    mode: u32,
+    pad: [u32; 2],
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct CameraKey {
     revision: u64,
@@ -151,6 +265,9 @@ struct CameraKey {
 
 struct MeshCache {
     vertices: Vec<Vertex>,
+    edges: Vec<EdgeRecord>,
+    /// Mesh prim paths, in the order used as the per-edge model id.
+    models: Vec<String>,
     minimum: Vec3,
     maximum: Vec3,
 }
@@ -177,6 +294,21 @@ pub struct UsdRenderer {
     pipeline_layout: wgpu::PipelineLayout,
     info: GpuViewportInfo,
     redraw_sink: scene::StageSinkId,
+    wireframe: Wireframe,
+    model_wireframes: HashMap<String, Wireframe>,
+    models: Vec<String>,
+    wire_generation: u64,
+    wire_uploaded: Option<u64>,
+    wire_occluded: bool,
+    wire_overlay: bool,
+    edges: wgpu::Buffer,
+    edge_vertices: u32,
+    model_wires: wgpu::Buffer,
+    wire_binding: wgpu::BindGroup,
+    wire_layout: wgpu::BindGroupLayout,
+    wire_pipeline_layout: wgpu::PipelineLayout,
+    wire_pipeline: wgpu::RenderPipeline,
+    wire_overlay_pipeline: wgpu::RenderPipeline,
 }
 
 struct Orbit {
@@ -294,6 +426,19 @@ impl UsdRenderer {
             });
         let targets = aa::Targets::new(gpu, init.info);
         let pipeline = mesh_pipeline(gpu, &pipeline_layout, init.info, targets.samples);
+        let wire_layout = wire_bind_group_layout(&gpu.device);
+        let wire_pipeline_layout =
+            gpu.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("USD wireframe"),
+                    bind_group_layouts: &[Some(&layout), Some(&wire_layout)],
+                    immediate_size: 0,
+                });
+        let (wire_pipeline, wire_overlay_pipeline) =
+            wire_pipelines(gpu, &wire_pipeline_layout, init.info, targets.samples);
+        let model_wires = model_wire_buffer(gpu, cache.models.len());
+        let (edges, wire_binding, edge_vertices) =
+            wire_resources(gpu, &wire_layout, &model_wires, &cache.edges);
         let redraw_sink = scene
             .stage
             .add_sink(move |_: &Stage, _: &scene::CommittedChange| {
@@ -324,11 +469,128 @@ impl UsdRenderer {
             pipeline_layout,
             info: init.info,
             redraw_sink,
+            wireframe: Wireframe::default(),
+            model_wireframes: HashMap::new(),
+            models: cache.models.clone(),
+            wire_generation: 0,
+            wire_uploaded: None,
+            wire_occluded: false,
+            wire_overlay: false,
+            edges,
+            edge_vertices,
+            model_wires,
+            wire_binding,
+            wire_layout,
+            wire_pipeline_layout,
+            wire_pipeline,
+            wire_overlay_pipeline,
         })
     }
 
     pub fn control(&self) -> UsdViewControl {
         self.control.clone()
+    }
+
+    fn wire_changed(&mut self) {
+        self.wire_generation = self.wire_generation.wrapping_add(1);
+        self.control.0.borrow().redraw.request_redraw();
+    }
+
+    /// Set the default mode for meshes without their own override. The default
+    /// style is kept.
+    pub fn set_wireframe(&mut self, mode: WireframeMode) {
+        let next = Wireframe {
+            mode,
+            ..self.wireframe
+        };
+        self.set_wireframe_default(next);
+    }
+
+    /// Replace the viewport defaults applied to meshes without an override.
+    pub fn set_wireframe_default(&mut self, wireframe: Wireframe) {
+        if self.wireframe == wireframe {
+            return;
+        }
+        self.wireframe = wireframe;
+        self.wire_changed();
+    }
+
+    pub fn wireframe(&self) -> Wireframe {
+        self.wireframe
+    }
+
+    /// Set the default stroke width and colours, keeping the default mode.
+    pub fn set_wireframe_style(&mut self, style: WireframeStyle) {
+        let next = Wireframe {
+            style,
+            ..self.wireframe
+        };
+        self.set_wireframe_default(next);
+    }
+
+    pub fn wireframe_style(&self) -> WireframeStyle {
+        self.wireframe.style
+    }
+
+    /// Override the wireframe for the mesh at `path`, which is a prim path such
+    /// as `/World/Preview`. Paths are matched exactly and unknown paths are
+    /// kept until the mesh appears.
+    pub fn set_model_wireframe(&mut self, path: &str, wireframe: Wireframe) {
+        if self.model_wireframes.get(path) == Some(&wireframe) {
+            return;
+        }
+        self.model_wireframes.insert(path.to_owned(), wireframe);
+        self.wire_changed();
+    }
+
+    pub fn clear_model_wireframe(&mut self, path: &str) {
+        if self.model_wireframes.remove(path).is_some() {
+            self.wire_changed();
+        }
+    }
+
+    pub fn model_wireframe(&self, path: &str) -> Option<Wireframe> {
+        self.model_wireframes.get(path).copied()
+    }
+
+    /// Mesh prim paths, in the order used as the per-edge model id.
+    pub fn models(&self) -> &[String] {
+        &self.models
+    }
+
+    /// Upload the per-model stroke parameters when the model list or the
+    /// wireframe settings have changed since the last frame.
+    fn sync_wire(&mut self, gpu: &GpuContext) {
+        if self.wire_uploaded == Some(self.wire_generation) {
+            return;
+        }
+        let paths = self.models.clone();
+        let mut params = Vec::with_capacity(paths.len());
+        let mut occluded = false;
+        let mut overlay = false;
+        for path in &paths {
+            let wireframe = self
+                .model_wireframes
+                .get(path)
+                .copied()
+                .unwrap_or(self.wireframe);
+            let mode = match wireframe.mode {
+                WireframeMode::Off => 0,
+                WireframeMode::Edges => 1,
+                WireframeMode::Silhouette => 2,
+                WireframeMode::Overlay => 3,
+            };
+            occluded |= mode == 1 || mode == 2;
+            overlay |= mode == 3;
+            params.push(model_wire(wireframe, mode));
+        }
+        self.wire_occluded = occluded;
+        self.wire_overlay = overlay;
+        if !params.is_empty() {
+            gpu.queue
+                .write_buffer(&self.model_wires, 0, bytemuck::cast_slice(&params));
+        }
+        self.wire_uploaded = Some(self.wire_generation);
     }
 
     fn camera_uniform(&self, time: Option<scene::TimeCode>) -> Result<CameraUniform> {
@@ -404,6 +666,10 @@ impl GpuViewportRenderer for UsdRenderer {
             let targets = aa::Targets::new(gpu, info);
             if self.targets.samples != targets.samples || self.info.format != info.format {
                 self.pipeline = mesh_pipeline(gpu, &self.pipeline_layout, info, targets.samples);
+                let (wire, overlay) =
+                    wire_pipelines(gpu, &self.wire_pipeline_layout, info, targets.samples);
+                self.wire_pipeline = wire;
+                self.wire_overlay_pipeline = overlay;
             }
             self.targets = targets;
         }
@@ -425,9 +691,19 @@ impl GpuViewportRenderer for UsdRenderer {
             let cache = extract_meshes(&self.scene.stage, time)?;
             self.vertices = vertex_buffer(gpu, &cache.vertices);
             self.vertex_count = cache.vertices.len() as u32;
+            self.model_wires = model_wire_buffer(gpu, cache.models.len());
+            let (edges, wire_binding, edge_vertices) =
+                wire_resources(gpu, &self.wire_layout, &self.model_wires, &cache.edges);
+            self.edges = edges;
+            self.wire_binding = wire_binding;
+            self.edge_vertices = edge_vertices;
+            self.models = cache.models.clone();
+            // The model list changed, so per-model parameters must be re-uploaded.
+            self.wire_uploaded = None;
             self.revision = self.scene.revision.get();
             self.evaluated_time = time;
         }
+        self.sync_wire(gpu);
         let key = CameraKey {
             revision: self.camera_revision.get(),
             time,
@@ -494,6 +770,20 @@ impl GpuViewportRenderer for UsdRenderer {
                 pass.set_bind_group(0, &self.camera_binding, &[]);
                 pass.set_vertex_buffer(0, self.vertices.slice(..));
                 pass.draw(0..self.vertex_count, strip as u32..strip as u32 + 1);
+                // Per-model modes resolve on the GPU from the model array: the
+                // occluded pipeline emits modes 1 and 2, the through-surface
+                // pipeline emits mode 3. Both draw the same edge range, and the
+                // stroke pass binds no vertex buffer.
+                if self.wire_occluded {
+                    pass.set_pipeline(&self.wire_pipeline);
+                    pass.set_bind_group(1, &self.wire_binding, &[]);
+                    pass.draw(0..self.edge_vertices, strip as u32..strip as u32 + 1);
+                }
+                if self.wire_overlay {
+                    pass.set_pipeline(&self.wire_overlay_pipeline);
+                    pass.set_bind_group(1, &self.wire_binding, &[]);
+                    pass.draw(0..self.edge_vertices, strip as u32..strip as u32 + 1);
+                }
             }
             if let Some(resolve) = &self.targets.resolve {
                 frame.encoder.copy_texture_to_texture(
@@ -630,12 +920,7 @@ fn mesh_pipeline(
     info: GpuViewportInfo,
     samples: u32,
 ) -> wgpu::RenderPipeline {
-    let shader = gpu
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("USD studio shading"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("usd.wgsl").into()),
-        });
+    let shader = usd_shader(gpu);
     gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("USD mesh pipeline"), layout: Some(pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vertex"), compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3] })] },
@@ -644,6 +929,160 @@ fn mesh_pipeline(
             depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Less), stencil: Default::default(), bias: Default::default() }),
             multisample: wgpu::MultisampleState { count: samples, ..Default::default() }, multiview_mask: None, cache: None,
         })
+}
+
+fn usd_shader(gpu: &GpuContext) -> wgpu::ShaderModule {
+    gpu.device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("USD studio shading"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("usd.wgsl").into()),
+        })
+}
+
+fn wire_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let storage = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("USD wireframe layout"),
+        entries: &[storage(0), storage(1)],
+    })
+}
+
+/// Wireframe pipelines share one stroke shader and differ in depth comparison
+/// and which model modes they emit. The overlay variant draws through the
+/// surface; both leave depth writes disabled so the stroke never occludes
+/// geometry drawn later in the same pass.
+fn wire_pipelines(
+    gpu: &GpuContext,
+    pipeline_layout: &wgpu::PipelineLayout,
+    info: GpuViewportInfo,
+    samples: u32,
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+    let shader = usd_shader(gpu);
+    let build = |label: &str, entry: &str, compare: wgpu::CompareFunction| {
+        gpu.device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("wire_fragment"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: info.format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(compare),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: samples,
+                    ..Default::default()
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+    };
+    (
+        build(
+            "USD wireframe pipeline",
+            "wire_vertex_occluded",
+            wgpu::CompareFunction::LessEqual,
+        ),
+        build(
+            "USD wireframe overlay pipeline",
+            "wire_vertex_overlay",
+            wgpu::CompareFunction::Always,
+        ),
+    )
+}
+
+fn model_wire_buffer(gpu: &GpuContext, models: usize) -> wgpu::Buffer {
+    // At least one element keeps the runtime-sized array bindable when a stage
+    // has no models; the shader then draws nothing.
+    gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("USD wireframe models"),
+        size: (models.max(1) * std::mem::size_of::<ModelWire>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn wire_resources(
+    gpu: &GpuContext,
+    layout: &wgpu::BindGroupLayout,
+    models: &wgpu::Buffer,
+    edges: &[EdgeRecord],
+) -> (wgpu::Buffer, wgpu::BindGroup, u32) {
+    // A zero-length buffer cannot be bound, and the stage is validated to have
+    // geometry, so this fallback only guards degenerate extractions.
+    let fallback = [EdgeRecord::ZERO];
+    let contents = if edges.is_empty() {
+        bytemuck::cast_slice(&fallback)
+    } else {
+        bytemuck::cast_slice(edges)
+    };
+    let buffer = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("USD wireframe edges"),
+            contents,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+    let binding = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("USD wireframe"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: models.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: buffer.as_entire_binding(),
+            },
+        ],
+    });
+    (buffer, binding, (edges.len() * 6) as u32)
+}
+
+fn model_wire(wireframe: Wireframe, mode: u32) -> ModelWire {
+    let WireframeStyle {
+        core,
+        outline,
+        width_px,
+    } = wireframe.style;
+    ModelWire {
+        core: [core[0], core[1], core[2], 1.0],
+        outline: [outline[0], outline[1], outline[2], 1.0],
+        width_px: width_px.max(1.0),
+        mode,
+        pad: [0; 2],
+    }
 }
 
 fn clear_color(info: GpuViewportInfo) -> wgpu::Color {
@@ -682,6 +1121,8 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
     let mut xforms = geom::XformCache::new(time);
     let mut cache = MeshCache {
         vertices: Vec::new(),
+        edges: Vec::new(),
+        models: Vec::new(),
         minimum: Vec3::splat(f32::INFINITY),
         maximum: Vec3::splat(f32::NEG_INFINITY),
     };
@@ -778,6 +1219,14 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
             .and_then(|v| v.first().copied())
             .map(|v| [v.x, v.y, v.z])
             .unwrap_or([0.62, 0.68, 0.78]);
+        // Cage edges are collected per mesh and deduplicated by point index, so
+        // a shared edge is stored once with both adjacent face normals. Fan
+        // diagonals never appear because only real polygon edges are emitted.
+        // The prim path is this mesh's model id, used to select stroke settings.
+        let model = cache.models.len() as u32;
+        cache.models.push(path.to_string());
+        let mut mesh_edges: Vec<EdgeRecord> = Vec::new();
+        let mut edge_lookup: HashMap<(u32, u32), usize> = HashMap::new();
         let mut offset = 0usize;
         for (face_index, count) in counts.into_iter().enumerate() {
             if count < 3 {
@@ -812,6 +1261,33 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                     )));
                 }
             }
+            let normal_array = [normal.x, normal.y, normal.z, 0.0];
+            for i in 0..polygon.len() {
+                let next = (i + 1) % polygon.len();
+                let (first, second) = (face[i], face[next]);
+                let key = (first.min(second) as u32, first.max(second) as u32);
+                let start = polygon[i].to_array();
+                let end = polygon[next].to_array();
+                match edge_lookup.entry(key) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(mesh_edges.len());
+                        mesh_edges.push(EdgeRecord {
+                            a: [start[0], start[1], start[2], 1.0],
+                            b: [end[0], end[1], end[2], 1.0],
+                            n0: normal_array,
+                            n1: normal_array,
+                            adjacency: [1, model, 0, 0],
+                        });
+                    }
+                    Entry::Occupied(slot) => {
+                        let edge = &mut mesh_edges[*slot.get()];
+                        if edge.adjacency[0] == 1 {
+                            edge.n1 = normal_array;
+                        }
+                        edge.adjacency[0] = edge.adjacency[0].saturating_add(1);
+                    }
+                }
+            }
             for i in 1..polygon.len() - 1 {
                 for corner in [0, i, i + 1] {
                     let p = polygon[corner];
@@ -839,6 +1315,7 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
             }
             offset = end;
         }
+        cache.edges.extend(mesh_edges);
         if offset != indices.len() {
             return Err(error(format!(
                 "{path}: face counts do not consume index array"
