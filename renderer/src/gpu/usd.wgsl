@@ -58,6 +58,7 @@ struct Varying {
     @location(2) world_position: vec3<f32>,
     @location(3) uv: vec3<f32>,
     @location(4) local: vec3<f32>,
+    @location(5) world_normal: vec3<f32>,
 }
 
 // Native UNORM targets are composited in encoded space. Resolving encoded
@@ -91,7 +92,8 @@ fn to_strip(position: vec4<f32>, strip: u32) -> vec4<f32> {
 ) -> Varying {
     var out: Varying;
     out.position = to_strip(camera.view_projection * vec4(position, 1.0), strip);
-    out.normal = normal;
+    out.normal = (camera.view * vec4(normal, 0.0)).xyz;
+    out.world_normal = normal;
     out.color = color;
     out.world_position = position;
     out.uv = uv;
@@ -180,9 +182,7 @@ fn shade_metal(base: vec3<f32>, normal: vec3<f32>, eye: vec3<f32>, up: vec3<f32>
 
 @fragment fn fragment(in: Varying, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let studio_enabled = studio.key.w > 0.5;
-    let rotation = mat3x3(camera.view[0].xyz, camera.view[1].xyz, camera.view[2].xyz);
-    let normal = unit_or_zero(select(-in.normal, in.normal, front));
-    let view_normal = unit_or_zero(rotation * normal);
+    let view_normal = normalize(select(-in.normal, in.normal, front));
     let legacy_key = normalize(vec3(-0.4, 0.7, 0.8));
     let plain_legacy = !studio_enabled && material.features.x == 0u;
     let legacy = 0.3 + 0.7 * max(dot(view_normal, legacy_key), 0.0);
@@ -193,6 +193,8 @@ fn shade_metal(base: vec3<f32>, normal: vec3<f32>, eye: vec3<f32>, up: vec3<f32>
         return vec4(target_encode(base * legacy + vec3(rim)), 1.0);
     }
 
+    let rotation = mat3x3(camera.view[0].xyz, camera.view[1].xyz, camera.view[2].xyz);
+    let normal = unit_or_zero(select(-in.world_normal, in.world_normal, front));
     let key = select(transpose(rotation) * legacy_key, studio.key.xyz, studio_enabled);
     let up = studio.up.xyz;
     let n_dot_l = max(dot(normal, key), 0.0);

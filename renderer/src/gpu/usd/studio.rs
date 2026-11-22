@@ -25,6 +25,7 @@ struct ShadowPass {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     map: ShadowMap,
+    sampler: wgpu::Sampler,
     needs_render: bool,
 }
 
@@ -46,12 +47,13 @@ impl Studio {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let shadow = gpu
-            .adapter
-            .get_texture_format_features(SHADOW_FORMAT)
-            .allowed_usages
-            .contains(SHADOW_USAGE)
-            .then(|| ShadowPass::new(gpu, layout));
+        let depth = gpu.adapter.get_texture_format_features(SHADOW_FORMAT);
+        let capabilities = gpu.adapter.get_downlevel_capabilities();
+        let shadow = (depth.allowed_usages.contains(SHADOW_USAGE)
+            && capabilities
+                .flags
+                .contains(wgpu::DownlevelFlags::COMPARISON_SAMPLERS))
+        .then(|| ShadowPass::new(gpu, layout));
         Self {
             uniform,
             settings: None,
@@ -97,7 +99,7 @@ impl Studio {
                     .min(gpu.device.limits().max_texture_dimension_2d)
             });
             if shadow.map.resolution != resolution {
-                shadow.map = ShadowMap::new(gpu, &shadow.layout, resolution);
+                shadow.map = ShadowMap::new(gpu, &shadow.layout, &shadow.sampler, resolution);
             }
             shadow.needs_render = shadow_settings.is_some();
         }
@@ -174,16 +176,24 @@ impl ShadowPass {
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("USD shadow texture layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
+                ],
             });
         let pipeline_layout = gpu
             .device
@@ -217,18 +227,29 @@ impl ShadowPass {
                 multiview_mask: None,
                 cache: None,
             });
-        let map = ShadowMap::new(gpu, &layout, 1);
+        let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("USD key-light depth comparison"),
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let map = ShadowMap::new(gpu, &layout, &sampler, 1);
         Self {
             layout,
             pipeline,
             map,
+            sampler,
             needs_render: false,
         }
     }
 }
 
 impl ShadowMap {
-    fn new(gpu: &GpuContext, layout: &wgpu::BindGroupLayout, resolution: u32) -> Self {
+    fn new(
+        gpu: &GpuContext,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        resolution: u32,
+    ) -> Self {
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("USD key-light depth map"),
             size: wgpu::Extent3d {
@@ -247,10 +268,16 @@ impl ShadowMap {
         let binding = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("USD shadow texture"),
             layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
         });
         Self {
             view,
