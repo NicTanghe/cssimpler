@@ -209,7 +209,10 @@ Ok(Box::new(renderer))
   `slope_bias` in small steps if a receiver shows self-shadow artifacts.
   `filter_radius` sets the disk filter radius in map texels. A nonzero
   `light_radius` enables contact hardening and uses `filter_radius` as the
-  maximum softness. Resolution is capped at the GPU's 2D texture limit. If the
+  maximum softness. `strength` scales how much key light a shadow blocks
+  between zero and one. Use `shadow_settings()` and `set_shadow_settings()`
+  to adjust the current key at runtime. Sampling changes reuse the depth map.
+  Resolution is capped at the GPU's 2D texture limit. If the
   device cannot sample a depth attachment, the studio lights and floor still
   render. `supports_shadow_mapping()` reports this capability and
   `shadows: None` explicitly disables the depth pass.

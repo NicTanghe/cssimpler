@@ -536,12 +536,26 @@ impl UsdRenderer {
         if let Some(settings) = settings {
             settings.validate()?;
         }
-        if self.studio.settings != settings {
-            self.studio.settings = settings;
-            self.studio.dirty = true;
+        if self.studio.set_settings(settings) {
             self.control.0.borrow().redraw.request_redraw();
         }
         Ok(())
+    }
+
+    /// Read the current studio key's shadow settings.
+    pub fn shadow_settings(&self) -> Option<UsdShadowSettings> {
+        self.studio.settings.and_then(|settings| settings.shadows)
+    }
+
+    /// Change the existing studio key's shadow sampling parameters at runtime.
+    /// Adjusting radius, strength or bias reuses the existing depth map.
+    pub fn set_shadow_settings(&mut self, shadows: UsdShadowSettings) -> Result<()> {
+        let mut settings = self
+            .studio
+            .settings
+            .ok_or_else(|| error("studio lighting is disabled"))?;
+        settings.shadows = Some(shadows);
+        self.set_studio_lighting(Some(settings))
     }
 
     /// Whether the viewport's GPU supports a sampled key-light depth map.

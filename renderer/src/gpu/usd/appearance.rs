@@ -147,6 +147,8 @@ pub struct UsdShadowSettings {
     /// Angular radius of the key in radians. Zero uses a fixed filter radius.
     /// With an area key, the filter radius caps the penumbra in map texels.
     pub light_radius: f32,
+    /// Fraction of key light blocked by a fully occluded sample (0 to 1).
+    pub strength: f32,
 }
 
 impl Default for UsdShadowSettings {
@@ -157,6 +159,7 @@ impl Default for UsdShadowSettings {
             slope_bias: 0.001,
             filter_radius: 1,
             light_radius: 0.0,
+            strength: 1.0,
         }
     }
 }
@@ -234,6 +237,7 @@ impl UsdStudioLighting {
                     || !(0.0..=1.0).contains(&s.slope_bias)
                     || s.filter_radius > 64
                     || !(0.0..=0.5).contains(&s.light_radius)
+                    || !(0.0..=1.0).contains(&s.strength)
             })
         {
             return Err(error("invalid USD studio lighting or shadow settings"));

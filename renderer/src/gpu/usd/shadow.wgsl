@@ -15,7 +15,7 @@ fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -> f32 {
         depth_gradient = vec2(dx.z * dy.y - dx.y * dy.z, dx.x * dy.z - dx.z * dy.x) / area;
     }
 
-    if studio.shadows.x < 0.5 || n_dot_l <= 0.0 ||
+    if studio.shadows.x < 0.5 || studio.fill_tint.w == 0.0 || n_dot_l <= 0.0 ||
         any(uv < vec2(0.0)) || any(uv >= vec2(1.0)) || light.z < 0.0 {
         return 1.0;
     }

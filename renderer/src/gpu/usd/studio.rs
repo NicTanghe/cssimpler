@@ -41,7 +41,8 @@ pub(super) struct Studio {
     scene_bounds: [Vec3; 2],
     caster_ranges: Vec<Range<u32>>,
     up: Vec3,
-    pub dirty: bool,
+    dirty: bool,
+    depth_dirty: bool,
 }
 
 impl Studio {
@@ -71,6 +72,7 @@ impl Studio {
             caster_ranges: cache.shadow_ranges.clone(),
             up: cache.up,
             dirty: true,
+            depth_dirty: true,
         }
     }
 
@@ -82,12 +84,30 @@ impl Studio {
         self.shadow.as_ref().map(|shadow| &shadow.map.binding)
     }
 
+    pub fn set_settings(&mut self, settings: Option<UsdStudioLighting>) -> bool {
+        if self.settings == settings {
+            return false;
+        }
+        let depth_key = |settings: Option<UsdStudioLighting>| {
+            settings.and_then(|light| {
+                light
+                    .shadows
+                    .map(|shadow| (light.toward_key, shadow.resolution))
+            })
+        };
+        self.depth_dirty |= depth_key(self.settings) != depth_key(settings);
+        self.settings = settings;
+        self.dirty = true;
+        true
+    }
+
     pub fn update_mesh(&mut self, cache: &MeshCache) {
         self.scene_bounds = [cache.minimum, cache.maximum];
         self.caster_bounds = cache.shadow_bounds.unwrap_or(self.scene_bounds);
         self.caster_ranges.clone_from(&cache.shadow_ranges);
         self.up = cache.up;
         self.dirty = true;
+        self.depth_dirty = true;
     }
 
     pub fn sync(&mut self, gpu: &GpuContext) {
@@ -115,8 +135,10 @@ impl Studio {
             if shadow.map.resolution != resolution {
                 shadow.map = ShadowMap::new(gpu, &shadow.layout, &shadow.sampler, resolution);
             }
-            shadow.needs_render = shadow_settings.is_some();
+            shadow.needs_render =
+                shadow_settings.is_some() && (shadow.needs_render || self.depth_dirty);
         }
+        self.depth_dirty = false;
         self.floor = None;
         if let Some(settings) = self.settings {
             let key = from_studio_axes(Vec3::from_array(settings.toward_key), self.up).normalize();
@@ -145,6 +167,7 @@ impl Studio {
                     light_projection(center, radius, key, self.up).to_cols_array_2d();
                 params.shadows = [1.0, s.depth_bias, s.slope_bias, s.filter_radius as f32];
                 params.key_tint[3] = s.light_radius.tan();
+                params.fill_tint[3] = s.strength;
             }
 
             if settings.floor {
