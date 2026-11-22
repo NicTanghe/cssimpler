@@ -99,7 +99,7 @@ fn studio_shadows_reach_mesh_and_floor() {
     let draw = |renderer: &mut UsdRenderer| aa_tests::read_frame(&gpu, info, &image, renderer);
     let legacy = draw(&mut renderer);
     let studio = UsdStudioLighting {
-        toward_key: [-0.45, 0.95, -0.48],
+        toward_key: [-0.45, 0.95, -0.62],
         shadows: Some(UsdShadowSettings {
             filter_radius: 5,
             ..Default::default()

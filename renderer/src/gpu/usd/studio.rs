@@ -34,7 +34,8 @@ pub(super) struct Studio {
     pub settings: Option<UsdStudioLighting>,
     pub floor: Option<wgpu::Buffer>,
     shadow: Option<ShadowPass>,
-    bounds: [Vec3; 2],
+    caster_bounds: [Vec3; 2],
+    scene_bounds: [Vec3; 2],
     caster_ranges: Vec<Range<u32>>,
     up: Vec3,
     pub dirty: bool,
@@ -113,10 +114,10 @@ impl Studio {
         self.floor = None;
         if let Some(settings) = self.settings {
             let key = from_studio_axes(Vec3::from_array(settings.toward_key), self.up).normalize();
-            let [minimum, maximum] = self.bounds;
+            let [minimum, maximum] = self.caster_bounds;
             let center = minimum + (maximum - minimum) * 0.5;
             let radius = ((maximum - minimum) * 0.5).length().max(0.01);
-            let height = minimum.dot(self.up) - radius * 0.015;
+            let height = self.scene_bounds[0].dot(self.up) - radius * 0.015;
             params.key = key.extend(1.0).to_array();
             params.up = self.up.extend(settings.ambient).to_array();
             params.lighting = [
@@ -134,6 +135,9 @@ impl Studio {
             }
 
             if settings.floor {
+                let [minimum, maximum] = self.scene_bounds;
+                let center = minimum + (maximum - minimum) * 0.5;
+                let radius = ((maximum - minimum) * 0.5).length().max(0.01);
                 self.floor = Some(vertex_buffer(
                     gpu,
                     &floor_vertices(center, height, radius, self.up),
