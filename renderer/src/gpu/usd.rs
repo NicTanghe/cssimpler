@@ -6,17 +6,27 @@ use glam::{DVec3, Mat4, Vec3};
 use openusd::{gf, sdf, usd as scene};
 use openusd_schemas::geom::{
     self, AttributeMetadata, CameraSchema, GprimSchema, ImageableExt, MeshSchema, PointBasedSchema,
-    XformableExt,
+    PrimvarsAPI, XformableExt,
 };
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, hash_map::Entry},
+    ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
 };
 use wgpu::util::DeviceExt;
 
 mod aa;
+mod appearance;
+mod studio;
+#[cfg(test)]
+mod studio_tests;
+use appearance::{MaterialOverride, Materials};
+pub use appearance::{
+    UsdColorTexture, UsdMaterial, UsdShadowSettings, UsdStudioLighting, UsdSurface, UsdUvMapping,
+};
+use studio::Studio;
 #[cfg(test)]
 mod aa_tests;
 #[cfg(test)]
@@ -211,13 +221,22 @@ struct Vertex {
     position: [f32; 3],
     normal: [f32; 3],
     color: [f32; 3],
+    uv: [f32; 3],
+    local: [f32; 3],
 }
+
+const VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<Vertex>() as u64,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x3, 4 => Float32x3],
+};
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_projection: [[f32; 4]; 4],
     view: [[f32; 4]; 4],
     viewport: [f32; 4],
+    projection_params: [f32; 4],
 }
 
 /// One unique polygon-cage edge. `adjacency[0]` counts the adjacent faces that
@@ -268,8 +287,10 @@ struct MeshCache {
     edges: Vec<EdgeRecord>,
     /// Mesh prim paths, in the order used as the per-edge model id.
     models: Vec<String>,
+    ranges: Vec<Range<u32>>,
     minimum: Vec3,
     maximum: Vec3,
+    up: Vec3,
 }
 
 /// Initial USD-to-wgpu backend. The stage and camera USD prims are authoritative;
@@ -292,6 +313,10 @@ pub struct UsdRenderer {
     camera_key: Option<CameraKey>,
     targets: aa::Targets,
     pipeline_layout: wgpu::PipelineLayout,
+    studio: Studio,
+    materials: Materials,
+    model_materials: HashMap<String, MaterialOverride>,
+    model_ranges: Vec<Range<u32>>,
     info: GpuViewportInfo,
     redraw_sink: scene::StageSinkId,
     wireframe: Wireframe,
@@ -368,13 +393,9 @@ impl UsdRenderer {
                 let aspect = init.info.physical_size[0] as f32 / init.info.physical_size[1] as f32;
                 let radius =
                     (cache.maximum - cache.minimum).length().max(0.01) * 1.6 / aspect.min(1.0);
-                let up = match scene.stage.stage_metadata("upAxis").map_err(error)? {
-                    Some(sdf::Value::Token(axis)) if axis.as_ref() == "Z" => Vec3::Z,
-                    _ => Vec3::Y,
-                };
                 let orbit = Orbit {
                     center,
-                    up,
+                    up: cache.up,
                     radius,
                     yaw: 0.5,
                     pitch: 0.25,
@@ -398,34 +419,46 @@ impl UsdRenderer {
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("USD camera layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
+                entries: &[
+                    appearance::uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                    appearance::uniform_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                ],
             });
+        let studio = Studio::new(gpu, &layout, &cache);
+        let materials = Materials::new(gpu);
         let camera_binding = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("USD camera"),
+            label: Some("USD view uniforms"),
             layout: &layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: studio.uniform.as_entire_binding(),
+                },
+            ],
         });
+        let mut mesh_layouts = vec![Some(&layout), Some(&materials.layout)];
+        if let Some(shadow_layout) = studio.shadow_layout() {
+            mesh_layouts.push(Some(shadow_layout));
+        }
         let pipeline_layout = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("USD renderer"),
-                bind_group_layouts: &[Some(&layout)],
+                bind_group_layouts: &mesh_layouts,
                 immediate_size: 0,
             });
         let targets = aa::Targets::new(gpu, init.info);
-        let pipeline = mesh_pipeline(gpu, &pipeline_layout, init.info, targets.samples);
+        let pipeline = mesh_pipeline(
+            gpu,
+            &pipeline_layout,
+            init.info,
+            targets.samples,
+            studio.shadow_layout().is_some(),
+        );
         let wire_layout = wire_bind_group_layout(&gpu.device);
         let wire_pipeline_layout =
             gpu.device
@@ -467,6 +500,10 @@ impl UsdRenderer {
             camera_key: None,
             targets,
             pipeline_layout,
+            studio,
+            materials,
+            model_materials: HashMap::new(),
+            model_ranges: cache.ranges,
             info: init.info,
             redraw_sink,
             wireframe: Wireframe::default(),
@@ -489,6 +526,52 @@ impl UsdRenderer {
 
     pub fn control(&self) -> UsdViewControl {
         self.control.clone()
+    }
+
+    /// Set view-local studio lighting. Pass `None` for the original camera-relative
+    /// lighting and background. The USD stage and other views are left alone.
+    pub fn set_studio_lighting(&mut self, settings: Option<UsdStudioLighting>) -> Result<()> {
+        if let Some(settings) = settings {
+            settings.validate()?;
+        }
+        if self.studio.settings != settings {
+            self.studio.settings = settings;
+            self.studio.dirty = true;
+            self.control.0.borrow().redraw.request_redraw();
+        }
+        Ok(())
+    }
+
+    /// Whether the viewport's GPU supports a sampled key-light depth map.
+    pub fn supports_shadow_mapping(&self) -> bool {
+        self.studio.shadow_layout().is_some()
+    }
+
+    /// Assign a render-only material for an exact USD mesh prim path. An
+    /// assignment may precede the mesh's appearance in the evaluated stage.
+    pub fn set_model_material(&mut self, path: &str, material: UsdMaterial) -> Result<()> {
+        material.validate(self.materials.max_dimension)?;
+        if self.model_material(path) != Some(&material) {
+            self.model_materials.insert(
+                path.to_owned(),
+                MaterialOverride {
+                    material,
+                    binding: None,
+                },
+            );
+            self.control.0.borrow().redraw.request_redraw();
+        }
+        Ok(())
+    }
+
+    pub fn model_material(&self, path: &str) -> Option<&UsdMaterial> {
+        self.model_materials.get(path).map(|entry| &entry.material)
+    }
+
+    pub fn clear_model_material(&mut self, path: &str) {
+        if self.model_materials.remove(path).is_some() {
+            self.control.0.borrow().redraw.request_redraw();
+        }
     }
 
     fn wire_changed(&mut self) {
@@ -626,7 +709,8 @@ impl UsdRenderer {
             .get_at::<geom::Projection>(time)
             .map_err(error)?
             .unwrap_or(geom::Projection::Perspective);
-        let projection = if projection == geom::Projection::Orthographic {
+        let orthographic = projection == geom::Projection::Orthographic;
+        let projection = if orthographic {
             let height = aperture * 0.1;
             glam::camera::rh::proj::directx::orthographic(
                 -height * aspect * 0.5,
@@ -653,6 +737,7 @@ impl UsdRenderer {
                 self.targets.height as f32,
                 if self.info.format.is_srgb() { 0.0 } else { 1.0 },
             ],
+            projection_params: [f32::from(orthographic), 0.0, 0.0, 0.0],
         })
     }
 }
@@ -665,7 +750,13 @@ impl GpuViewportRenderer for UsdRenderer {
         {
             let targets = aa::Targets::new(gpu, info);
             if self.targets.samples != targets.samples || self.info.format != info.format {
-                self.pipeline = mesh_pipeline(gpu, &self.pipeline_layout, info, targets.samples);
+                self.pipeline = mesh_pipeline(
+                    gpu,
+                    &self.pipeline_layout,
+                    info,
+                    targets.samples,
+                    self.supports_shadow_mapping(),
+                );
                 let (wire, overlay) =
                     wire_pipelines(gpu, &self.wire_pipeline_layout, info, targets.samples);
                 self.wire_pipeline = wire;
@@ -697,13 +788,23 @@ impl GpuViewportRenderer for UsdRenderer {
             self.edges = edges;
             self.wire_binding = wire_binding;
             self.edge_vertices = edge_vertices;
-            self.models = cache.models.clone();
+            self.studio.update_mesh(&cache);
+            self.models = cache.models;
+            self.model_ranges = cache.ranges;
             // The model list changed, so per-model parameters must be re-uploaded.
             self.wire_uploaded = None;
             self.revision = self.scene.revision.get();
             self.evaluated_time = time;
         }
         self.sync_wire(gpu);
+        self.studio.sync(gpu);
+        for path in &self.models {
+            if let Some(entry) = self.model_materials.get_mut(path)
+                && entry.binding.is_none()
+            {
+                entry.binding = Some(self.materials.binding(gpu, &entry.material));
+            }
+        }
         let key = CameraKey {
             revision: self.camera_revision.get(),
             time,
@@ -719,6 +820,12 @@ impl GpuViewportRenderer for UsdRenderer {
             );
             self.camera_key = Some(key);
         }
+        self.studio.render_shadow(
+            frame.encoder,
+            &self.camera_binding,
+            &self.vertices,
+            self.vertex_count,
+        );
         let depth = self.targets.depth.create_view(&Default::default());
         let color = self
             .targets
@@ -768,8 +875,31 @@ impl GpuViewportRenderer for UsdRenderer {
                     });
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.camera_binding, &[]);
+                if let Some(binding) = self.studio.shadow_binding() {
+                    pass.set_bind_group(2, binding, &[]);
+                }
+                let instance = strip as u32..strip as u32 + 1;
                 pass.set_vertex_buffer(0, self.vertices.slice(..));
-                pass.draw(0..self.vertex_count, strip as u32..strip as u32 + 1);
+                let default_material = &self.materials.default_binding;
+                if self.model_materials.is_empty() {
+                    pass.set_bind_group(1, default_material, &[]);
+                    pass.draw(0..self.vertex_count, instance.clone());
+                } else {
+                    for (path, range) in self.models.iter().zip(&self.model_ranges) {
+                        let material = self
+                            .model_materials
+                            .get(path)
+                            .and_then(|entry| entry.binding.as_ref())
+                            .unwrap_or(default_material);
+                        pass.set_bind_group(1, material, &[]);
+                        pass.draw(range.clone(), instance.clone());
+                    }
+                }
+                if let Some(floor) = &self.studio.floor {
+                    pass.set_bind_group(1, default_material, &[]);
+                    pass.set_vertex_buffer(0, floor.slice(..));
+                    pass.draw(0..6, instance);
+                }
                 // Per-model modes resolve on the GPU from the model array: the
                 // occluded pipeline emits modes 1 and 2, the through-surface
                 // pipeline emits mode 3. Both draw the same edge range, and the
@@ -919,23 +1049,61 @@ fn mesh_pipeline(
     pipeline_layout: &wgpu::PipelineLayout,
     info: GpuViewportInfo,
     samples: u32,
+    shadows_supported: bool,
 ) -> wgpu::RenderPipeline {
-    let shader = usd_shader(gpu);
-    gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("USD mesh pipeline"), layout: Some(pipeline_layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vertex"), compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3] })] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fragment"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: info.format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
-            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Less), stencil: Default::default(), bias: Default::default() }),
-            multisample: wgpu::MultisampleState { count: samples, ..Default::default() }, multiview_mask: None, cache: None,
+    let shader = usd_shader(gpu, shadows_supported);
+    gpu.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("USD mesh pipeline"),
+            layout: Some(pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex"),
+                compilation_options: Default::default(),
+                buffers: &[Some(VERTEX_LAYOUT)],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fragment"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: info.format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: samples,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
         })
 }
 
-fn usd_shader(gpu: &GpuContext) -> wgpu::ShaderModule {
+fn usd_shader(gpu: &GpuContext, shadows_supported: bool) -> wgpu::ShaderModule {
+    let shadow = if shadows_supported {
+        include_str!("usd/shadow.wgsl")
+    } else {
+        "fn key_visibility(position: vec3<f32>, n_dot_l: f32) -> f32 { return 1.0; }"
+    };
     gpu.device
         .create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("USD studio shading"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("usd.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{shadow}", include_str!("usd.wgsl")).into(),
+            ),
         })
 }
 
@@ -966,7 +1134,7 @@ fn wire_pipelines(
     info: GpuViewportInfo,
     samples: u32,
 ) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
-    let shader = usd_shader(gpu);
+    let shader = usd_shader(gpu, false);
     let build = |label: &str, entry: &str, compare: wgpu::CompareFunction| {
         gpu.device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1123,6 +1291,8 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
         vertices: Vec::new(),
         edges: Vec::new(),
         models: Vec::new(),
+        ranges: Vec::new(),
+        up: studio::stage_up(stage)?,
         minimum: Vec3::splat(f32::INFINITY),
         maximum: Vec3::splat(f32::NEG_INFINITY),
     };
@@ -1204,10 +1374,19 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
         } else {
             None
         };
-        let points: Vec<Vec3> = points
-            .into_iter()
+        let uvs = mesh_uvs(&prim, time, [points.len(), counts.len(), indices.len()]);
+        let mut local_min = Vec3::splat(f32::INFINITY);
+        let mut local_max = Vec3::splat(f32::NEG_INFINITY);
+        for p in &points {
+            let p = Vec3::new(p.x, p.y, p.z);
+            local_min = local_min.min(p);
+            local_max = local_max.max(p);
+        }
+        let local_center = local_min * 0.5 + local_max * 0.5;
+        let world_points: Vec<Vec3> = points
+            .iter()
             .map(|p| {
-                let p = world.transform_point(p);
+                let p = world.transform_point(*p);
                 Vec3::new(p.x, p.y, p.z)
             })
             .collect();
@@ -1225,6 +1404,7 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
         // The prim path is this mesh's model id, used to select stroke settings.
         let model = cache.models.len() as u32;
         cache.models.push(path.to_string());
+        let first_vertex = cache.vertices.len() as u32;
         let mut mesh_edges: Vec<EdgeRecord> = Vec::new();
         let mut edge_lookup: HashMap<(u32, u32), usize> = HashMap::new();
         let mut offset = 0usize;
@@ -1241,7 +1421,7 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
             let polygon: Vec<Vec3> = face
                 .iter()
                 .map(|i| {
-                    points
+                    world_points
                         .get(*i as usize)
                         .copied()
                         .ok_or_else(|| error(format!("{path}: invalid point index {i}")))
@@ -1306,16 +1486,38 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                     }
                     cache.minimum = cache.minimum.min(p);
                     cache.maximum = cache.maximum.max(p);
+                    let point_index = face[corner] as usize;
+                    let uv = uvs.as_ref().map_or([0.0; 3], |(interpolation, values)| {
+                        let index = match interpolation {
+                            geom::Interpolation::Constant => 0,
+                            geom::Interpolation::Uniform => face_index,
+                            geom::Interpolation::Vertex | geom::Interpolation::Varying => {
+                                point_index
+                            }
+                            geom::Interpolation::FaceVarying => offset + corner,
+                        };
+                        [values[index].x, values[index].y, 1.0]
+                    });
+                    let p_local = points[point_index];
+                    let local = Vec3::new(p_local.x, p_local.y, p_local.z) - local_center;
+                    let local = if cache.up == Vec3::Z {
+                        Vec3::new(local.x, local.z, -local.y)
+                    } else {
+                        local
+                    };
                     cache.vertices.push(Vertex {
                         position: p.to_array(),
                         normal: shading_normal.to_array(),
                         color,
+                        uv,
+                        local: local.to_array(),
                     });
                 }
             }
             offset = end;
         }
         cache.edges.extend(mesh_edges);
+        cache.ranges.push(first_vertex..cache.vertices.len() as u32);
         if offset != indices.len() {
             return Err(error(format!(
                 "{path}: face counts do not consume index array"
@@ -1328,6 +1530,33 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
         ));
     }
     Ok(cache)
+}
+
+/// Usable indexed or unindexed authored `st`, resolved at the geometry's time.
+/// A USD asset can carry other primvar types without affecting plain rendering.
+fn mesh_uvs(
+    prim: &scene::Prim,
+    time: Option<scene::TimeCode>,
+    [points, faces, corners]: [usize; 3],
+) -> Option<(geom::Interpolation, Vec<gf::Vec2f>)> {
+    let api = PrimvarsAPI::from_prim_unchecked(prim.clone());
+    let uv = api.find_primvar_with_inheritance("st").ok()??;
+    let interpolation = uv.interpolation().ok()?;
+    let expected = match interpolation {
+        geom::Interpolation::Constant => 1,
+        geom::Interpolation::Uniform => faces,
+        geom::Interpolation::Vertex | geom::Interpolation::Varying => points,
+        geom::Interpolation::FaceVarying => corners,
+    };
+    let values = match uv.compute_flattened::<Vec<gf::Vec2f>>(time) {
+        Ok(Some(values)) => values,
+        Err(_) if interpolation == geom::Interpolation::Constant => {
+            vec![uv.compute_flattened::<gf::Vec2f>(time).ok()??]
+        }
+        _ => return None,
+    };
+    (values.len() == expected && values.iter().all(|v| v.x.is_finite() && v.y.is_finite()))
+        .then_some((interpolation, values))
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! cargo run --features gpu-viewport --example usd_viewport -- [file.usd] [--transparent] [--continuous] [--smoke] [--wireframe=off|edges|silhouette|overlay]
+//! cargo run --features gpu-viewport --example usd_viewport -- [file.usd] [--studio] [--transparent] [--continuous] [--smoke] [--wireframe=off|edges|silhouette|overlay]
 use cssimpler::{
     app::{App, Invalidation},
     core::Node,
@@ -7,7 +7,10 @@ use cssimpler::{
         gpu::{
             GpuContext, GpuRedrawHandle, GpuViewportFrame, GpuViewportInfo, GpuViewportOptions,
             GpuViewportRenderer,
-            usd::{UsdCameraMode, UsdRenderer, UsdScene, Wireframe, WireframeMode, WireframeStyle},
+            usd::{
+                UsdCameraMode, UsdMaterial, UsdRenderer, UsdScene, UsdStudioLighting, Wireframe,
+                WireframeMode, WireframeStyle,
+            },
         },
     },
     style::parse_stylesheet,
@@ -186,17 +189,41 @@ impl GpuViewportRenderer for Preview {
     }
 }
 
+fn preview_renderer(
+    init: renderer::gpu::GpuViewportInit<'_>,
+    scene: UsdScene,
+    camera: UsdCameraMode,
+    studio: bool,
+) -> renderer::Result<UsdRenderer> {
+    let mut renderer = UsdRenderer::new(init, scene, camera)?;
+    if studio {
+        renderer.set_studio_lighting(Some(UsdStudioLighting {
+            toward_key: [-0.55, 0.85, -0.70],
+            ..Default::default()
+        }))?;
+        renderer.set_model_material("/Studio/Receiver", UsdMaterial::fabric([0.40, 0.11, 0.06]))?;
+        renderer.set_model_material(
+            "/Studio/Caster",
+            UsdMaterial::brushed_metal([0.65, 0.72, 0.80]),
+        )?;
+    }
+    Ok(renderer)
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    let studio = args.iter().any(|a| a == "--studio");
     let path = args
         .iter()
         .find(|a| !a.starts_with("--"))
         .cloned()
         .unwrap_or_else(|| {
-            format!(
-                "{}/examples/assets/usd-preview.usda",
-                env!("CARGO_MANIFEST_DIR")
-            )
+            let asset = if studio {
+                "tests/fixtures/usd-studio-shadows.usda"
+            } else {
+                "examples/assets/usd-preview.usda"
+            };
+            format!("{}/{asset}", env!("CARGO_MANIFEST_DIR"))
         });
     let transparent = args.iter().any(|a| a == "--transparent");
     let smoke = args.iter().any(|a| a == "--smoke");
@@ -313,7 +340,7 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|e| e.into_inner())
                 .push(init.redraw.clone());
             Ok(Box::new(Preview {
-                renderer: UsdRenderer::new(init, primary_scene, primary_camera)?,
+                renderer: preview_renderer(init, primary_scene, primary_camera, studio)?,
                 wires: primary_wires,
                 models: primary_models,
                 frames: primary_counter,
@@ -336,7 +363,7 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|e| e.into_inner())
                     .push(init.redraw.clone());
                 Ok(Box::new(Preview {
-                    renderer: UsdRenderer::new(init, scene, camera)?,
+                    renderer: preview_renderer(init, scene, camera, studio)?,
                     wires: secondary_wires,
                     models: secondary_models,
                     frames: secondary_counter,

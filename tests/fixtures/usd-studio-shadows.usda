@@ -13,9 +13,10 @@ def Xform "Studio"
         point3f[] points = [(-1, 0.2, -0.65), (1, 0.2, -0.65), (1, 0.2, 0.65), (-1, 0.2, 0.65)]
         int[] faceVertexCounts = [4]
         int[] faceVertexIndices = [0, 3, 2, 1]
-        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
-            interpolation = "vertex"
+        texCoord2f[] primvars:st = [(0, 1), (1, 0), (0, 0), (1, 1)] (
+            interpolation = "faceVarying"
         )
+        int[] primvars:st:indices = [2, 0, 3, 1]
     }
 
     def Mesh "Caster"

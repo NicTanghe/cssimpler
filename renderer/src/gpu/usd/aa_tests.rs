@@ -1,6 +1,6 @@
 use super::*;
 
-fn test_instance() -> wgpu::Instance {
+pub(super) fn test_instance() -> wgpu::Instance {
     // Match Windows DirectComposition's backend instead of the default Vulkan
     // adapter selected by headless request_adapter on multi-backend systems.
     wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -128,6 +128,7 @@ fn measure_msaa_frame_cost(size: [u32; 2]) {
                 &renderer.pipeline_layout,
                 info,
                 renderer.targets.samples,
+                renderer.supports_shadow_mapping(),
             );
             for frame_index in 0..40 {
                 if uncached {
@@ -227,57 +228,7 @@ fn check_strip_resolve(format: wgpu::TextureFormat) {
         usage: info.texture_usage,
         view_formats: &[],
     });
-    let draw = |renderer: &mut UsdRenderer| {
-        let view = image.create_view(&Default::default());
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        renderer
-            .render(
-                &gpu,
-                GpuViewportFrame {
-                    info,
-                    frame: FrameInfo {
-                        frame_index: 0,
-                        delta: Default::default(),
-                    },
-                    target: &view,
-                    texture: &image,
-                    encoder: &mut encoder,
-                },
-            )
-            .unwrap();
-        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("AA test readback"),
-            size: 128 * 117 * 4,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            image.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(512),
-                    rows_per_image: None,
-                },
-            },
-            image.size(),
-        );
-        gpu.queue.submit([encoder.finish()]);
-        let (send, receive) = std::sync::mpsc::channel();
-        buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                send.send(result).unwrap();
-            });
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .unwrap();
-        receive.recv().unwrap().unwrap();
-        let pixels = buffer.slice(..).get_mapped_range().unwrap().to_vec();
-        buffer.unmap();
-        pixels
-    };
+    let draw = |renderer: &mut UsdRenderer| read_frame(&gpu, info, &image, renderer);
     let strips = draw(&mut renderer);
     assert!(
         strips.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 255),
@@ -465,4 +416,64 @@ fn check_strip_resolve(format: wgpu::TextureFormat) {
         );
         assert!(renderer.targets.resolve.is_none());
     }
+}
+
+pub(super) fn read_frame(
+    gpu: &GpuContext,
+    info: GpuViewportInfo,
+    image: &wgpu::Texture,
+    renderer: &mut UsdRenderer,
+) -> Vec<u8> {
+    let size = image.size();
+    let row = size.width * 4;
+    assert_eq!(row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
+    let view = image.create_view(&Default::default());
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    renderer
+        .render(
+            gpu,
+            GpuViewportFrame {
+                info,
+                frame: FrameInfo {
+                    frame_index: 0,
+                    delta: Default::default(),
+                },
+                target: &view,
+                texture: image,
+                encoder: &mut encoder,
+            },
+        )
+        .unwrap();
+    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("USD test readback"),
+        size: u64::from(row) * u64::from(size.height),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        image.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: None,
+            },
+        },
+        size,
+    );
+    gpu.queue.submit([encoder.finish()]);
+    let (send, receive) = std::sync::mpsc::channel();
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            send.send(result).unwrap();
+        });
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    receive.recv().unwrap().unwrap();
+    let pixels = buffer.slice(..).get_mapped_range().unwrap().to_vec();
+    buffer.unmap();
+    pixels
 }
