@@ -200,21 +200,27 @@ Ok(Box::new(renderer))
 ```
 
 - A directional key adds shadowing within and between opaque meshes. The depth
-  pass fits the evaluated mesh bounds, includes both sides of cloth, and reuses
-  the map during orbit navigation and material changes. The optional neutral
-  floor sits just below the bounds. Set `floor: false` to use an authored
-  receiver or leave the background exposed.
+  pass fits the evaluated caster bounds, includes both sides of cloth, and
+  reuses the map during orbit navigation and material changes. The optional
+  neutral floor sits below the scene. Set `floor: false` to use an authored
+  receiver. A mesh with `custom bool cssimpler:castsShadow = false` receives
+  shadows while staying outside the caster pass and its fitted bounds.
 - Bias parameters use normalized light depth. Increase `depth_bias` or
   `slope_bias` in small steps if a receiver shows self-shadow artifacts.
-  `filter_radius` selects a square percentage-closer filter from a single tap
-  up to 5 × 5 taps. Resolution is capped at the GPU's 2D texture limit. If the
-  device cannot sample a depth attachment, the studio light and floor still
+  `filter_radius` sets the disk filter radius in map texels. A nonzero
+  `light_radius` enables contact hardening and uses `filter_radius` as the
+  maximum softness. `strength` scales how much key light a shadow blocks
+  between zero and one. Use `shadow_settings()` and `set_shadow_settings()`
+  to adjust the current key at runtime. Sampling changes reuse the depth map.
+  Resolution is capped at the GPU's 2D texture limit. If the
+  device cannot sample a depth attachment, the studio lights and floor still
   render. `supports_shadow_mapping()` reports this capability and
   `shadows: None` explicitly disables the depth pass.
 - Ambient occlusion here approximates ground-facing darkening near the base of
   the scene. Exposure is in stops and highlight rolloff compresses bright
-  channels together to preserve their ratios. The key direction uses +Y as up
-  in the API, mapped to the stage's up axis.
+  channels together to preserve their ratios. The directional key and
+  unshadowed fill have independent linear RGB tints. Both directions use +Y
+  as up in the API, mapped to the stage's up axis.
 - Materials use linear RGB tints or the existing USD display color. Fabric has
   grazing sheen and a derivative-filtered weave with surface relief. Brushed
   metal has a directional grain and a soft studio reflection gradient. Dark

@@ -29,6 +29,19 @@ fn studio_fixture_keeps_prim_ranges_and_flattened_uvs() {
             [1.0, 0.0, 1.0],
         ]
     );
+    let caster_index = cache
+        .models
+        .iter()
+        .position(|p| p == "/Studio/Caster")
+        .unwrap();
+    assert_eq!(
+        cache.shadow_ranges,
+        vec![cache.ranges[caster_index].clone()]
+    );
+    assert_eq!(
+        cache.shadow_bounds.unwrap(),
+        [Vec3::new(-0.25, 0.8, -0.3), Vec3::new(0.35, 1.1, 0.3),]
+    );
     let caster = range_for("/Studio/Caster");
     assert_eq!(caster.len(), 36);
     assert!(caster.iter().all(|v| v.uv == [0.0; 3]));
@@ -86,7 +99,11 @@ fn studio_shadows_reach_mesh_and_floor() {
     let draw = |renderer: &mut UsdRenderer| aa_tests::read_frame(&gpu, info, &image, renderer);
     let legacy = draw(&mut renderer);
     let studio = UsdStudioLighting {
-        toward_key: [-0.55, 0.85, -0.70],
+        toward_key: [-0.45, 0.95, -0.62],
+        shadows: Some(UsdShadowSettings {
+            filter_radius: 5,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let mut cloth = UsdMaterial::fabric([0.70, 0.09, 0.05]);

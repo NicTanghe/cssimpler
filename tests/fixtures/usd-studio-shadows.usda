@@ -10,6 +10,7 @@ def Xform "Studio"
     def Mesh "Receiver"
     {
         uniform token subdivisionScheme = "none"
+        custom bool cssimpler:castsShadow = false
         point3f[] points = [(-1, 0.2, -0.65), (1, 0.2, -0.65), (1, 0.2, 0.65), (-1, 0.2, 0.65)]
         int[] faceVertexCounts = [4]
         int[] faceVertexIndices = [0, 3, 2, 1]

@@ -13,6 +13,9 @@ struct StudioUniform {
     lighting: [f32; 4],
     occlusion_plane: [f32; 4],
     shadows: [f32; 4],
+    key_tint: [f32; 4],
+    fill: [f32; 4],
+    fill_tint: [f32; 4],
 }
 
 struct ShadowMap {
@@ -34,9 +37,12 @@ pub(super) struct Studio {
     pub settings: Option<UsdStudioLighting>,
     pub floor: Option<wgpu::Buffer>,
     shadow: Option<ShadowPass>,
-    bounds: [Vec3; 2],
+    caster_bounds: [Vec3; 2],
+    scene_bounds: [Vec3; 2],
+    caster_ranges: Vec<Range<u32>>,
     up: Vec3,
-    pub dirty: bool,
+    dirty: bool,
+    depth_dirty: bool,
 }
 
 impl Studio {
@@ -59,9 +65,14 @@ impl Studio {
             settings: None,
             floor: None,
             shadow,
-            bounds: [cache.minimum, cache.maximum],
+            caster_bounds: cache
+                .shadow_bounds
+                .unwrap_or([cache.minimum, cache.maximum]),
+            scene_bounds: [cache.minimum, cache.maximum],
+            caster_ranges: cache.shadow_ranges.clone(),
             up: cache.up,
             dirty: true,
+            depth_dirty: true,
         }
     }
 
@@ -73,10 +84,30 @@ impl Studio {
         self.shadow.as_ref().map(|shadow| &shadow.map.binding)
     }
 
+    pub fn set_settings(&mut self, settings: Option<UsdStudioLighting>) -> bool {
+        if self.settings == settings {
+            return false;
+        }
+        let depth_key = |settings: Option<UsdStudioLighting>| {
+            settings.and_then(|light| {
+                light
+                    .shadows
+                    .map(|shadow| (light.toward_key, shadow.resolution))
+            })
+        };
+        self.depth_dirty |= depth_key(self.settings) != depth_key(settings);
+        self.settings = settings;
+        self.dirty = true;
+        true
+    }
+
     pub fn update_mesh(&mut self, cache: &MeshCache) {
-        self.bounds = [cache.minimum, cache.maximum];
+        self.scene_bounds = [cache.minimum, cache.maximum];
+        self.caster_bounds = cache.shadow_bounds.unwrap_or(self.scene_bounds);
+        self.caster_ranges.clone_from(&cache.shadow_ranges);
         self.up = cache.up;
         self.dirty = true;
+        self.depth_dirty = true;
     }
 
     pub fn sync(&mut self, gpu: &GpuContext) {
@@ -91,6 +122,9 @@ impl Studio {
             lighting: [0.0, 0.0, 1.0, 0.0],
             occlusion_plane: [0.0; 4],
             shadows: [0.0; 4],
+            key_tint: [1.0, 1.0, 1.0, 0.0],
+            fill: [0.0; 4],
+            fill_tint: [1.0, 1.0, 1.0, 0.0],
         };
         let shadow_settings = self.settings.and_then(|settings| settings.shadows);
         if let Some(shadow) = &mut self.shadow {
@@ -101,16 +135,24 @@ impl Studio {
             if shadow.map.resolution != resolution {
                 shadow.map = ShadowMap::new(gpu, &shadow.layout, &shadow.sampler, resolution);
             }
-            shadow.needs_render = shadow_settings.is_some();
+            shadow.needs_render =
+                shadow_settings.is_some() && (shadow.needs_render || self.depth_dirty);
         }
+        self.depth_dirty = false;
         self.floor = None;
         if let Some(settings) = self.settings {
             let key = from_studio_axes(Vec3::from_array(settings.toward_key), self.up).normalize();
-            let [minimum, maximum] = self.bounds;
+            let [minimum, maximum] = self.caster_bounds;
             let center = minimum + (maximum - minimum) * 0.5;
             let radius = ((maximum - minimum) * 0.5).length().max(0.01);
-            let height = minimum.dot(self.up) - radius * 0.015;
+            let height = self.scene_bounds[0].dot(self.up) - radius * 0.015;
             params.key = key.extend(1.0).to_array();
+            params.key_tint[..3].copy_from_slice(&settings.key_tint);
+            params.fill = from_studio_axes(Vec3::from_array(settings.toward_fill), self.up)
+                .normalize()
+                .extend(settings.fill_intensity)
+                .to_array();
+            params.fill_tint[..3].copy_from_slice(&settings.fill_tint);
             params.up = self.up.extend(settings.ambient).to_array();
             params.lighting = [
                 settings.key_intensity,
@@ -124,9 +166,14 @@ impl Studio {
                 params.light_projection =
                     light_projection(center, radius, key, self.up).to_cols_array_2d();
                 params.shadows = [1.0, s.depth_bias, s.slope_bias, s.filter_radius as f32];
+                params.key_tint[3] = s.light_radius.tan();
+                params.fill_tint[3] = s.strength;
             }
 
             if settings.floor {
+                let [minimum, maximum] = self.scene_bounds;
+                let center = minimum + (maximum - minimum) * 0.5;
+                let radius = ((maximum - minimum) * 0.5).length().max(0.01);
                 self.floor = Some(vertex_buffer(
                     gpu,
                     &floor_vertices(center, height, radius, self.up),
@@ -137,14 +184,12 @@ impl Studio {
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
     }
 
-    /// Only scene geometry casts into the cached map. The generated floor
-    /// receives shadows but is excluded from the light-space pass.
+    /// Receiver-only scene meshes and the generated floor stay out of this pass.
     pub fn render_shadow(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         uniforms: &wgpu::BindGroup,
         vertices: &wgpu::Buffer,
-        vertex_count: u32,
     ) {
         let Some(shadow) = self.shadow.as_mut().filter(|shadow| shadow.needs_render) else {
             return;
@@ -165,7 +210,9 @@ impl Studio {
         pass.set_pipeline(&shadow.pipeline);
         pass.set_bind_group(0, uniforms, &[]);
         pass.set_vertex_buffer(0, vertices.slice(..));
-        pass.draw(0..vertex_count, 0..1);
+        for range in &self.caster_ranges {
+            pass.draw(range.clone(), 0..1);
+        }
         shadow.needs_render = false;
     }
 }
@@ -230,6 +277,8 @@ impl ShadowPass {
         let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("USD key-light depth comparison"),
             compare: Some(wgpu::CompareFunction::LessEqual),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let map = ShadowMap::new(gpu, &layout, &sampler, 1);
