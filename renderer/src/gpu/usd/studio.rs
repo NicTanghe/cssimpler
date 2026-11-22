@@ -35,6 +35,7 @@ pub(super) struct Studio {
     pub floor: Option<wgpu::Buffer>,
     shadow: Option<ShadowPass>,
     bounds: [Vec3; 2],
+    caster_ranges: Vec<Range<u32>>,
     up: Vec3,
     pub dirty: bool,
 }
@@ -59,7 +60,10 @@ impl Studio {
             settings: None,
             floor: None,
             shadow,
-            bounds: [cache.minimum, cache.maximum],
+            bounds: cache
+                .shadow_bounds
+                .unwrap_or([cache.minimum, cache.maximum]),
+            caster_ranges: cache.shadow_ranges.clone(),
             up: cache.up,
             dirty: true,
         }
@@ -74,7 +78,10 @@ impl Studio {
     }
 
     pub fn update_mesh(&mut self, cache: &MeshCache) {
-        self.bounds = [cache.minimum, cache.maximum];
+        self.bounds = cache
+            .shadow_bounds
+            .unwrap_or([cache.minimum, cache.maximum]);
+        self.caster_ranges.clone_from(&cache.shadow_ranges);
         self.up = cache.up;
         self.dirty = true;
     }
@@ -137,14 +144,12 @@ impl Studio {
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
     }
 
-    /// Only scene geometry casts into the cached map. The generated floor
-    /// receives shadows but is excluded from the light-space pass.
+    /// Receiver-only scene meshes and the generated floor stay out of this pass.
     pub fn render_shadow(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         uniforms: &wgpu::BindGroup,
         vertices: &wgpu::Buffer,
-        vertex_count: u32,
     ) {
         let Some(shadow) = self.shadow.as_mut().filter(|shadow| shadow.needs_render) else {
             return;
@@ -165,7 +170,9 @@ impl Studio {
         pass.set_pipeline(&shadow.pipeline);
         pass.set_bind_group(0, uniforms, &[]);
         pass.set_vertex_buffer(0, vertices.slice(..));
-        pass.draw(0..vertex_count, 0..1);
+        for range in &self.caster_ranges {
+            pass.draw(range.clone(), 0..1);
+        }
         shadow.needs_render = false;
     }
 }
@@ -230,6 +237,8 @@ impl ShadowPass {
         let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("USD key-light depth comparison"),
             compare: Some(wgpu::CompareFunction::LessEqual),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let map = ShadowMap::new(gpu, &layout, &sampler, 1);

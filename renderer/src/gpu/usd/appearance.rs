@@ -137,7 +137,7 @@ impl UsdMaterial {
 }
 
 /// Directional key-light depth map settings. Biases are in normalized light
-/// depth, and the filter radius is in shadow-map texels (0 to 2).
+/// depth, and the filter radius is in shadow-map texels (0 to 6).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UsdShadowSettings {
     pub resolution: u32,
@@ -207,7 +207,7 @@ impl UsdStudioLighting {
                 s.resolution == 0
                     || !(0.0..=1.0).contains(&s.depth_bias)
                     || !(0.0..=1.0).contains(&s.slope_bias)
-                    || s.filter_radius > 2
+                    || s.filter_radius > 6
             })
         {
             return Err(error("invalid USD studio lighting or shadow settings"));

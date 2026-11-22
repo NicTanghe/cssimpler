@@ -481,3 +481,9 @@ smoke tests also passed for the glass cube and two transparent viewports.
 
 See the [specsheet](./native-gpu-viewport-specsheet.md) for the full target, deferred
 platform work, and future upstream Hydra-like backend migration.
+
+
+A visible mesh can receive studio shadows without casting them by authoring
+`custom bool cssimpler:castsShadow = false` on its USD prim. Receiver-only meshes
+stay outside the shadow-map bounds, so a large backdrop can receive shadows
+without reducing resolution around the casters.

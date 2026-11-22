@@ -288,6 +288,8 @@ struct MeshCache {
     /// Mesh prim paths, in the order used as the per-edge model id.
     models: Vec<String>,
     ranges: Vec<Range<u32>>,
+    shadow_ranges: Vec<Range<u32>>,
+    shadow_bounds: Option<[Vec3; 2]>,
     minimum: Vec3,
     maximum: Vec3,
     up: Vec3,
@@ -820,12 +822,8 @@ impl GpuViewportRenderer for UsdRenderer {
             );
             self.camera_key = Some(key);
         }
-        self.studio.render_shadow(
-            frame.encoder,
-            &self.camera_binding,
-            &self.vertices,
-            self.vertex_count,
-        );
+        self.studio
+            .render_shadow(frame.encoder, &self.camera_binding, &self.vertices);
         let depth = self.targets.depth.create_view(&Default::default());
         let color = self
             .targets
@@ -1292,6 +1290,8 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
         edges: Vec::new(),
         models: Vec::new(),
         ranges: Vec::new(),
+        shadow_ranges: Vec::new(),
+        shadow_bounds: None,
         up: studio::stage_up(stage)?,
         minimum: Vec3::splat(f32::INFINITY),
         maximum: Vec3::splat(f32::NEG_INFINITY),
@@ -1319,6 +1319,11 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
             .map_err(error)?
             .ok_or_else(|| error(format!("{path}: missing faceVertexIndices")))?;
         let prim = stage.prim(&path).map_err(error)?;
+        let casts_shadow = prim
+            .attribute("cssimpler:castsShadow")
+            .get_at::<bool>(time)
+            .map_err(error)?
+            .unwrap_or(true);
         let world = xforms.local_to_world_transform(&prim).map_err(error)?;
         let normals_attr = mesh.normals_attr();
         let authored_normals = normals_attr
@@ -1486,6 +1491,11 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                     }
                     cache.minimum = cache.minimum.min(p);
                     cache.maximum = cache.maximum.max(p);
+                    if casts_shadow {
+                        let bounds = cache.shadow_bounds.get_or_insert([p, p]);
+                        bounds[0] = bounds[0].min(p);
+                        bounds[1] = bounds[1].max(p);
+                    }
                     let point_index = face[corner] as usize;
                     let uv = uvs.as_ref().map_or([0.0; 3], |(interpolation, values)| {
                         let index = match interpolation {
@@ -1517,7 +1527,11 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
             offset = end;
         }
         cache.edges.extend(mesh_edges);
-        cache.ranges.push(first_vertex..cache.vertices.len() as u32);
+        let range = first_vertex..cache.vertices.len() as u32;
+        if casts_shadow && !range.is_empty() {
+            cache.shadow_ranges.push(range.clone());
+        }
+        cache.ranges.push(range);
         if offset != indices.len() {
             return Err(error(format!(
                 "{path}: face counts do not consume index array"
