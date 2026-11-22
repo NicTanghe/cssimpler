@@ -1,5 +1,33 @@
-struct Camera { view_projection: mat4x4<f32>, view: mat4x4<f32>, viewport: vec4<f32> }
+struct Camera {
+    view_projection: mat4x4<f32>,
+    view: mat4x4<f32>,
+    viewport: vec4<f32>,
+    projection_params: vec4<f32>,
+}
 @group(0) @binding(0) var<uniform> camera: Camera;
+
+struct Studio {
+    light_projection: mat4x4<f32>,
+    key: vec4<f32>,
+    up: vec4<f32>,
+    lighting: vec4<f32>,
+    occlusion_plane: vec4<f32>,
+    shadows: vec4<f32>,
+    key_tint: vec4<f32>,
+    fill: vec4<f32>,
+    fill_tint: vec4<f32>,
+}
+@group(0) @binding(1) var<uniform> studio: Studio;
+
+struct Material {
+    color: vec4<f32>,
+    features: vec4<u32>,
+    response: vec4<f32>,
+    uv_scale: vec4<f32>,
+}
+@group(1) @binding(2) var<uniform> material: Material;
+@group(1) @binding(3) var albedo: texture_2d<f32>;
+@group(1) @binding(4) var albedo_sampler: sampler;
 
 // Per-model wireframe state, indexed by the model id stored on each edge.
 // `mode` is 0 for off, 1 for every edge, 2 for silhouette/boundary edges and
@@ -30,6 +58,10 @@ struct Varying {
     @builtin(position) position: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) color: vec3<f32>,
+    @location(2) world_position: vec3<f32>,
+    @location(3) uv: vec3<f32>,
+    @location(4) local: vec3<f32>,
+    @location(5) world_normal: vec3<f32>,
 }
 
 // Native UNORM targets are composited in encoded space. Resolving encoded
@@ -53,19 +85,160 @@ fn to_strip(position: vec4<f32>, strip: u32) -> vec4<f32> {
     return out;
 }
 
-@vertex fn vertex(@location(0) position: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>, @builtin(instance_index) strip: u32) -> Varying {
+@vertex fn vertex(
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec3<f32>,
+    @location(3) uv: vec3<f32>,
+    @location(4) local: vec3<f32>,
+    @builtin(instance_index) strip: u32,
+) -> Varying {
     var out: Varying;
     out.position = to_strip(camera.view_projection * vec4(position, 1.0), strip);
     out.normal = (camera.view * vec4(normal, 0.0)).xyz;
+    out.world_normal = normal;
     out.color = color;
+    out.world_position = position;
+    out.uv = uv;
+    out.local = local;
     return out;
 }
 
+@vertex fn shadow_vertex(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+    return studio.light_projection * vec4(position, 1.0);
+}
+
+struct SurfaceUv {
+    value: vec2<f32>,
+    dx: vec2<f32>,
+    dy: vec2<f32>,
+    valid: bool,
+}
+
+fn surface_uv(in: Varying) -> SurfaceUv {
+    let authored = in.uv.z > 0.5;
+    let cylindrical = material.features.y == 1u || (material.features.y == 2u && !authored);
+    // Keep derivatives continuous across the cylindrical seam. Vertical
+    // coordinates use local mesh units, so motion does not slide the pattern.
+    let radial = in.local.xz;
+    let angle = atan2(radial.y, select(1.0, radial.x, dot(radial, radial) > 0.0));
+    let angular_gradient = vec2(-radial.y, radial.x) / (6.2831853 * max(dot(radial, radial), 1e-12));
+    let local_dx = dpdx(in.local);
+    let local_dy = dpdy(in.local);
+    let uv_dx = dpdx(in.uv.xy);
+    let uv_dy = dpdy(in.uv.xy);
+    let uv = select(in.uv.xy, vec2(angle / 6.2831853 + 0.5, in.local.y), cylindrical);
+    let dx = select(uv_dx, vec2(dot(angular_gradient, local_dx.xz), local_dx.y), cylindrical);
+    let dy = select(uv_dy, vec2(dot(angular_gradient, local_dy.xz), local_dy.y), cylindrical);
+    return SurfaceUv(uv * material.uv_scale.xy, dx * material.uv_scale.xy, dy * material.uv_scale.xy, authored || cylindrical);
+}
+
+struct SurfaceFrame {
+    tangent: vec3<f32>,
+    bitangent: vec3<f32>,
+}
+
+fn unit_or_zero(v: vec3<f32>) -> vec3<f32> {
+    return v * inverseSqrt(max(dot(v, v), 1e-24));
+}
+
+fn surface_frame(uv: SurfaceUv, position: vec3<f32>, normal: vec3<f32>) -> SurfaceFrame {
+    let dx = dpdx(position);
+    let dy = dpdy(position);
+    let det = uv.dx.x * uv.dy.y - uv.dx.y * uv.dy.x;
+    let t = (dx * uv.dy.y - dy * uv.dx.y) * sign(det);
+    let b = (dy * uv.dx.x - dx * uv.dy.x) * sign(det);
+    return SurfaceFrame(unit_or_zero(t - normal * dot(normal, t)),
+                        unit_or_zero(b - normal * dot(normal, b)));
+}
+
+fn shade_fabric(base: vec3<f32>, normal: vec3<f32>, key: vec3<f32>, uv: SurfaceUv,
+                frame: SurfaceFrame, facing: f32, key_power: vec3<f32>, ambient: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let frequency = material.response.z;
+    let footprint = (abs(uv.dx) + abs(uv.dy)) * frequency;
+    let detail = select(vec2(0.0), 1.0 - smoothstep(vec2(0.18), vec2(0.5), footprint), uv.valid);
+    let phase = 6.2831853 * fract(uv.value * frequency);
+    let thread = cos(phase) * detail;
+    let weave = 0.04 * (thread.x + thread.y) + 0.04 * thread.x * thread.y;
+    let slope = sin(phase) * detail;
+    let woven_normal = normalize(normal + 0.13 * (frame.tangent * slope.x + frame.bitangent * slope.y));
+    let direct = max(dot(woven_normal, key), 0.0) * key_power;
+    let grazing = pow(1.0 - facing, mix(5.0, 2.0, roughness));
+    let sheen = material.response.y * grazing * (0.35 * ambient + 0.35 * direct);
+    return base * (ambient + direct) * (1.0 + weave) + mix(base, vec3(1.0), 0.5) * sheen;
+}
+
+fn shade_metal(base: vec3<f32>, normal: vec3<f32>, eye: vec3<f32>, up: vec3<f32>,
+               key: vec3<f32>, uv: SurfaceUv, frame: SurfaceFrame, direct: vec3<f32>,
+               ambient: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let reflected = reflect(-eye, normal);
+    let height = 0.5 + 0.5 * dot(reflected, up);
+    let brush_axis = dot(reflected - key, frame.tangent);
+    let alignment = clamp(dot(reflected, key) - 0.25 * brush_axis * brush_axis, 0.0, 1.0);
+    let softbox = pow(alignment, mix(18.0, 2.0, roughness));
+    let footprint = (abs(uv.dx.x) + abs(uv.dy.x)) * 90.0;
+    let grain = select(0.0, cos(6.2831853 * fract(uv.value.x * 90.0)) *
+        (1.0 - smoothstep(0.15, 0.5, footprint)), uv.valid);
+    let gradient = mix(0.60, 2.25, smoothstep(0.1, 0.9, height));
+    return base * (ambient * gradient * (1.0 + 0.065 * grain) + 0.65 * softbox * direct);
+}
+
 @fragment fn fragment(in: Varying, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    let n = normalize(select(-in.normal, in.normal, front));
-    let studio = 0.3 + 0.7 * max(dot(n, normalize(vec3(-0.4, 0.7, 0.8))), 0.0);
-    let rim = pow(1.0 - abs(n.z), 3.0) * 0.2;
-    let color = in.color * studio + vec3(rim);
+    let studio_enabled = studio.key.w > 0.5;
+    let view_normal = normalize(select(-in.normal, in.normal, front));
+    let legacy_key = normalize(vec3(-0.4, 0.7, 0.8));
+    let plain_legacy = !studio_enabled && material.features.x == 0u;
+    let legacy = 0.3 + 0.7 * max(dot(view_normal, legacy_key), 0.0);
+    let rim = pow(1.0 - abs(view_normal.z), 3.0) * 0.2;
+    var base = select(in.color, material.color.rgb, material.color.w > 0.5);
+    if plain_legacy && material.features.z == 0u {
+        // Keep the original camera-relative look for unconfigured viewports.
+        return vec4(target_encode(base * legacy + vec3(rim)), 1.0);
+    }
+
+    let rotation = mat3x3(camera.view[0].xyz, camera.view[1].xyz, camera.view[2].xyz);
+    let normal = unit_or_zero(select(-in.world_normal, in.world_normal, front));
+    let key = select(transpose(rotation) * legacy_key, studio.key.xyz, studio_enabled);
+    let up = studio.up.xyz;
+    let n_dot_l = max(dot(normal, key), 0.0);
+    let ambient = select(0.3, studio.up.w, studio_enabled);
+    let irradiance = select(0.7, studio.lighting.x, studio_enabled);
+    let height = max(dot(in.world_position, up) - studio.occlusion_plane.x, 0.0);
+    let ground = exp(-4.0 * height * studio.occlusion_plane.y);
+    let sky = 0.5 + 0.5 * dot(normal, up);
+    let ambient_occlusion = 1.0 - studio.lighting.y * ground * (1.0 - 0.75 * sky);
+    let fill_power = max(dot(normal, studio.fill.xyz), 0.0) * studio.fill.w;
+    let fill = (vec3(ambient) + studio.fill_tint.rgb * fill_power) * ambient_occlusion;
+    let visibility = key_visibility(in.world_position, normal, n_dot_l);
+    let key_power = studio.key_tint.rgb * (irradiance * mix(1.0, visibility, studio.fill_tint.w));
+    let direct = n_dot_l * key_power;
+
+    let uv = surface_uv(in);
+    if material.features.z != 0u && uv.valid {
+        let flip_v = vec2(1.0, -1.0);
+        base *= textureSampleGrad(albedo, albedo_sampler, uv.value * flip_v, uv.dx * flip_v, uv.dy * flip_v).rgb;
+    }
+
+    let view_position = (camera.view * vec4(in.world_position, 1.0)).xyz;
+    let view_ray = select(-view_position, vec3(0.0, 0.0, 1.0), camera.projection_params.x > 0.5);
+    let eye = unit_or_zero(transpose(rotation) * view_ray);
+    let roughness = material.response.x;
+    var color = base * (fill + direct);
+    if material.features.x != 0u {
+        let frame = surface_frame(uv, in.world_position, normal);
+        if material.features.x == 1u {
+            color = shade_fabric(base, normal, key, uv, frame, clamp(abs(dot(normal, eye)), 0.0, 1.0),
+                                 key_power, fill, roughness);
+        } else {
+            color = shade_metal(base, normal, eye, up, key, uv, frame, direct, fill, roughness);
+        }
+    } else if plain_legacy {
+        color = base * legacy + vec3(rim);
+    }
+
+    color *= studio.lighting.z;
+    let peak = max(color.r, max(color.g, color.b));
+    color /= 1.0 + studio.lighting.w * max(peak - 0.65, 0.0);
     return vec4(target_encode(color), 1.0);
 }
 

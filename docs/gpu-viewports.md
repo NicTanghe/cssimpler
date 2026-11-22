@@ -164,11 +164,85 @@ perspective/orthographic authored cameras, and Y-up/Z-up orbit views. It uses
 normals from the mesh's `normals` attribute when a value is available at the
 selected evaluation time; otherwise it keeps the existing flat-face fallback.
 Authored normals are transformed with the inverse transpose and normalized before
-being uploaded as shading normals. It uses built-in studio shading. It does not
-yet evaluate subdivision, skinning, arbitrary material networks, textures,
-authored lighting, or production PBR. Material and lighting data remain in the
-USD stage for later rendering support.
+being uploaded as shading normals. It defaults to camera-relative shading using
+USD display colors. The built-in backend also offers view-local studio lighting
+and material overrides. Subdivision, skinning, arbitrary UsdShade networks,
+UsdLux evaluation, and production PBR remain outside this backend's subset.
+Authored material and lighting data stay in the USD stage.
 Concave faces and malformed topology return errors instead of incorrect geometry.
+
+### Studio lighting and mesh materials
+
+Construct an `UsdRenderer` inside a `with_gpu_viewport` factory and configure it
+before returning it. Assignments match exact USD mesh prim paths, including
+meshes that appear later. They affect only this view's rendering. A collider
+can continue to use its own geometry.
+
+```rust,ignore
+use cssimpler::renderer::gpu::usd::{
+    UsdCameraMode, UsdMaterial, UsdRenderer, UsdShadowSettings, UsdStudioLighting,
+};
+
+let mut renderer = UsdRenderer::new(init, scene, UsdCameraMode::Orbit)?;
+renderer.set_studio_lighting(Some(UsdStudioLighting {
+    ambient: 0.30,
+    occlusion: 0.25,
+    exposure: 0.25,
+    highlight_rolloff: 0.35,
+    shadows: Some(UsdShadowSettings { filter_radius: 2, ..Default::default() }),
+    ..Default::default()
+}))?;
+renderer.set_model_material("/Form/DressForm", UsdMaterial::fabric([0.55, 0.43, 0.29]))?;
+renderer.set_model_material("/Form/AluminumCap", UsdMaterial::brushed_metal([0.66, 0.72, 0.78]))?;
+renderer.set_model_material("/Form/Brass", UsdMaterial::brushed_metal([0.60, 0.42, 0.16]))?;
+renderer.set_model_material("/Form/Stand", UsdMaterial::dark_stand())?;
+Ok(Box::new(renderer))
+```
+
+- A directional key adds shadowing within and between opaque meshes. The depth
+  pass fits the evaluated caster bounds, includes both sides of cloth, and
+  reuses the map during orbit navigation and material changes. The optional
+  neutral floor sits below the scene. Set `floor: false` to use an authored
+  receiver. A mesh with `custom bool cssimpler:castsShadow = false` receives
+  shadows while staying outside the caster pass and its fitted bounds.
+- Bias parameters use normalized light depth. Increase `depth_bias` or
+  `slope_bias` in small steps if a receiver shows self-shadow artifacts.
+  `filter_radius` sets the disk filter radius in map texels. A nonzero
+  `light_radius` enables contact hardening and uses `filter_radius` as the
+  maximum softness. `strength` scales how much key light a shadow blocks
+  between zero and one. Use `shadow_settings()` and `set_shadow_settings()`
+  to adjust the current key at runtime. Sampling changes reuse the depth map.
+  Resolution is capped at the GPU's 2D texture limit. If the
+  device cannot sample a depth attachment, the studio lights and floor still
+  render. `supports_shadow_mapping()` reports this capability and
+  `shadows: None` explicitly disables the depth pass.
+- Ambient occlusion here approximates ground-facing darkening near the base of
+  the scene. Exposure is in stops and highlight rolloff compresses bright
+  channels together to preserve their ratios. The directional key and
+  unshadowed fill have independent linear RGB tints. Both directions use +Y
+  as up in the API, mapped to the stage's up axis.
+- Materials use linear RGB tints or the existing USD display color. Fabric has
+  grazing sheen and a derivative-filtered weave with surface relief. Brushed
+  metal has a directional grain and a soft studio reflection gradient. Dark
+  stands use a low-reflectance plain tint.
+- For a texture, assign a `UsdColorTexture::new([width, height], rgba8)?` to
+  `UsdMaterial::color_texture`. The renderer expects decoded, top-row-first
+  sRGB pixels and samples RGB with repeating bilinear filtering. Meshes remain
+  opaque. Indexed and unindexed `primvars:st` are read at the selected time and
+  support constant, uniform, vertex, varying, and face-varying interpolation.
+  `UsdUvMapping::AuthoredOrCylindrical` falls back to a cylinder around the
+  mesh's local up axis, with one wrap horizontally and local units vertically.
+  `uv_scale` controls repeat counts. Use `Cylindrical` to force that mapping or
+  `Authored` to skip texture and weave detail when usable UVs are absent.
+
+`clear_model_material` restores a mesh's default surface, and
+`set_studio_lighting(None)` restores camera-relative lighting and removes the
+generated floor. These view controls keep the USD stage and prim identities
+as the input boundary for a future viewport backend. They leave authored
+UsdShade and UsdLux data available for backends that evaluate them.
+
+Run `cargo run --features gpu-viewport --example usd_viewport -- --studio`
+to view the fabric receiver, metal caster and floor in the two-mesh fixture.
 
 ### Authored mesh normals
 
