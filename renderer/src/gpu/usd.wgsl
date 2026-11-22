@@ -209,7 +209,7 @@ fn shade_metal(base: vec3<f32>, normal: vec3<f32>, eye: vec3<f32>, up: vec3<f32>
     let ambient_occlusion = 1.0 - studio.lighting.y * ground * (1.0 - 0.75 * sky);
     let fill_power = max(dot(normal, studio.fill.xyz), 0.0) * studio.fill.w;
     let fill = (vec3(ambient) + studio.fill_tint.rgb * fill_power) * ambient_occlusion;
-    let key_power = studio.key_tint.rgb * (irradiance * key_visibility(in.world_position, n_dot_l));
+    let key_power = studio.key_tint.rgb * (irradiance * key_visibility(in.world_position, normal, n_dot_l));
     let direct = n_dot_l * key_power;
 
     let uv = surface_uv(in);

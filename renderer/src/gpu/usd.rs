@@ -1094,7 +1094,7 @@ fn usd_shader(gpu: &GpuContext, shadows_supported: bool) -> wgpu::ShaderModule {
     let shadow = if shadows_supported {
         include_str!("usd/shadow.wgsl")
     } else {
-        "fn key_visibility(position: vec3<f32>, n_dot_l: f32) -> f32 { return 1.0; }"
+        "fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -> f32 { return 1.0; }"
     };
     gpu.device
         .create_shader_module(wgpu::ShaderModuleDescriptor {

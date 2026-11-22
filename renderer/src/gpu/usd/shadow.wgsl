@@ -1,7 +1,7 @@
 @group(2) @binding(0) var shadow_map: texture_depth_2d;
 @group(2) @binding(1) var shadow_sampler: sampler_comparison;
 
-fn key_visibility(position: vec3<f32>, n_dot_l: f32) -> f32 {
+fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -> f32 {
     let light = studio.light_projection * vec4(position, 1.0);
     let uv = light.xy * vec2(0.5, -0.5) + vec2(0.5);
 
@@ -25,8 +25,14 @@ fn key_visibility(position: vec3<f32>, n_dot_l: f32) -> f32 {
     let bias = studio.shadows.y + studio.shadows.z * (1.0 - n_dot_l) + subtexel_bias;
     let receiver = light.z - bias;
     var radius = max_radius;
-    if studio.key_tint.w > 0.0 && max_radius > 0.0 {
-        let separation = blocker_separation(uv, receiver, depth_gradient, texel * max_radius);
+    let area_key = studio.key_tint.w > 0.0 && max_radius > 0.0;
+    var wide_gradient = depth_gradient;
+    if area_key {
+        // Screen derivatives describe a single triangle. Extrapolating that
+        // plane across a wide filter makes penumbras change at mesh edges.
+        // Use the interpolated normal for the broad footprint instead.
+        wide_gradient = smooth_receiver_gradient(normal, n_dot_l);
+        let separation = blocker_separation(uv, receiver, wide_gradient, texel * max_radius);
         // The depth projection spans 3 radii and the UV projection spans 2.1.
         // Project angular key size along that receiver-to-blocker distance.
         let projected = (3.0 / 2.1) * separation * studio.key_tint.w;
@@ -37,14 +43,35 @@ fn key_visibility(position: vec3<f32>, n_dot_l: f32) -> f32 {
     }
 
     // A disk breaks up the staircase produced by equally spaced square taps.
-    let count = select(16u, 48u, radius > 6.0);
+    // Keep the same sample pattern as the area-key radius changes.
+    let count = select(16u, 48u, area_key || radius > 6.0);
     var lit = 0.0;
     for (var i = 0u; i < count; i++) {
         let delta = disk_samples[i + select(0u, 16u, count == 48u)] * (radius * texel);
-        let slope_offset = clamp(dot(depth_gradient, delta), -0.02, 0.02);
+        // Retain precise geometric receiver depth for taps near contact.
+        let local_weight = 1.0 - smoothstep(1.0, 5.0, length(delta / texel));
+        let gradient = mix(wide_gradient, depth_gradient, local_weight);
+        let slope_offset = clamp(dot(gradient, delta), -0.02, 0.02);
         lit += compare_shadow(uv + delta, receiver + slope_offset);
     }
     return lit / f32(count);
+}
+
+fn smooth_receiver_gradient(normal: vec3<f32>, n_dot_l: f32) -> vec2<f32> {
+    let projection = transpose(studio.light_projection);
+    let x_axis = projection[0].xyz;
+    let y_axis = projection[1].xyz;
+    let z_axis = projection[2].xyz;
+    // The key projection is orthographic. These rows are orthogonal axes;
+    // dividing by their squared lengths transforms the plane covector.
+    let n = vec3(
+        dot(normal, x_axis) / dot(x_axis, x_axis),
+        dot(normal, y_axis) / dot(y_axis, y_axis),
+        dot(normal, z_axis) / dot(z_axis, z_axis),
+    );
+    // Taper the correction at grazing angles, where a plane is ill-conditioned.
+    return vec2(2.0, -2.0) * n.xy / max(abs(n.z), length(n) * 0.05)
+        * smoothstep(0.03, 0.20, n_dot_l);
 }
 
 fn compare_shadow(uv: vec2<f32>, depth: f32) -> f32 {
@@ -65,11 +92,13 @@ fn blocker_separation(uv: vec2<f32>, receiver: f32, gradient: vec2<f32>, extent:
     );
     var sum = 0.0;
     var count = 0.0;
-    for (var i = 0u; i < 13u && count < 5.0; i++) {
+    for (var i = 0u; i < 13u; i++) {
         let delta = probes[i] * extent;
         let sample_uv = uv + delta;
         let surface_depth = receiver + clamp(dot(gradient, delta), -0.02, 0.02);
-        if compare_shadow(sample_uv, surface_depth) < 0.5 {
+        let occluded = 1.0 - compare_shadow(sample_uv, surface_depth);
+        let weight = smoothstep(0.5, 0.95, occluded);
+        if weight > 0.0 {
             // Recover approximate blocker depth using comparison sampling,
             // which is portable to backends without depth texture loads.
             var near = clamp(surface_depth - 0.5, 0.0, 1.0);
@@ -82,8 +111,8 @@ fn blocker_separation(uv: vec2<f32>, receiver: f32, gradient: vec2<f32>, extent:
                     far = middle;
                 }
             }
-            sum += max(0.0, surface_depth - (near + far) * 0.5);
-            count += 1.0;
+            sum += weight * max(0.0, surface_depth - (near + far) * 0.5);
+            count += weight;
         }
     }
     return sum / max(1.0, count);
