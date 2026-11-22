@@ -56,17 +56,23 @@ fn compare_shadow(uv: vec2<f32>, depth: f32) -> f32 {
 }
 
 fn blocker_separation(uv: vec2<f32>, receiver: f32, gradient: vec2<f32>, extent: vec2<f32>) -> f32 {
-    let probes = array(vec2(0.0), vec2(0.55, 0.0), vec2(-0.55, 0.0), vec2(0.0, 0.55), vec2(0.0, -0.55));
+    // Search past the filter footprint so a wide penumbra can extend into
+    // pixels whose centre and inner probes are still fully illuminated.
+    let probes = array(
+        vec2(0.0), vec2(0.55, 0.0), vec2(-0.55, 0.0), vec2(0.0, 0.55), vec2(0.0, -0.55),
+        vec2(1.1, 0.0), vec2(-1.1, 0.0), vec2(0.0, 1.1), vec2(0.0, -1.1),
+        vec2(0.78, 0.78), vec2(-0.78, 0.78), vec2(0.78, -0.78), vec2(-0.78, -0.78),
+    );
     var sum = 0.0;
     var count = 0.0;
-    for (var i = 0u; i < 5u; i++) {
+    for (var i = 0u; i < 13u && count < 5.0; i++) {
         let delta = probes[i] * extent;
         let sample_uv = uv + delta;
         let surface_depth = receiver + clamp(dot(gradient, delta), -0.02, 0.02);
         if compare_shadow(sample_uv, surface_depth) < 0.5 {
             // Recover approximate blocker depth using comparison sampling,
             // which is portable to backends without depth texture loads.
-            var near = max(0.0, surface_depth - 0.5);
+            var near = clamp(surface_depth - 0.5, 0.0, 1.0);
             var far = clamp(surface_depth, 0.0, 1.0);
             for (var search = 0u; search < 7u; search++) {
                 let middle = (near + far) * 0.5;
