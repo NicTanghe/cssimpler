@@ -137,13 +137,16 @@ impl UsdMaterial {
 }
 
 /// Directional key-light depth map settings. Biases are in normalized light
-/// depth, and the filter radius is in shadow-map texels (0 to 6).
+/// depth, and the filter radius is in shadow-map texels (0 to 64).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UsdShadowSettings {
     pub resolution: u32,
     pub depth_bias: f32,
     pub slope_bias: f32,
     pub filter_radius: u32,
+    /// Angular radius of the key in radians. Zero uses a fixed filter radius.
+    /// With an area key, the filter radius caps the penumbra in map texels.
+    pub light_radius: f32,
 }
 
 impl Default for UsdShadowSettings {
@@ -153,6 +156,7 @@ impl Default for UsdShadowSettings {
             depth_bias: 0.0004,
             slope_bias: 0.001,
             filter_radius: 1,
+            light_radius: 0.0,
         }
     }
 }
@@ -163,6 +167,13 @@ impl Default for UsdShadowSettings {
 pub struct UsdStudioLighting {
     pub toward_key: [f32; 3],
     pub key_intensity: f32,
+    /// Linear RGB multiplier for the shadow-casting key.
+    pub key_tint: [f32; 3],
+    /// Direction toward the unshadowed fill in the same studio coordinates.
+    pub toward_fill: [f32; 3],
+    pub fill_intensity: f32,
+    /// Linear RGB multiplier for the fill.
+    pub fill_tint: [f32; 3],
     pub ambient: f32,
     /// Strength of the approximate ground-facing ambient occlusion (0 to 1).
     pub occlusion: f32,
@@ -181,6 +192,10 @@ impl Default for UsdStudioLighting {
         Self {
             toward_key: [-0.55, 0.85, 0.45],
             key_intensity: 0.8,
+            key_tint: [1.0; 3],
+            toward_fill: [0.65, 0.55, 0.65],
+            fill_intensity: 0.0,
+            fill_tint: [1.0; 3],
             ambient: 0.3,
             occlusion: 0.25,
             exposure: 0.0,
@@ -193,9 +208,19 @@ impl Default for UsdStudioLighting {
 
 impl UsdStudioLighting {
     pub(super) fn validate(self) -> Result<()> {
-        let length = Vec3::from_array(self.toward_key).length_squared();
-        if !length.is_finite()
-            || length <= f32::MIN_POSITIVE
+        let valid_direction = |direction| {
+            let length = Vec3::from_array(direction).length_squared();
+            length.is_finite() && length > f32::MIN_POSITIVE
+        };
+        if !valid_direction(self.toward_key)
+            || !valid_direction(self.toward_fill)
+            || !self.fill_intensity.is_finite()
+            || self.fill_intensity < 0.0
+            || self
+                .key_tint
+                .iter()
+                .chain(&self.fill_tint)
+                .any(|v| !v.is_finite() || *v < 0.0)
             || !self.key_intensity.is_finite()
             || self.key_intensity < 0.0
             || !self.ambient.is_finite()
@@ -207,7 +232,8 @@ impl UsdStudioLighting {
                 s.resolution == 0
                     || !(0.0..=1.0).contains(&s.depth_bias)
                     || !(0.0..=1.0).contains(&s.slope_bias)
-                    || s.filter_radius > 6
+                    || s.filter_radius > 64
+                    || !(0.0..=0.5).contains(&s.light_radius)
             })
         {
             return Err(error("invalid USD studio lighting or shadow settings"));

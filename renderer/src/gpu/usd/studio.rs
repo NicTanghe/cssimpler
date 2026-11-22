@@ -13,6 +13,9 @@ struct StudioUniform {
     lighting: [f32; 4],
     occlusion_plane: [f32; 4],
     shadows: [f32; 4],
+    key_tint: [f32; 4],
+    fill: [f32; 4],
+    fill_tint: [f32; 4],
 }
 
 struct ShadowMap {
@@ -99,6 +102,9 @@ impl Studio {
             lighting: [0.0, 0.0, 1.0, 0.0],
             occlusion_plane: [0.0; 4],
             shadows: [0.0; 4],
+            key_tint: [1.0, 1.0, 1.0, 0.0],
+            fill: [0.0; 4],
+            fill_tint: [1.0, 1.0, 1.0, 0.0],
         };
         let shadow_settings = self.settings.and_then(|settings| settings.shadows);
         if let Some(shadow) = &mut self.shadow {
@@ -119,6 +125,12 @@ impl Studio {
             let radius = ((maximum - minimum) * 0.5).length().max(0.01);
             let height = self.scene_bounds[0].dot(self.up) - radius * 0.015;
             params.key = key.extend(1.0).to_array();
+            params.key_tint[..3].copy_from_slice(&settings.key_tint);
+            params.fill = from_studio_axes(Vec3::from_array(settings.toward_fill), self.up)
+                .normalize()
+                .extend(settings.fill_intensity)
+                .to_array();
+            params.fill_tint[..3].copy_from_slice(&settings.fill_tint);
             params.up = self.up.extend(settings.ambient).to_array();
             params.lighting = [
                 settings.key_intensity,
@@ -132,6 +144,7 @@ impl Studio {
                 params.light_projection =
                     light_projection(center, radius, key, self.up).to_cols_array_2d();
                 params.shadows = [1.0, s.depth_bias, s.slope_bias, s.filter_radius as f32];
+                params.key_tint[3] = s.light_radius.tan();
             }
 
             if settings.floor {

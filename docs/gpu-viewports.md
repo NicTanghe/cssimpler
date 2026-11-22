@@ -483,6 +483,11 @@ See the [specsheet](./native-gpu-viewport-specsheet.md) for the full target, def
 platform work, and future upstream Hydra-like backend migration.
 
 
+The studio key and unshadowed directional fill can have independent linear
+RGB tints. A nonzero `UsdShadowSettings::light_radius` enables contact-hardening
+shadows. The comparison filter uses a disk whose width increases with estimated
+caster-to-receiver separation, capped by `filter_radius` map texels.
+
 A visible mesh can receive studio shadows without casting them by authoring
 `custom bool cssimpler:castsShadow = false` on its USD prim. Receiver-only meshes
 stay outside the shadow-map bounds, so a large backdrop can receive shadows

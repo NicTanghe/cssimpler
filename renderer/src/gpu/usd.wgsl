@@ -13,6 +13,9 @@ struct Studio {
     lighting: vec4<f32>,
     occlusion_plane: vec4<f32>,
     shadows: vec4<f32>,
+    key_tint: vec4<f32>,
+    fill: vec4<f32>,
+    fill_tint: vec4<f32>,
 }
 @group(0) @binding(1) var<uniform> studio: Studio;
 
@@ -150,7 +153,7 @@ fn surface_frame(uv: SurfaceUv, position: vec3<f32>, normal: vec3<f32>) -> Surfa
 }
 
 fn shade_fabric(base: vec3<f32>, normal: vec3<f32>, key: vec3<f32>, uv: SurfaceUv,
-                frame: SurfaceFrame, facing: f32, key_power: f32, ambient: f32, roughness: f32) -> vec3<f32> {
+                frame: SurfaceFrame, facing: f32, key_power: vec3<f32>, ambient: vec3<f32>, roughness: f32) -> vec3<f32> {
     let frequency = material.response.z;
     let footprint = (abs(uv.dx) + abs(uv.dy)) * frequency;
     let detail = select(vec2(0.0), 1.0 - smoothstep(vec2(0.18), vec2(0.5), footprint), uv.valid);
@@ -166,8 +169,8 @@ fn shade_fabric(base: vec3<f32>, normal: vec3<f32>, key: vec3<f32>, uv: SurfaceU
 }
 
 fn shade_metal(base: vec3<f32>, normal: vec3<f32>, eye: vec3<f32>, up: vec3<f32>,
-               key: vec3<f32>, uv: SurfaceUv, frame: SurfaceFrame, direct: f32,
-               ambient: f32, roughness: f32) -> vec3<f32> {
+               key: vec3<f32>, uv: SurfaceUv, frame: SurfaceFrame, direct: vec3<f32>,
+               ambient: vec3<f32>, roughness: f32) -> vec3<f32> {
     let reflected = reflect(-eye, normal);
     let height = 0.5 + 0.5 * dot(reflected, up);
     let brush_axis = dot(reflected - key, frame.tangent);
@@ -203,8 +206,10 @@ fn shade_metal(base: vec3<f32>, normal: vec3<f32>, eye: vec3<f32>, up: vec3<f32>
     let height = max(dot(in.world_position, up) - studio.occlusion_plane.x, 0.0);
     let ground = exp(-4.0 * height * studio.occlusion_plane.y);
     let sky = 0.5 + 0.5 * dot(normal, up);
-    let fill = ambient * (1.0 - studio.lighting.y * ground * (1.0 - 0.75 * sky));
-    let key_power = irradiance * key_visibility(in.world_position, n_dot_l);
+    let ambient_occlusion = 1.0 - studio.lighting.y * ground * (1.0 - 0.75 * sky);
+    let fill_power = max(dot(normal, studio.fill.xyz), 0.0) * studio.fill.w;
+    let fill = (vec3(ambient) + studio.fill_tint.rgb * fill_power) * ambient_occlusion;
+    let key_power = studio.key_tint.rgb * (irradiance * key_visibility(in.world_position, n_dot_l));
     let direct = n_dot_l * key_power;
 
     let uv = surface_uv(in);
