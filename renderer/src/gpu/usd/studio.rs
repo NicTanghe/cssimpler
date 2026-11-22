@@ -61,9 +61,10 @@ impl Studio {
             settings: None,
             floor: None,
             shadow,
-            bounds: cache
+            caster_bounds: cache
                 .shadow_bounds
                 .unwrap_or([cache.minimum, cache.maximum]),
+            scene_bounds: [cache.minimum, cache.maximum],
             caster_ranges: cache.shadow_ranges.clone(),
             up: cache.up,
             dirty: true,
@@ -79,9 +80,8 @@ impl Studio {
     }
 
     pub fn update_mesh(&mut self, cache: &MeshCache) {
-        self.bounds = cache
-            .shadow_bounds
-            .unwrap_or([cache.minimum, cache.maximum]);
+        self.scene_bounds = [cache.minimum, cache.maximum];
+        self.caster_bounds = cache.shadow_bounds.unwrap_or(self.scene_bounds);
         self.caster_ranges.clone_from(&cache.shadow_ranges);
         self.up = cache.up;
         self.dirty = true;
