@@ -409,22 +409,6 @@ impl StyleRule {
             );
         }
     }
-
-    fn apply_other_declarations(
-        &self,
-        style: &mut Style,
-        position_explicit: &mut bool,
-        font_state: &mut FontDeclarationState,
-    ) {
-        for &index in &self.other_declaration_indices {
-            apply_declaration(
-                style,
-                position_explicit,
-                font_state,
-                &self.declarations[index],
-            );
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -913,9 +897,61 @@ fn resolve_style_target(
         );
     }
 
-    for &rule_index in &matching_rule_indices {
-        if let Some(rule) = stylesheet.rules.get(rule_index) {
-            rule.apply_other_declarations(&mut resolved, &mut position_explicit, &mut font_state);
+    let declarations = || {
+        matching_rule_indices.iter().flat_map(|&rule_index| {
+            let rule = &stylesheet.rules[rule_index];
+            rule.other_declaration_indices
+                .iter()
+                .map(|&i| &rule.declarations[i])
+        })
+    };
+    if declarations()
+        .any(|declaration| matches!(declaration, Declaration::VariableDependentProperty { .. }))
+    {
+        let inherited_color = resolved.visual.foreground;
+        let mut computed_color = inherited_color;
+        for declaration in declarations() {
+            match declaration {
+                Declaration::Foreground(color) => computed_color = *color,
+                Declaration::VariableDependentProperty { property_name, .. }
+                    if property_name == "color" =>
+                {
+                    if let Some(result) = variable_resolution::resolve_declaration(
+                        declaration,
+                        &resolved.custom_properties,
+                        inherited_color,
+                    ) {
+                        match result {
+                            Ok(declarations) => {
+                                for declaration in declarations {
+                                    if let Declaration::Foreground(color) = declaration {
+                                        computed_color = color;
+                                    }
+                                }
+                            }
+                            Err(error) if error.to_string().contains("missing or invalid") => {}
+                            Err(error) => panic!("{error}"),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        resolved.visual.foreground = computed_color;
+        for declaration in declarations().filter(|declaration| {
+            !matches!(declaration, Declaration::Foreground(_))
+                && !matches!(declaration, Declaration::VariableDependentProperty { property_name, .. } if property_name == "color")
+        }) {
+            apply_declaration(&mut resolved, &mut position_explicit, &mut font_state, declaration);
+        }
+    } else {
+        for declaration in declarations() {
+            apply_declaration(
+                &mut resolved,
+                &mut position_explicit,
+                &mut font_state,
+                declaration,
+            );
         }
     }
 
@@ -1843,9 +1879,11 @@ fn apply_declaration(
         return;
     }
 
-    if let Some(declarations) =
-        variable_resolution::resolve_declaration(declaration, &style.custom_properties)
-    {
+    if let Some(declarations) = variable_resolution::resolve_declaration(
+        declaration,
+        &style.custom_properties,
+        style.visual.foreground,
+    ) {
         let declarations = match declarations {
             Ok(decls) => decls,
             Err(error) if error.to_string().contains("missing or invalid") => return,
