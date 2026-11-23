@@ -149,6 +149,14 @@ setup and migration guide. Run the example with `cargo run --example actions`.
 
 ---
 
+### Registered custom properties
+
+Use `@property` to declare a custom property's syntax, initial value, and
+inheritance. For example, a registration with `syntax: "<string>"` can provide
+the default caption for generated text using `content: var(--caption)`.
+Registrations in media rules apply when the viewport matches.
+
+
 ## Counter Button Example
 
 If you do want a button, it can stay simple too:

@@ -170,7 +170,7 @@ fn extract_alpha(pixel: u32) -> u16 {
     ((pixel >> ALPHA_SHIFT) & TWO_BIT_MAX) as u16
 }
 
-fn srgb_unit_to_linear(value: f32) -> f32 {
+pub(crate) fn srgb_unit_to_linear(value: f32) -> f32 {
     if value <= 0.04045 {
         value / 12.92
     } else {
@@ -179,7 +179,7 @@ fn srgb_unit_to_linear(value: f32) -> f32 {
 }
 
 #[allow(dead_code)]
-fn linear_to_srgb_unit(value: f32) -> f32 {
+pub(crate) fn linear_to_srgb_unit(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
     if value <= 0.003_130_8 {
         value * 12.92

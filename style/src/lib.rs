@@ -51,6 +51,7 @@ mod attributes;
 mod containers;
 mod custom_properties;
 mod fonts;
+mod highlights;
 mod invalidation;
 mod media;
 mod render_tree;
@@ -79,6 +80,7 @@ pub use render_tree::{
 };
 
 pub use attributes::{AttributeTextSource, parse_attribute_text_source};
+pub use highlights::{TextHighlightKind, apply_text_highlight};
 pub use invalidation::StyleInvalidation;
 pub use selectors::{
     AncestorSelector, CompoundSelector, ElementRef, PseudoElementKind, Selector,
@@ -91,6 +93,7 @@ pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 pub struct Stylesheet {
     position_tries: HashMap<String, AnchorArea>,
     pub rules: Vec<StyleRule>,
+    registrations: Vec<custom_properties::Registration>,
     index: StylesheetIndex,
 }
 
@@ -101,6 +104,10 @@ impl Stylesheet {
             .rules
             .iter()
             .all(|rule| rule.media_conditions.is_empty())
+            && self
+                .registrations
+                .iter()
+                .all(|entry| entry.media_conditions.is_empty())
         {
             return std::borrow::Cow::Borrowed(self);
         }
@@ -112,6 +119,17 @@ impl Stylesheet {
                 .all(|condition| condition.matches(width, height))
             {
                 filtered.push(rule.clone());
+            }
+        }
+        for registration in &self.registrations {
+            if registration
+                .media_conditions
+                .iter()
+                .all(|condition| condition.matches(width, height))
+            {
+                let mut active = registration.clone();
+                active.media_conditions.clear();
+                filtered.registrations.push(active);
             }
         }
         filtered.position_tries.clone_from(&self.position_tries);
@@ -236,13 +254,13 @@ impl Stylesheet {
             let Some(rule) = self.rules.get(index) else {
                 return false;
             };
-            rule.may_match_pseudo_and_interaction(pseudo_element, interaction)
+            rule.may_match_pseudo_and_interaction(pseudo_element.as_ref(), interaction)
                 && rule.selector.matches_with_ancestors_interaction_and_pseudo(
                     element,
                     ancestors,
                     element_path,
                     interaction,
-                    pseudo_element,
+                    pseudo_element.clone(),
                 )
         });
         candidates
@@ -419,10 +437,10 @@ impl StyleRule {
 
     fn may_match_pseudo_and_interaction(
         &self,
-        pseudo_element: Option<PseudoElementKind>,
+        pseudo_element: Option<&PseudoElementKind>,
         interaction: &ElementInteractionState,
     ) -> bool {
-        self.selector.pseudo_element == pseudo_element
+        self.selector.pseudo_element.as_ref() == pseudo_element
             && (!self.interaction_dependencies.hover || interaction.hovered.is_some())
             && (!self.interaction_dependencies.active || interaction.active.is_some())
     }
@@ -434,22 +452,6 @@ impl StyleRule {
         font_state: &mut FontDeclarationState,
     ) {
         for &index in &self.custom_declaration_indices {
-            apply_declaration(
-                style,
-                position_explicit,
-                font_state,
-                &self.declarations[index],
-            );
-        }
-    }
-
-    fn apply_other_declarations(
-        &self,
-        style: &mut Style,
-        position_explicit: &mut bool,
-        font_state: &mut FontDeclarationState,
-    ) {
-        for &index in &self.other_declaration_indices {
             apply_declaration(
                 style,
                 position_explicit,
@@ -488,6 +490,8 @@ pub enum Declaration {
     RasterRepeat((bool, bool)),
     RasterOpacity(f32),
     Foreground(Color),
+    MixBlendMode(cssimpler_core::MixBlendMode),
+    Isolation(bool),
     NativeMaterial(NativeMaterial),
     GlassTint(Option<Color>),
     SvgFill(SvgPaint),
@@ -633,6 +637,7 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
         .map_err(|error| StyleError::Parse(error.to_string()))?;
     let mut stylesheet = Stylesheet::default();
     collect_style_rules(&parsed.rules, &mut stylesheet)?;
+    stylesheet.registrations = custom_properties::collect_registrations(&parsed.rules);
     stylesheet.position_tries = anchors::collect_position_tries(&parsed.rules);
 
     Ok(stylesheet)
@@ -659,6 +664,7 @@ pub fn parse_stylesheet_lossy(source: &str) -> Result<Stylesheet, StyleError> {
     };
     let mut stylesheet = Stylesheet::default();
     collect_style_rules_lossy(&parsed.rules, &mut stylesheet);
+    stylesheet.registrations = custom_properties::collect_registrations(&parsed.rules);
     stylesheet.position_tries = anchors::collect_position_tries(&parsed.rules);
 
     Ok(stylesheet)
@@ -794,9 +800,6 @@ fn collect_style_rules(
             | CssRule::CustomMedia(_)
             | CssRule::LayerStatement(_)
             | CssRule::Property(_)
-            // `@position-try` defines anchor-positioning fallbacks. Nothing in
-            // the box model consumes them yet, so it is skipped like the other
-            // at-rules that carry no style rules.
             | CssRule::ViewTransition(_)
             | CssRule::Unknown(_)
             | CssRule::Custom(_)
@@ -915,7 +918,15 @@ fn resolve_style_target(
         resolved.visual.foreground = inherited_foreground;
     }
     if let Some(inherited_custom_properties) = inherited_custom_properties {
-        custom_properties::inherit(&mut resolved, inherited_custom_properties);
+        if stylesheet.registrations.is_empty() {
+            custom_properties::inherit(&mut resolved, inherited_custom_properties);
+        } else {
+            custom_properties::inherit_with_registrations(
+                &mut resolved,
+                inherited_custom_properties,
+                &stylesheet.registrations,
+            );
+        }
     }
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
     let mut font_state = FontDeclarationState::default();
@@ -934,9 +945,69 @@ fn resolve_style_target(
         }
     }
 
-    for &rule_index in &matching_rule_indices {
-        if let Some(rule) = stylesheet.rules.get(rule_index) {
-            rule.apply_other_declarations(&mut resolved, &mut position_explicit, &mut font_state);
+    if !stylesheet.registrations.is_empty() {
+        custom_properties::compute_registered_values(
+            &mut resolved.custom_properties,
+            inherited_custom_properties,
+            &stylesheet.registrations,
+        );
+    }
+
+    let declarations = || {
+        matching_rule_indices.iter().flat_map(|&rule_index| {
+            let rule = &stylesheet.rules[rule_index];
+            rule.other_declaration_indices
+                .iter()
+                .map(|&i| &rule.declarations[i])
+        })
+    };
+    if declarations()
+        .any(|declaration| matches!(declaration, Declaration::VariableDependentProperty { .. }))
+    {
+        let inherited_color = resolved.visual.foreground;
+        let mut computed_color = inherited_color;
+        for declaration in declarations() {
+            match declaration {
+                Declaration::Foreground(color) => computed_color = *color,
+                Declaration::VariableDependentProperty { property_name, .. }
+                    if property_name == "color" =>
+                {
+                    if let Some(result) = variable_resolution::resolve_declaration(
+                        declaration,
+                        &resolved.custom_properties,
+                        inherited_color,
+                    ) {
+                        match result {
+                            Ok(declarations) => {
+                                for declaration in declarations {
+                                    if let Declaration::Foreground(color) = declaration {
+                                        computed_color = color;
+                                    }
+                                }
+                            }
+                            Err(error) if error.to_string().contains("missing or invalid") => {}
+                            Err(error) => panic!("{error}"),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        resolved.visual.foreground = computed_color;
+        for declaration in declarations().filter(|declaration| {
+            !matches!(declaration, Declaration::Foreground(_))
+                && !matches!(declaration, Declaration::VariableDependentProperty { property_name, .. } if property_name == "color")
+        }) {
+            apply_declaration(&mut resolved, &mut position_explicit, &mut font_state, declaration);
+        }
+    } else {
+        for declaration in declarations() {
+            apply_declaration(
+                &mut resolved,
+                &mut position_explicit,
+                &mut font_state,
+                declaration,
+            );
         }
     }
 
@@ -1867,9 +1938,11 @@ fn apply_declaration(
         return;
     }
 
-    if let Some(declarations) =
-        variable_resolution::resolve_declaration(declaration, &style.custom_properties)
-    {
+    if let Some(declarations) = variable_resolution::resolve_declaration(
+        declaration,
+        &style.custom_properties,
+        style.visual.foreground,
+    ) {
         let declarations = match declarations {
             Ok(decls) => decls,
             Err(error) if error.to_string().contains("missing or invalid") => return,
