@@ -48,6 +48,7 @@ use taffy::prelude::{
 mod attributes;
 mod custom_properties;
 mod fonts;
+mod highlights;
 mod invalidation;
 mod media;
 mod render_tree;
@@ -76,6 +77,7 @@ pub use render_tree::{
 };
 
 pub use attributes::{AttributeTextSource, parse_attribute_text_source};
+pub use highlights::{TextHighlightKind, apply_text_highlight};
 pub use invalidation::StyleInvalidation;
 pub use selectors::{
     AncestorSelector, CompoundSelector, ElementRef, PseudoElementKind, Selector,
@@ -182,13 +184,13 @@ impl Stylesheet {
             let Some(rule) = self.rules.get(index) else {
                 return false;
             };
-            rule.may_match_pseudo_and_interaction(pseudo_element, interaction)
+            rule.may_match_pseudo_and_interaction(pseudo_element.as_ref(), interaction)
                 && rule.selector.matches_with_ancestors_interaction_and_pseudo(
                     element,
                     ancestors,
                     element_path,
                     interaction,
-                    pseudo_element,
+                    pseudo_element.clone(),
                 )
         });
         candidates
@@ -345,10 +347,10 @@ impl StyleRule {
 
     fn may_match_pseudo_and_interaction(
         &self,
-        pseudo_element: Option<PseudoElementKind>,
+        pseudo_element: Option<&PseudoElementKind>,
         interaction: &ElementInteractionState,
     ) -> bool {
-        self.selector.pseudo_element == pseudo_element
+        self.selector.pseudo_element.as_ref() == pseudo_element
             && (!self.interaction_dependencies.hover || interaction.hovered.is_some())
             && (!self.interaction_dependencies.active || interaction.active.is_some())
     }
