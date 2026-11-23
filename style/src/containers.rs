@@ -156,21 +156,68 @@ impl Scrollable {
 #[derive(Clone, Debug)]
 pub(crate) struct ScrollQuery {
     name: Option<String>,
-    scrollable: Scrollable,
+    condition: ScrollCondition,
 }
 
-impl ScrollQuery {
-    pub(crate) fn from_rule(
-        rule: &lightningcss::rules::container::ContainerRule<'_, impl Clone>,
+#[derive(Clone, Debug)]
+enum ScrollCondition {
+    Feature(Scrollable),
+    Not(Box<Self>),
+    All(Vec<Self>),
+    Any(Vec<Self>),
+}
+
+impl ScrollCondition {
+    fn from_container(
+        condition: &lightningcss::rules::container::ContainerCondition<'_>,
     ) -> Option<Self> {
-        use lightningcss::media_query::{MediaFeatureName, MediaFeatureValue, QueryFeature};
-        use lightningcss::rules::container::{
-            ContainerCondition, ScrollStateFeatureId, ScrollStateQuery,
+        use lightningcss::media_query::Operator;
+        use lightningcss::rules::container::ContainerCondition;
+        Some(match condition {
+            ContainerCondition::ScrollState(query) => return Self::from_scroll_state(query),
+            ContainerCondition::Not(inner) => Self::Not(Box::new(Self::from_container(inner)?)),
+            ContainerCondition::Operation {
+                operator,
+                conditions,
+            } => {
+                let conditions = conditions
+                    .iter()
+                    .map(Self::from_container)
+                    .collect::<Option<Vec<_>>>()?;
+                match operator {
+                    Operator::And => Self::All(conditions),
+                    Operator::Or => Self::Any(conditions),
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    fn from_scroll_state(
+        query: &lightningcss::rules::container::ScrollStateQuery<'_>,
+    ) -> Option<Self> {
+        use lightningcss::media_query::{
+            MediaFeatureName, MediaFeatureValue, Operator, QueryFeature,
         };
-        let ContainerCondition::ScrollState(ScrollStateQuery::Feature(feature)) =
-            rule.condition.as_ref()?
-        else {
-            return None;
+        use lightningcss::rules::container::{ScrollStateFeatureId, ScrollStateQuery};
+        let feature = match query {
+            ScrollStateQuery::Feature(feature) => feature,
+            ScrollStateQuery::Not(inner) => {
+                return Some(Self::Not(Box::new(Self::from_scroll_state(inner)?)));
+            }
+            ScrollStateQuery::Operation {
+                operator,
+                conditions,
+            } => {
+                let conditions = conditions
+                    .iter()
+                    .map(Self::from_scroll_state)
+                    .collect::<Option<Vec<_>>>()?;
+                return Some(match operator {
+                    Operator::And => Self::All(conditions),
+                    Operator::Or => Self::Any(conditions),
+                });
+            }
         };
         let scrollable = match feature {
             QueryFeature::Boolean {
@@ -185,15 +232,36 @@ impl ScrollQuery {
                 "right" => Scrollable::Right,
                 "top" => Scrollable::Top,
                 "bottom" => Scrollable::Bottom,
-                "x" => Scrollable::X,
-                "y" => Scrollable::Y,
+                "x" | "inline" => Scrollable::X,
+                "y" | "block" => Scrollable::Y,
                 _ => return None,
             },
             _ => return None,
         };
+        Some(Self::Feature(scrollable))
+    }
+
+    fn matches(&self, directions: cssimpler_core::ScrollDirections) -> bool {
+        match self {
+            Self::Feature(feature) => feature.matches(directions),
+            Self::Not(condition) => !condition.matches(directions),
+            Self::All(conditions) => conditions
+                .iter()
+                .all(|condition| condition.matches(directions)),
+            Self::Any(conditions) => conditions
+                .iter()
+                .any(|condition| condition.matches(directions)),
+        }
+    }
+}
+
+impl ScrollQuery {
+    pub(crate) fn from_rule(
+        rule: &lightningcss::rules::container::ContainerRule<'_, impl Clone>,
+    ) -> Option<Self> {
         Some(Self {
             name: rule.name.as_ref().map(|name| name.0.0.to_string()),
-            scrollable,
+            condition: ScrollCondition::from_container(rule.condition.as_ref()?)?,
         })
     }
 
@@ -214,6 +282,6 @@ impl ScrollQuery {
                         .is_none_or(|name| entry.names.contains(name))
             })
             .max_by_key(|entry| entry.element.children.len())
-            .is_some_and(|entry| self.scrollable.matches(entry.scrollable))
+            .is_some_and(|entry| self.condition.matches(entry.scrollable))
     }
 }

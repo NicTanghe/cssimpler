@@ -8,7 +8,7 @@ fn css_scrollable_queries_restyle_after_scroll_boundary_changes() {
     let sheet = parse_stylesheet(
         "panel { container: feed / scroll-state; }
          #status { width: 40px; height: 20px; background-color: red; }
-         @container feed scroll-state(scrollable: bottom) {
+         @container feed scroll-state((scrollable: bottom) and (not (scrollable: top))) {
              #status { background-color: blue; }
          }",
     )
