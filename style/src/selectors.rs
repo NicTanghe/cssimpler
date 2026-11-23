@@ -22,11 +22,13 @@ pub(crate) enum SelectorAnchor {
     Tag(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PseudoElementKind {
     Before,
     After,
     Selection,
+    Highlight(String),
+    SearchText { current: bool },
 }
 
 impl InteractionDependencies {
@@ -445,9 +447,15 @@ fn extract_compound_selector(
 ) -> Result<(CompoundSelector, Option<PseudoElementKind>), StyleError> {
     let mut pseudo_element = None;
 
+    let mut current = false;
+
     let simple_selectors = compound
         .iter()
         .map(|component| {
+            if matches!(component, Component::NonTSPseudoClass(PseudoClass::Current)) {
+                current = true;
+                return Ok(None);
+            }
             let (simple_selector, component_pseudo) = extract_simple_selector(selector, component)?;
 
             if component_pseudo.is_some_and(|p| pseudo_element.replace(p).is_some()) {
@@ -469,6 +477,13 @@ fn extract_compound_selector(
 
     if simple_selectors.is_empty() {
         return Err(unsupported_selector(selector));
+    }
+
+    if current {
+        if !matches!(pseudo_element, Some(PseudoElementKind::SearchText { .. })) {
+            return Err(unsupported_selector(selector));
+        }
+        pseudo_element = Some(PseudoElementKind::SearchText { current: true });
     }
 
     Ok((CompoundSelector::new(simple_selectors), pseudo_element))
@@ -523,6 +538,12 @@ fn extract_simple_selector(
         }
         Component::PseudoElement(LightningPseudoElement::Selection(_)) => {
             Ok((None, Some(PseudoElementKind::Selection)))
+        }
+        Component::PseudoElement(LightningPseudoElement::HighlightFunction { name }) => {
+            Ok((None, Some(PseudoElementKind::Highlight(name.0.to_string()))))
+        }
+        Component::PseudoElement(LightningPseudoElement::SearchText) => {
+            Ok((None, Some(PseudoElementKind::SearchText { current: false })))
         }
         Component::Combinator(LightningCombinator::PseudoElement) => Ok((None, None)),
         Component::ExplicitUniversalType => Ok((None, None)),

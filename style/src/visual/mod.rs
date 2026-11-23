@@ -1,4 +1,5 @@
 mod backdrop;
+mod blend;
 mod border;
 mod color;
 mod glass;
@@ -52,6 +53,12 @@ pub(crate) fn extract_property(
     }
 
     match property {
+        Property::MixBlendMode(mode) => {
+            Some(Ok(vec![Declaration::MixBlendMode(blend::extract(*mode))]))
+        }
+        Property::Custom(value) if value.name.as_ref() == "isolation" => {
+            Some(blend::isolation(property))
+        }
         Property::BackgroundColor(color) => Some(color::background_color_declaration(color)),
         Property::Background(backgrounds) => Some(
             gradient::background_declarations(backgrounds).map(|mut declarations| {
@@ -124,6 +131,14 @@ pub(crate) fn extract_property(
 
 pub(crate) fn apply_declaration(style: &mut Style, declaration: &Declaration) -> bool {
     match declaration {
+        Declaration::MixBlendMode(mode) => {
+            style.visual.mix_blend_mode = *mode;
+            true
+        }
+        Declaration::Isolation(isolate) => {
+            style.visual.isolate_blending = *isolate;
+            true
+        }
         Declaration::RasterSource(source) => {
             style.visual.raster_background.source = source.clone();
             true

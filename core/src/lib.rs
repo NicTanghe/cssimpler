@@ -12,6 +12,7 @@ macro_rules! event_builder_methods {
     };
 }
 
+mod blend;
 pub mod color;
 pub mod custom_properties;
 pub mod dom;
@@ -36,6 +37,7 @@ pub mod transitions;
 use crate::fonts::{PreparedTextLayout, TextStyle};
 use taffy::Style as TaffyStyle;
 
+pub use blend::MixBlendMode;
 pub use color::{Color, GradientInterpolation, LinearRgba};
 pub use custom_properties::CustomProperties;
 pub use dom::{
@@ -777,6 +779,8 @@ pub struct VisualStyle {
     /// Request a reusable raster layer for this subtree. Defaults to false.
     /// Layers share the renderer cache budget and create a stacking context.
     pub cache_layer: bool,
+    pub mix_blend_mode: MixBlendMode,
+    pub isolate_blending: bool,
     pub scroll_state_container: bool,
     pub container_names: Vec<String>,
     pub background: Option<Color>,
@@ -787,6 +791,7 @@ pub struct VisualStyle {
     pub text: TextStyle,
     pub text_stroke: TextStrokeStyle,
     pub text_shadows: Vec<ShadowEffect>,
+    pub text_highlights: Vec<TextSelectionRange>,
     pub filter_drop_shadows: Vec<ShadowEffect>,
     pub backdrop_blur_radius: f32,
     pub backdrop_occlusion: BackdropOcclusion,
@@ -809,6 +814,8 @@ impl Default for VisualStyle {
     fn default() -> Self {
         Self {
             cache_layer: false,
+            mix_blend_mode: MixBlendMode::Normal,
+            isolate_blending: false,
             scroll_state_container: false,
             container_names: Vec::new(),
             background: None,
@@ -819,6 +826,7 @@ impl Default for VisualStyle {
             text: TextStyle::default(),
             text_stroke: TextStrokeStyle::default(),
             text_shadows: Vec::new(),
+            text_highlights: Vec::new(),
             filter_drop_shadows: Vec::new(),
             backdrop_blur_radius: 0.0,
             backdrop_occlusion: BackdropOcclusion::None,

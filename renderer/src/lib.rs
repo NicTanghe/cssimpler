@@ -11,6 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod backdrop;
+mod blend;
+use color::{linear_to_srgb_unit, srgb_unit_to_linear};
 mod color;
 mod dpi;
 mod fonts;
@@ -1125,6 +1127,7 @@ fn node_can_use_promoted_surface(node: &RenderNode, cached_bounds: &CachedSubtre
         && !node.style.transform.uses_depth()
         && node.style.perspective.is_none()
         && node.style.transform_style == TransformStyleMode::Flat
+        && !cached_bounds.subtree_uses_mix_blend
         && !cached_bounds.subtree_uses_backdrop_blur
         && !cached_bounds.subtree_uses_backdrop_occlusion
         && !cached_bounds.subtree_uses_native_glass
@@ -3094,6 +3097,8 @@ fn render_nodes_match_own_visuals_ignoring_projection(
 
 fn visual_styles_match_ignoring_projection(left: &VisualStyle, right: &VisualStyle) -> bool {
     left.cache_layer == right.cache_layer
+        && left.mix_blend_mode == right.mix_blend_mode
+        && left.isolate_blending == right.isolate_blending
         && left.background == right.background
         && left.background_layers == right.background_layers
         && left.raster_background == right.raster_background
@@ -3102,6 +3107,7 @@ fn visual_styles_match_ignoring_projection(left: &VisualStyle, right: &VisualSty
         && left.text == right.text
         && left.text_stroke == right.text_stroke
         && left.text_shadows == right.text_shadows
+        && left.text_highlights == right.text_highlights
         && left.filter_drop_shadows == right.filter_drop_shadows
         && left.backdrop_blur_radius == right.backdrop_blur_radius
         && left.backdrop_occlusion == right.backdrop_occlusion
@@ -3131,6 +3137,7 @@ pub(crate) struct CachedSubtreeBounds {
     pub(crate) subtree_uses_backdrop_blur: bool,
     pub(crate) subtree_uses_backdrop_occlusion: bool,
     pub(crate) subtree_uses_native_glass: bool,
+    pub(crate) subtree_uses_mix_blend: bool,
     pub(crate) children: Vec<CachedSubtreeBounds>,
 }
 
@@ -3742,6 +3749,7 @@ fn draw_node_contents_internal(
         glass_mode,
         allow_surface_promotion,
         true,
+        false,
     );
 }
 
@@ -3771,6 +3779,7 @@ fn draw_node_contents_in_current_stacking_context(
         glass_mode,
         allow_surface_promotion,
         false,
+        false,
     );
 }
 
@@ -3787,6 +3796,7 @@ fn draw_node_contents_internal_impl(
     glass_mode: GlassRenderMode,
     allow_surface_promotion: bool,
     draw_deferred_stacking_contexts: bool,
+    drawing_blend_group: bool,
 ) {
     if clip.is_empty()
         || cached_bounds
@@ -3830,6 +3840,39 @@ fn draw_node_contents_internal_impl(
             clear_color,
             glass_mode,
             allow_surface_promotion,
+        );
+        return;
+    }
+
+    if !drawing_blend_group
+        && blend::needs_group(node, cached_bounds)
+        && let Some(bounds) = cached_bounds
+            .bounds
+            .and_then(|bounds| bounds.intersect(clip))
+    {
+        blend::draw_group(
+            node.style.mix_blend_mode,
+            buffer,
+            width,
+            height,
+            bounds,
+            |buffer| {
+                draw_node_contents_internal_impl(
+                    node,
+                    cached_bounds,
+                    buffer,
+                    width,
+                    height,
+                    clip,
+                    parent_perspective,
+                    in_3d_context,
+                    clear_color,
+                    glass_mode,
+                    false,
+                    draw_deferred_stacking_contexts,
+                    true,
+                );
+            },
         );
         return;
     }
@@ -4958,6 +5001,7 @@ fn draw_node_transformed_internal(
         glass_mode,
         allow_surface_promotion,
         true,
+        false,
     );
 }
 
@@ -4989,6 +5033,7 @@ fn draw_node_transformed_in_current_stacking_context(
         glass_mode,
         allow_surface_promotion,
         false,
+        false,
     );
 }
 
@@ -5006,6 +5051,7 @@ fn draw_node_transformed_internal_impl(
     glass_mode: GlassRenderMode,
     allow_surface_promotion: bool,
     draw_deferred_stacking_contexts: bool,
+    drawing_blend_group: bool,
 ) {
     if clip_state.coarse.is_empty()
         || cached_bounds
@@ -5045,6 +5091,41 @@ fn draw_node_transformed_internal_impl(
             glass_mode,
             allow_surface_promotion,
             draw_deferred_stacking_contexts,
+            drawing_blend_group,
+        );
+        return;
+    }
+
+    if !drawing_blend_group
+        && blend::needs_group(node, cached_bounds)
+        && let Some(bounds) = cached_bounds
+            .bounds
+            .and_then(|bounds| bounds.intersect(clip_state.coarse))
+    {
+        blend::draw_group(
+            node.style.mix_blend_mode,
+            buffer,
+            width,
+            height,
+            bounds,
+            |buffer| {
+                draw_node_transformed_internal_impl(
+                    node,
+                    cached_bounds,
+                    buffer,
+                    width,
+                    height,
+                    parent_world_matrix,
+                    parent_perspective,
+                    clip_state,
+                    in_3d_context,
+                    clear_color,
+                    glass_mode,
+                    false,
+                    draw_deferred_stacking_contexts,
+                    true,
+                );
+            },
         );
         return;
     }
@@ -7181,6 +7262,9 @@ fn cache_subtree_bounds(
                     .any(|child| child.subtree_uses_backdrop_occlusion),
             subtree_uses_native_glass: node.style.native_material == NativeMaterial::Glass
                 || children.iter().any(|child| child.subtree_uses_native_glass),
+            subtree_uses_mix_blend: node.style.mix_blend_mode
+                != cssimpler_core::MixBlendMode::Normal
+                || children.iter().any(|child| child.subtree_uses_mix_blend),
             children,
         };
     };
@@ -7234,6 +7318,8 @@ fn cache_subtree_bounds(
                 .any(|child| child.subtree_uses_backdrop_occlusion),
         subtree_uses_native_glass: node.style.native_material == NativeMaterial::Glass
             || children.iter().any(|child| child.subtree_uses_native_glass),
+        subtree_uses_mix_blend: node.style.mix_blend_mode != cssimpler_core::MixBlendMode::Normal
+            || children.iter().any(|child| child.subtree_uses_mix_blend),
         children,
     }
 }
