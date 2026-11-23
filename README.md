@@ -369,3 +369,10 @@ draggable strip at the top of the client area. Interactive content takes priorit
 edges and corners with matching pointer cursors. Both measurements use logical
 pixels and default to zero. Resizing takes priority over dragging and is disabled
 for decorated, maximized, fullscreen, or non-resizable windows.
+
+### Custom element state
+
+Set the `data-cssimpler-state` attribute to a space-separated list of
+case-sensitive states. For example, `<button data-cssimpler-state="busy primary">`
+matches `button:state(busy)`. Compute the attribute from application state when
+building the view, like you would for a class.
