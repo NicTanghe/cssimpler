@@ -1,5 +1,8 @@
 mod input;
 mod scene_transition;
+mod update_handle;
+
+pub use update_handle::UpdateHandle;
 
 use crate::actions::{ActionQueue, ActionSource};
 use std::collections::HashMap;
@@ -404,6 +407,8 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     update: Update,
     view: View,
     action_source: Option<Arc<dyn ActionSource>>,
+    update_handle: Option<UpdateHandle>,
+    update_deadline: Option<fn(&State) -> Option<Instant>>,
     runtime_world: RuntimeWorld,
     text_inputs: NativeTextInputs,
     render_mode: RenderMode,
@@ -482,6 +487,8 @@ where
             update,
             view,
             action_source: None,
+            update_handle: None,
+            update_deadline: None,
             runtime_world: RuntimeWorld::default(),
             text_inputs: NativeTextInputs::default(),
             render_mode: RenderMode::OnInvalidation,
@@ -565,6 +572,22 @@ where
     /// still reusing clean scenes in [`RenderMode::OnInvalidation`].
     pub fn with_continuous_updates(mut self, enabled: bool) -> Self {
         self.continuous_updates = enabled;
+        self
+    }
+
+    /// Allow a background producer to request a coalesced application update.
+    pub fn with_update_handle(mut self, handle: UpdateHandle) -> Self {
+        self.update_handle = Some(handle);
+        self
+    }
+
+    /// Supply the next application update deadline. Return `None` while idle.
+    ///
+    /// Update the underlying state when the deadline is handled so the callback
+    /// returns a future deadline or `None`. Any earlier update can also change
+    /// or cancel the deadline.
+    pub fn with_update_deadline(mut self, deadline: fn(&State) -> Option<Instant>) -> Self {
+        self.update_deadline = Some(deadline);
         self
     }
 
@@ -686,6 +709,9 @@ where
     }
 
     fn advance(&mut self, frame: FrameInfo) {
+        if let Some(handle) = &self.update_handle {
+            handle.begin_update();
+        }
         let mut stats = RuntimeStats::default();
         let update = &mut self.update;
         let state = &mut self.state;
@@ -1047,6 +1073,17 @@ where
         if let Some(source) = &self.action_source {
             source.install_wake(wake);
         }
+    }
+
+    fn install_update_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
+        if let Some(handle) = &self.update_handle {
+            handle.install_wake(wake);
+        }
+    }
+
+    fn next_update_at(&self) -> Option<Instant> {
+        self.update_deadline
+            .and_then(|deadline| deadline(&self.state))
     }
 
     fn can_close(&mut self) -> bool {
@@ -2462,6 +2499,34 @@ mod tests {
             SceneProvider::redraw_schedule(&app),
             RedrawSchedule::EveryFrame
         );
+    }
+
+    #[test]
+    fn update_deadline_is_read_from_state_and_can_be_consumed_without_a_rebuild() {
+        let stylesheet = Stylesheet::default();
+        let deadline = std::time::Instant::now();
+        let views = Cell::new(0);
+        let mut app = App::new(
+            None::<std::time::Instant>,
+            &stylesheet,
+            |deadline, _| {
+                deadline.take();
+                Invalidation::Clean
+            },
+            |_| {
+                views.set(views.get() + 1);
+                ui! { <div></div> }
+            },
+        )
+        .with_update_deadline(|deadline| *deadline);
+
+        app.frame(frame(0));
+        assert_eq!(SceneProvider::next_update_at(&app), None);
+        *app.state_mut() = Some(deadline);
+        assert_eq!(SceneProvider::next_update_at(&app), Some(deadline));
+        app.frame(frame(1));
+        assert_eq!(SceneProvider::next_update_at(&app), None);
+        assert_eq!(views.get(), 1);
     }
 
     #[test]
