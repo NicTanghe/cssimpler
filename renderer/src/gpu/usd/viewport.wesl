@@ -1,3 +1,6 @@
+import package::studio_uniform::studio;
+@if(shadow_maps) import package::shadow::key_visibility;
+
 struct Camera {
     view_projection: mat4x4<f32>,
     view: mat4x4<f32>,
@@ -6,18 +9,10 @@ struct Camera {
 }
 @group(0) @binding(0) var<uniform> camera: Camera;
 
-struct Studio {
-    light_projection: mat4x4<f32>,
-    key: vec4<f32>,
-    up: vec4<f32>,
-    lighting: vec4<f32>,
-    occlusion_plane: vec4<f32>,
-    shadows: vec4<f32>,
-    key_tint: vec4<f32>,
-    fill: vec4<f32>,
-    fill_tint: vec4<f32>,
+@if(!shadow_maps)
+fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -> f32 {
+    return 1.0;
 }
-@group(0) @binding(1) var<uniform> studio: Studio;
 
 struct Material {
     color: vec4<f32>,

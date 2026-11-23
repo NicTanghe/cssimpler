@@ -1,7 +1,9 @@
+import package::studio_uniform::studio;
+
 @group(2) @binding(0) var shadow_map: texture_depth_2d;
 @group(2) @binding(1) var shadow_sampler: sampler_comparison;
 
-fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -> f32 {
+public fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -> f32 {
     let light = studio.light_projection * vec4(position, 1.0);
     let uv = light.xy * vec2(0.5, -0.5) + vec2(0.5);
 
