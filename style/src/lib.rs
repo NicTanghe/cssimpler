@@ -95,6 +95,8 @@ pub struct Stylesheet {
     pub rules: Vec<StyleRule>,
     registrations: Vec<custom_properties::Registration>,
     index: StylesheetIndex,
+    scroll_snapshot: std::sync::Arc<[cssimpler_core::ScrollState]>,
+    has_scroll_queries: bool,
 }
 
 impl Stylesheet {
@@ -111,7 +113,10 @@ impl Stylesheet {
         {
             return std::borrow::Cow::Borrowed(self);
         }
-        let mut filtered = Self::default();
+        let mut filtered = Self {
+            scroll_snapshot: self.scroll_snapshot.clone(),
+            ..Self::default()
+        };
         for rule in &self.rules {
             if rule
                 .media_conditions
@@ -136,7 +141,18 @@ impl Stylesheet {
         std::borrow::Cow::Owned(filtered)
     }
 
+    pub fn has_scroll_queries(&self) -> bool {
+        self.has_scroll_queries
+    }
+
+    pub fn with_scroll_snapshot(&self, snapshot: &[cssimpler_core::ScrollState]) -> Self {
+        let mut sheet = self.clone();
+        sheet.scroll_snapshot = std::sync::Arc::from(snapshot);
+        sheet
+    }
+
     pub fn push(&mut self, rule: StyleRule) {
+        self.has_scroll_queries |= !rule.scroll_queries.is_empty();
         self.index.insert(self.rules.len(), &rule);
         self.rules.push(rule);
     }
@@ -145,9 +161,11 @@ impl Stylesheet {
         &'a self,
         element: ElementRef<'a>,
     ) -> impl Iterator<Item = &'a StyleRule> {
-        self.rules
-            .iter()
-            .filter(move |rule| rule.container_names.is_empty() && rule.selector.matches(element))
+        self.rules.iter().filter(move |rule| {
+            rule.container_names.is_empty()
+                && rule.scroll_queries.is_empty()
+                && rule.selector.matches(element)
+        })
     }
 
     pub fn matching_rules_with_context<'a>(
@@ -254,7 +272,10 @@ impl Stylesheet {
             let Some(rule) = self.rules.get(index) else {
                 return false;
             };
-            rule.may_match_pseudo_and_interaction(pseudo_element.as_ref(), interaction)
+            rule.scroll_queries
+                .iter()
+                .all(|query| query.matches(&self.scroll_snapshot, element_path))
+                && rule.may_match_pseudo_and_interaction(pseudo_element.as_ref(), interaction)
                 && rule.selector.matches_with_ancestors_interaction_and_pseudo(
                     element,
                     ancestors,
@@ -407,6 +428,7 @@ pub struct StyleRule {
     interaction_dependencies: InteractionDependencies,
     media_conditions: Vec<media::Condition>,
     container_names: Vec<String>,
+    scroll_queries: Vec<containers::ScrollQuery>,
 }
 
 impl StyleRule {
@@ -423,6 +445,7 @@ impl StyleRule {
         Self {
             media_conditions: Vec::new(),
             container_names: Vec::new(),
+            scroll_queries: Vec::new(),
             interaction_dependencies: selector.interaction_dependencies(),
             selector,
             declarations,
@@ -470,6 +493,7 @@ pub enum Declaration {
     AnchorArea(Option<AnchorArea>),
     AnchorFallbacks(Vec<AnchorFallback>),
     ContainerNames(Vec<String>),
+    ScrollStateContainer(bool),
     CustomProperty {
         name: String,
         value: String,
@@ -703,6 +727,13 @@ fn collect_style_rules_lossy(rule_list: &CssRuleList<'_, impl Clone>, stylesheet
                     for rule in &mut stylesheet.rules[start..] {
                         rule.container_names.push(name.0.0.to_string());
                     }
+                } else if let Some(query) = containers::ScrollQuery::from_rule(container_rule) {
+                    stylesheet.has_scroll_queries = true;
+                    let start = stylesheet.rules.len();
+                    collect_style_rules_lossy(&container_rule.rules, stylesheet);
+                    for rule in &mut stylesheet.rules[start..] {
+                        rule.scroll_queries.push(query.clone());
+                    }
                 }
             }
             CssRule::Scope(scope_rule) => {
@@ -774,6 +805,13 @@ fn collect_style_rules(
                     collect_style_rules(&container_rule.rules, stylesheet)?;
                     for rule in &mut stylesheet.rules[start..] {
                         rule.container_names.push(name.0.0.to_string());
+                    }
+                } else if let Some(query) = containers::ScrollQuery::from_rule(container_rule) {
+                    stylesheet.has_scroll_queries = true;
+                    let start = stylesheet.rules.len();
+                    collect_style_rules(&container_rule.rules, stylesheet)?;
+                    for rule in &mut stylesheet.rules[start..] {
+                        rule.scroll_queries.push(query.clone());
                     }
                 }
             }
@@ -1081,8 +1119,20 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
         return Ok(vec![declaration]);
     }
 
+    use lightningcss::properties::contain::ContainerType;
+    if let Property::ContainerType(value) = property {
+        return Ok(vec![Declaration::ScrollStateContainer(
+            *value == ContainerType::ScrollState,
+        )]);
+    }
     if let Some(declaration) = containers::extract_names(property) {
-        return Ok(vec![declaration]);
+        let mut declarations = vec![declaration];
+        if let Property::Container(container) = property {
+            declarations.push(Declaration::ScrollStateContainer(
+                container.container_type == ContainerType::ScrollState,
+            ));
+        }
+        return Ok(declarations);
     }
 
     if let Some(declarations) = custom_properties::extract_property(property) {
@@ -1967,7 +2017,10 @@ fn apply_declaration(
     }
 
     match declaration {
-        Declaration::ContainerNames(_) => {}
+        Declaration::ContainerNames(names) => style.visual.container_names.clone_from(names),
+        Declaration::ScrollStateContainer(enabled) => {
+            style.visual.scroll_state_container = *enabled
+        }
         Declaration::Content(value) => {
             style.generated_text = value.clone().map(attribute_text_source_to_core);
         }

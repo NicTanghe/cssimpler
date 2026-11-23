@@ -25,7 +25,9 @@ mod input;
 mod layer_cache_tests;
 mod native_glass;
 mod runtime;
+mod scroll_state;
 mod scrollbar;
+pub use cssimpler_core::{ScrollDirections, ScrollState};
 mod selection_geometry;
 mod shadow;
 mod shapes;
@@ -1450,6 +1452,17 @@ pub trait SceneProvider {
     /// Return a one-shot deadline for the next update, or `None` to wait for input.
     fn next_update_at(&self) -> Option<Instant> {
         None
+    }
+
+    /// Opt in to notifications when native scroll directions change.
+    fn tracks_scroll_state(&self) -> bool {
+        false
+    }
+
+    /// Receive the post-input scroll snapshot before painting the frame.
+    /// Return true to schedule a follow-up update that uses the new state.
+    fn set_scroll_state(&mut self, _scroll_state: &[ScrollState]) -> bool {
+        false
     }
 
     /// Transfer optional native GPU viewport registrations to the window runtime.

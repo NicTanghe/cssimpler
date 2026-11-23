@@ -157,3 +157,21 @@ impl ScrollbarData {
         self.metrics.offset_x.abs() > f32::EPSILON || self.metrics.offset_y.abs() > f32::EPSILON
     }
 }
+
+/// Directions in which an element can scroll from its current native offset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScrollDirections {
+    pub left: bool,
+    pub right: bool,
+    pub up: bool,
+    pub down: bool,
+}
+
+/// Geometry-independent scroll state sent to an interested scene provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScrollState {
+    pub element: crate::ElementPath,
+    pub scrollable: ScrollDirections,
+    pub query_container: bool,
+    pub names: Vec<String>,
+}

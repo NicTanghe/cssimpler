@@ -53,8 +53,8 @@ pub use runtime_ecs::{
     RuntimeSyncResult, RuntimeViewport, RuntimeWorld,
 };
 pub use scrollbar::{
-    OverflowMode, ScrollbarAxisState, ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics,
-    ScrollbarStyle, ScrollbarWidth,
+    OverflowMode, ScrollDirections, ScrollState, ScrollbarAxisState, ScrollbarData,
+    ScrollbarInteractionState, ScrollbarMetrics, ScrollbarStyle, ScrollbarWidth,
 };
 pub use stacking::{establishes_stacking_context, stacking_context_level};
 pub use svg::{
@@ -781,6 +781,8 @@ pub struct VisualStyle {
     pub cache_layer: bool,
     pub mix_blend_mode: MixBlendMode,
     pub isolate_blending: bool,
+    pub scroll_state_container: bool,
+    pub container_names: Vec<String>,
     pub background: Option<Color>,
     pub background_layers: Vec<BackgroundLayer>,
     pub raster_background: images::RasterBackground,
@@ -814,6 +816,8 @@ impl Default for VisualStyle {
             cache_layer: false,
             mix_blend_mode: MixBlendMode::Normal,
             isolate_blending: false,
+            scroll_state_container: false,
+            container_names: Vec::new(),
             background: None,
             background_layers: Vec::new(),
             raster_background: images::RasterBackground::default(),

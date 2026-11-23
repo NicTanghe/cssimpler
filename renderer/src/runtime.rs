@@ -287,6 +287,7 @@ struct RuntimeApp<P> {
     previous_presented_bounds: Option<CachedSceneBounds>,
     previous_presented_indicator: Option<scrollbar::AutoScrollIndicator>,
     scrollbar_controller: scrollbar::ScrollbarController,
+    scroll_state: Option<Vec<crate::ScrollState>>,
     native_glass_active: bool,
     native_glass_tint: Option<Color>,
     native_glass_diagnostic: Option<String>,
@@ -343,6 +344,7 @@ where
             previous_presented_bounds: None,
             previous_presented_indicator: None,
             scrollbar_controller: scrollbar::ScrollbarController::default(),
+            scroll_state: None,
             native_glass_active: false,
             native_glass_tint: None,
             native_glass_diagnostic: None,
@@ -1100,6 +1102,20 @@ where
             );
         }
 
+        let scroll_state_changed = if self.scene_provider.tracks_scroll_state() {
+            let snapshot = crate::scroll_state::snapshot(&scene);
+            if self.scroll_state.as_ref() == Some(&snapshot) {
+                false
+            } else {
+                let redraw = self.scene_provider.set_scroll_state(&snapshot);
+                self.scroll_state = Some(snapshot);
+                redraw
+            }
+        } else {
+            self.scroll_state = None;
+            false
+        };
+
         frame_stats.scene_prep_us = duration_to_us(scene_prep_start.elapsed());
         // Install/clear the macOS glass content view before attaching GPU layers.
         let native_glass = summarize_native_glass(&scene);
@@ -1333,7 +1349,7 @@ where
         frame_stats.total_us = duration_to_us(frame_begin.elapsed());
         record_frame_timing_stats(frame_stats);
         self.frame_index = self.frame_index.saturating_add(1);
-        self.immediate_redraw = false;
+        self.immediate_redraw = scroll_state_changed;
         self.next_redraw_at = self
             .wants_continuous_redraw()
             .then_some(now + self.config.frame_time);
