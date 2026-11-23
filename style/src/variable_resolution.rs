@@ -236,6 +236,20 @@ fn resolve_variable_dependent_property(
     Ok(declarations)
 }
 
+pub(crate) fn resolve_custom_property_value(
+    name: &str,
+    value: &str,
+    properties: &CustomProperties,
+) -> Result<String, StyleError> {
+    let property = Property::parse_string(PropertyId::from(name), value, ParserOptions::default())
+        .map_err(|_| invalid_custom_property_value(name, value))?;
+    if !property_contains_var_reference(&property) {
+        return Ok(value.to_string());
+    }
+    let variables = custom_property_tokens(properties)?;
+    resolve_property_value_css(name, value, property, &variables)
+}
+
 fn custom_property_tokens<'a>(
     custom_properties: &'a CustomProperties,
 ) -> Result<HashMap<&'a str, TokenList<'a>>, StyleError> {
@@ -282,7 +296,7 @@ fn resolve_property_value_css<'a>(
                 )
             })
         }
-        Property::Custom(custom) if !custom.name.as_ref().starts_with("--") => {
+        Property::Custom(custom) => {
             let resolved_tokens = substitute_token_list(
                 &custom.value,
                 variables,

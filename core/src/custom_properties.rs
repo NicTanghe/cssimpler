@@ -24,6 +24,10 @@ impl CustomProperties {
         self.values.insert(name.into(), value.into());
     }
 
+    pub fn remove(&mut self, name: &str) {
+        self.values.remove(name);
+    }
+
     pub fn inherit_from(&mut self, inherited: &Self) {
         for (name, value) in &inherited.values {
             self.values
