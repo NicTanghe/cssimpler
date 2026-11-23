@@ -16,6 +16,7 @@ use crate::{ElementRef, PseudoElementKind, Stylesheet};
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedElement {
     pub(crate) element_id: Option<String>,
+    anchor: crate::anchors::Placement,
     pub(crate) style: Style,
     pub(crate) text: String,
     pub(crate) svg_scene: Option<SvgScene>,
@@ -27,6 +28,7 @@ pub(crate) struct ResolvedElement {
 #[derive(Clone, Debug)]
 struct LayoutTree {
     node_id: NodeId,
+    anchor: crate::anchors::Placement,
     element_id: Option<String>,
     style: Style,
     text: String,
@@ -46,6 +48,7 @@ struct LeafMeasureContext {
 #[derive(Clone, Debug)]
 pub struct ResolvedRenderTree {
     root: ResolvedElement,
+    has_anchor_rules: bool,
 }
 
 pub struct LaidOutRenderTree {
@@ -84,6 +87,7 @@ pub fn resolve_render_tree_with_interaction_at_path(
     };
 
     ResolvedRenderTree {
+        has_anchor_rules: stylesheet.index.has_anchor_rules,
         root: resolve_element_tree(
             root_element,
             stylesheet,
@@ -109,6 +113,7 @@ pub fn resolve_render_tree_with_interaction_in_root(
 
     if element_path.children.is_empty() {
         return ResolvedRenderTree {
+            has_anchor_rules: stylesheet.index.has_anchor_rules,
             root: resolve_element_tree(
                 root_element,
                 stylesheet,
@@ -186,6 +191,7 @@ pub fn resolve_render_tree_with_interaction_in_root(
     }
 
     ResolvedRenderTree {
+        has_anchor_rules: stylesheet.index.has_anchor_rules,
         root: resolve_element_tree(
             current_element,
             stylesheet,
@@ -233,6 +239,7 @@ pub fn layout_resolved_render_tree_in_viewport(
         let mut stretched_root = resolved.root().clone();
         auto_stretch_root_to_viewport(&mut stretched_root.style.layout.taffy);
         let stretched = ResolvedRenderTree {
+            has_anchor_rules: resolved.has_anchor_rules,
             root: stretched_root,
         };
         layout_resolved_render_tree(&stretched, available_space)
@@ -242,13 +249,66 @@ pub fn layout_resolved_render_tree_in_viewport(
 }
 
 pub fn extract_render_tree(layout: &mut LaidOutRenderTree) -> RenderNode {
-    render_node_from_layout(&layout.root, &mut layout.taffy, 0.0, 0.0)
+    let mut render = render_node_from_layout(&layout.root, &mut layout.taffy, 0.0, 0.0);
+    if has_anchor_placement(&layout.root) {
+        let containing = render.layout;
+        place_anchors(
+            &layout.root,
+            &mut render,
+            containing,
+            (0.0, 0.0),
+            &mut Default::default(),
+        );
+    }
+    render
+}
+
+fn has_anchor_placement(tree: &LayoutTree) -> bool {
+    tree.anchor.target.is_some() || tree.children.iter().any(has_anchor_placement)
+}
+
+fn place_anchors(
+    tree: &LayoutTree,
+    node: &mut RenderNode,
+    containing: LayoutBox,
+    (mut dx, mut dy): (f32, f32),
+    anchors: &mut crate::anchors::Anchors,
+) {
+    crate::anchors::move_rect(node, dx, dy);
+    if tree.style.layout.taffy.position == taffy::style::Position::Absolute
+        && let Some(anchor) = tree
+            .anchor
+            .target
+            .as_ref()
+            .and_then(|name| anchors.get(name))
+        && let Some((x, y)) =
+            crate::anchors::choose_position(&tree.anchor, *anchor, node.layout, containing)
+    {
+        dx += x - node.layout.x;
+        dy += y - node.layout.y;
+        node.layout.x = x;
+        node.layout.y = y;
+    }
+    for name in &tree.anchor.names {
+        anchors.insert(name.clone(), node.layout);
+    }
+    let containing = if node.style.positioned {
+        node.layout
+    } else {
+        containing
+    };
+    for (child, node) in tree.children.iter().zip(&mut node.children) {
+        place_anchors(child, node, containing, (dx, dy), anchors);
+    }
 }
 
 pub fn rebuild_resolved_render_tree_with_cached_layout(
     resolved: &ResolvedRenderTree,
     template: &RenderNode,
 ) -> Option<RenderNode> {
+    if resolved.has_anchor_rules {
+        return None;
+    }
     render_node_with_cached_layout(resolved.root(), template)
 }
 
@@ -294,7 +354,10 @@ pub fn rebuild_render_tree_with_cached_layout(
         element_path,
     );
     rebuild_resolved_render_tree_with_cached_layout(
-        &ResolvedRenderTree { root: resolved },
+        &ResolvedRenderTree {
+            root: resolved,
+            has_anchor_rules: stylesheet.index.has_anchor_rules,
+        },
         template,
     )
 }
@@ -374,6 +437,12 @@ pub(crate) fn resolve_element_tree(
         element_path,
         None,
     );
+    let anchor = stylesheet.anchor_placement(
+        ElementRef::from(element),
+        ancestors,
+        element_path,
+        interaction,
+    );
     if element.tag == "img" {
         if let Some(source) = element.attribute("src") {
             style.visual.raster_background.source = Some(source.to_owned());
@@ -416,6 +485,7 @@ pub(crate) fn resolve_element_tree(
         crate::svg::apply_svg_root_intrinsic_size(&mut style, scene.view_box);
         return ResolvedElement {
             element_id: element.id.clone(),
+            anchor,
             style,
             text: String::new(),
             svg_scene: Some(scene.clone()),
@@ -435,6 +505,7 @@ pub(crate) fn resolve_element_tree(
         );
         return ResolvedElement {
             element_id: element.id.clone(),
+            anchor,
             style: resolved_svg.style,
             text: String::new(),
             svg_scene: Some(resolved_svg.scene),
@@ -452,6 +523,7 @@ pub(crate) fn resolve_element_tree(
     if style.layout.taffy.display == TaffyDisplay::None {
         return ResolvedElement {
             element_id: element.id.clone(),
+            anchor,
             style,
             text: String::new(),
             svg_scene: None,
@@ -499,6 +571,7 @@ pub(crate) fn resolve_element_tree(
     {
         return ResolvedElement {
             element_id: element.id.clone(),
+            anchor,
             style,
             text: direct_text,
             svg_scene: None,
@@ -554,6 +627,7 @@ pub(crate) fn resolve_element_tree(
 
     ResolvedElement {
         element_id: element.id.clone(),
+        anchor,
         style,
         text: String::new(),
         svg_scene: None,
@@ -630,6 +704,7 @@ fn build_layout_tree(
     };
 
     LayoutTree {
+        anchor: resolved.anchor.clone(),
         node_id,
         element_id: resolved.element_id.clone(),
         style: resolved.style.clone(),
@@ -984,6 +1059,7 @@ fn resolve_pseudo_element_tree(
 
     Some(ResolvedElement {
         element_id: None,
+        anchor: Default::default(),
         style,
         text,
         svg_scene: None,
@@ -1020,6 +1096,7 @@ fn flush_text_child(
 
     children.push(ResolvedElement {
         element_id: None,
+        anchor: Default::default(),
         style: text_child_style(parent_style),
         text: std::mem::take(pending_text),
         svg_scene: None,

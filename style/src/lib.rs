@@ -1,3 +1,5 @@
+mod anchors;
+pub use anchors::{AnchorArea, AnchorFallback};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -89,6 +91,7 @@ pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
+    position_tries: HashMap<String, AnchorArea>,
     pub rules: Vec<StyleRule>,
     registrations: Vec<custom_properties::Registration>,
     index: StylesheetIndex,
@@ -129,6 +132,7 @@ impl Stylesheet {
                 filtered.registrations.push(active);
             }
         }
+        filtered.position_tries.clone_from(&self.position_tries);
         std::borrow::Cow::Owned(filtered)
     }
 
@@ -178,6 +182,41 @@ impl Stylesheet {
             pseudo_element,
         );
         indices.into_iter().map(move |i| &self.rules[i])
+    }
+
+    pub(crate) fn anchor_placement(
+        &self,
+        element: ElementRef<'_>,
+        ancestors: &[ElementRef<'_>],
+        path: &ElementPath,
+        interaction: &ElementInteractionState,
+    ) -> anchors::Placement {
+        let mut placement = anchors::Placement::default();
+        if !self.index.has_anchor_rules {
+            return placement;
+        }
+        for rule in self.matching_rules_with_context(element, ancestors, path, interaction) {
+            for declaration in &rule.declarations {
+                match declaration {
+                    Declaration::AnchorNames(names) => placement.names.clone_from(names),
+                    Declaration::PositionAnchor(target) => placement.target.clone_from(target),
+                    Declaration::AnchorArea(area) => placement.area = *area,
+                    Declaration::AnchorFallbacks(fallbacks) => {
+                        placement.fallbacks.clone_from(fallbacks)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        placement.fallback_areas = placement
+            .fallbacks
+            .iter()
+            .filter_map(|fallback| match fallback {
+                AnchorFallback::Area(area) => Some(*area),
+                AnchorFallback::Named(name) => self.position_tries.get(name).copied(),
+            })
+            .collect();
+        placement
     }
 
     fn matching_rule_indices_with_context_and_pseudo<'a>(
@@ -238,12 +277,22 @@ struct StylesheetIndex {
     interactive_only_hover_active_rules: Vec<usize>,
     unanchored_rules: Vec<usize>,
     container_name_rules: Vec<usize>,
+    has_anchor_rules: bool,
     hover_rules: Vec<usize>,
     active_rules: Vec<usize>,
 }
 
 impl StylesheetIndex {
     fn insert(&mut self, index: usize, rule: &StyleRule) {
+        self.has_anchor_rules |= rule.declarations.iter().any(|declaration| {
+            matches!(
+                declaration,
+                Declaration::AnchorNames(_)
+                    | Declaration::PositionAnchor(_)
+                    | Declaration::AnchorArea(_)
+                    | Declaration::AnchorFallbacks(_)
+            )
+        });
         if rule
             .declarations
             .iter()
@@ -416,6 +465,10 @@ impl StyleRule {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Declaration {
     Content(Option<AttributeTextSource>),
+    AnchorNames(Vec<String>),
+    PositionAnchor(Option<String>),
+    AnchorArea(Option<AnchorArea>),
+    AnchorFallbacks(Vec<AnchorFallback>),
     ContainerNames(Vec<String>),
     CustomProperty {
         name: String,
@@ -585,6 +638,7 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
     let mut stylesheet = Stylesheet::default();
     collect_style_rules(&parsed.rules, &mut stylesheet)?;
     stylesheet.registrations = custom_properties::collect_registrations(&parsed.rules);
+    stylesheet.position_tries = anchors::collect_position_tries(&parsed.rules);
 
     Ok(stylesheet)
 }
@@ -611,6 +665,7 @@ pub fn parse_stylesheet_lossy(source: &str) -> Result<Stylesheet, StyleError> {
     let mut stylesheet = Stylesheet::default();
     collect_style_rules_lossy(&parsed.rules, &mut stylesheet);
     stylesheet.registrations = custom_properties::collect_registrations(&parsed.rules);
+    stylesheet.position_tries = anchors::collect_position_tries(&parsed.rules);
 
     Ok(stylesheet)
 }
@@ -731,7 +786,8 @@ fn collect_style_rules(
             CssRule::MozDocument(document_rule) => {
                 collect_style_rules(&document_rule.rules, stylesheet)?;
             }
-            CssRule::NestedDeclarations(_)
+            CssRule::PositionTry(_)
+            | CssRule::NestedDeclarations(_)
             | CssRule::Import(_)
             | CssRule::Keyframes(_)
             | CssRule::FontFace(_)
@@ -743,10 +799,6 @@ fn collect_style_rules(
             | CssRule::Viewport(_)
             | CssRule::CustomMedia(_)
             | CssRule::LayerStatement(_)
-            // `@position-try` defines anchor-positioning fallbacks. Nothing in
-            // the box model consumes them yet, so it is skipped like the other
-            // at-rules that carry no style rules.
-            | CssRule::PositionTry(_)
             | CssRule::Property(_)
             | CssRule::ViewTransition(_)
             | CssRule::Unknown(_)
@@ -1025,6 +1077,9 @@ fn contextualize_property_error(property: &Property<'_>, error: StyleError) -> S
 
 fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleError> {
     reject_unsupported_attr_usage(property)?;
+    if let Some(declaration) = anchors::extract(property) {
+        return Ok(vec![declaration]);
+    }
 
     if let Some(declaration) = containers::extract_names(property) {
         return Ok(vec![declaration]);
@@ -1916,6 +1971,10 @@ fn apply_declaration(
         Declaration::Content(value) => {
             style.generated_text = value.clone().map(attribute_text_source_to_core);
         }
+        Declaration::AnchorNames(_)
+        | Declaration::PositionAnchor(_)
+        | Declaration::AnchorArea(_)
+        | Declaration::AnchorFallbacks(_) => {}
         Declaration::OverflowX(mode) => {
             style.layout.taffy.overflow.x = visual::taffy_overflow_from_mode(*mode);
             style.visual.overflow.x = *mode;
