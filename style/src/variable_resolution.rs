@@ -205,7 +205,7 @@ fn resolve_variable_dependent_property(
         value_css,
         property,
         &variables,
-        current_color,
+        Some(current_color),
     )?;
     let resolved_property = Property::parse_string(
         PropertyId::from(property_name),
@@ -249,6 +249,50 @@ fn resolve_variable_dependent_property(
     Ok(declarations)
 }
 
+pub(crate) fn resolve_custom_property_value(
+    name: &str,
+    value: &str,
+    properties: &CustomProperties,
+) -> Result<String, StyleError> {
+    let property = Property::parse_string(PropertyId::from(name), value, ParserOptions::default())
+        .map_err(|_| invalid_custom_property_value(name, value))?;
+    if !property_contains_var_reference(&property) {
+        return Ok(value.to_string());
+    }
+    let variables = custom_property_tokens(properties)?;
+    resolve_property_value_css(name, value, property, &variables, None)
+}
+
+pub(crate) fn custom_property_dependencies(name: &str, value: &str) -> Vec<String> {
+    fn visit(tokens: &TokenList<'_>, names: &mut Vec<String>) {
+        for token in &tokens.0 {
+            match token {
+                TokenOrValue::Var(variable) => {
+                    names.push(variable.name.ident.0.to_string());
+                    if let Some(fallback) = &variable.fallback {
+                        visit(fallback, names);
+                    }
+                }
+                TokenOrValue::Function(function) => visit(&function.arguments, names),
+                TokenOrValue::Env(environment) => {
+                    if let Some(fallback) = &environment.fallback {
+                        visit(fallback, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut names = Vec::new();
+    if let Ok(Property::Custom(custom)) =
+        Property::parse_string(PropertyId::from(name), value, ParserOptions::default())
+    {
+        visit(&custom.value, &mut names);
+    }
+    names
+}
+
 fn custom_property_tokens<'a>(
     custom_properties: &'a CustomProperties,
 ) -> Result<HashMap<&'a str, TokenList<'a>>, StyleError> {
@@ -272,7 +316,7 @@ fn resolve_property_value_css<'a>(
     value_css: &str,
     property: Property<'a>,
     variables: &HashMap<&'a str, TokenList<'a>>,
-    current_color: Color,
+    current_color: Option<Color>,
 ) -> Result<String, StyleError> {
     match property {
         Property::Unparsed(unparsed) => {
@@ -283,7 +327,9 @@ fn resolve_property_value_css<'a>(
                 property_name,
                 value_css,
             )?;
-            substitute_relative_current_alpha(&mut resolved_tokens, false, current_color);
+            if let Some(color) = current_color {
+                substitute_relative_current_alpha(&mut resolved_tokens, false, color);
+            }
             Property::Unparsed(UnparsedProperty {
                 property_id: unparsed.property_id,
                 value: resolved_tokens,
@@ -297,7 +343,7 @@ fn resolve_property_value_css<'a>(
                 )
             })
         }
-        Property::Custom(custom) if !custom.name.as_ref().starts_with("--") => {
+        Property::Custom(custom) => {
             let mut resolved_tokens = substitute_token_list(
                 &custom.value,
                 variables,
@@ -305,7 +351,9 @@ fn resolve_property_value_css<'a>(
                 property_name,
                 value_css,
             )?;
-            substitute_relative_current_alpha(&mut resolved_tokens, false, current_color);
+            if let Some(color) = current_color {
+                substitute_relative_current_alpha(&mut resolved_tokens, false, color);
+            }
             Property::Custom(CustomProperty {
                 name: custom.name,
                 value: resolved_tokens,

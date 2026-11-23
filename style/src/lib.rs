@@ -88,6 +88,7 @@ pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
     pub rules: Vec<StyleRule>,
+    registrations: Vec<custom_properties::Registration>,
     index: StylesheetIndex,
 }
 
@@ -98,6 +99,10 @@ impl Stylesheet {
             .rules
             .iter()
             .all(|rule| rule.media_conditions.is_empty())
+            && self
+                .registrations
+                .iter()
+                .all(|entry| entry.media_conditions.is_empty())
         {
             return std::borrow::Cow::Borrowed(self);
         }
@@ -109,6 +114,17 @@ impl Stylesheet {
                 .all(|condition| condition.matches(width, height))
             {
                 filtered.push(rule.clone());
+            }
+        }
+        for registration in &self.registrations {
+            if registration
+                .media_conditions
+                .iter()
+                .all(|condition| condition.matches(width, height))
+            {
+                let mut active = registration.clone();
+                active.media_conditions.clear();
+                filtered.registrations.push(active);
             }
         }
         std::borrow::Cow::Owned(filtered)
@@ -564,6 +580,7 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
         .map_err(|error| StyleError::Parse(error.to_string()))?;
     let mut stylesheet = Stylesheet::default();
     collect_style_rules(&parsed.rules, &mut stylesheet)?;
+    stylesheet.registrations = custom_properties::collect_registrations(&parsed.rules);
 
     Ok(stylesheet)
 }
@@ -589,6 +606,7 @@ pub fn parse_stylesheet_lossy(source: &str) -> Result<Stylesheet, StyleError> {
     };
     let mut stylesheet = Stylesheet::default();
     collect_style_rules_lossy(&parsed.rules, &mut stylesheet);
+    stylesheet.registrations = custom_properties::collect_registrations(&parsed.rules);
 
     Ok(stylesheet)
 }
@@ -721,11 +739,11 @@ fn collect_style_rules(
             | CssRule::Viewport(_)
             | CssRule::CustomMedia(_)
             | CssRule::LayerStatement(_)
-            | CssRule::Property(_)
             // `@position-try` defines anchor-positioning fallbacks. Nothing in
             // the box model consumes them yet, so it is skipped like the other
             // at-rules that carry no style rules.
             | CssRule::PositionTry(_)
+            | CssRule::Property(_)
             | CssRule::ViewTransition(_)
             | CssRule::Unknown(_)
             | CssRule::Custom(_)
@@ -844,7 +862,15 @@ fn resolve_style_target(
         resolved.visual.foreground = inherited_foreground;
     }
     if let Some(inherited_custom_properties) = inherited_custom_properties {
-        custom_properties::inherit(&mut resolved, inherited_custom_properties);
+        if stylesheet.registrations.is_empty() {
+            custom_properties::inherit(&mut resolved, inherited_custom_properties);
+        } else {
+            custom_properties::inherit_with_registrations(
+                &mut resolved,
+                inherited_custom_properties,
+                &stylesheet.registrations,
+            );
+        }
     }
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
     let mut font_state = FontDeclarationState::default();
@@ -861,6 +887,14 @@ fn resolve_style_target(
         if let Some(rule) = stylesheet.rules.get(rule_index) {
             rule.apply_custom_declarations(&mut resolved, &mut position_explicit, &mut font_state);
         }
+    }
+
+    if !stylesheet.registrations.is_empty() {
+        custom_properties::compute_registered_values(
+            &mut resolved.custom_properties,
+            inherited_custom_properties,
+            &stylesheet.registrations,
+        );
     }
 
     let declarations = || {
