@@ -175,6 +175,8 @@ The `gpu-viewport` build compiles the built-in USD shader from
 [`viewport.wesl`](../renderer/src/gpu/usd/viewport.wesl) into two WGSL variants
 and validates both with Naga. The mesh pipeline selects its variant based on the
 adapter's shadow-map support. The WESL compiler requires Rust 1.97.1 or newer.
+The WESL report walks through the build and runtime workflow with code examples.
+[PDF report](./reports/cssimpler-wesl-report.pdf) · [Typst source](./reports/cssimpler-wesl-report.typ)
 
 ### Studio lighting and mesh materials
 
