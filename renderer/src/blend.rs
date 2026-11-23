@@ -14,7 +14,7 @@ pub(crate) fn needs_group(node: &RenderNode, bounds: &CachedSubtreeBounds) -> bo
         && !bounds.subtree_uses_backdrop_blur
         && !bounds.subtree_uses_backdrop_occlusion
         && !bounds.subtree_uses_native_glass
-        && (establishes_stacking_context(node) || !node.style.transform.is_identity())
+        && establishes_stacking_context(node)
 }
 
 pub(crate) fn draw_group(
@@ -259,6 +259,24 @@ mod tests {
         let mut pixels = [0; 256];
         super::super::render_to_rgba8(&[layer], &mut pixels, 8, 8, Color::rgba(0, 0, 0, 0));
         assert_eq!(&pixels[..4], &[255, 30, 0, 128]);
+    }
+
+    #[test]
+    fn transformed_container_keeps_descendant_blend_inside_its_group() {
+        let child = rect(Color::rgb(255, 0, 0), MixBlendMode::Multiply);
+        let mut group = RenderNode::container(LayoutBox::new(0.0, 0.0, 8.0, 8.0)).with_child(child);
+        group
+            .style
+            .transform
+            .operations
+            .push(TransformOperation::Translate {
+                x: LengthPercentageValue::from_px(8.0),
+                y: LengthPercentageValue::from_px(8.0),
+            });
+        let root = RenderNode::container(LayoutBox::new(0.0, 0.0, 24.0, 24.0)).with_child(group);
+        let mut pixels = [0; 576];
+        render_to_buffer(&[root], &mut pixels, 24, 24, Color::rgb(0, 0, 255));
+        assert_eq!(unpack_rgb(pixels[9 * 24 + 9]), Color::rgb(255, 0, 0));
     }
 
     #[test]
