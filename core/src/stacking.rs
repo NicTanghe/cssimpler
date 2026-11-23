@@ -1,7 +1,9 @@
-use crate::{RenderNode, ZIndex};
+use crate::{MixBlendMode, RenderNode, ZIndex};
 
 pub fn establishes_stacking_context(node: &RenderNode) -> bool {
     node.style.cache_layer
+        || node.style.isolate_blending
+        || node.style.mix_blend_mode != MixBlendMode::Normal
         || (node.style.positioned && matches!(node.style.z_index, ZIndex::Integer(_)))
 }
 

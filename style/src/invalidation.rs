@@ -88,6 +88,8 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::RasterRepeat(_)
         | Declaration::RasterOpacity(_)
         | Declaration::Foreground(_)
+        | Declaration::MixBlendMode(_)
+        | Declaration::Isolation(_)
         | Declaration::NativeMaterial(_)
         | Declaration::GlassTint(_)
         | Declaration::SvgFill(_)
@@ -194,6 +196,7 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
 
 fn variable_property_invalidation(property_name: &str) -> StyleInvalidation {
     match property_name {
+        "mix-blend-mode" | "isolation" => StyleInvalidation::Paint,
         "background"
         | "background-color"
         | "background-image"
