@@ -250,6 +250,36 @@ pub(crate) fn resolve_custom_property_value(
     resolve_property_value_css(name, value, property, &variables)
 }
 
+pub(crate) fn custom_property_dependencies(name: &str, value: &str) -> Vec<String> {
+    fn visit(tokens: &TokenList<'_>, names: &mut Vec<String>) {
+        for token in &tokens.0 {
+            match token {
+                TokenOrValue::Var(variable) => {
+                    names.push(variable.name.ident.0.to_string());
+                    if let Some(fallback) = &variable.fallback {
+                        visit(fallback, names);
+                    }
+                }
+                TokenOrValue::Function(function) => visit(&function.arguments, names),
+                TokenOrValue::Env(environment) => {
+                    if let Some(fallback) = &environment.fallback {
+                        visit(fallback, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut names = Vec::new();
+    if let Ok(Property::Custom(custom)) =
+        Property::parse_string(PropertyId::from(name), value, ParserOptions::default())
+    {
+        visit(&custom.value, &mut names);
+    }
+    names
+}
+
 fn custom_property_tokens<'a>(
     custom_properties: &'a CustomProperties,
 ) -> Result<HashMap<&'a str, TokenList<'a>>, StyleError> {

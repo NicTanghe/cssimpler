@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashSet};
+
 use cssimpler_core::{CustomProperties, Style};
 use cssparser::{Parser, ParserInput};
 use lightningcss::printer::PrinterOptions;
@@ -133,40 +135,88 @@ pub(crate) fn compute_registered_values(
     }
 
     let specified = properties.clone();
-    for (&name, registration) in &registrations_by_name {
-        if properties.get(name).is_none()
-            && let Some(initial) = &registration.initial
-        {
-            properties.set(name, initial);
-        }
+    let mut evaluator = RegisteredValueEvaluator {
+        specified: &specified,
+        inherited,
+        registrations: &registrations_by_name,
+        values: properties,
+        stack: Vec::new(),
+        settled: HashSet::new(),
+        cyclic: HashSet::new(),
+    };
+    for &name in registrations_by_name.keys() {
+        evaluator.resolve(name);
     }
-    let values = properties.clone();
-    for (name, registration) in registrations_by_name {
-        let parent_value = inherited.and_then(|properties| properties.get(name));
-        let inherited_or_initial = || parent_value.or(registration.initial.as_deref());
-        let fallback = if registration.inherits {
-            inherited_or_initial()
-        } else {
-            registration.initial.as_deref()
-        };
-        let computed = match specified.get(name) {
-            Some(value) if value.eq_ignore_ascii_case("initial") => registration.initial.clone(),
-            Some(value) if value.eq_ignore_ascii_case("inherit") => {
-                inherited_or_initial().map(str::to_owned)
+}
+
+struct RegisteredValueEvaluator<'a> {
+    specified: &'a CustomProperties,
+    inherited: Option<&'a CustomProperties>,
+    registrations: &'a BTreeMap<&'a str, &'a Registration>,
+    values: &'a mut CustomProperties,
+    stack: Vec<String>,
+    settled: HashSet<String>,
+    cyclic: HashSet<String>,
+}
+
+impl RegisteredValueEvaluator<'_> {
+    fn resolve(&mut self, name: &str) {
+        if self.settled.contains(name) {
+            return;
+        }
+        if let Some(start) = self.stack.iter().position(|member| member == name) {
+            self.cyclic.extend(self.stack[start..].iter().cloned());
+            return;
+        }
+
+        let specified = self.specified.get(name);
+        self.stack.push(name.to_owned());
+        if let Some(value) = specified {
+            for dependency in crate::variable_resolution::custom_property_dependencies(name, value)
+            {
+                self.resolve(&dependency);
             }
-            Some(value) if !value.eq_ignore_ascii_case("unset") => {
-                crate::variable_resolution::resolve_custom_property_value(name, value, &values)
+        }
+        self.stack.pop();
+
+        if let Some(registration) = self.registrations.get(name) {
+            let parent_value = self.inherited.and_then(|properties| properties.get(name));
+            let inherited_or_initial = parent_value.or(registration.initial.as_deref());
+            let fallback = if registration.inherits {
+                inherited_or_initial
+            } else {
+                registration.initial.as_deref()
+            };
+            let computed = match specified {
+                Some(value) if value.eq_ignore_ascii_case("initial") => {
+                    registration.initial.clone()
+                }
+                Some(value) if value.eq_ignore_ascii_case("inherit") => {
+                    inherited_or_initial.map(str::to_owned)
+                }
+                Some(value)
+                    if !value.eq_ignore_ascii_case("unset") && !self.cyclic.contains(name) =>
+                {
+                    crate::variable_resolution::resolve_custom_property_value(
+                        name,
+                        value,
+                        self.values,
+                    )
                     .ok()
                     .filter(|value| registration.accepts(value))
                     .or_else(|| fallback.map(str::to_owned))
+                }
+                _ => fallback.map(str::to_owned),
+            };
+            if let Some(value) = computed {
+                self.values.set(name, value);
+            } else {
+                self.values.remove(name);
             }
-            _ => fallback.map(str::to_owned),
-        };
-        if let Some(value) = computed {
-            properties.set(name, value);
-        } else {
-            properties.remove(name);
+        } else if self.cyclic.contains(name) {
+            self.values.remove(name);
         }
+        self.settled.insert(name.to_owned());
     }
 }
 
@@ -309,6 +359,31 @@ mod registration_tests {
                 Some(GeneratedTextSource::Literal("Ready".into()))
             );
         }
+    }
+
+    #[test]
+    fn registered_dependencies_use_validated_values_and_cycles_use_initial_values() {
+        let sheet = parse_stylesheet(
+            r#"
+            @property --a { syntax: "<string>"; inherits: false; initial-value: "A"; }
+            @property --b { syntax: "<string>"; inherits: false; initial-value: "B"; }
+            label { --a: var(--alias); --alias: var(--b); --b: 18; content: var(--a); }
+            .cycle { --b: var(--a); }
+        "#,
+        )
+        .unwrap();
+        let label = ElementNode::new("label");
+        let plain = resolve_style(&label, &sheet);
+        assert_eq!(
+            plain.generated_text,
+            Some(GeneratedTextSource::Literal("B".into()))
+        );
+        let cycle = resolve_style(&label.with_class("cycle"), &sheet);
+        assert_eq!(
+            cycle.generated_text,
+            Some(GeneratedTextSource::Literal("A".into()))
+        );
+        assert_eq!(cycle.custom_properties.get("--b"), Some("\"B\""));
     }
 
     #[test]
