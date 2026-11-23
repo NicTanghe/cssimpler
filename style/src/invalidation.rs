@@ -73,7 +73,8 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
     match declaration {
         Declaration::Content(_)
         | Declaration::ContainerNames(_)
-        | Declaration::ScrollStateContainer(_) => StyleInvalidation::Structure,
+        | Declaration::ScrollStateContainer(_)
+        | Declaration::ScrollTargetGroup(_) => StyleInvalidation::Structure,
         Declaration::CustomProperty { .. }
         | Declaration::TransitionProperties(_)
         | Declaration::TransitionDurations(_)

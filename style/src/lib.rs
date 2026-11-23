@@ -152,7 +152,11 @@ impl Stylesheet {
     }
 
     pub fn push(&mut self, rule: StyleRule) {
-        self.has_scroll_queries |= !rule.scroll_queries.is_empty();
+        self.has_scroll_queries |= !rule.scroll_queries.is_empty()
+            || rule
+                .declarations
+                .iter()
+                .any(|decl| matches!(decl, Declaration::ScrollTargetGroup(true)));
         self.index.insert(self.rules.len(), &rule);
         self.rules.push(rule);
     }
@@ -276,12 +280,13 @@ impl Stylesheet {
                 .iter()
                 .all(|query| query.matches(&self.scroll_snapshot, element_path))
                 && rule.may_match_pseudo_and_interaction(pseudo_element.as_ref(), interaction)
-                && rule.selector.matches_with_ancestors_interaction_and_pseudo(
+                && rule.selector.matches_with_scroll_state(
                     element,
                     ancestors,
                     element_path,
                     interaction,
                     pseudo_element.clone(),
+                    &self.scroll_snapshot,
                 )
         });
         candidates
@@ -494,6 +499,7 @@ pub enum Declaration {
     AnchorFallbacks(Vec<AnchorFallback>),
     ContainerNames(Vec<String>),
     ScrollStateContainer(bool),
+    ScrollTargetGroup(bool),
     CustomProperty {
         name: String,
         value: String,
@@ -643,8 +649,15 @@ impl Display for StyleError {
 
 impl Error for StyleError {}
 
+fn stylesheet_parser_options<'i>() -> ParserOptions<'i> {
+    ParserOptions {
+        flags: lightningcss::stylesheet::ParserFlags::SCROLL_NAVIGATION_CONTROLS,
+        ..ParserOptions::default()
+    }
+}
+
 pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
-    let parsed = StyleSheet::parse(source, ParserOptions::default())
+    let parsed = StyleSheet::parse(source, stylesheet_parser_options())
         .map_err(|error| StyleError::Parse(error.to_string()))?;
     let normalized = parsed
         .to_css(PrinterOptions {
@@ -657,7 +670,7 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
             ..PrinterOptions::default()
         })
         .map_err(|error| StyleError::Parse(error.to_string()))?;
-    let parsed = StyleSheet::parse(&normalized.code, ParserOptions::default())
+    let parsed = StyleSheet::parse(&normalized.code, stylesheet_parser_options())
         .map_err(|error| StyleError::Parse(error.to_string()))?;
     let mut stylesheet = Stylesheet::default();
     collect_style_rules(&parsed.rules, &mut stylesheet)?;
@@ -668,7 +681,7 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
 }
 
 pub fn parse_stylesheet_lossy(source: &str) -> Result<Stylesheet, StyleError> {
-    let parsed = match StyleSheet::parse(source, ParserOptions::default()) {
+    let parsed = match StyleSheet::parse(source, stylesheet_parser_options()) {
         Ok(parsed) => parsed,
         Err(_) => return Ok(Stylesheet::default()),
     };
@@ -682,7 +695,7 @@ pub fn parse_stylesheet_lossy(source: &str) -> Result<Stylesheet, StyleError> {
         Ok(normalized) => normalized,
         Err(_) => return Ok(Stylesheet::default()),
     };
-    let parsed = match StyleSheet::parse(&normalized.code, ParserOptions::default()) {
+    let parsed = match StyleSheet::parse(&normalized.code, stylesheet_parser_options()) {
         Ok(parsed) => parsed,
         Err(_) => return Ok(Stylesheet::default()),
     };
@@ -966,6 +979,13 @@ fn resolve_style_target(
             );
         }
     }
+    if element.tag.eq_ignore_ascii_case("a") {
+        resolved.visual.scroll_target_href = element
+            .attribute("href")
+            .and_then(|href| href.strip_prefix('#'))
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+    }
     let mut position_explicit = resolved.layout.taffy.position != TaffyPosition::Relative;
     let mut font_state = FontDeclarationState::default();
     let element_ref = ElementRef::from(element);
@@ -1119,6 +1139,18 @@ fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleEr
         return Ok(vec![declaration]);
     }
 
+    if let Property::Custom(custom) = property
+        && custom.name.as_ref() == "scroll-target-group"
+    {
+        let value = property
+            .value_to_css_string(PrinterOptions::default())
+            .map_err(|error| StyleError::UnsupportedValue(error.to_string()))?;
+        return match value.trim() {
+            "auto" => Ok(vec![Declaration::ScrollTargetGroup(true)]),
+            "none" => Ok(vec![Declaration::ScrollTargetGroup(false)]),
+            _ => Err(StyleError::UnsupportedValue(value)),
+        };
+    }
     use lightningcss::properties::contain::ContainerType;
     if let Property::ContainerType(value) = property {
         return Ok(vec![Declaration::ScrollStateContainer(
@@ -2017,6 +2049,7 @@ fn apply_declaration(
     }
 
     match declaration {
+        Declaration::ScrollTargetGroup(enabled) => style.visual.scroll_target_group = *enabled,
         Declaration::ContainerNames(names) => style.visual.container_names.clone_from(names),
         Declaration::ScrollStateContainer(enabled) => {
             style.visual.scroll_state_container = *enabled
