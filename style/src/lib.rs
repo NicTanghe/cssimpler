@@ -698,6 +698,10 @@ fn collect_style_rules(
             | CssRule::CustomMedia(_)
             | CssRule::LayerStatement(_)
             | CssRule::Property(_)
+            // `@position-try` defines anchor-positioning fallbacks. Nothing in
+            // the box model consumes them yet, so it is skipped like the other
+            // at-rules that carry no style rules.
+            | CssRule::PositionTry(_)
             | CssRule::ViewTransition(_)
             | CssRule::Unknown(_)
             | CssRule::Custom(_)
@@ -2161,6 +2165,32 @@ mod tests {
                 .contains(&Declaration::InsetLeft(TaffyLengthPercentageAuto::Length(
                     160.0
                 ),))
+        );
+    }
+
+    #[test]
+    fn position_try_at_rule_is_skipped_without_dropping_style_rules() {
+        // lightningcss 1.33 reports `@position-try` as its own rule kind instead
+        // of an unknown at-rule. Anchor positioning is not implemented, so the
+        // at-rule is skipped while the surrounding style rules keep their order
+        // and declarations.
+        let stylesheet = parse_stylesheet(
+            ".before { width: 120px; }
+             @position-try --flip-block { position-area: bottom; }
+             .after { height: 40px; }",
+        )
+        .expect("anchor-positioning at-rules must not fail parsing");
+
+        assert_eq!(stylesheet.rules.len(), 2);
+        assert!(
+            stylesheet.rules[0]
+                .declarations
+                .contains(&Declaration::Width(Dimension::Length(120.0)))
+        );
+        assert!(
+            stylesheet.rules[1]
+                .declarations
+                .contains(&Declaration::Height(Dimension::Length(40.0)))
         );
     }
 
