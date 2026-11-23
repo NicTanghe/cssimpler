@@ -59,6 +59,7 @@ pub enum SimpleSelector {
     Root,
     Hover,
     Active,
+    State(String),
 }
 
 impl SimpleSelector {
@@ -108,6 +109,15 @@ impl SimpleSelector {
             Self::Root => element_path.children.is_empty(),
             Self::Hover => interaction.is_hovered(element_path),
             Self::Active => interaction.is_active(element_path),
+            Self::State(expected) => {
+                element
+                    .attribute("data-cssimpler-state")
+                    .is_some_and(|states| {
+                        states
+                            .split_ascii_whitespace()
+                            .any(|state| state == expected)
+                    })
+            }
         }
     }
 }
@@ -516,6 +526,9 @@ fn extract_simple_selector(
         Component::NonTSPseudoClass(PseudoClass::Hover) => Ok((Some(SimpleSelector::Hover), None)),
         Component::NonTSPseudoClass(PseudoClass::Active) => {
             Ok((Some(SimpleSelector::Active), None))
+        }
+        Component::NonTSPseudoClass(PseudoClass::State { state }) => {
+            Ok((Some(SimpleSelector::State(state.0.to_string())), None))
         }
         Component::PseudoElement(LightningPseudoElement::Before) => {
             Ok((None, Some(PseudoElementKind::Before)))
