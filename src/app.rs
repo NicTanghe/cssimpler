@@ -1,3 +1,5 @@
+mod highlights;
+pub use highlights::{HighlightRequest, HighlightSource};
 mod input;
 mod scene_transition;
 mod update_handle;
@@ -410,6 +412,7 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     action_source: Option<Arc<dyn ActionSource>>,
     update_handle: Option<UpdateHandle>,
     update_deadline: Option<fn(&State) -> Option<Instant>>,
+    highlight_requests: Option<fn(&State) -> &[HighlightRequest]>,
     runtime_world: RuntimeWorld,
     text_inputs: NativeTextInputs,
     render_mode: RenderMode,
@@ -491,6 +494,7 @@ where
             action_source: None,
             update_handle: None,
             update_deadline: None,
+            highlight_requests: None,
             runtime_world: RuntimeWorld::default(),
             text_inputs: NativeTextInputs::default(),
             render_mode: RenderMode::OnInvalidation,
@@ -590,6 +594,13 @@ where
     /// or cancel the deadline.
     pub fn with_update_deadline(mut self, deadline: fn(&State) -> Option<Instant>) -> Self {
         self.update_deadline = Some(deadline);
+        self
+    }
+
+    /// Supply application search results or annotations after a view refresh.
+    /// Return a paint invalidation when the requested ranges change.
+    pub fn with_text_highlights(mut self, highlights: fn(&State) -> &[HighlightRequest]) -> Self {
+        self.highlight_requests = Some(highlights);
         self
     }
 
@@ -821,6 +832,18 @@ where
             &self.runtime_world,
         );
 
+        if let Some(requests) = self.highlight_requests {
+            let viewport_sheet = self
+                .viewport()
+                .map(|v| self.stylesheet.for_viewport(v.width, v.height));
+            highlights::decorate(
+                &mut scene,
+                viewport_sheet.as_deref().unwrap_or(self.stylesheet),
+                &self.runtime_world,
+                requests(&self.state),
+            );
+        }
+
         let scene_swap_start = Instant::now();
         self.replace_scene(scene);
         stats.scene_swap_us = duration_to_us(scene_swap_start.elapsed());
@@ -830,6 +853,9 @@ where
     }
 
     fn refresh_fragments(&mut self, ids: &[String], stats: &mut RuntimeStats) -> bool {
+        if self.highlight_requests.is_some() {
+            return false;
+        }
         let Some(existing_scene) = self
             .scene_transition
             .as_ref()

@@ -1,3 +1,5 @@
+mod anchors;
+pub use anchors::{AnchorArea, AnchorFallback};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -49,6 +51,7 @@ mod attributes;
 mod containers;
 mod custom_properties;
 mod fonts;
+mod highlights;
 mod invalidation;
 mod media;
 mod render_tree;
@@ -77,6 +80,7 @@ pub use render_tree::{
 };
 
 pub use attributes::{AttributeTextSource, parse_attribute_text_source};
+pub use highlights::{TextHighlightKind, apply_text_highlight};
 pub use invalidation::StyleInvalidation;
 pub use selectors::{
     AncestorSelector, CompoundSelector, ElementRef, PseudoElementKind, Selector,
@@ -87,7 +91,9 @@ pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
+    position_tries: HashMap<String, AnchorArea>,
     pub rules: Vec<StyleRule>,
+    registrations: Vec<custom_properties::Registration>,
     index: StylesheetIndex,
     scroll_snapshot: std::sync::Arc<[cssimpler_core::ScrollState]>,
     has_scroll_queries: bool,
@@ -100,6 +106,10 @@ impl Stylesheet {
             .rules
             .iter()
             .all(|rule| rule.media_conditions.is_empty())
+            && self
+                .registrations
+                .iter()
+                .all(|entry| entry.media_conditions.is_empty())
         {
             return std::borrow::Cow::Borrowed(self);
         }
@@ -116,6 +126,18 @@ impl Stylesheet {
                 filtered.push(rule.clone());
             }
         }
+        for registration in &self.registrations {
+            if registration
+                .media_conditions
+                .iter()
+                .all(|condition| condition.matches(width, height))
+            {
+                let mut active = registration.clone();
+                active.media_conditions.clear();
+                filtered.registrations.push(active);
+            }
+        }
+        filtered.position_tries.clone_from(&self.position_tries);
         std::borrow::Cow::Owned(filtered)
     }
 
@@ -184,6 +206,41 @@ impl Stylesheet {
         indices.into_iter().map(move |i| &self.rules[i])
     }
 
+    pub(crate) fn anchor_placement(
+        &self,
+        element: ElementRef<'_>,
+        ancestors: &[ElementRef<'_>],
+        path: &ElementPath,
+        interaction: &ElementInteractionState,
+    ) -> anchors::Placement {
+        let mut placement = anchors::Placement::default();
+        if !self.index.has_anchor_rules {
+            return placement;
+        }
+        for rule in self.matching_rules_with_context(element, ancestors, path, interaction) {
+            for declaration in &rule.declarations {
+                match declaration {
+                    Declaration::AnchorNames(names) => placement.names.clone_from(names),
+                    Declaration::PositionAnchor(target) => placement.target.clone_from(target),
+                    Declaration::AnchorArea(area) => placement.area = *area,
+                    Declaration::AnchorFallbacks(fallbacks) => {
+                        placement.fallbacks.clone_from(fallbacks)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        placement.fallback_areas = placement
+            .fallbacks
+            .iter()
+            .filter_map(|fallback| match fallback {
+                AnchorFallback::Area(area) => Some(*area),
+                AnchorFallback::Named(name) => self.position_tries.get(name).copied(),
+            })
+            .collect();
+        placement
+    }
+
     fn matching_rule_indices_with_context_and_pseudo<'a>(
         &'a self,
         element: ElementRef<'a>,
@@ -222,13 +279,13 @@ impl Stylesheet {
             rule.scroll_queries
                 .iter()
                 .all(|query| query.matches(&self.scroll_snapshot, element_path))
-                && rule.may_match_pseudo_and_interaction(pseudo_element, interaction)
+                && rule.may_match_pseudo_and_interaction(pseudo_element.as_ref(), interaction)
                 && rule.selector.matches_with_scroll_state(
                     element,
                     ancestors,
                     element_path,
                     interaction,
-                    pseudo_element,
+                    pseudo_element.clone(),
                     &self.scroll_snapshot,
                 )
         });
@@ -246,12 +303,22 @@ struct StylesheetIndex {
     interactive_only_hover_active_rules: Vec<usize>,
     unanchored_rules: Vec<usize>,
     container_name_rules: Vec<usize>,
+    has_anchor_rules: bool,
     hover_rules: Vec<usize>,
     active_rules: Vec<usize>,
 }
 
 impl StylesheetIndex {
     fn insert(&mut self, index: usize, rule: &StyleRule) {
+        self.has_anchor_rules |= rule.declarations.iter().any(|declaration| {
+            matches!(
+                declaration,
+                Declaration::AnchorNames(_)
+                    | Declaration::PositionAnchor(_)
+                    | Declaration::AnchorArea(_)
+                    | Declaration::AnchorFallbacks(_)
+            )
+        });
         if rule
             .declarations
             .iter()
@@ -398,10 +465,10 @@ impl StyleRule {
 
     fn may_match_pseudo_and_interaction(
         &self,
-        pseudo_element: Option<PseudoElementKind>,
+        pseudo_element: Option<&PseudoElementKind>,
         interaction: &ElementInteractionState,
     ) -> bool {
-        self.selector.pseudo_element == pseudo_element
+        self.selector.pseudo_element.as_ref() == pseudo_element
             && (!self.interaction_dependencies.hover || interaction.hovered.is_some())
             && (!self.interaction_dependencies.active || interaction.active.is_some())
     }
@@ -421,27 +488,15 @@ impl StyleRule {
             );
         }
     }
-
-    fn apply_other_declarations(
-        &self,
-        style: &mut Style,
-        position_explicit: &mut bool,
-        font_state: &mut FontDeclarationState,
-    ) {
-        for &index in &self.other_declaration_indices {
-            apply_declaration(
-                style,
-                position_explicit,
-                font_state,
-                &self.declarations[index],
-            );
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Declaration {
     Content(Option<AttributeTextSource>),
+    AnchorNames(Vec<String>),
+    PositionAnchor(Option<String>),
+    AnchorArea(Option<AnchorArea>),
+    AnchorFallbacks(Vec<AnchorFallback>),
     ContainerNames(Vec<String>),
     ScrollStateContainer(bool),
     ScrollTargetGroup(bool),
@@ -465,6 +520,8 @@ pub enum Declaration {
     RasterRepeat((bool, bool)),
     RasterOpacity(f32),
     Foreground(Color),
+    MixBlendMode(cssimpler_core::MixBlendMode),
+    Isolation(bool),
     NativeMaterial(NativeMaterial),
     GlassTint(Option<Color>),
     SvgFill(SvgPaint),
@@ -617,6 +674,8 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
         .map_err(|error| StyleError::Parse(error.to_string()))?;
     let mut stylesheet = Stylesheet::default();
     collect_style_rules(&parsed.rules, &mut stylesheet)?;
+    stylesheet.registrations = custom_properties::collect_registrations(&parsed.rules);
+    stylesheet.position_tries = anchors::collect_position_tries(&parsed.rules);
 
     Ok(stylesheet)
 }
@@ -642,6 +701,8 @@ pub fn parse_stylesheet_lossy(source: &str) -> Result<Stylesheet, StyleError> {
     };
     let mut stylesheet = Stylesheet::default();
     collect_style_rules_lossy(&parsed.rules, &mut stylesheet);
+    stylesheet.registrations = custom_properties::collect_registrations(&parsed.rules);
+    stylesheet.position_tries = anchors::collect_position_tries(&parsed.rules);
 
     Ok(stylesheet)
 }
@@ -776,7 +837,8 @@ fn collect_style_rules(
             CssRule::MozDocument(document_rule) => {
                 collect_style_rules(&document_rule.rules, stylesheet)?;
             }
-            CssRule::NestedDeclarations(_)
+            CssRule::PositionTry(_)
+            | CssRule::NestedDeclarations(_)
             | CssRule::Import(_)
             | CssRule::Keyframes(_)
             | CssRule::FontFace(_)
@@ -789,10 +851,6 @@ fn collect_style_rules(
             | CssRule::CustomMedia(_)
             | CssRule::LayerStatement(_)
             | CssRule::Property(_)
-            // `@position-try` defines anchor-positioning fallbacks. Nothing in
-            // the box model consumes them yet, so it is skipped like the other
-            // at-rules that carry no style rules.
-            | CssRule::PositionTry(_)
             | CssRule::ViewTransition(_)
             | CssRule::Unknown(_)
             | CssRule::Custom(_)
@@ -911,7 +969,15 @@ fn resolve_style_target(
         resolved.visual.foreground = inherited_foreground;
     }
     if let Some(inherited_custom_properties) = inherited_custom_properties {
-        custom_properties::inherit(&mut resolved, inherited_custom_properties);
+        if stylesheet.registrations.is_empty() {
+            custom_properties::inherit(&mut resolved, inherited_custom_properties);
+        } else {
+            custom_properties::inherit_with_registrations(
+                &mut resolved,
+                inherited_custom_properties,
+                &stylesheet.registrations,
+            );
+        }
     }
     if element.tag.eq_ignore_ascii_case("a") {
         resolved.visual.scroll_target_href = element
@@ -937,9 +1003,69 @@ fn resolve_style_target(
         }
     }
 
-    for &rule_index in &matching_rule_indices {
-        if let Some(rule) = stylesheet.rules.get(rule_index) {
-            rule.apply_other_declarations(&mut resolved, &mut position_explicit, &mut font_state);
+    if !stylesheet.registrations.is_empty() {
+        custom_properties::compute_registered_values(
+            &mut resolved.custom_properties,
+            inherited_custom_properties,
+            &stylesheet.registrations,
+        );
+    }
+
+    let declarations = || {
+        matching_rule_indices.iter().flat_map(|&rule_index| {
+            let rule = &stylesheet.rules[rule_index];
+            rule.other_declaration_indices
+                .iter()
+                .map(|&i| &rule.declarations[i])
+        })
+    };
+    if declarations()
+        .any(|declaration| matches!(declaration, Declaration::VariableDependentProperty { .. }))
+    {
+        let inherited_color = resolved.visual.foreground;
+        let mut computed_color = inherited_color;
+        for declaration in declarations() {
+            match declaration {
+                Declaration::Foreground(color) => computed_color = *color,
+                Declaration::VariableDependentProperty { property_name, .. }
+                    if property_name == "color" =>
+                {
+                    if let Some(result) = variable_resolution::resolve_declaration(
+                        declaration,
+                        &resolved.custom_properties,
+                        inherited_color,
+                    ) {
+                        match result {
+                            Ok(declarations) => {
+                                for declaration in declarations {
+                                    if let Declaration::Foreground(color) = declaration {
+                                        computed_color = color;
+                                    }
+                                }
+                            }
+                            Err(error) if error.to_string().contains("missing or invalid") => {}
+                            Err(error) => panic!("{error}"),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        resolved.visual.foreground = computed_color;
+        for declaration in declarations().filter(|declaration| {
+            !matches!(declaration, Declaration::Foreground(_))
+                && !matches!(declaration, Declaration::VariableDependentProperty { property_name, .. } if property_name == "color")
+        }) {
+            apply_declaration(&mut resolved, &mut position_explicit, &mut font_state, declaration);
+        }
+    } else {
+        for declaration in declarations() {
+            apply_declaration(
+                &mut resolved,
+                &mut position_explicit,
+                &mut font_state,
+                declaration,
+            );
         }
     }
 
@@ -1009,6 +1135,9 @@ fn contextualize_property_error(property: &Property<'_>, error: StyleError) -> S
 
 fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleError> {
     reject_unsupported_attr_usage(property)?;
+    if let Some(declaration) = anchors::extract(property) {
+        return Ok(vec![declaration]);
+    }
 
     if let Property::Custom(custom) = property
         && custom.name.as_ref() == "scroll-target-group"
@@ -1891,9 +2020,11 @@ fn apply_declaration(
         return;
     }
 
-    if let Some(declarations) =
-        variable_resolution::resolve_declaration(declaration, &style.custom_properties)
-    {
+    if let Some(declarations) = variable_resolution::resolve_declaration(
+        declaration,
+        &style.custom_properties,
+        style.visual.foreground,
+    ) {
         let declarations = match declarations {
             Ok(decls) => decls,
             Err(error) if error.to_string().contains("missing or invalid") => return,
@@ -1926,6 +2057,10 @@ fn apply_declaration(
         Declaration::Content(value) => {
             style.generated_text = value.clone().map(attribute_text_source_to_core);
         }
+        Declaration::AnchorNames(_)
+        | Declaration::PositionAnchor(_)
+        | Declaration::AnchorArea(_)
+        | Declaration::AnchorFallbacks(_) => {}
         Declaration::OverflowX(mode) => {
             style.layout.taffy.overflow.x = visual::taffy_overflow_from_mode(*mode);
             style.visual.overflow.x = *mode;

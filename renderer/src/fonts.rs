@@ -67,6 +67,52 @@ impl SelectionColor {
     }
 }
 
+fn paint_highlight_regions(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    layout: LayoutBox,
+    text: &str,
+    prepared: Option<&PreparedTextLayout>,
+    style: &VisualStyle,
+    matrix: AffineTransform,
+    clip_state: &ClipState,
+) -> Vec<SelectionColor> {
+    style
+        .text_highlights
+        .iter()
+        .map(|highlight| {
+            let segments = super::text_range_segments(
+                layout,
+                text,
+                prepared,
+                &style.text,
+                highlight.start,
+                highlight.end,
+            );
+            let backgrounds = super::selection_geometry::local_backgrounds(
+                layout,
+                &segments,
+                style.text.size_px * 0.1,
+            );
+            super::selection_geometry::paint_background(
+                buffer,
+                width,
+                height,
+                layout,
+                &backgrounds,
+                highlight.style.background,
+                matrix,
+                clip_state,
+            );
+            SelectionColor {
+                color: highlight.style.foreground,
+                regions: segments.into_iter().map(|segment| segment.layout).collect(),
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn draw_text(
     buffer: &mut [u32],
     width: usize,
@@ -173,6 +219,23 @@ fn draw_text_impl(
         return;
     };
 
+    let highlights;
+    let selections = if let Some(selection) = selection {
+        std::slice::from_ref(selection)
+    } else {
+        highlights = paint_highlight_regions(
+            buffer,
+            width,
+            height,
+            layout,
+            text,
+            prepared_text_layout,
+            style,
+            AffineTransform::IDENTITY,
+            &ClipState::new(clip),
+        );
+        &highlights
+    };
     for shadow in style
         .filter_drop_shadows
         .iter()
@@ -210,7 +273,7 @@ fn draw_text_impl(
         raster.offset_x,
         raster.offset_y,
         clip,
-        selection,
+        selections,
     );
 }
 
@@ -266,6 +329,23 @@ fn draw_text_transformed_impl(
         return;
     };
 
+    let highlights;
+    let selections = if let Some(selection) = selection {
+        std::slice::from_ref(selection)
+    } else {
+        highlights = paint_highlight_regions(
+            buffer,
+            width,
+            height,
+            layout,
+            text,
+            prepared_text_layout,
+            style,
+            matrix,
+            clip_state,
+        );
+        &highlights
+    };
     for shadow in style
         .filter_drop_shadows
         .iter()
@@ -327,7 +407,7 @@ fn draw_text_transformed_impl(
         raster.offset_y,
         matrix,
         clip_state,
-        selection,
+        selections,
     );
 }
 
@@ -452,7 +532,15 @@ fn draw_mask(
     clip: ClipRect,
 ) {
     draw_mask_with_selection(
-        buffer, width, height, mask, color, offset_x, offset_y, clip, None,
+        buffer,
+        width,
+        height,
+        mask,
+        color,
+        offset_x,
+        offset_y,
+        clip,
+        &[],
     );
 }
 
@@ -468,8 +556,38 @@ fn draw_mask_transformed(
     clip_state: &ClipState,
 ) {
     draw_mask_transformed_with_selection(
-        buffer, width, height, mask, color, offset_x, offset_y, matrix, clip_state, None,
+        buffer,
+        width,
+        height,
+        mask,
+        color,
+        offset_x,
+        offset_y,
+        matrix,
+        clip_state,
+        &[],
     );
+}
+
+fn prepare_selection_colors(
+    selections: &[SelectionColor],
+) -> Vec<(&SelectionColor, PreparedBlendColor)> {
+    selections
+        .iter()
+        .map(|selection| (selection, PreparedBlendColor::new(selection.color)))
+        .collect()
+}
+
+fn selection_at(
+    selections: &[(&SelectionColor, PreparedBlendColor)],
+    x: f32,
+    y: f32,
+) -> Option<(PreparedBlendColor, u8)> {
+    selections.iter().rev().find_map(|(selection, color)| {
+        selection
+            .contains(x, y)
+            .then_some((*color, selection.color.a))
+    })
 }
 
 fn draw_mask_with_selection(
@@ -481,9 +599,9 @@ fn draw_mask_with_selection(
     offset_x: i32,
     offset_y: i32,
     clip: ClipRect,
-    selection: Option<&SelectionColor>,
+    selections: &[SelectionColor],
 ) {
-    if (color.a == 0 && selection.is_none_or(|s| s.color.a == 0))
+    if (color.a == 0 && selections.iter().all(|s| s.color.a == 0))
         || mask.width == 0
         || mask.height == 0
     {
@@ -509,8 +627,7 @@ fn draw_mask_with_selection(
     }
 
     let prepared_color = PreparedBlendColor::new(color);
-    let selection = selection.filter(|selection| selection.color != color);
-    let selected_color = selection.map(|selection| PreparedBlendColor::new(selection.color));
+    let prepared_selections = prepare_selection_colors(selections);
     let local_x0 = (draw_x0 - mask_x0) as usize;
     let local_x1 = (draw_x1 - mask_x0) as usize;
     for y in draw_y0..draw_y1 {
@@ -519,20 +636,18 @@ fn draw_mask_with_selection(
         let mask_row_end = local_y * mask.width + local_x1;
         let buffer_row_start = (y as usize - rows.start) * width + draw_x0 as usize;
         let buffer_row_end = buffer_row_start + (local_x1 - local_x0);
-        if let (Some(selection), Some(selected_color)) = (selection, selected_color) {
+        if !prepared_selections.is_empty() {
             for (index, x) in (draw_x0..draw_x1).enumerate() {
-                let selected = selection.contains(x as f32 + 0.5, y as f32 + 0.5);
+                let (paint, alpha) =
+                    selection_at(&prepared_selections, x as f32 + 0.5, y as f32 + 0.5)
+                        .unwrap_or((prepared_color, color.a));
                 let target = buffer_row_start + index;
                 blend_mask_row(
                     &mut buffer[target..target + 1],
                     target,
                     &mask.alpha[mask_row_start + index..mask_row_start + index + 1],
-                    if selected {
-                        selected_color
-                    } else {
-                        prepared_color
-                    },
-                    if selected { selection.color.a } else { color.a },
+                    paint,
+                    alpha,
                 );
             }
         } else {
@@ -557,9 +672,9 @@ fn draw_mask_transformed_with_selection(
     offset_y: i32,
     matrix: AffineTransform,
     clip_state: &ClipState,
-    selection: Option<&SelectionColor>,
+    selections: &[SelectionColor],
 ) {
-    if (color.a == 0 && selection.is_none_or(|s| s.color.a == 0))
+    if (color.a == 0 && selections.iter().all(|s| s.color.a == 0))
         || mask.width == 0
         || mask.height == 0
     {
@@ -584,7 +699,7 @@ fn draw_mask_transformed_with_selection(
         return;
     };
     let prepared_color = PreparedBlendColor::new(color);
-    let selected_color = selection.map(|selection| PreparedBlendColor::new(selection.color));
+    let prepared_selections = prepare_selection_colors(selections);
     let rows = current_render_buffer_rows();
     let row_start = rows.start.min(height) as i32;
     let row_end = rows.end.min(height) as i32;
@@ -606,14 +721,8 @@ fn draw_mask_transformed_with_selection(
 
             let row_start = (y as usize - rows.start) * width;
             let buffer_start = row_start + x as usize;
-            let (paint, opacity) = match (selection, selected_color) {
-                (Some(selection), Some(selected_color))
-                    if selection.contains(source_x, source_y) =>
-                {
-                    (selected_color, selection.color.a)
-                }
-                _ => (prepared_color, color.a),
-            };
+            let (paint, opacity) = selection_at(&prepared_selections, source_x, source_y)
+                .unwrap_or((prepared_color, color.a));
             blend_mask_row(
                 &mut buffer[buffer_start..buffer_start + 1],
                 buffer_start,

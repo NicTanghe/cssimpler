@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
-use cssimpler_core::CustomProperties;
+use cssimpler_core::{Color, CustomProperties};
 use lightningcss::printer::PrinterOptions;
+use lightningcss::properties::custom::Token;
 use lightningcss::properties::custom::{CustomProperty, TokenList, TokenOrValue, UnparsedProperty};
 use lightningcss::properties::{Property, PropertyId};
 use lightningcss::stylesheet::ParserOptions;
+use lightningcss::values::color::{CssColor, RGBA};
 
 use crate::{Declaration, StyleError};
 
@@ -59,6 +61,8 @@ fn is_supported_property(name: &str) -> bool {
         | "grid-column-end"
         | "grid-row-start"
         | "grid-row-end"
+        | "mix-blend-mode"
+        | "isolation"
         | "background-color"
         | "background"
         | "background-image"
@@ -129,7 +133,10 @@ pub(crate) fn extract_property(
     property: &Property<'_>,
 ) -> Option<Result<Vec<Declaration>, StyleError>> {
     match property {
-        Property::Unparsed(unparsed) if contains_var_reference(&unparsed.value) => {
+        Property::Unparsed(unparsed)
+            if (contains_var_reference(&unparsed.value)
+                || has_relative_current_alpha(&unparsed.value, false)) =>
+        {
             let name = unparsed.property_id.name();
             if !is_supported_property(name) {
                 return None;
@@ -158,6 +165,7 @@ pub(crate) fn extract_property(
 pub(crate) fn resolve_declaration(
     declaration: &Declaration,
     custom_properties: &CustomProperties,
+    current_color: Color,
 ) -> Option<Result<Vec<Declaration>, StyleError>> {
     let Declaration::VariableDependentProperty {
         property_name,
@@ -171,6 +179,7 @@ pub(crate) fn resolve_declaration(
         property_name,
         value_css,
         custom_properties,
+        current_color,
     ))
 }
 
@@ -178,6 +187,7 @@ fn resolve_variable_dependent_property(
     property_name: &str,
     value_css: &str,
     custom_properties: &CustomProperties,
+    current_color: Color,
 ) -> Result<Vec<Declaration>, StyleError> {
     let property = Property::parse_string(
         PropertyId::from(property_name),
@@ -192,8 +202,13 @@ fn resolve_variable_dependent_property(
         )
     })?;
     let variables = custom_property_tokens(custom_properties)?;
-    let resolved_value =
-        resolve_property_value_css(property_name, value_css, property, &variables)?;
+    let resolved_value = resolve_property_value_css(
+        property_name,
+        value_css,
+        property,
+        &variables,
+        Some(current_color),
+    )?;
     let resolved_property = Property::parse_string(
         PropertyId::from(property_name),
         &resolved_value,
@@ -236,6 +251,50 @@ fn resolve_variable_dependent_property(
     Ok(declarations)
 }
 
+pub(crate) fn resolve_custom_property_value(
+    name: &str,
+    value: &str,
+    properties: &CustomProperties,
+) -> Result<String, StyleError> {
+    let property = Property::parse_string(PropertyId::from(name), value, ParserOptions::default())
+        .map_err(|_| invalid_custom_property_value(name, value))?;
+    if !property_contains_var_reference(&property) {
+        return Ok(value.to_string());
+    }
+    let variables = custom_property_tokens(properties)?;
+    resolve_property_value_css(name, value, property, &variables, None)
+}
+
+pub(crate) fn custom_property_dependencies(name: &str, value: &str) -> Vec<String> {
+    fn visit(tokens: &TokenList<'_>, names: &mut Vec<String>) {
+        for token in &tokens.0 {
+            match token {
+                TokenOrValue::Var(variable) => {
+                    names.push(variable.name.ident.0.to_string());
+                    if let Some(fallback) = &variable.fallback {
+                        visit(fallback, names);
+                    }
+                }
+                TokenOrValue::Function(function) => visit(&function.arguments, names),
+                TokenOrValue::Env(environment) => {
+                    if let Some(fallback) = &environment.fallback {
+                        visit(fallback, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut names = Vec::new();
+    if let Ok(Property::Custom(custom)) =
+        Property::parse_string(PropertyId::from(name), value, ParserOptions::default())
+    {
+        visit(&custom.value, &mut names);
+    }
+    names
+}
+
 fn custom_property_tokens<'a>(
     custom_properties: &'a CustomProperties,
 ) -> Result<HashMap<&'a str, TokenList<'a>>, StyleError> {
@@ -259,16 +318,20 @@ fn resolve_property_value_css<'a>(
     value_css: &str,
     property: Property<'a>,
     variables: &HashMap<&'a str, TokenList<'a>>,
+    current_color: Option<Color>,
 ) -> Result<String, StyleError> {
     match property {
         Property::Unparsed(unparsed) => {
-            let resolved_tokens = substitute_token_list(
+            let mut resolved_tokens = substitute_token_list(
                 &unparsed.value,
                 variables,
                 &mut Vec::new(),
                 property_name,
                 value_css,
             )?;
+            if let Some(color) = current_color {
+                substitute_relative_current_alpha(&mut resolved_tokens, false, color);
+            }
             Property::Unparsed(UnparsedProperty {
                 property_id: unparsed.property_id,
                 value: resolved_tokens,
@@ -282,14 +345,17 @@ fn resolve_property_value_css<'a>(
                 )
             })
         }
-        Property::Custom(custom) if !custom.name.as_ref().starts_with("--") => {
-            let resolved_tokens = substitute_token_list(
+        Property::Custom(custom) => {
+            let mut resolved_tokens = substitute_token_list(
                 &custom.value,
                 variables,
                 &mut Vec::new(),
                 property_name,
                 value_css,
             )?;
+            if let Some(color) = current_color {
+                substitute_relative_current_alpha(&mut resolved_tokens, false, color);
+            }
             Property::Custom(CustomProperty {
                 name: custom.name,
                 value: resolved_tokens,
@@ -328,6 +394,42 @@ fn property_contains_var_reference(property: &Property<'_>) -> bool {
         Property::Unparsed(unparsed) => contains_var_reference(&unparsed.value),
         Property::Custom(custom) => contains_var_reference(&custom.value),
         _ => false,
+    }
+}
+
+fn is_current_color(token: &TokenOrValue<'_>) -> bool {
+    matches!(token, TokenOrValue::Color(CssColor::CurrentColor))
+        || matches!(token, TokenOrValue::Token(Token::Ident(ident)) if ident.eq_ignore_ascii_case("currentcolor"))
+}
+
+fn has_relative_current_alpha(tokens: &TokenList<'_>, inside_alpha: bool) -> bool {
+    tokens.0.iter().any(|token| match token {
+        TokenOrValue::Function(function) => has_relative_current_alpha(
+            &function.arguments,
+            inside_alpha || function.name.0.eq_ignore_ascii_case("alpha"),
+        ),
+        _ => inside_alpha && is_current_color(token),
+    })
+}
+
+fn substitute_relative_current_alpha(tokens: &mut TokenList<'_>, inside_alpha: bool, color: Color) {
+    for token in &mut tokens.0 {
+        match token {
+            TokenOrValue::Function(function) => substitute_relative_current_alpha(
+                &mut function.arguments,
+                inside_alpha || function.name.0.eq_ignore_ascii_case("alpha"),
+                color,
+            ),
+            _ if inside_alpha && is_current_color(token) => {
+                *token = TokenOrValue::Color(CssColor::RGBA(RGBA {
+                    red: color.r,
+                    green: color.g,
+                    blue: color.b,
+                    alpha: color.a,
+                }));
+            }
+            _ => {}
+        }
     }
 }
 
