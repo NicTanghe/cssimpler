@@ -189,11 +189,15 @@ impl Stylesheet {
             Vec::new()
         };
         candidates.retain(|&index| {
+            self.rules
+                .get(index)
+                .is_some_and(|rule| containers::required_names_match(rule, &container_names))
+        });
+        candidates.retain(|&index| {
             let Some(rule) = self.rules.get(index) else {
                 return false;
             };
-            containers::required_names_match(rule, &container_names)
-                && rule.may_match_pseudo_and_interaction(pseudo_element, interaction)
+            rule.may_match_pseudo_and_interaction(pseudo_element, interaction)
                 && rule.selector.matches_with_ancestors_interaction_and_pseudo(
                     element,
                     ancestors,
