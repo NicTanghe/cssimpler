@@ -1,8 +1,8 @@
 use std::ops::Range;
 
 use cssimpler_core::{
-    Color, ElementInteractionState, Node, RenderKind, RenderNode, Style, TextEditDecoration,
-    TextSelectionRange, TextSelectionStyle,
+    Color, ElementInteractionState, Node, RenderKind, RenderNode, Style, TextSelectionRange,
+    TextSelectionStyle,
 };
 
 use crate::{PseudoElementKind, Stylesheet, element_and_ancestors_at_path, resolve_style_target};
@@ -18,7 +18,7 @@ pub enum TextHighlightKind<'a> {
 /// Style and paint a UTF-8 byte range on a prepared read-only text run.
 ///
 /// The application supplies the range after layout, using the bytes of this
-/// render node's text. This first API handles one range per run. Existing
+/// render node's text. Later ranges take precedence where they overlap. Existing
 /// text-input and document-selection decorations keep precedence.
 pub fn apply_text_highlight(
     root: &Node,
@@ -94,20 +94,17 @@ pub fn apply_text_highlight(
         );
     }
 
-    run.text_edit = Some(TextEditDecoration {
-        selection: Some(TextSelectionRange {
-            start: range.start,
-            end: range.end,
-            style: TextSelectionStyle {
-                background: highlight
-                    .visual
-                    .background
-                    .unwrap_or(Color::rgba(0, 0, 0, 0)),
-                foreground: highlight.visual.foreground,
-                text_shadows: highlight.visual.text_shadows,
-            },
-        }),
-        ..TextEditDecoration::default()
+    run.style.text_highlights.push(TextSelectionRange {
+        start: range.start,
+        end: range.end,
+        style: TextSelectionStyle {
+            background: highlight
+                .visual
+                .background
+                .unwrap_or(Color::rgba(0, 0, 0, 0)),
+            foreground: highlight.visual.foreground,
+            text_shadows: highlight.visual.text_shadows,
+        },
     });
     true
 }
@@ -147,7 +144,7 @@ mod tests {
             TextHighlightKind::Named("note")
         ));
         assert_eq!(
-            named.text_edit.unwrap().selection.unwrap().style.background,
+            named.style.text_highlights[0].style.background,
             Color::rgb(255, 0, 0)
         );
 
@@ -168,7 +165,7 @@ mod tests {
             3..5,
             TextHighlightKind::Search { current: true }
         ));
-        let style = current.text_edit.unwrap().selection.unwrap().style;
+        let style = &current.style.text_highlights[0].style;
         assert_eq!(style.foreground, Color::rgb(0, 0, 255));
         assert_eq!(style.background, Color::rgb(0, 128, 0));
     }

@@ -24,7 +24,7 @@ fn a_named_highlight_paints_its_authored_background() {
         0..4,
         TextHighlightKind::Named("hit")
     ));
-    assert!(!apply_text_highlight(
+    assert!(apply_text_highlight(
         &source,
         &sheet,
         &interaction,
@@ -51,10 +51,7 @@ fn app_updates_apply_and_clear_application_highlights() {
 
     fn has_painted_highlight(scene: &[cssimpler::core::RenderNode]) -> bool {
         scene.iter().any(|node| {
-            node.text_edit
-                .as_ref()
-                .is_some_and(|edit| edit.selection.is_some())
-                || has_painted_highlight(&node.children)
+            !node.style.text_highlights.is_empty() || has_painted_highlight(&node.children)
         })
     }
 
