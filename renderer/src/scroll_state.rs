@@ -1,5 +1,7 @@
 use cssimpler_core::{RenderNode, ScrollDirections, ScrollState};
 
+mod targets;
+
 pub(crate) fn snapshot(scene: &[RenderNode]) -> Vec<ScrollState> {
     fn visit(node: &RenderNode, out: &mut Vec<ScrollState>) {
         if let Some(element) = &node.element_path
@@ -16,6 +18,7 @@ pub(crate) fn snapshot(scene: &[RenderNode]) -> Vec<ScrollState> {
                 element: element.clone(),
                 query_container: node.style.scroll_state_container,
                 names: node.style.container_names.clone(),
+                target_relation: None,
                 scrollable: ScrollDirections {
                     left: allowed_x && metrics.offset_x > 0.0,
                     right: allowed_x && metrics.offset_x < metrics.max_offset_x,
@@ -32,6 +35,7 @@ pub(crate) fn snapshot(scene: &[RenderNode]) -> Vec<ScrollState> {
     for node in scene {
         visit(node, &mut states);
     }
+    targets::append_relations(scene, &mut states);
     states
 }
 

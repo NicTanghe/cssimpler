@@ -58,6 +58,7 @@ pub enum SimpleSelector {
     Hover,
     Active,
     State(String),
+    ScrollTarget(cssimpler_core::ScrollTargetRelation),
 }
 
 impl SimpleSelector {
@@ -107,6 +108,7 @@ impl SimpleSelector {
             Self::Root => element_path.children.is_empty(),
             Self::Hover => interaction.is_hovered(element_path),
             Self::Active => interaction.is_active(element_path),
+            Self::ScrollTarget(_) => false,
             Self::State(expected) => {
                 element
                     .attribute("data-cssimpler-state")
@@ -151,6 +153,21 @@ impl CompoundSelector {
         self.simple_selectors
             .iter()
             .all(|selector| selector.matches_with_interaction(element, element_path, interaction))
+    }
+
+    fn matches_with_scroll_state(
+        &self,
+        element: ElementRef<'_>,
+        path: &ElementPath,
+        interaction: &ElementInteractionState,
+        snapshot: &[cssimpler_core::ScrollState],
+    ) -> bool {
+        self.simple_selectors.iter().all(|selector| match selector {
+            SimpleSelector::ScrollTarget(relation) => snapshot
+                .iter()
+                .any(|entry| entry.element == *path && entry.target_relation == Some(*relation)),
+            _ => selector.matches_with_interaction(element, path, interaction),
+        })
     }
 
     pub(crate) fn interaction_dependencies(&self) -> InteractionDependencies {
@@ -279,13 +296,32 @@ impl Selector {
         interaction: &ElementInteractionState,
         pseudo_element: Option<PseudoElementKind>,
     ) -> bool {
+        self.matches_with_scroll_state(
+            element,
+            ancestors,
+            element_path,
+            interaction,
+            pseudo_element,
+            &[],
+        )
+    }
+
+    pub(crate) fn matches_with_scroll_state(
+        &self,
+        element: ElementRef<'_>,
+        ancestors: &[ElementRef<'_>],
+        element_path: &ElementPath,
+        interaction: &ElementInteractionState,
+        pseudo_element: Option<PseudoElementKind>,
+        snapshot: &[cssimpler_core::ScrollState],
+    ) -> bool {
         if self.pseudo_element != pseudo_element {
             return false;
         }
 
         if !self
             .rightmost
-            .matches_with_interaction(element, element_path, interaction)
+            .matches_with_scroll_state(element, element_path, interaction, snapshot)
         {
             return false;
         }
@@ -300,10 +336,11 @@ impl Selector {
                     let Some(parent_path) = ancestor_path(element_path, ancestor_index) else {
                         return false;
                     };
-                    if !selector.compound.matches_with_interaction(
+                    if !selector.compound.matches_with_scroll_state(
                         *parent,
                         &parent_path,
                         interaction,
+                        snapshot,
                     ) {
                         return false;
                     }
@@ -314,10 +351,11 @@ impl Selector {
                         |(offset, ancestor)| {
                             ancestor_path(element_path, ancestor_index + offset).is_some_and(
                                 |ancestor_path| {
-                                    selector.compound.matches_with_interaction(
+                                    selector.compound.matches_with_scroll_state(
                                         *ancestor,
                                         &ancestor_path,
                                         interaction,
+                                        snapshot,
                                     )
                                 },
                             )
@@ -515,6 +553,24 @@ fn extract_simple_selector(
         Component::NonTSPseudoClass(PseudoClass::State { state }) => {
             Ok((Some(SimpleSelector::State(state.0.to_string())), None))
         }
+        Component::NonTSPseudoClass(PseudoClass::TargetAfter) => Ok((
+            Some(SimpleSelector::ScrollTarget(
+                cssimpler_core::ScrollTargetRelation::After,
+            )),
+            None,
+        )),
+        Component::NonTSPseudoClass(PseudoClass::TargetCurrent) => Ok((
+            Some(SimpleSelector::ScrollTarget(
+                cssimpler_core::ScrollTargetRelation::Current,
+            )),
+            None,
+        )),
+        Component::NonTSPseudoClass(PseudoClass::TargetBefore) => Ok((
+            Some(SimpleSelector::ScrollTarget(
+                cssimpler_core::ScrollTargetRelation::Before,
+            )),
+            None,
+        )),
         Component::PseudoElement(LightningPseudoElement::Before) => {
             Ok((None, Some(PseudoElementKind::Before)))
         }

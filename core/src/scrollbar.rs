@@ -167,6 +167,13 @@ pub struct ScrollDirections {
     pub down: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollTargetRelation {
+    Before,
+    Current,
+    After,
+}
+
 /// Geometry-independent scroll state sent to an interested scene provider.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScrollState {
@@ -174,4 +181,5 @@ pub struct ScrollState {
     pub scrollable: ScrollDirections,
     pub query_container: bool,
     pub names: Vec<String>,
+    pub target_relation: Option<ScrollTargetRelation>,
 }

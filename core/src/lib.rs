@@ -51,8 +51,8 @@ pub use runtime_ecs::{
     RuntimeSyncResult, RuntimeViewport, RuntimeWorld,
 };
 pub use scrollbar::{
-    OverflowMode, ScrollDirections, ScrollState, ScrollbarAxisState, ScrollbarData,
-    ScrollbarInteractionState, ScrollbarMetrics, ScrollbarStyle, ScrollbarWidth,
+    OverflowMode, ScrollDirections, ScrollState, ScrollTargetRelation, ScrollbarAxisState,
+    ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics, ScrollbarStyle, ScrollbarWidth,
 };
 pub use stacking::{establishes_stacking_context, stacking_context_level};
 pub use svg::{
@@ -778,6 +778,8 @@ pub struct VisualStyle {
     /// Layers share the renderer cache budget and create a stacking context.
     pub cache_layer: bool,
     pub scroll_state_container: bool,
+    pub scroll_target_group: bool,
+    pub scroll_target_href: Option<String>,
     pub container_names: Vec<String>,
     pub background: Option<Color>,
     pub background_layers: Vec<BackgroundLayer>,
@@ -810,6 +812,8 @@ impl Default for VisualStyle {
         Self {
             cache_layer: false,
             scroll_state_container: false,
+            scroll_target_group: false,
+            scroll_target_href: None,
             container_names: Vec::new(),
             background: None,
             background_layers: Vec::new(),
