@@ -4112,3 +4112,36 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod custom_state_tests {
+    use super::*;
+
+    #[test]
+    fn custom_state_applies_to_elements_and_their_descendants() {
+        let sheet = parse_stylesheet(
+            "panel:state(ready) > label { color: red } label:state(selected) { background: blue }",
+        )
+        .unwrap();
+        let panel = ElementNode::new("panel").with_attribute("data-cssimpler-state", "Ready");
+        let label =
+            ElementNode::new("label").with_attribute("data-cssimpler-state", "focused selected");
+        let path = ElementPath::root(0).with_child(0);
+        let interaction = ElementInteractionState::default();
+        let matching = |ancestor: &ElementNode| {
+            sheet
+                .matching_rules_with_context(
+                    ElementRef::from(&label),
+                    &[ElementRef::from(ancestor)],
+                    &path,
+                    &interaction,
+                )
+                .count()
+        };
+        assert_eq!(matching(&panel), 1);
+        assert_eq!(
+            matching(&panel.with_attribute("data-cssimpler-state", "busy ready")),
+            2
+        );
+    }
+}
