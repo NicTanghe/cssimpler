@@ -1441,6 +1441,14 @@ pub trait SceneProvider {
     /// Install a thread-safe callback that wakes an idle runtime for new work.
     fn install_wake(&mut self, _wake: std::sync::Arc<dyn Fn() + Send + Sync>) {}
 
+    /// Install the wake callback for frame-aligned background updates.
+    fn install_update_wake(&mut self, _wake: std::sync::Arc<dyn Fn() + Send + Sync>) {}
+
+    /// Return a one-shot deadline for the next update, or `None` to wait for input.
+    fn next_update_at(&self) -> Option<Instant> {
+        None
+    }
+
     /// Transfer optional native GPU viewport registrations to the window runtime.
     #[cfg(feature = "gpu-viewport")]
     fn take_gpu_viewports(&mut self) -> gpu::GpuViewportRegistry {

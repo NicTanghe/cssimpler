@@ -43,6 +43,7 @@ use super::{
 #[derive(Clone, Copy, Debug)]
 enum RuntimeEvent {
     ActionsPending,
+    UpdateRequested,
     #[cfg(feature = "gpu-viewport")]
     GpuRedraw,
 }
@@ -177,8 +178,12 @@ where
     let context = Context::new(event_loop.owned_display_handle()).map_err(RendererError::from)?;
     let mut app = RuntimeApp::new(config, scene_provider, context);
     let proxy = event_loop.create_proxy();
+    let action_proxy = proxy.clone();
     app.scene_provider.install_wake(Arc::new(move || {
-        let _ = proxy.send_event(RuntimeEvent::ActionsPending);
+        let _ = action_proxy.send_event(RuntimeEvent::ActionsPending);
+    }));
+    app.scene_provider.install_update_wake(Arc::new(move || {
+        let _ = proxy.send_event(RuntimeEvent::UpdateRequested);
     }));
     #[cfg(feature = "gpu-viewport")]
     {
@@ -253,6 +258,7 @@ struct RuntimeApp<P> {
     frame_index: u64,
     last_frame_at: Option<Instant>,
     next_redraw_at: Option<Instant>,
+    auto_scroll_moving: bool,
     redraw_pending: bool,
     immediate_redraw: bool,
     suspended: bool,
@@ -308,6 +314,7 @@ where
             frame_index: 0,
             last_frame_at: None,
             next_redraw_at: None,
+            auto_scroll_moving: false,
             redraw_pending: false,
             immediate_redraw: true,
             suspended: false,
@@ -347,44 +354,42 @@ where
             event_loop.exit();
             return;
         }
-        if self.window.is_none() {
-            event_loop.set_control_flow(ControlFlow::Wait);
+        event_loop.set_control_flow(ControlFlow::Wait);
+        if !self.can_draw() {
+            self.redraw_pending = false;
+            self.next_redraw_at = None;
+            self.input_cadence.clear_deadline();
+            return;
+        }
+        if self.redraw_pending {
             return;
         }
         if self.immediate_redraw {
-            event_loop.set_control_flow(ControlFlow::Wait);
             self.request_redraw_if_possible();
             return;
         }
-        if !self.can_draw() {
-            self.next_redraw_at = None;
-            self.input_cadence.clear_deadline();
-            event_loop.set_control_flow(ControlFlow::Wait);
-            return;
-        }
-        // A frame-aligned provider deferred pointer input to the next frame
-        // boundary. Wake exactly then even when the provider is otherwise idle.
+
         let now = Instant::now();
-        if self.input_cadence.take_due(now) {
-            event_loop.set_control_flow(ControlFlow::Wait);
-            self.request_redraw_if_possible();
-            return;
-        }
-        if let Some(deadline) = self.input_cadence.deadline() {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            return;
-        }
         if self.wants_continuous_redraw() {
-            let deadline = self
-                .next_redraw_at
-                .unwrap_or_else(|| Instant::now() + self.config.frame_time);
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            if Instant::now() >= deadline {
-                self.request_redraw_if_possible();
-            }
+            self.next_redraw_at
+                .get_or_insert(now + self.config.frame_time);
         } else {
             self.next_redraw_at = None;
-            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+        let deadline = [
+            self.input_cadence.deadline(),
+            self.scene_provider.next_update_at(),
+            self.next_redraw_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if let Some(deadline) = deadline {
+            if now >= deadline {
+                self.request_redraw_if_possible();
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            }
         }
     }
 
@@ -422,6 +427,7 @@ where
             self.scene_provider.redraw_schedule(),
             RedrawSchedule::EveryFrame
         ) || self.scene_provider.needs_redraw()
+            || self.auto_scroll_moving
     }
 
     fn request_immediate_redraw(&mut self) {
@@ -443,6 +449,10 @@ where
             self.request_immediate_redraw();
             return;
         }
+        self.request_frame_aligned_redraw();
+    }
+
+    fn request_frame_aligned_redraw(&mut self) {
         match self
             .input_cadence
             .schedule(Instant::now(), self.config.frame_time)
@@ -961,7 +971,7 @@ where
             let _ = self.scrollbar_controller.cancel_middle_button_auto_scroll();
         }
 
-        let _ = self.scrollbar_controller.step_middle_button_auto_scroll(
+        self.auto_scroll_moving = self.scrollbar_controller.step_middle_button_auto_scroll(
             &mut scene,
             mouse_position,
             delta,
@@ -1486,6 +1496,7 @@ where
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: RuntimeEvent) {
         match event {
             RuntimeEvent::ActionsPending => self.request_redraw_if_possible(),
+            RuntimeEvent::UpdateRequested => self.request_frame_aligned_redraw(),
             // GPU redraws are serviced independently in about_to_wait.
             #[cfg(feature = "gpu-viewport")]
             RuntimeEvent::GpuRedraw => {}
