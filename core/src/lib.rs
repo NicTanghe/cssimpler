@@ -51,8 +51,8 @@ pub use runtime_ecs::{
     RuntimeSyncResult, RuntimeViewport, RuntimeWorld,
 };
 pub use scrollbar::{
-    OverflowMode, ScrollbarAxisState, ScrollbarData, ScrollbarInteractionState, ScrollbarMetrics,
-    ScrollbarStyle, ScrollbarWidth,
+    OverflowMode, ScrollDirections, ScrollState, ScrollbarAxisState, ScrollbarData,
+    ScrollbarInteractionState, ScrollbarMetrics, ScrollbarStyle, ScrollbarWidth,
 };
 pub use stacking::{establishes_stacking_context, stacking_context_level};
 pub use svg::{
@@ -777,6 +777,8 @@ pub struct VisualStyle {
     /// Request a reusable raster layer for this subtree. Defaults to false.
     /// Layers share the renderer cache budget and create a stacking context.
     pub cache_layer: bool,
+    pub scroll_state_container: bool,
+    pub container_names: Vec<String>,
     pub background: Option<Color>,
     pub background_layers: Vec<BackgroundLayer>,
     pub raster_background: images::RasterBackground,
@@ -807,6 +809,8 @@ impl Default for VisualStyle {
     fn default() -> Self {
         Self {
             cache_layer: false,
+            scroll_state_container: false,
+            container_names: Vec::new(),
             background: None,
             background_layers: Vec::new(),
             raster_background: images::RasterBackground::default(),

@@ -404,6 +404,7 @@ pub struct App<'a, State, Update, View, Signal = Invalidation> {
     close_handler: Option<fn(&mut State) -> bool>,
     exit_when: Option<fn(&State) -> bool>,
     stylesheet: &'a Stylesheet,
+    scroll_stylesheet: Option<Stylesheet>,
     update: Update,
     view: View,
     action_source: Option<Arc<dyn ActionSource>>,
@@ -484,6 +485,7 @@ where
             close_handler: None,
             exit_when: None,
             stylesheet,
+            scroll_stylesheet: None,
             update,
             view,
             action_source: None,
@@ -799,7 +801,7 @@ where
             render_root_with_schedule(
                 &self.runtime_world,
                 0,
-                self.stylesheet,
+                self.scroll_stylesheet.as_ref().unwrap_or(self.stylesheet),
                 self.viewport(),
                 root_render_mode(
                     dirty_flags,
@@ -813,8 +815,11 @@ where
             )
             .expect("runtime world should contain the app root before rendering"),
         ];
-        self.text_inputs
-            .decorate_scene(&mut scene, self.stylesheet, &self.runtime_world);
+        self.text_inputs.decorate_scene(
+            &mut scene,
+            self.scroll_stylesheet.as_ref().unwrap_or(self.stylesheet),
+            &self.runtime_world,
+        );
 
         let scene_swap_start = Instant::now();
         self.replace_scene(scene);
@@ -874,12 +879,17 @@ where
                 return false;
             }
             let style_start = Instant::now();
-            let viewport_stylesheet = self
-                .viewport()
-                .map(|v| self.stylesheet.for_viewport(v.width, v.height));
+            let viewport_stylesheet = self.viewport().map(|v| {
+                self.scroll_stylesheet
+                    .as_ref()
+                    .unwrap_or(self.stylesheet)
+                    .for_viewport(v.width, v.height)
+            });
             let resolved = resolve_render_tree_with_interaction_in_root(
                 &tree,
-                viewport_stylesheet.as_deref().unwrap_or(self.stylesheet),
+                viewport_stylesheet
+                    .as_deref()
+                    .unwrap_or(self.scroll_stylesheet.as_ref().unwrap_or(self.stylesheet)),
                 self.runtime_world.interaction(),
                 &node_match.path,
             );
@@ -929,8 +939,11 @@ where
             };
             *target = node;
         }
-        self.text_inputs
-            .decorate_scene(&mut scene, self.stylesheet, &self.runtime_world);
+        self.text_inputs.decorate_scene(
+            &mut scene,
+            self.scroll_stylesheet.as_ref().unwrap_or(self.stylesheet),
+            &self.runtime_world,
+        );
 
         let scene_swap_start = Instant::now();
         self.replace_scene(scene);
@@ -1069,6 +1082,16 @@ where
     View: FnMut(&State) -> Node,
     Signal: Into<Refresh>,
 {
+    fn tracks_scroll_state(&self) -> bool {
+        self.stylesheet.has_scroll_queries()
+    }
+
+    fn set_scroll_state(&mut self, snapshot: &[renderer::ScrollState]) -> bool {
+        self.scroll_stylesheet = Some(self.stylesheet.with_scroll_snapshot(snapshot));
+        self.invalidate(Invalidation::Structure);
+        true
+    }
+
     fn install_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
         if let Some(source) = &self.action_source {
             source.install_wake(wake);
@@ -1193,6 +1216,7 @@ pub struct FragmentApp<'a, State, Update, Signal = Invalidation> {
     close_handler: Option<fn(&mut State) -> bool>,
     exit_when: Option<fn(&State) -> bool>,
     stylesheet: &'a Stylesheet,
+    scroll_stylesheet: Option<Stylesheet>,
     update: Update,
     fragments: Vec<Fragment<'a, State>>,
     fragment_indices: HashMap<String, usize>,
@@ -1226,6 +1250,7 @@ where
             close_handler: None,
             exit_when: None,
             stylesheet,
+            scroll_stylesheet: None,
             update,
             fragment_indices: build_fragment_indices(&fragments),
             fragments,
@@ -1510,7 +1535,7 @@ where
                 render_root_with_schedule(
                     &self.runtime_world,
                     index,
-                    self.stylesheet,
+                    self.scroll_stylesheet.as_ref().unwrap_or(self.stylesheet),
                     self.viewport(),
                     root_render_mode(
                         dirty_flags,
@@ -1525,8 +1550,11 @@ where
                 .expect("runtime world should contain the fragment root before rendering"),
             );
         }
-        self.text_inputs
-            .decorate_scene(&mut scene, self.stylesheet, &self.runtime_world);
+        self.text_inputs.decorate_scene(
+            &mut scene,
+            self.scroll_stylesheet.as_ref().unwrap_or(self.stylesheet),
+            &self.runtime_world,
+        );
         self.replace_scene(scene);
         self.runtime_world.clear_dirty_flags();
     }
@@ -1570,7 +1598,7 @@ where
                 render_root_with_schedule(
                     &self.runtime_world,
                     index,
-                    self.stylesheet,
+                    self.scroll_stylesheet.as_ref().unwrap_or(self.stylesheet),
                     self.viewport(),
                     root_render_mode(dirty_flags, existing_scene.get(index)),
                     stats,
@@ -1589,8 +1617,11 @@ where
         for (index, node) in replacements {
             scene[index] = node;
         }
-        self.text_inputs
-            .decorate_scene(&mut scene, self.stylesheet, &self.runtime_world);
+        self.text_inputs.decorate_scene(
+            &mut scene,
+            self.scroll_stylesheet.as_ref().unwrap_or(self.stylesheet),
+            &self.runtime_world,
+        );
 
         self.replace_scene(scene);
         self.runtime_world.clear_dirty_flags();
@@ -1712,6 +1743,16 @@ where
     Update: FnMut(&mut State, FrameInfo) -> Signal,
     Signal: Into<Refresh>,
 {
+    fn tracks_scroll_state(&self) -> bool {
+        self.stylesheet.has_scroll_queries()
+    }
+
+    fn set_scroll_state(&mut self, snapshot: &[renderer::ScrollState]) -> bool {
+        self.scroll_stylesheet = Some(self.stylesheet.with_scroll_snapshot(snapshot));
+        self.invalidate(Invalidation::Structure);
+        true
+    }
+
     fn can_close(&mut self) -> bool {
         let result = self
             .close_handler

@@ -123,3 +123,97 @@ mod tests {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Scrollable {
+    None,
+    Any,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    X,
+    Y,
+}
+
+impl Scrollable {
+    fn matches(self, directions: cssimpler_core::ScrollDirections) -> bool {
+        let horizontal = directions.left || directions.right;
+        let vertical = directions.up || directions.down;
+        match self {
+            Self::None => !horizontal && !vertical,
+            Self::Any => horizontal || vertical,
+            Self::Left => directions.left,
+            Self::Right => directions.right,
+            Self::Top => directions.up,
+            Self::Bottom => directions.down,
+            Self::X => horizontal,
+            Self::Y => vertical,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScrollQuery {
+    name: Option<String>,
+    scrollable: Scrollable,
+}
+
+impl ScrollQuery {
+    pub(crate) fn from_rule(
+        rule: &lightningcss::rules::container::ContainerRule<'_, impl Clone>,
+    ) -> Option<Self> {
+        use lightningcss::media_query::{MediaFeatureName, MediaFeatureValue, QueryFeature};
+        use lightningcss::rules::container::{
+            ContainerCondition, ScrollStateFeatureId, ScrollStateQuery,
+        };
+        let ContainerCondition::ScrollState(ScrollStateQuery::Feature(feature)) =
+            rule.condition.as_ref()?
+        else {
+            return None;
+        };
+        let scrollable = match feature {
+            QueryFeature::Boolean {
+                name: MediaFeatureName::Standard(ScrollStateFeatureId::Scrollable),
+            } => Scrollable::Any,
+            QueryFeature::Plain {
+                name: MediaFeatureName::Standard(ScrollStateFeatureId::Scrollable),
+                value: MediaFeatureValue::Ident(ident),
+            } => match ident.0.to_ascii_lowercase().as_str() {
+                "none" => Scrollable::None,
+                "left" => Scrollable::Left,
+                "right" => Scrollable::Right,
+                "top" => Scrollable::Top,
+                "bottom" => Scrollable::Bottom,
+                "x" => Scrollable::X,
+                "y" => Scrollable::Y,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(Self {
+            name: rule.name.as_ref().map(|name| name.0.0.to_string()),
+            scrollable,
+        })
+    }
+
+    pub(crate) fn matches(
+        &self,
+        state: &[cssimpler_core::ScrollState],
+        path: &ElementPath,
+    ) -> bool {
+        state
+            .iter()
+            .filter(|entry| {
+                entry.query_container
+                    && entry.element.children.len() < path.children.len()
+                    && entry.element.is_prefix_of(path)
+                    && self
+                        .name
+                        .as_ref()
+                        .is_none_or(|name| entry.names.contains(name))
+            })
+            .max_by_key(|entry| entry.element.children.len())
+            .is_some_and(|entry| self.scrollable.matches(entry.scrollable))
+    }
+}
