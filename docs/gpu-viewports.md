@@ -171,6 +171,11 @@ UsdLux evaluation, and production PBR remain outside this backend's subset.
 Authored material and lighting data stay in the USD stage.
 Concave faces and malformed topology return errors instead of incorrect geometry.
 
+The `gpu-viewport` build compiles the built-in USD shader from
+[`viewport.wesl`](../renderer/src/gpu/usd/viewport.wesl) into two WGSL variants
+and validates both with Naga. The mesh pipeline selects its variant based on the
+adapter's shadow-map support. The WESL compiler requires Rust 1.97.1 or newer.
+
 ### Studio lighting and mesh materials
 
 Construct an `UsdRenderer` inside a `with_gpu_viewport` factory and configure it

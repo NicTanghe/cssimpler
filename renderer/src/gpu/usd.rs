@@ -262,7 +262,7 @@ impl EdgeRecord {
     };
 }
 
-/// Matches `ModelWire` in `usd.wgsl`.
+/// Matches `ModelWire` in `usd/viewport.wesl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ModelWire {
@@ -1105,17 +1105,15 @@ fn mesh_pipeline(
 }
 
 fn usd_shader(gpu: &GpuContext, shadows_supported: bool) -> wgpu::ShaderModule {
-    let shadow = if shadows_supported {
-        include_str!("usd/shadow.wgsl")
+    let source = if shadows_supported {
+        include_str!(concat!(env!("OUT_DIR"), "/usd_shadows.wgsl"))
     } else {
-        "fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -> f32 { return 1.0; }"
+        include_str!(concat!(env!("OUT_DIR"), "/usd_no_shadows.wgsl"))
     };
     gpu.device
         .create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("USD studio shading"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{}\n{shadow}", include_str!("usd.wgsl")).into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         })
 }
 
