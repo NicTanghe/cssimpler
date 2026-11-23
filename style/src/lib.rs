@@ -435,6 +435,8 @@ pub enum Declaration {
     RasterRepeat((bool, bool)),
     RasterOpacity(f32),
     Foreground(Color),
+    MixBlendMode(cssimpler_core::MixBlendMode),
+    Isolation(bool),
     NativeMaterial(NativeMaterial),
     GlassTint(Option<Color>),
     SvgFill(SvgPaint),

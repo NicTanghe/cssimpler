@@ -61,6 +61,8 @@ fn is_supported_property(name: &str) -> bool {
         | "grid-column-end"
         | "grid-row-start"
         | "grid-row-end"
+        | "mix-blend-mode"
+        | "isolation"
         | "background-color"
         | "background"
         | "background-image"
