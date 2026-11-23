@@ -369,3 +369,10 @@ draggable strip at the top of the client area. Interactive content takes priorit
 edges and corners with matching pointer cursors. Both measurements use logical
 pixels and default to zero. Resizing takes priority over dragging and is disabled
 for decorated, maximized, fullscreen, or non-resizable windows.
+
+### Named container rules
+
+Use `container-name: workspace` or `container: workspace / normal` on an
+ancestor. A name-only rule such as `@container workspace { .card { color: red } }`
+then applies to matching descendants. CSSimpler currently skips container rules
+with size, style, or scroll-state conditions.

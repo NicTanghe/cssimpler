@@ -46,6 +46,7 @@ use taffy::prelude::{
 };
 
 mod attributes;
+mod containers;
 mod custom_properties;
 mod fonts;
 mod invalidation;
@@ -124,7 +125,7 @@ impl Stylesheet {
     ) -> impl Iterator<Item = &'a StyleRule> {
         self.rules
             .iter()
-            .filter(move |rule| rule.selector.matches(element))
+            .filter(move |rule| rule.container_names.is_empty() && rule.selector.matches(element))
     }
 
     pub fn matching_rules_with_context<'a>(
@@ -178,11 +179,21 @@ impl Stylesheet {
 
         candidates.sort_unstable();
         candidates.dedup();
+        let container_names = if candidates.iter().any(|&i| {
+            self.rules
+                .get(i)
+                .is_some_and(|rule| !rule.container_names.is_empty())
+        }) {
+            self.ancestor_container_names(ancestors, element_path, interaction)
+        } else {
+            Vec::new()
+        };
         candidates.retain(|&index| {
             let Some(rule) = self.rules.get(index) else {
                 return false;
             };
-            rule.may_match_pseudo_and_interaction(pseudo_element, interaction)
+            containers::required_names_match(rule, &container_names)
+                && rule.may_match_pseudo_and_interaction(pseudo_element, interaction)
                 && rule.selector.matches_with_ancestors_interaction_and_pseudo(
                     element,
                     ancestors,
@@ -204,12 +215,20 @@ struct StylesheetIndex {
     interactive_only_active_rules: Vec<usize>,
     interactive_only_hover_active_rules: Vec<usize>,
     unanchored_rules: Vec<usize>,
+    container_name_rules: Vec<usize>,
     hover_rules: Vec<usize>,
     active_rules: Vec<usize>,
 }
 
 impl StylesheetIndex {
     fn insert(&mut self, index: usize, rule: &StyleRule) {
+        if rule
+            .declarations
+            .iter()
+            .any(|declaration| matches!(declaration, Declaration::ContainerNames(_)))
+        {
+            self.container_name_rules.push(index);
+        }
         match rule.selector.primary_anchor() {
             Some(SelectorAnchor::Id(name)) => {
                 self.id_rules.entry(name).or_default().push(index);
@@ -316,6 +335,7 @@ pub struct StyleRule {
     other_declaration_indices: Vec<usize>,
     interaction_dependencies: InteractionDependencies,
     media_conditions: Vec<media::Condition>,
+    container_names: Vec<String>,
 }
 
 impl StyleRule {
@@ -331,6 +351,7 @@ impl StyleRule {
         }
         Self {
             media_conditions: Vec::new(),
+            container_names: Vec::new(),
             interaction_dependencies: selector.interaction_dependencies(),
             selector,
             declarations,
@@ -389,6 +410,7 @@ impl StyleRule {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Declaration {
     Content(Option<AttributeTextSource>),
+    ContainerNames(Vec<String>),
     CustomProperty {
         name: String,
         value: String,
@@ -609,7 +631,14 @@ fn collect_style_rules_lossy(rule_list: &CssRuleList<'_, impl Clone>, stylesheet
                 collect_style_rules_lossy(&layer_rule.rules, stylesheet);
             }
             CssRule::Container(container_rule) => {
-                collect_style_rules_lossy(&container_rule.rules, stylesheet);
+                // Unsupported conditions cannot be assumed to match.
+                if let (Some(name), None) = (&container_rule.name, &container_rule.condition) {
+                    let start = stylesheet.rules.len();
+                    collect_style_rules_lossy(&container_rule.rules, stylesheet);
+                    for rule in &mut stylesheet.rules[start..] {
+                        rule.container_names.push(name.0.0.to_string());
+                    }
+                }
             }
             CssRule::Scope(scope_rule) => {
                 collect_style_rules_lossy(&scope_rule.rules, stylesheet);
@@ -674,7 +703,14 @@ fn collect_style_rules(
                 collect_style_rules(&layer_rule.rules, stylesheet)?;
             }
             CssRule::Container(container_rule) => {
-                collect_style_rules(&container_rule.rules, stylesheet)?;
+                // Unsupported conditions cannot be assumed to match.
+                if let (Some(name), None) = (&container_rule.name, &container_rule.condition) {
+                    let start = stylesheet.rules.len();
+                    collect_style_rules(&container_rule.rules, stylesheet)?;
+                    for rule in &mut stylesheet.rules[start..] {
+                        rule.container_names.push(name.0.0.to_string());
+                    }
+                }
             }
             CssRule::Scope(scope_rule) => {
                 collect_style_rules(&scope_rule.rules, stylesheet)?;
@@ -911,6 +947,10 @@ fn contextualize_property_error(property: &Property<'_>, error: StyleError) -> S
 
 fn extract_property(property: &Property<'_>) -> Result<Vec<Declaration>, StyleError> {
     reject_unsupported_attr_usage(property)?;
+
+    if let Some(declaration) = containers::extract_names(property) {
+        return Ok(vec![declaration]);
+    }
 
     if let Some(declarations) = custom_properties::extract_property(property) {
         return declarations;
@@ -1792,6 +1832,7 @@ fn apply_declaration(
     }
 
     match declaration {
+        Declaration::ContainerNames(_) => {}
         Declaration::Content(value) => {
             style.generated_text = value.clone().map(attribute_text_source_to_core);
         }
