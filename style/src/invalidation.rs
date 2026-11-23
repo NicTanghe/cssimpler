@@ -71,7 +71,7 @@ fn changed_interaction(
 
 fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
     match declaration {
-        Declaration::Content(_) => StyleInvalidation::Structure,
+        Declaration::Content(_) | Declaration::ContainerNames(_) => StyleInvalidation::Structure,
         Declaration::CustomProperty { .. }
         | Declaration::TransitionProperties(_)
         | Declaration::TransitionDurations(_)
