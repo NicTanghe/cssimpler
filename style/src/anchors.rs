@@ -129,6 +129,32 @@ pub(crate) fn move_rect(node: &mut RenderNode, dx: f32, dy: f32) {
     node.layout.y += dy;
 }
 
+pub(crate) fn collect_position_tries(
+    rules: &lightningcss::rules::CssRuleList<'_, impl Clone>,
+) -> HashMap<String, AnchorArea> {
+    use lightningcss::rules::CssRule;
+
+    rules
+        .0
+        .iter()
+        .filter_map(|rule| {
+            let CssRule::PositionTry(rule) = rule else {
+                return None;
+            };
+            let area = rule
+                .declarations
+                .iter()
+                .filter_map(|(property, _)| match extract(property) {
+                    Some(Declaration::AnchorArea(area)) => Some(area),
+                    _ => None,
+                })
+                .last()
+                .flatten()?;
+            Some((rule.name.0.to_string(), area))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use cssimpler_core::{ElementNode, Node};

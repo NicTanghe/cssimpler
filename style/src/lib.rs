@@ -89,9 +89,9 @@ pub use visual::{BackgroundLayerDeclaration, ShadowDeclaration};
 
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
+    position_tries: HashMap<String, AnchorArea>,
     pub rules: Vec<StyleRule>,
     index: StylesheetIndex,
-    position_tries: HashMap<String, AnchorArea>,
 }
 
 impl Stylesheet {
@@ -104,10 +104,7 @@ impl Stylesheet {
         {
             return std::borrow::Cow::Borrowed(self);
         }
-        let mut filtered = Self {
-            position_tries: self.position_tries.clone(),
-            ..Self::default()
-        };
+        let mut filtered = Self::default();
         for rule in &self.rules {
             if rule
                 .media_conditions
@@ -117,6 +114,7 @@ impl Stylesheet {
                 filtered.push(rule.clone());
             }
         }
+        filtered.position_tries.clone_from(&self.position_tries);
         std::borrow::Cow::Owned(filtered)
     }
 
@@ -635,24 +633,7 @@ pub fn parse_stylesheet(source: &str) -> Result<Stylesheet, StyleError> {
         .map_err(|error| StyleError::Parse(error.to_string()))?;
     let mut stylesheet = Stylesheet::default();
     collect_style_rules(&parsed.rules, &mut stylesheet)?;
-    for rule in &parsed.rules.0 {
-        if let CssRule::PositionTry(rule) = rule {
-            if let Some(area) = rule
-                .declarations
-                .iter()
-                .filter_map(|(property, _)| match anchors::extract(property) {
-                    Some(Declaration::AnchorArea(area)) => Some(area),
-                    _ => None,
-                })
-                .last()
-                .flatten()
-            {
-                stylesheet
-                    .position_tries
-                    .insert(rule.name.0.to_string(), area);
-            }
-        }
-    }
+    stylesheet.position_tries = anchors::collect_position_tries(&parsed.rules);
 
     Ok(stylesheet)
 }
@@ -678,24 +659,7 @@ pub fn parse_stylesheet_lossy(source: &str) -> Result<Stylesheet, StyleError> {
     };
     let mut stylesheet = Stylesheet::default();
     collect_style_rules_lossy(&parsed.rules, &mut stylesheet);
-    for rule in &parsed.rules.0 {
-        if let CssRule::PositionTry(rule) = rule {
-            if let Some(area) = rule
-                .declarations
-                .iter()
-                .filter_map(|(property, _)| match anchors::extract(property) {
-                    Some(Declaration::AnchorArea(area)) => Some(area),
-                    _ => None,
-                })
-                .last()
-                .flatten()
-            {
-                stylesheet
-                    .position_tries
-                    .insert(rule.name.0.to_string(), area);
-            }
-        }
-    }
+    stylesheet.position_tries = anchors::collect_position_tries(&parsed.rules);
 
     Ok(stylesheet)
 }
@@ -1930,14 +1894,14 @@ fn apply_declaration(
     }
 
     match declaration {
-        Declaration::ContainerNames(_)
-        | Declaration::AnchorNames(_)
-        | Declaration::PositionAnchor(_)
-        | Declaration::AnchorArea(_)
-        | Declaration::AnchorFallbacks(_) => {}
+        Declaration::ContainerNames(_) => {}
         Declaration::Content(value) => {
             style.generated_text = value.clone().map(attribute_text_source_to_core);
         }
+        Declaration::AnchorNames(_)
+        | Declaration::PositionAnchor(_)
+        | Declaration::AnchorArea(_)
+        | Declaration::AnchorFallbacks(_) => {}
         Declaration::OverflowX(mode) => {
             style.layout.taffy.overflow.x = visual::taffy_overflow_from_mode(*mode);
             style.visual.overflow.x = *mode;

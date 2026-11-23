@@ -71,12 +71,7 @@ fn changed_interaction(
 
 fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
     match declaration {
-        Declaration::Content(_)
-        | Declaration::ContainerNames(_)
-        | Declaration::AnchorNames(_)
-        | Declaration::PositionAnchor(_)
-        | Declaration::AnchorArea(_)
-        | Declaration::AnchorFallbacks(_) => StyleInvalidation::Structure,
+        Declaration::Content(_) | Declaration::ContainerNames(_) => StyleInvalidation::Structure,
         Declaration::CustomProperty { .. }
         | Declaration::TransitionProperties(_)
         | Declaration::TransitionDurations(_)
@@ -193,7 +188,11 @@ fn declaration_invalidation(declaration: &Declaration) -> StyleInvalidation {
         | Declaration::GridColumnEnd(_)
         | Declaration::GridRowStart(_)
         | Declaration::GridRowEnd(_) => StyleInvalidation::Layout,
-        Declaration::Display(_) => StyleInvalidation::Structure,
+        Declaration::AnchorNames(_)
+        | Declaration::PositionAnchor(_)
+        | Declaration::AnchorArea(_)
+        | Declaration::AnchorFallbacks(_)
+        | Declaration::Display(_) => StyleInvalidation::Structure,
     }
 }
 
