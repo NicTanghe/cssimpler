@@ -3094,6 +3094,7 @@ fn visual_styles_match_ignoring_projection(left: &VisualStyle, right: &VisualSty
         && left.text == right.text
         && left.text_stroke == right.text_stroke
         && left.text_shadows == right.text_shadows
+        && left.text_highlights == right.text_highlights
         && left.filter_drop_shadows == right.filter_drop_shadows
         && left.backdrop_blur_radius == right.backdrop_blur_radius
         && left.backdrop_occlusion == right.backdrop_occlusion
