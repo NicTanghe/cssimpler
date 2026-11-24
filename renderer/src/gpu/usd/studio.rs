@@ -103,10 +103,14 @@ impl Studio {
     }
 
     pub fn update_mesh(&mut self, cache: &MeshCache) {
-        self.scene_bounds = [cache.minimum, cache.maximum];
-        self.caster_bounds = cache.shadow_bounds.unwrap_or(self.scene_bounds);
         self.caster_ranges.clone_from(&cache.shadow_ranges);
         self.up = cache.up;
+        self.update_pose_bounds([cache.minimum, cache.maximum], cache.shadow_bounds);
+    }
+
+    pub fn update_pose_bounds(&mut self, scene: [Vec3; 2], casters: Option<[Vec3; 2]>) {
+        self.scene_bounds = scene;
+        self.caster_bounds = casters.unwrap_or(scene);
         self.dirty = true;
         self.depth_dirty = true;
     }
@@ -190,6 +194,7 @@ impl Studio {
                 self.floor = Some(vertex_buffer(
                     gpu,
                     &floor_vertices(center, height, radius, self.up),
+                    false,
                 ));
             }
         }
