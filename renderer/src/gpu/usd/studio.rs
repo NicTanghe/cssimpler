@@ -13,6 +13,7 @@ struct StudioUniform {
     lighting: [f32; 4],
     occlusion_plane: [f32; 4],
     shadows: [f32; 4],
+    shadow_fit: [f32; 4],
     key_tint: [f32; 4],
     fill: [f32; 4],
     fill_tint: [f32; 4],
@@ -92,7 +93,7 @@ impl Studio {
             settings.and_then(|light| {
                 light
                     .shadows
-                    .map(|shadow| (light.toward_key, shadow.resolution))
+                    .map(|shadow| (light.toward_key, shadow.resolution, shadow.coverage))
             })
         };
         self.depth_dirty |= depth_key(self.settings) != depth_key(settings);
@@ -122,6 +123,7 @@ impl Studio {
             lighting: [0.0, 0.0, 1.0, 0.0],
             occlusion_plane: [0.0; 4],
             shadows: [0.0; 4],
+            shadow_fit: [1.0, 1.0, 0.0, 1.0],
             key_tint: [1.0, 1.0, 1.0, 0.0],
             fill: [0.0; 4],
             fill_tint: [1.0, 1.0, 1.0, 0.0],
@@ -143,7 +145,6 @@ impl Studio {
         if let Some(settings) = self.settings {
             let key = from_studio_axes(Vec3::from_array(settings.toward_key), self.up).normalize();
             let [minimum, maximum] = self.caster_bounds;
-            let center = minimum + (maximum - minimum) * 0.5;
             let radius = ((maximum - minimum) * 0.5).length().max(0.01);
             let height = self.scene_bounds[0].dot(self.up) - radius * 0.015;
             params.key = key.extend(1.0).to_array();
@@ -163,9 +164,21 @@ impl Studio {
             params.occlusion_plane = [height, radius.recip(), 0.0, 0.0];
 
             if let Some(s) = shadow_settings.filter(|_| self.shadow.is_some()) {
-                params.light_projection =
-                    light_projection(center, radius, key, self.up).to_cols_array_2d();
-                params.shadows = [1.0, s.depth_bias, s.slope_bias, s.filter_radius as f32];
+                let fit = shadow_projection(
+                    self.caster_bounds,
+                    self.scene_bounds,
+                    key,
+                    self.up,
+                    s.coverage,
+                );
+                params.light_projection = fit.matrix.to_cols_array_2d();
+                params.shadow_fit = fit.sampling;
+                params.shadows = [
+                    1.0,
+                    s.depth_bias * fit.bias_scale,
+                    s.slope_bias * fit.bias_scale,
+                    s.filter_radius as f32,
+                ];
                 params.key_tint[3] = s.light_radius.tan();
                 params.fill_tint[3] = s.strength;
             }
@@ -353,23 +366,67 @@ pub(super) fn stage_up(stage: &Stage) -> Result<Vec3> {
     })
 }
 
-fn light_projection(center: Vec3, radius: f32, key: Vec3, up: Vec3) -> Mat4 {
+struct ShadowProjection {
+    matrix: Mat4,
+    /// UV span per unit of normalized depth, then the caster depth interval.
+    sampling: [f32; 4],
+    bias_scale: f32,
+}
+
+fn shadow_projection(
+    casters: [Vec3; 2],
+    scene: [Vec3; 2],
+    key: Vec3,
+    up: Vec3,
+    coverage: f32,
+) -> ShadowProjection {
     let light_up = if key.dot(up).abs() > 0.99 {
         Vec3::X
     } else {
         up
     };
-    let view =
-        glam::camera::rh::view::look_at_mat4(center + key * (2.0 * radius), center, light_up);
-    let extent = radius * 1.05;
-    glam::camera::rh::proj::directx::orthographic(
-        -extent,
-        extent,
-        -extent,
-        extent,
-        radius * 0.5,
-        radius * 3.5,
-    ) * view
+    let center = casters[0] + (casters[1] - casters[0]) * 0.5;
+    let view = glam::camera::rh::view::look_to_mat4(center, -key, light_up);
+    let [caster_min, caster_max] = light_bounds(view, casters);
+    let [scene_min, scene_max] = light_bounds(view, scene);
+    // The cove can be many times larger than the subject. Give small
+    // adjustments near the caster-only end more room on the control.
+    let weight = coverage.powi(3);
+    let mut minimum = caster_min.lerp(scene_min, weight);
+    let mut maximum = caster_max.lerp(scene_max, weight);
+    let padding = ((maximum - minimum) * 0.025).max(Vec3::splat(0.01));
+    minimum -= padding;
+    maximum += padding;
+    let span = maximum - minimum;
+    let caster_depth = caster_max.z - caster_min.z;
+    let tight_depth_span = caster_depth + 2.0 * (caster_depth * 0.025).max(0.01);
+    ShadowProjection {
+        matrix: glam::camera::rh::proj::directx::orthographic(
+            minimum.x, maximum.x, minimum.y, maximum.y, -maximum.z, -minimum.z,
+        ) * view,
+        sampling: [
+            span.z / span.x,
+            span.z / span.y,
+            (maximum.z - caster_max.z) / span.z,
+            (maximum.z - caster_min.z) / span.z,
+        ],
+        bias_scale: tight_depth_span / span.z,
+    }
+}
+
+fn light_bounds(view: Mat4, [min, max]: [Vec3; 2]) -> [Vec3; 2] {
+    let mut minimum = Vec3::splat(f32::INFINITY);
+    let mut maximum = Vec3::splat(f32::NEG_INFINITY);
+    for x in [min.x, max.x] {
+        for y in [min.y, max.y] {
+            for z in [min.z, max.z] {
+                let point = view.transform_point3(Vec3::new(x, y, z));
+                minimum = minimum.min(point);
+                maximum = maximum.max(point);
+            }
+        }
+    }
+    [minimum, maximum]
 }
 
 fn floor_vertices(center: Vec3, height: f32, radius: f32, up: Vec3) -> [Vertex; 6] {
@@ -390,4 +447,60 @@ fn floor_vertices(center: Vec3, height: f32, radius: f32, up: Vec3) -> [Vertex; 
         uv: [0.0; 3],
         local: [0.0; 3],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coverage_expands_from_subject_to_cove_without_clipping_casters() {
+        let casters = [Vec3::new(-0.55, 0.0, -0.25), Vec3::new(0.55, 1.8, 0.4)];
+        let scene = [Vec3::new(-30.0, 0.0, -30.0), Vec3::new(30.0, 40.0, 30.0)];
+        let key = Vec3::from_array(UsdStudioLighting::default().toward_key).normalize();
+        let fit = |coverage| shadow_projection(casters, scene, key, Vec3::Y, coverage);
+        let tight = fit(0.0);
+        let middle = fit(0.5);
+        let full = fit(1.0);
+        let contains = |projection, bounds| {
+            let [min, max] = light_bounds(projection, bounds);
+            min.cmpge(Vec3::new(-1.0, -1.0, 0.0)).all() && max.cmple(Vec3::ONE).all()
+        };
+
+        assert!(contains(tight.matrix, casters));
+        assert!(contains(middle.matrix, casters));
+        assert!(contains(full.matrix, scene));
+        assert!(!contains(tight.matrix, scene));
+        assert!(!contains(middle.matrix, scene));
+
+        let ground_area = |matrix: Mat4| {
+            let axes = matrix.transpose();
+            let area_in_light_space =
+                4.0 / (axes.x_axis.truncate().length() * axes.y_axis.truncate().length());
+            area_in_light_space / key.y
+        };
+        let tight_area = ground_area(tight.matrix);
+        assert!((3.0..10.0).contains(&tight_area), "{tight_area} m²");
+        assert!(tight_area < ground_area(middle.matrix));
+        assert!(ground_area(middle.matrix) < ground_area(full.matrix));
+        assert!((tight.bias_scale - 1.0).abs() < 1e-6);
+        assert!(full.bias_scale < middle.bias_scale && middle.bias_scale < tight.bias_scale);
+        for projection in [tight, middle, full] {
+            let [min, max] = light_bounds(projection.matrix, casters);
+            assert!((projection.sampling[2] - min.z).abs() < 1e-6);
+            assert!((projection.sampling[3] - max.z).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn shadow_projection_handles_degenerate_bounds_and_vertical_z_up_light() {
+        let bounds = [Vec3::new(0.0, 0.0, 2.0); 2];
+        let fit = shadow_projection(bounds, bounds, Vec3::Z, Vec3::Z, 1.0);
+        assert!(fit.matrix.is_finite());
+        assert!(
+            fit.matrix
+                .transform_point3(bounds[0])
+                .abs_diff_eq(Vec3::Z * 0.5, 1e-5)
+        );
+    }
 }

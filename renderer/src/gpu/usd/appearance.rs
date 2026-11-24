@@ -136,11 +136,14 @@ impl UsdMaterial {
     }
 }
 
-/// Directional key-light depth map settings. Biases are in normalized light
-/// depth, and the filter radius is in shadow-map texels (0 to 64).
+/// Directional key-light depth map settings. Biases are relative to the
+/// caster-only depth range, and the filter radius is in map texels (0 to 64).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UsdShadowSettings {
     pub resolution: u32,
+    /// Grow the light-space fit from the casters at 0 to all visible USD
+    /// meshes at 1. The range gives finer control close to the casters.
+    pub coverage: f32,
     pub depth_bias: f32,
     pub slope_bias: f32,
     pub filter_radius: u32,
@@ -155,6 +158,7 @@ impl Default for UsdShadowSettings {
     fn default() -> Self {
         Self {
             resolution: 1024,
+            coverage: 0.0,
             depth_bias: 0.0004,
             slope_bias: 0.001,
             filter_radius: 1,
@@ -233,6 +237,7 @@ impl UsdStudioLighting {
             || !(0.0..=1.0).contains(&self.highlight_rolloff)
             || self.shadows.is_some_and(|s| {
                 s.resolution == 0
+                    || !(0.0..=1.0).contains(&s.coverage)
                     || !(0.0..=1.0).contains(&s.depth_bias)
                     || !(0.0..=1.0).contains(&s.slope_bias)
                     || s.filter_radius > 64

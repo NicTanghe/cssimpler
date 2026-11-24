@@ -27,6 +27,7 @@ public fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -
     let bias = studio.shadows.y + studio.shadows.z * (1.0 - n_dot_l) + subtexel_bias;
     let receiver = light.z - bias;
     var radius = max_radius;
+    var aspect = vec2(1.0);
     let area_key = studio.key_tint.w > 0.0 && max_radius > 0.0;
     var wide_gradient = depth_gradient;
     if area_key {
@@ -34,11 +35,13 @@ public fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -
         // plane across a wide filter makes penumbras change at mesh edges.
         // Use the interpolated normal for the broad footprint instead.
         wide_gradient = smooth_receiver_gradient(normal, n_dot_l);
-        let separation = blocker_separation(uv, receiver, wide_gradient, texel * max_radius);
-        // The depth projection spans 3 radii and the UV projection spans 2.1.
-        // Project angular key size along that receiver-to-blocker distance.
-        let projected = (3.0 / 2.1) * separation * studio.key_tint.w;
-        radius = clamp(projected / max(texel.x, texel.y), min(1.25, max_radius), max_radius);
+        let texels_per_depth = studio.shadow_fit.xy / texel;
+        let widest = max(texels_per_depth.x, texels_per_depth.y);
+        aspect = texels_per_depth / widest;
+        let separation = blocker_separation(uv, receiver, wide_gradient, texel * max_radius * aspect);
+        // Project the angular penumbra into the fitted rectangle in map texels.
+        let projected = separation * studio.key_tint.w * widest;
+        radius = clamp(projected, min(1.25, max_radius), max_radius);
     }
     if radius <= 1.0 {
         return compare_shadow(uv, receiver);
@@ -49,7 +52,7 @@ public fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -
     let count = select(16u, 48u, area_key || radius > 6.0);
     var lit = 0.0;
     for (var i = 0u; i < count; i++) {
-        let delta = disk_samples[i + select(0u, 16u, count == 48u)] * (radius * texel);
+        let delta = disk_samples[i + select(0u, 16u, count == 48u)] * (radius * texel * aspect);
         // Retain precise geometric receiver depth for taps near contact.
         let local_weight = 1.0 - smoothstep(1.0, 5.0, length(delta / texel));
         let gradient = mix(wide_gradient, depth_gradient, local_weight);
@@ -103,8 +106,8 @@ fn blocker_separation(uv: vec2<f32>, receiver: f32, gradient: vec2<f32>, extent:
         if weight > 0.0 {
             // Recover approximate blocker depth using comparison sampling,
             // which is portable to backends without depth texture loads.
-            var near = clamp(surface_depth - 0.5, 0.0, 1.0);
-            var far = clamp(surface_depth, 0.0, 1.0);
+            var near = studio.shadow_fit.z;
+            var far = clamp(surface_depth, near, studio.shadow_fit.w);
             for (var search = 0u; search < 7u; search++) {
                 let middle = (near + far) * 0.5;
                 if compare_shadow(sample_uv, middle) >= 0.5 {

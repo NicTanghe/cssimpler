@@ -5,6 +5,7 @@ struct Studio {
     lighting: vec4<f32>,
     occlusion_plane: vec4<f32>,
     shadows: vec4<f32>,
+    shadow_fit: vec4<f32>,
     key_tint: vec4<f32>,
     fill: vec4<f32>,
     fill_tint: vec4<f32>,
