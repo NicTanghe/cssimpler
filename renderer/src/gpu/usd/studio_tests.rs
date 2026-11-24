@@ -15,7 +15,10 @@ fn studio_fixture_keeps_prim_ranges_and_flattened_uvs() {
     let range_for = |path| {
         let index = cache.models.iter().position(|model| model == path).unwrap();
         let range = &cache.ranges[index];
-        &cache.vertices[range.start as usize..range.end as usize]
+        cache.indices[range.start as usize..range.end as usize]
+            .iter()
+            .map(|i| cache.vertices[*i as usize])
+            .collect::<Vec<_>>()
     };
     let receiver = range_for("/Studio/Receiver");
     assert_eq!(
@@ -44,6 +47,8 @@ fn studio_fixture_keeps_prim_ranges_and_flattened_uvs() {
     );
     let caster = range_for("/Studio/Caster");
     assert_eq!(caster.len(), 36);
+    // Four receiver vertices plus four vertices for each hard-edged box face.
+    assert_eq!(cache.vertices.len(), 4 + 6 * 4);
     assert!(caster.iter().all(|v| v.uv == [0.0; 3]));
     assert!(caster.iter().any(|v| v.local[1] < 0.0));
     assert!(caster.iter().any(|v| v.local[1] > 0.0));
@@ -71,14 +76,31 @@ fn studio_shadows_reach_mesh_and_floor() {
             | wgpu::TextureUsages::COPY_SRC
             | wgpu::TextureUsages::COPY_DST,
     };
-    let mut renderer = UsdRenderer::new(
+    let scene = fixture();
+    let redraw = GpuRedrawHandle::default();
+    let mut orbit_renderer = UsdRenderer::new(
         GpuViewportInit {
             gpu: &gpu,
             info,
             redraw: GpuRedrawHandle::default(),
         },
-        fixture(),
+        scene.clone(),
         UsdCameraMode::Orbit,
+    )
+    .unwrap();
+    let camera_stage = orbit_renderer.camera_stage.clone();
+    let camera_path = orbit_renderer.camera_path.clone();
+    let mut orbit = orbit_renderer.orbit.take().unwrap();
+    drop(orbit_renderer);
+    let mut renderer = UsdRenderer::new_with_authored_camera(
+        GpuViewportInit {
+            gpu: &gpu,
+            info,
+            redraw: redraw.clone(),
+        },
+        scene,
+        camera_stage.clone(),
+        &camera_path.to_string(),
     )
     .unwrap();
     assert!(renderer.supports_shadow_mapping());
@@ -194,6 +216,19 @@ fn studio_shadows_reach_mesh_and_floor() {
         floor_shadow > 50,
         "expected a shadow on the floor, found {floor_shadow} pixels"
     );
+
+    let vertices = renderer.vertices.clone();
+    let indices = renderer.indices.clone();
+    redraw.take_dirty();
+    let yaw = orbit.yaw;
+    orbit.yaw += 0.25;
+    update_orbit_camera(&camera_stage, &camera_path, &orbit).unwrap();
+    assert!(redraw.take_dirty(), "camera edits must wake the viewport");
+    assert_ne!(with, draw(&mut renderer));
+    assert_eq!(renderer.vertices, vertices);
+    assert_eq!(renderer.indices, indices);
+    orbit.yaw = yaw;
+    update_orbit_camera(&camera_stage, &camera_path, &orbit).unwrap();
 
     renderer.clear_model_material("/Studio/Receiver");
     renderer.clear_model_material("/Studio/Caster");

@@ -190,6 +190,7 @@ impl Studio {
         encoder: &mut wgpu::CommandEncoder,
         uniforms: &wgpu::BindGroup,
         vertices: &wgpu::Buffer,
+        indices: &wgpu::Buffer,
     ) {
         let Some(shadow) = self.shadow.as_mut().filter(|shadow| shadow.needs_render) else {
             return;
@@ -210,8 +211,9 @@ impl Studio {
         pass.set_pipeline(&shadow.pipeline);
         pass.set_bind_group(0, uniforms, &[]);
         pass.set_vertex_buffer(0, vertices.slice(..));
+        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
         for range in &self.caster_ranges {
-            pass.draw(range.clone(), 0..1);
+            pass.draw_indexed(range.clone(), 0, 0..1);
         }
         shadow.needs_render = false;
     }
