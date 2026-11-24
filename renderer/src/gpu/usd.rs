@@ -284,6 +284,7 @@ struct CameraKey {
 
 struct MeshCache {
     vertices: Vec<Vertex>,
+    indices: Vec<u32>,
     edges: Vec<EdgeRecord>,
     /// Mesh prim paths, in the order used as the per-edge model id.
     models: Vec<String>,
@@ -306,7 +307,8 @@ pub struct UsdRenderer {
     revision: u64,
     evaluated_time: Option<scene::TimeCode>,
     vertices: wgpu::Buffer,
-    vertex_count: u32,
+    indices: wgpu::Buffer,
+    index_count: u32,
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_binding: wgpu::BindGroup,
@@ -351,9 +353,35 @@ struct Orbit {
 
 impl UsdRenderer {
     pub fn new(init: GpuViewportInit<'_>, scene: UsdScene, mode: UsdCameraMode) -> Result<Self> {
+        Self::new_with_camera_stage(init, scene, mode, None)
+    }
+
+    /// Use a camera on a separate stage so its edits redraw the view without
+    /// rebuilding the scene's mesh buffers or light-space depth map.
+    pub fn new_with_authored_camera(
+        init: GpuViewportInit<'_>,
+        scene: UsdScene,
+        camera_stage: Stage,
+        path: &str,
+    ) -> Result<Self> {
+        Self::new_with_camera_stage(
+            init,
+            scene,
+            UsdCameraMode::Authored(path.into()),
+            Some(camera_stage),
+        )
+    }
+
+    fn new_with_camera_stage(
+        init: GpuViewportInit<'_>,
+        scene: UsdScene,
+        mode: UsdCameraMode,
+        camera_stage: Option<Stage>,
+    ) -> Result<Self> {
         let initial_time = Some(scene::TimeCode::new(scene.stage.start_time_code()));
         let cache = extract_meshes(&scene.stage, initial_time)?;
         let redraw = init.redraw.clone();
+        let camera_redraw = camera_stage.is_some().then(|| redraw.clone());
         let control = UsdViewControl(Rc::new(RefCell::new(ViewState {
             time: initial_time,
             redraw: init.redraw,
@@ -361,13 +389,14 @@ impl UsdRenderer {
         let (camera_stage, camera_path, orbit) = match mode {
             UsdCameraMode::Authored(path) => {
                 let path = sdf::Path::new(&path).map_err(error)?;
-                if geom::Camera::get(&scene.stage, &path)
+                let camera_stage = camera_stage.unwrap_or_else(|| scene.stage.clone());
+                if geom::Camera::get(&camera_stage, &path)
                     .map_err(error)?
                     .is_none()
                 {
                     return Err(error(format!("USD camera not found: {path}")));
                 }
-                (scene.stage.clone(), path, None)
+                (camera_stage, path, None)
             }
             UsdCameraMode::Orbit => {
                 let camera_stage = Stage::builder()
@@ -411,6 +440,7 @@ impl UsdRenderer {
         };
         let gpu = init.gpu;
         let vertices = vertex_buffer(gpu, &cache.vertices);
+        let indices = index_buffer(gpu, &cache.indices);
         let camera_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("USD camera uniforms"),
             size: std::mem::size_of::<CameraUniform>() as u64,
@@ -483,6 +513,9 @@ impl UsdRenderer {
         let changes = camera_revision.clone();
         let camera_sink = camera_stage.add_sink(move |_: &Stage, _: &scene::CommittedChange| {
             changes.set(changes.get().wrapping_add(1));
+            if let Some(redraw) = &camera_redraw {
+                redraw.request_redraw();
+            }
         });
         Ok(Self {
             revision: scene.revision.get(),
@@ -493,7 +526,8 @@ impl UsdRenderer {
             camera_path,
             orbit,
             vertices,
-            vertex_count: cache.vertices.len() as u32,
+            indices,
+            index_count: cache.indices.len() as u32,
             pipeline,
             camera_buffer,
             camera_binding,
@@ -797,7 +831,8 @@ impl GpuViewportRenderer for UsdRenderer {
         if self.revision != self.scene.revision.get() || self.evaluated_time != time {
             let cache = extract_meshes(&self.scene.stage, time)?;
             self.vertices = vertex_buffer(gpu, &cache.vertices);
-            self.vertex_count = cache.vertices.len() as u32;
+            self.indices = index_buffer(gpu, &cache.indices);
+            self.index_count = cache.indices.len() as u32;
             self.model_wires = model_wire_buffer(gpu, cache.models.len());
             let (edges, wire_binding, edge_vertices) =
                 wire_resources(gpu, &self.wire_layout, &self.model_wires, &cache.edges);
@@ -836,8 +871,12 @@ impl GpuViewportRenderer for UsdRenderer {
             );
             self.camera_key = Some(key);
         }
-        self.studio
-            .render_shadow(frame.encoder, &self.camera_binding, &self.vertices);
+        self.studio.render_shadow(
+            frame.encoder,
+            &self.camera_binding,
+            &self.vertices,
+            &self.indices,
+        );
         let depth = self.targets.depth.create_view(&Default::default());
         let color = self
             .targets
@@ -892,10 +931,11 @@ impl GpuViewportRenderer for UsdRenderer {
                 }
                 let instance = strip as u32..strip as u32 + 1;
                 pass.set_vertex_buffer(0, self.vertices.slice(..));
+                pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
                 let default_material = &self.materials.default_binding;
                 if self.model_materials.is_empty() {
                     pass.set_bind_group(1, default_material, &[]);
-                    pass.draw(0..self.vertex_count, instance.clone());
+                    pass.draw_indexed(0..self.index_count, 0, instance.clone());
                 } else {
                     for (path, range) in self.models.iter().zip(&self.model_ranges) {
                         let material = self
@@ -904,7 +944,7 @@ impl GpuViewportRenderer for UsdRenderer {
                             .and_then(|entry| entry.binding.as_ref())
                             .unwrap_or(default_material);
                         pass.set_bind_group(1, material, &[]);
-                        pass.draw(range.clone(), instance.clone());
+                        pass.draw_indexed(range.clone(), 0, instance.clone());
                     }
                 }
                 if let Some(floor) = &self.studio.floor {
@@ -1289,6 +1329,15 @@ fn vertex_buffer(gpu: &GpuContext, vertices: &[Vertex]) -> wgpu::Buffer {
         })
 }
 
+fn index_buffer(gpu: &GpuContext, indices: &[u32]) -> wgpu::Buffer {
+    gpu.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("USD derived mesh indices"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        })
+}
+
 fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCache> {
     let mut paths = Vec::new();
     stage
@@ -1299,6 +1348,7 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
     let mut xforms = geom::XformCache::new(time);
     let mut cache = MeshCache {
         vertices: Vec::new(),
+        indices: Vec::new(),
         edges: Vec::new(),
         models: Vec::new(),
         ranges: Vec::new(),
@@ -1307,6 +1357,15 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
         up: studio::stage_up(stage)?,
         minimum: Vec3::splat(f32::INFINITY),
         maximum: Vec3::splat(f32::NEG_INFINITY),
+    };
+    // Flat normals computed on either side of a shared edge can differ only
+    // in the sign of a zero component.
+    let component_bits = |component: f32| {
+        if component == 0.0 {
+            0
+        } else {
+            component.to_bits()
+        }
     };
     for path in paths {
         let Some(mesh) = geom::Mesh::get(stage, &path).map_err(error)? else {
@@ -1421,7 +1480,9 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
         // The prim path is this mesh's model id, used to select stroke settings.
         let model = cache.models.len() as u32;
         cache.models.push(path.to_string());
-        let first_vertex = cache.vertices.len() as u32;
+        let first_index = cache.indices.len() as u32;
+        let mut vertex_lookup = HashMap::new();
+        let mut face_vertices = Vec::new();
         let mut mesh_edges: Vec<EdgeRecord> = Vec::new();
         let mut edge_lookup: HashMap<(u32, u32), usize> = HashMap::new();
         let mut offset = 0usize;
@@ -1485,61 +1546,74 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                     }
                 }
             }
-            for i in 1..polygon.len() - 1 {
-                for corner in [0, i, i + 1] {
-                    let p = polygon[corner];
-                    let shading_normal = authored_normals.as_ref().map_or(normal, |normals| {
-                        let index = match interpolation {
-                            "constant" => 0,
-                            "uniform" => face_index,
-                            "vertex" | "varying" => face[corner] as usize,
-                            "faceVarying" => offset + corner,
-                            _ => unreachable!(), // Validated above.
-                        };
-                        normals[index]
-                    });
-                    if !p.is_finite() {
-                        return Err(error(format!("{path}: non-finite point")));
-                    }
-                    cache.minimum = cache.minimum.min(p);
-                    cache.maximum = cache.maximum.max(p);
-                    if casts_shadow {
-                        let bounds = cache.shadow_bounds.get_or_insert([p, p]);
-                        bounds[0] = bounds[0].min(p);
-                        bounds[1] = bounds[1].max(p);
-                    }
-                    let point_index = face[corner] as usize;
-                    let uv = uvs.as_ref().map_or([0.0; 3], |(interpolation, values)| {
-                        let index = match interpolation {
-                            geom::Interpolation::Constant => 0,
-                            geom::Interpolation::Uniform => face_index,
-                            geom::Interpolation::Vertex | geom::Interpolation::Varying => {
-                                point_index
-                            }
-                            geom::Interpolation::FaceVarying => offset + corner,
-                        };
-                        [values[index].x, values[index].y, 1.0]
-                    });
-                    let p_local = points[point_index];
-                    let local = Vec3::new(p_local.x, p_local.y, p_local.z) - local_center;
-                    let local = if cache.up == Vec3::Z {
-                        Vec3::new(local.x, local.z, -local.y)
-                    } else {
-                        local
+            face_vertices.clear();
+            for corner in 0..polygon.len() {
+                let p = polygon[corner];
+                let shading_normal = authored_normals.as_ref().map_or(normal, |normals| {
+                    let index = match interpolation {
+                        "constant" => 0,
+                        "uniform" => face_index,
+                        "vertex" | "varying" => face[corner] as usize,
+                        "faceVarying" => offset + corner,
+                        _ => unreachable!(), // Validated above.
                     };
+                    normals[index]
+                });
+                if !p.is_finite() {
+                    return Err(error(format!("{path}: non-finite point")));
+                }
+                cache.minimum = cache.minimum.min(p);
+                cache.maximum = cache.maximum.max(p);
+                if casts_shadow {
+                    let bounds = cache.shadow_bounds.get_or_insert([p, p]);
+                    bounds[0] = bounds[0].min(p);
+                    bounds[1] = bounds[1].max(p);
+                }
+                let point_index = face[corner] as usize;
+                let uv = uvs.as_ref().map_or([0.0; 3], |(interpolation, values)| {
+                    let index = match interpolation {
+                        geom::Interpolation::Constant => 0,
+                        geom::Interpolation::Uniform => face_index,
+                        geom::Interpolation::Vertex | geom::Interpolation::Varying => point_index,
+                        geom::Interpolation::FaceVarying => offset + corner,
+                    };
+                    [values[index].x, values[index].y, 1.0]
+                });
+                let p_local = points[point_index];
+                let local = Vec3::new(p_local.x, p_local.y, p_local.z) - local_center;
+                let local = if cache.up == Vec3::Z {
+                    Vec3::new(local.x, local.z, -local.y)
+                } else {
+                    local
+                };
+                let normal = shading_normal.to_array();
+                // Position and local coordinates are fixed for this point within
+                // the prim. The resolved normal and UV can differ at seams.
+                let key = (
+                    point_index,
+                    normal.map(component_bits),
+                    uv.map(component_bits),
+                );
+                let index = *vertex_lookup.entry(key).or_insert_with(|| {
+                    let index = cache.vertices.len() as u32;
                     cache.vertices.push(Vertex {
                         position: p.to_array(),
-                        normal: shading_normal.to_array(),
+                        normal,
                         color,
                         uv,
                         local: local.to_array(),
                     });
-                }
+                    index
+                });
+                face_vertices.push(index);
+            }
+            for pair in face_vertices[1..].windows(2) {
+                cache.indices.extend([face_vertices[0], pair[0], pair[1]]);
             }
             offset = end;
         }
         cache.edges.extend(mesh_edges);
-        let range = first_vertex..cache.vertices.len() as u32;
+        let range = first_index..cache.indices.len() as u32;
         if casts_shadow && !range.is_empty() {
             cache.shadow_ranges.push(range.clone());
         }
@@ -1762,8 +1836,13 @@ mod tests {
                 )
                 .unwrap();
             let cache = extract_meshes(&stage, None).unwrap();
-            for (vertex, index) in cache.vertices.iter().zip(expected) {
-                assert_eq!(vertex.normal, values[index], "{mode}");
+            assert_eq!(cache.vertices.len(), 4);
+            assert_eq!(cache.indices, [0, 1, 2, 0, 2, 3]);
+            for (vertex, index) in cache.indices.iter().zip(expected) {
+                assert_eq!(
+                    cache.vertices[*vertex as usize].normal, values[index],
+                    "{mode}"
+                );
             }
         }
     }
@@ -1880,11 +1959,58 @@ def Mesh "Cloth" {
                 )
                 .unwrap();
             let cache = extract_meshes(&stage, None).unwrap();
-            assert_eq!(cache.vertices.len(), 6);
-            for (v, i) in cache.vertices.iter().zip(expected) {
-                assert_eq!(v.normal, directions[i], "{mode}");
+            let split = matches!(mode, "uniform" | "faceVarying");
+            assert_eq!(cache.vertices.len(), if split { 6 } else { 4 });
+            assert_eq!(cache.indices.len(), expected.len());
+            for (vertex, i) in cache.indices.iter().zip(expected) {
+                assert_eq!(
+                    cache.vertices[*vertex as usize].normal, directions[i],
+                    "{mode}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn mesh_indices_preserve_face_varying_uv_seams() {
+        let stage = triangle();
+        let mesh = geom::Mesh::get(&stage, "/Cloth").unwrap().unwrap();
+        mesh.points_attr()
+            .set(vec![
+                gf::vec3f(0., 0., 0.),
+                gf::vec3f(1., 0., 0.),
+                gf::vec3f(0., 1., 0.),
+                gf::vec3f(1., 1., 0.),
+            ])
+            .unwrap();
+        mesh.face_vertex_counts_attr().set(vec![3_i32, 3]).unwrap();
+        mesh.face_vertex_indices_attr()
+            .set(vec![0_i32, 1, 2, 1, 3, 2])
+            .unwrap();
+        let primvars = PrimvarsAPI::from_prim_unchecked(stage.prim("/Cloth").unwrap());
+        let st = primvars
+            .create_primvar("st", "texCoord2f[]")
+            .unwrap()
+            .set_interpolation(geom::Interpolation::FaceVarying)
+            .unwrap();
+        st.attribute()
+            .clone()
+            .set(vec![
+                gf::vec2f(0., 0.),
+                gf::vec2f(1., 0.),
+                gf::vec2f(0., 1.),
+                gf::vec2f(1., 1.),
+                gf::vec2f(0.5, 0.),
+            ])
+            .unwrap();
+        st.set_indices(vec![0, 1, 2, 4, 3, 2], None).unwrap();
+
+        let cache = extract_meshes(&stage, None).unwrap();
+        assert_eq!(cache.indices, [0, 1, 2, 3, 4, 2]);
+        assert_eq!(cache.vertices.len(), 5);
+        assert_eq!(cache.vertices[1].position, cache.vertices[3].position);
+        assert_eq!(cache.vertices[1].uv, [1., 0., 1.]);
+        assert_eq!(cache.vertices[3].uv, [0.5, 0., 1.]);
     }
 
     #[test]
@@ -2072,10 +2198,9 @@ def Mesh "Cloth" {
             "/../examples/assets/usd-preview.usda"
         ))
         .unwrap();
-        assert_eq!(
-            extract_meshes(scene.stage(), None).unwrap().vertices.len(),
-            36
-        );
+        let cache = extract_meshes(scene.stage(), None).unwrap();
+        assert_eq!(cache.indices.len(), 36);
+        assert_eq!(cache.vertices.len(), 24);
         assert!(
             geom::Camera::get(scene.stage(), "/World/Camera")
                 .unwrap()

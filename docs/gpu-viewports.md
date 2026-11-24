@@ -284,6 +284,9 @@ The renderer reads normals at the same selected time as points and topology.
 Changing authored normals through the shared USD stage invalidates derived mesh
 vertices through the existing stage revision tracking; changing evaluation time
 also reevaluates normals. USD resolves the time samples before normalization.
+Both the shaded mesh and the shadow pass use indexed triangles. Corners of the
+same point share a vertex when their resolved normal and UV match. This retains
+hard normals and UV seams while reducing vertex duplication on smooth meshes.
 
 A missing value at the selected time uses generated flat face normals. An authored
 value with a wrong count, unsupported interpolation, zero/nonfinite direction, or
@@ -299,6 +302,9 @@ source asset. `UsdRenderer::control()` provides view-local animation-time contro
 when constructing a renderer through the generic factory API. Stage edits wake
 the viewport and invalidate its derived geometry. The initial evaluation time is
 the stage's start time.
+An application that authors its own navigation camera can call
+`UsdRenderer::new_with_authored_camera` with a separate camera stage. Edits on
+that stage refresh the view without invalidating mesh buffers or the shadow map.
 
 Separate native surfaces currently require fully visible, rectangular, childless
 regions. A viewport hides when partially clipped, covered by later-painted UI,
