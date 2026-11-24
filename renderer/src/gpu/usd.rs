@@ -547,8 +547,8 @@ impl UsdRenderer {
         self.studio.settings.and_then(|settings| settings.shadows)
     }
 
-    /// Change the existing studio key's shadow sampling parameters at runtime.
-    /// Adjusting radius, strength or bias reuses the existing depth map.
+    /// Change the existing studio key's shadow settings at runtime. Sampling
+    /// changes reuse the depth map. Coverage changes redraw it before sampling.
     pub fn set_shadow_settings(&mut self, shadows: UsdShadowSettings) -> Result<()> {
         let mut settings = self
             .studio

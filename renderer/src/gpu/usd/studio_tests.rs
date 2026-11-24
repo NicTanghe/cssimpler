@@ -195,6 +195,36 @@ fn studio_shadows_reach_mesh_and_floor() {
         "expected a shadow on the floor, found {floor_shadow} pixels"
     );
 
+    let close = studio.shadows.unwrap();
+    renderer
+        .set_shadow_settings(UsdShadowSettings {
+            coverage: 1.0,
+            light_radius: 0.12,
+            ..close
+        })
+        .unwrap();
+    let wide = draw(&mut renderer);
+    let wide_receiver_shadow = without
+        .chunks_exact(4)
+        .zip(wide.chunks_exact(4))
+        .filter(|(lit, shadow)| {
+            lit[3] == 255
+                && shadow[3] == 255
+                && i32::from(lit[0]) - i32::from(lit[1]) > 45
+                && lit[0].saturating_sub(shadow[0]) > 24
+        })
+        .count();
+    assert!(
+        wide_receiver_shadow > 50,
+        "expected a shadow in the full fit"
+    );
+    renderer.set_shadow_settings(close).unwrap();
+    assert_eq!(
+        with,
+        draw(&mut renderer),
+        "restoring close fit must restore its shadow"
+    );
+
     renderer.clear_model_material("/Studio/Receiver");
     renderer.clear_model_material("/Studio/Caster");
     renderer.set_studio_lighting(None).unwrap();
