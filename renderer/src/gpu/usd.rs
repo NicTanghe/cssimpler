@@ -1358,6 +1358,15 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
         minimum: Vec3::splat(f32::INFINITY),
         maximum: Vec3::splat(f32::NEG_INFINITY),
     };
+    // Flat normals computed on either side of a shared edge can differ only
+    // in the sign of a zero component.
+    let component_bits = |component: f32| {
+        if component == 0.0 {
+            0
+        } else {
+            component.to_bits()
+        }
+    };
     for path in paths {
         let Some(mesh) = geom::Mesh::get(stage, &path).map_err(error)? else {
             continue;
@@ -1580,7 +1589,11 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                 let normal = shading_normal.to_array();
                 // Position and local coordinates are fixed for this point within
                 // the prim. The resolved normal and UV can differ at seams.
-                let key = (point_index, normal.map(f32::to_bits), uv.map(f32::to_bits));
+                let key = (
+                    point_index,
+                    normal.map(component_bits),
+                    uv.map(component_bits),
+                );
                 let index = *vertex_lookup.entry(key).or_insert_with(|| {
                     let index = cache.vertices.len() as u32;
                     cache.vertices.push(Vertex {
@@ -2185,10 +2198,9 @@ def Mesh "Cloth" {
             "/../examples/assets/usd-preview.usda"
         ))
         .unwrap();
-        assert_eq!(
-            extract_meshes(scene.stage(), None).unwrap().vertices.len(),
-            36
-        );
+        let cache = extract_meshes(scene.stage(), None).unwrap();
+        assert_eq!(cache.indices.len(), 36);
+        assert_eq!(cache.vertices.len(), 24);
         assert!(
             geom::Camera::get(scene.stage(), "/World/Camera")
                 .unwrap()
