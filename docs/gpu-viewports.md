@@ -297,6 +297,14 @@ evaluated by this path.
 
 ### Cameras and viewport composition
 
+For a transient cloth display stage, call `UsdScene::with_deforming_meshes`
+with the subtree of triangulated meshes and publish poses through
+`set_deformed_mesh_points`. This authors point data while preserving topology
+and shading mode. For world-space Y-up meshes the renderer uploads points,
+derives smooth or flat normals on the GPU, and patches the existing mesh and
+cage buffers before the shadow and shaded passes. Other adapters and coordinate
+systems use fresh CPU normals. Ordinary stage edits still rebuild the caches.
+
 Orbit cameras live in a viewport-owned in-memory USD stage and do not modify the
 source asset. `UsdRenderer::control()` provides view-local animation-time control
 when constructing a renderer through the generic factory API. Stage edits wake

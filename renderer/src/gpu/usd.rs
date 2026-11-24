@@ -19,6 +19,9 @@ use wgpu::util::DeviceExt;
 
 mod aa;
 mod appearance;
+mod deform;
+#[cfg(test)]
+mod deform_tests;
 mod studio;
 #[cfg(test)]
 mod studio_tests;
@@ -122,6 +125,9 @@ pub struct Wireframe {
 pub struct UsdScene {
     stage: Stage,
     revision: Rc<Cell<u64>>,
+    pose_revision: Rc<Cell<u64>>,
+    pose_property: Rc<RefCell<Option<sdf::Path>>>,
+    deform_root: Option<sdf::Path>,
 }
 
 impl UsdScene {
@@ -139,14 +145,63 @@ impl UsdScene {
     /// Use the schema registry from `openusd_schemas` when constructing the stage.
     pub fn from_stage(stage: Stage) -> Result<Self> {
         let revision = Rc::new(Cell::new(1u64));
+        let pose_revision = Rc::new(Cell::new(0u64));
+        let pose_property = Rc::new(RefCell::new(None));
         let changes = revision.clone();
-        stage.add_sink(move |_: &Stage, _: &scene::CommittedChange| {
-            changes.set(changes.get().wrapping_add(1));
+        let poses = pose_revision.clone();
+        let property = pose_property.clone();
+        stage.add_sink(move |_: &Stage, change: &scene::CommittedChange| {
+            let is_pose = property.borrow().as_ref().is_some_and(|property| {
+                matches!(change.provenance, scene::Provenance::LocalStack)
+                    && change.asset_paths_resynced.is_empty()
+                    && !(change.resynced.is_empty() && change.changed_info_only.is_empty())
+                    && change
+                        .resynced
+                        .iter()
+                        .chain(change.changed_info_only)
+                        .all(|path| path == property)
+            });
+            let revision = if is_pose { &poses } else { &changes };
+            revision.set(revision.get().wrapping_add(1));
         });
-        Ok(Self { stage, revision })
+        Ok(Self {
+            stage,
+            revision,
+            pose_revision,
+            pose_property,
+            deform_root: None,
+        })
     }
     pub fn stage(&self) -> &Stage {
         &self.stage
+    }
+
+    /// Enable position-only updates for triangle meshes below this prim on a
+    /// transient viewport stage. Call before sharing the scene. Vertex normals
+    /// are area-weighted, or flat when authored interpolation is faceVarying.
+    pub fn with_deforming_meshes(mut self, root: &str) -> Result<Self> {
+        self.deform_root = Some(sdf::Path::new(root).map_err(error)?);
+        Ok(self)
+    }
+
+    /// Author positions without changing topology, point count, or shading mode.
+    /// The viewport derives normals. Normal attributes remain available for
+    /// authored edits, and are not rewritten by this position-only operation.
+    pub fn set_deformed_mesh_points(&self, path: &str, points: Vec<gf::Vec3f>) -> Result<()> {
+        let prim = sdf::Path::new(path).map_err(error)?;
+        if !self
+            .deform_root
+            .as_ref()
+            .is_some_and(|root| prim.has_prefix(root))
+        {
+            return Err(error("mesh is outside the deforming USD subtree"));
+        }
+        let property = sdf::Path::new(&format!("{path}.points")).map_err(error)?;
+        let attribute = self.stage.attribute(&property).map_err(error)?;
+        let previous = self.pose_property.replace(Some(property));
+        let result = attribute.set(points);
+        self.pose_property.replace(previous);
+        result.map(|_| ()).map_err(error)
     }
 }
 
@@ -294,6 +349,7 @@ struct MeshCache {
     minimum: Vec3,
     maximum: Vec3,
     up: Vec3,
+    deformation: deform::Plan,
 }
 
 /// Initial USD-to-wgpu backend. The stage and camera USD prims are authoritative;
@@ -306,6 +362,8 @@ pub struct UsdRenderer {
     orbit: Option<Orbit>,
     revision: u64,
     evaluated_time: Option<scene::TimeCode>,
+    pose_revision: u64,
+    deformation: Option<deform::GpuPose>,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
@@ -379,7 +437,8 @@ impl UsdRenderer {
         camera_stage: Option<Stage>,
     ) -> Result<Self> {
         let initial_time = Some(scene::TimeCode::new(scene.stage.start_time_code()));
-        let cache = extract_meshes(&scene.stage, initial_time)?;
+        let mut cache =
+            extract_scene_meshes(&scene.stage, initial_time, scene.deform_root.as_ref())?;
         let redraw = init.redraw.clone();
         let camera_redraw = camera_stage.is_some().then(|| redraw.clone());
         let control = UsdViewControl(Rc::new(RefCell::new(ViewState {
@@ -439,7 +498,7 @@ impl UsdRenderer {
             }
         };
         let gpu = init.gpu;
-        let vertices = vertex_buffer(gpu, &cache.vertices);
+        let vertices = vertex_buffer(gpu, &cache.vertices, scene.deform_root.is_some());
         let indices = index_buffer(gpu, &cache.indices);
         let camera_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("USD camera uniforms"),
@@ -504,6 +563,12 @@ impl UsdRenderer {
         let model_wires = model_wire_buffer(gpu, cache.models.len());
         let (edges, wire_binding, edge_vertices) =
             wire_resources(gpu, &wire_layout, &model_wires, &cache.edges);
+        let deformation = deform::GpuPose::new(
+            gpu,
+            std::mem::take(&mut cache.deformation),
+            &vertices,
+            &edges,
+        );
         let redraw_sink = scene
             .stage
             .add_sink(move |_: &Stage, _: &scene::CommittedChange| {
@@ -520,6 +585,8 @@ impl UsdRenderer {
         Ok(Self {
             revision: scene.revision.get(),
             evaluated_time: initial_time,
+            pose_revision: scene.pose_revision.get(),
+            deformation,
             scene,
             control,
             camera_stage,
@@ -828,9 +895,15 @@ impl GpuViewportRenderer for UsdRenderer {
             flush_orbit_camera(&self.camera_stage, &self.camera_path, orbit)?;
         }
         let time = self.control.0.borrow().time;
-        if self.revision != self.scene.revision.get() || self.evaluated_time != time {
-            let cache = extract_meshes(&self.scene.stage, time)?;
-            self.vertices = vertex_buffer(gpu, &cache.vertices);
+        let pose_revision = self.scene.pose_revision.get();
+        let pose_changed = self.pose_revision != pose_revision;
+        if self.revision != self.scene.revision.get()
+            || self.evaluated_time != time
+            || (pose_changed && self.deformation.is_none())
+        {
+            let mut cache =
+                extract_scene_meshes(&self.scene.stage, time, self.scene.deform_root.as_ref())?;
+            self.vertices = vertex_buffer(gpu, &cache.vertices, self.scene.deform_root.is_some());
             self.indices = index_buffer(gpu, &cache.indices);
             self.index_count = cache.indices.len() as u32;
             self.model_wires = model_wire_buffer(gpu, cache.models.len());
@@ -839,6 +912,12 @@ impl GpuViewportRenderer for UsdRenderer {
             self.edges = edges;
             self.wire_binding = wire_binding;
             self.edge_vertices = edge_vertices;
+            self.deformation = deform::GpuPose::new(
+                gpu,
+                std::mem::take(&mut cache.deformation),
+                &self.vertices,
+                &self.edges,
+            );
             self.studio.update_mesh(&cache);
             self.models = cache.models;
             self.model_ranges = cache.ranges;
@@ -846,7 +925,11 @@ impl GpuViewportRenderer for UsdRenderer {
             self.wire_uploaded = None;
             self.revision = self.scene.revision.get();
             self.evaluated_time = time;
+        } else if pose_changed && let Some(deformation) = &mut self.deformation {
+            let bounds = deformation.update(gpu, frame.encoder, &self.scene.stage, time)?;
+            self.studio.update_pose_bounds(bounds.scene, bounds.casters);
         }
+        self.pose_revision = pose_revision;
         self.sync_wire(gpu);
         self.studio.sync(gpu);
         for path in &self.models {
@@ -1269,7 +1352,13 @@ fn wire_resources(
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("USD wireframe edges"),
             contents,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | if cfg!(test) {
+                    wgpu::BufferUsages::COPY_SRC
+                } else {
+                    wgpu::BufferUsages::empty()
+                },
         });
     let binding = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("USD wireframe"),
@@ -1320,12 +1409,23 @@ fn clear_color(info: GpuViewportInfo) -> wgpu::Color {
     wgpu::Color { r, g, b, a: 1.0 }
 }
 
-fn vertex_buffer(gpu: &GpuContext, vertices: &[Vertex]) -> wgpu::Buffer {
+fn vertex_buffer(gpu: &GpuContext, vertices: &[Vertex], storage: bool) -> wgpu::Buffer {
+    let usage = wgpu::BufferUsages::VERTEX
+        | if storage {
+            wgpu::BufferUsages::STORAGE
+        } else {
+            wgpu::BufferUsages::empty()
+        };
+    let usage = if cfg!(test) {
+        usage | wgpu::BufferUsages::COPY_SRC
+    } else {
+        usage
+    };
     gpu.device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("USD derived mesh vertices"),
             contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage,
         })
 }
 
@@ -1338,7 +1438,16 @@ fn index_buffer(gpu: &GpuContext, indices: &[u32]) -> wgpu::Buffer {
         })
 }
 
+#[cfg(test)]
 fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCache> {
+    extract_scene_meshes(stage, time, None)
+}
+
+fn extract_scene_meshes(
+    stage: &Stage,
+    time: Option<scene::TimeCode>,
+    deform_root: Option<&sdf::Path>,
+) -> Result<MeshCache> {
     let mut paths = Vec::new();
     stage
         .traverse(scene::PrimPredicate::DEFAULT, |path| {
@@ -1357,6 +1466,7 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
         up: studio::stage_up(stage)?,
         minimum: Vec3::splat(f32::INFINITY),
         maximum: Vec3::splat(f32::NEG_INFINITY),
+        deformation: deform::Plan::default(),
     };
     // Flat normals computed on either side of a shared edge can differ only
     // in the sign of a zero component.
@@ -1396,10 +1506,24 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
             .map_err(error)?
             .unwrap_or(true);
         let world = xforms.local_to_world_transform(&prim).map_err(error)?;
+        let deforming =
+            deform_root.is_some_and(|root| path.has_prefix(root)) && !indices.is_empty();
+        if deforming
+            && (counts.iter().any(|&count| count != 3)
+                || counts.len().checked_mul(3) != Some(indices.len()))
+        {
+            return Err(error(format!(
+                "{path}: deforming viewport meshes must be triangulated"
+            )));
+        }
         let normals_attr = mesh.normals_attr();
-        let authored_normals = normals_attr
-            .get_at::<Vec<gf::Vec3f>>(time)
-            .map_err(|e| error(format!("{path}: cannot read normals: {e}")))?;
+        let authored_normals = if deforming {
+            None
+        } else {
+            normals_attr
+                .get_at::<Vec<gf::Vec3f>>(time)
+                .map_err(|e| error(format!("{path}: cannot read normals: {e}")))?
+        };
         let interpolation = normals_attr.interpolation().map_err(error)?;
         // USD normals default to vertex interpolation when metadata is absent.
         let interpolation = interpolation.as_deref().unwrap_or("vertex");
@@ -1466,6 +1590,27 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                 Vec3::new(p.x, p.y, p.z)
             })
             .collect();
+        let flat_pose = deforming && interpolation == "faceVarying";
+        let (authored_normals, interpolation) = if deforming {
+            (
+                Some(deform::normals(&world_points, &indices, flat_pose)?),
+                if flat_pose { "faceVarying" } else { "vertex" },
+            )
+        } else {
+            (authored_normals, interpolation)
+        };
+        let jobs = if deforming && world == gf::Matrix4d::IDENTITY && cache.up == Vec3::Y {
+            Some(cache.deformation.add_mesh(
+                path.clone(),
+                points.len(),
+                &indices,
+                flat_pose,
+                casts_shadow,
+            ))
+        } else {
+            cache.deformation.unsupported |= deforming;
+            None
+        };
         let colors = mesh
             .display_color_attr()
             .get_at::<Vec<gf::Vec3f>>(time)
@@ -1529,6 +1674,15 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                 match edge_lookup.entry(key) {
                     Entry::Vacant(slot) => {
                         slot.insert(mesh_edges.len());
+                        if let Some(jobs) = &jobs {
+                            cache.deformation.add_edge(
+                                jobs,
+                                cache.edges.len() + mesh_edges.len(),
+                                first,
+                                second,
+                                face_index,
+                            );
+                        }
                         mesh_edges.push(EdgeRecord {
                             a: [start[0], start[1], start[2], 1.0],
                             b: [end[0], end[1], end[2], 1.0],
@@ -1541,6 +1695,11 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                         let edge = &mut mesh_edges[*slot.get()];
                         if edge.adjacency[0] == 1 {
                             edge.n1 = normal_array;
+                            if let Some(jobs) = &jobs {
+                                cache
+                                    .deformation
+                                    .second_edge_face(jobs, *slot.get(), face_index);
+                            }
                         }
                         edge.adjacency[0] = edge.adjacency[0].saturating_add(1);
                     }
@@ -1569,6 +1728,9 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                     bounds[0] = bounds[0].min(p);
                     bounds[1] = bounds[1].max(p);
                 }
+                if deform_root.is_some() && !deforming {
+                    cache.deformation.static_bounds.include(p, casts_shadow);
+                }
                 let point_index = face[corner] as usize;
                 let uv = uvs.as_ref().map_or([0.0; 3], |(interpolation, values)| {
                     let index = match interpolation {
@@ -1593,9 +1755,16 @@ fn extract_meshes(stage: &Stage, time: Option<scene::TimeCode>) -> Result<MeshCa
                     point_index,
                     normal.map(component_bits),
                     uv.map(component_bits),
+                    // Coplanar flat-shaded faces can bend apart in the next pose.
+                    flat_pose.then_some(face_index),
                 );
                 let index = *vertex_lookup.entry(key).or_insert_with(|| {
                     let index = cache.vertices.len() as u32;
+                    if let Some(jobs) = &jobs {
+                        cache
+                            .deformation
+                            .add_vertex(jobs, index, point_index, face_index);
+                    }
                     cache.vertices.push(Vertex {
                         position: p.to_array(),
                         normal,
