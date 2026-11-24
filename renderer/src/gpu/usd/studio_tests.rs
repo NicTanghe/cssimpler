@@ -171,30 +171,6 @@ fn studio_shadows_reach_mesh_and_floor() {
         "cached depth map must render identically"
     );
 
-    let mut receiver_shadow = 0;
-    let mut floor_shadow = 0;
-    for ((lit, shadow), floorless) in without
-        .chunks_exact(4)
-        .zip(with.chunks_exact(4))
-        .zip(no_floor.chunks_exact(4))
-    {
-        if lit[3] == 255 && shadow[3] == 255 && lit[0].saturating_sub(shadow[0]) > 24 {
-            if floorless[3] == 0 {
-                floor_shadow += 1;
-            } else if i32::from(lit[0]) - i32::from(lit[1]) > 45 {
-                receiver_shadow += 1;
-            }
-        }
-    }
-    assert!(
-        receiver_shadow > 50,
-        "expected a shadow on the fabric receiver, found {receiver_shadow} pixels"
-    );
-    assert!(
-        floor_shadow > 50,
-        "expected a shadow on the floor, found {floor_shadow} pixels"
-    );
-
     let close = studio.shadows.unwrap();
     renderer
         .set_shadow_settings(UsdShadowSettings {
@@ -223,6 +199,30 @@ fn studio_shadows_reach_mesh_and_floor() {
         with,
         draw(&mut renderer),
         "restoring close fit must restore its shadow"
+    );
+
+    let mut receiver_shadow = 0;
+    let mut floor_shadow = 0;
+    for ((lit, shadow), floorless) in without
+        .chunks_exact(4)
+        .zip(with.chunks_exact(4))
+        .zip(no_floor.chunks_exact(4))
+    {
+        if lit[3] == 255 && shadow[3] == 255 && lit[0].saturating_sub(shadow[0]) > 24 {
+            if floorless[3] == 0 {
+                floor_shadow += 1;
+            } else if i32::from(lit[0]) - i32::from(lit[1]) > 45 {
+                receiver_shadow += 1;
+            }
+        }
+    }
+    assert!(
+        receiver_shadow > 50,
+        "expected a shadow on the fabric receiver, found {receiver_shadow} pixels"
+    );
+    assert!(
+        floor_shadow > 50,
+        "expected a shadow on the floor, found {floor_shadow} pixels"
     );
 
     renderer.clear_model_material("/Studio/Receiver");
