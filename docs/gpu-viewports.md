@@ -212,8 +212,8 @@ Ok(Box::new(renderer))
   neutral floor sits below the scene. Set `floor: false` to use an authored
   receiver. A mesh with `custom bool cssimpler:castsShadow = false` receives
   shadows and stays out of the caster pass. A `coverage` of `0` uses the close
-  fit. Moving it toward `1` expands the fit to include all visible USD mesh
-  bounds without changing the texture resolution.
+  fit. Moving it toward `1` expands the fit to include the scene's floor
+  footprint. Taller walls do not change the footprint or texture resolution.
 - Bias parameters use normalized caster-only light depth. Increase `depth_bias` or
   `slope_bias` in small steps if a receiver shows self-shadow artifacts.
   `filter_radius` sets the disk filter radius in map texels. A nonzero

@@ -141,8 +141,8 @@ impl UsdMaterial {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UsdShadowSettings {
     pub resolution: u32,
-    /// Grow the light-space fit from the casters at 0 to all visible USD
-    /// meshes at 1. The range gives finer control close to the casters.
+    /// Grow the light-space fit from the casters at 0 to the casters and the
+    /// scene's floor footprint at 1. The range gives finer control close in.
     pub coverage: f32,
     pub depth_bias: f32,
     pub slope_bias: f32,
