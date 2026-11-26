@@ -24,6 +24,8 @@ fn build_usd_shaders() {
     }
     println!("cargo::rerun-if-changed=src/gpu/usd/deform.wgsl");
     validate_wgsl("usd_deformation", include_str!("src/gpu/usd/deform.wgsl"));
+    println!("cargo::rerun-if-changed=src/gpu/overlay.wgsl");
+    validate_wgsl("viewport_overlay", include_str!("src/gpu/overlay.wgsl"));
 }
 
 #[cfg(feature = "gpu-viewport")]

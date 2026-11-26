@@ -38,7 +38,7 @@ impl NativeHost {
         layer.setOpaque(!transparent);
         layer.setHidden(true);
         // Above the native-glass tint and CPU overlay (z = 999999 and 1000000).
-        // Geometry validation hides viewports occluded by later-painted CPU UI.
+        // The viewport compositor paints overlapping CPU UI onto this layer.
         layer.setZPosition(1_000_001.0);
         let host = Self {
             input: input::InputMonitor::install(&parent)?,

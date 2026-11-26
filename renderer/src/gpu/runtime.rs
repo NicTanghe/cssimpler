@@ -1,3 +1,4 @@
+use super::overlay::Overlay;
 use super::*;
 use cssimpler_core::{LayoutBox, RenderNode};
 use std::{
@@ -13,6 +14,7 @@ struct LiveViewport {
     config: wgpu::SurfaceConfiguration,
     info: GpuViewportInfo,
     renderer: Box<dyn GpuViewportRenderer>,
+    overlay: Option<Overlay>,
     visible: bool,
     frame_index: u64,
     last_frame: Option<Instant>,
@@ -58,6 +60,7 @@ pub(crate) struct GpuRuntime {
     focused: Option<usize>,
     captured: Option<PointerCapture>,
     pointer: Option<crate::PointerPosition>,
+    last_modifiers: crate::KeyboardModifiers,
     trace_motion_count: u64,
     windowed: bool,
 }
@@ -74,6 +77,7 @@ impl GpuRuntime {
             focused: None,
             captured: None,
             pointer: None,
+            last_modifiers: Default::default(),
             trace_motion_count: 0,
             windowed: true,
         })
@@ -119,6 +123,7 @@ impl GpuRuntime {
                 if let Some(live) = &mut self.live[index] {
                     live.host.hide();
                     live.visible = false;
+                    live.overlay = None;
                 }
                 if self.focused == Some(index) {
                     self.focused = None;
@@ -265,6 +270,7 @@ impl GpuRuntime {
                     config,
                     info,
                     renderer,
+                    overlay: None,
                     visible: false,
                     frame_index: 0,
                     last_frame: None,
@@ -301,7 +307,17 @@ impl GpuRuntime {
                 entry.redraw.0.dirty.store(true, Ordering::Release);
             }
             live.visible = true;
+            if Overlay::sync(
+                &mut live.overlay,
+                self.gpu.as_ref().unwrap(),
+                info,
+                origin,
+                location.overlay,
+            ) {
+                entry.redraw.0.dirty.store(true, Ordering::Release);
+            }
         }
+        self.yield_covered_input(self.last_modifiers);
         Ok(())
     }
 
@@ -473,6 +489,9 @@ impl GpuRuntime {
                     encoder: &mut encoder,
                 },
             )?;
+            if let Some(overlay) = &live.overlay {
+                overlay.draw(&mut encoder, &target);
+            }
             let encoded = timing.map(|_| Instant::now());
             gpu.queue.submit([encoder.finish()]);
             gpu.queue.present(texture);
@@ -562,12 +581,23 @@ impl GpuRuntime {
         // Button events and motion share the event queue. Do not compare a
         // queued move with the current OS button state: the physical release
         // can already have happened while these valid drag events were queued.
+        let modifiers = match event {
+            EngineEvent::PointerMoved { modifiers, .. }
+            | EngineEvent::PointerButton { modifiers, .. }
+            | EngineEvent::Scroll { modifiers, .. }
+            | EngineEvent::ModifiersChanged(modifiers) => Some(*modifiers),
+            _ => None,
+        };
+        if let Some(modifiers) = modifiers {
+            self.last_modifiers = modifiers;
+        }
         if let EngineEvent::PointerMoved { position, .. } = event {
             self.pointer = Some(*position);
         }
         if matches!(event, EngineEvent::PointerLeft) {
             self.pointer = None;
         }
+        self.yield_covered_input(self.last_modifiers);
         let hit = self.pointer.and_then(|p| {
             self.live.iter().position(|live| {
                 live.as_ref().is_some_and(|l| {
@@ -576,6 +606,7 @@ impl GpuRuntime {
                         && p.y >= l.info.bounds.y
                         && p.x < l.info.bounds.x + l.info.bounds.width
                         && p.y < l.info.bounds.y + l.info.bounds.height
+                        && !l.overlay.as_ref().is_some_and(|overlay| overlay.blocks(p))
                 })
             })
         });
@@ -635,6 +666,31 @@ impl GpuRuntime {
             self.sync_native_capture();
         }
         consumed
+    }
+
+    fn yield_covered_input(&mut self, modifiers: crate::KeyboardModifiers) {
+        let covered = |index: usize| {
+            self.pointer.is_some_and(|point| {
+                self.live[index].as_ref().is_some_and(|live| {
+                    live.visible
+                        && live
+                            .overlay
+                            .as_ref()
+                            .is_some_and(|overlay| overlay.blocks(point))
+                })
+            })
+        };
+        let loses_focus = self.focused.is_some_and(covered);
+        let loses_capture = self
+            .captured
+            .as_ref()
+            .is_some_and(|drag| covered(drag.index));
+        if loses_focus {
+            self.focused = None;
+        }
+        if loses_capture {
+            self.cancel_pointer_capture(modifiers);
+        }
     }
 }
 

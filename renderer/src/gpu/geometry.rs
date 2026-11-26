@@ -1,8 +1,10 @@
 use super::error;
 use crate::Result;
 use cssimpler_core::{
-    Color, CornerRadius, ExtractedPaintKind, ExtractedScene, LayoutBox, RenderNode,
+    Color, CornerRadius, ExtractedPaintKind, ExtractedScene, LayoutBox, MixBlendMode, RenderKind,
+    RenderNode, VisualStyle,
 };
+use std::collections::BTreeSet;
 
 fn intersects(a: LayoutBox, b: LayoutBox) -> bool {
     a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
@@ -16,6 +18,7 @@ pub(super) struct Location {
     pub bounds: LayoutBox,
     pub background: Color,
     pub glass: bool,
+    pub overlay: Vec<RenderNode>,
 }
 
 fn over(top: Color, bottom: Color) -> Color {
@@ -28,7 +31,7 @@ fn over(top: Color, bottom: Color) -> Color {
     )
 }
 
-/// Return a fully visible content rectangle. Unsupported composition hides it.
+/// Locate the GPU rectangle and the later-painted CPU layer over it.
 pub(super) fn locate(
     roots: &[RenderNode],
     id: &str,
@@ -128,11 +131,12 @@ pub(super) fn locate(
         nodes = &mut nodes[*index].children;
     }
     let extracted = ExtractedScene::from_render_roots_owned(marked);
-    let mut after = false;
+    let mut overlay_start = None;
     let mut background = fallback;
     let mut glass = false;
-    for item in extracted.items {
-        if !after && contains(item.layout, bounds) {
+    let mut has_overlap = false;
+    for (index, item) in extracted.items.iter().enumerate() {
+        if overlay_start.is_none() && contains(item.layout, bounds) {
             if item.kind == ExtractedPaintKind::GlassReveal {
                 glass = true;
             }
@@ -152,29 +156,88 @@ pub(super) fn locate(
         }
         if item.path == path {
             if item.kind == ExtractedPaintKind::Background {
-                after = true;
+                overlay_start = Some(index + 1);
             }
             continue;
         }
-        if !after || path.starts_with(&item.path) {
+        if overlay_start.is_none() || path.starts_with(&item.path) {
             continue;
         }
-        let visible = match item.kind {
-            ExtractedPaintKind::Background => {
-                item.style.background.is_some_and(|c| c.a != 0)
-                    || !item.style.background_layers.is_empty()
+        if visible(item) && intersects(bounds, item.layout) {
+            // These effects need pixels from beneath the overlay. The GPU
+            // image is not available to the CPU rasterizer.
+            if matches!(
+                item.kind,
+                ExtractedPaintKind::GlassReveal
+                    | ExtractedPaintKind::BackdropOcclude
+                    | ExtractedPaintKind::BackdropBlur
+            ) || item.style.mix_blend_mode != MixBlendMode::Normal
+            {
+                return Ok(None);
             }
-            _ => true,
-        };
-        if visible && intersects(bounds, item.layout) {
-            return Ok(None);
+            has_overlap = true;
         }
     }
+    let overlay = if has_overlap {
+        let overlay_paths = extracted.items[overlay_start.unwrap()..]
+            .iter()
+            .filter(|item| {
+                !path.starts_with(&item.path) && visible(item) && intersects(bounds, item.layout)
+            })
+            .map(|item| item.path.clone())
+            .collect();
+        let mut roots = extracted.roots;
+        retain_paint(&mut roots, &mut Vec::new(), &overlay_paths);
+        roots
+    } else {
+        Vec::new()
+    };
     Ok(Some(Location {
         bounds,
         background,
         glass,
+        overlay,
     }))
+}
+
+fn visible(item: &cssimpler_core::ExtractedPaintItem) -> bool {
+    item.kind != ExtractedPaintKind::Background
+        || item.style.background.is_some_and(|color| color.a != 0)
+        || !item.style.background_layers.is_empty()
+}
+
+// Retain the original clip and stacking ancestors, clearing their own paint
+// when it precedes the viewport. Paint order among surviving siblings stays
+// the same, including positioned UI such as a dimmer and its dialog.
+fn retain_paint(nodes: &mut Vec<RenderNode>, path: &mut Vec<usize>, paint: &BTreeSet<Vec<usize>>) {
+    let mut index = 0;
+    nodes.retain_mut(|node| {
+        path.push(index);
+        index += 1;
+        let painted = paint.contains(path);
+        retain_paint(&mut node.children, path, paint);
+        path.pop();
+        if !painted && !node.children.is_empty() {
+            let style = &node.style;
+            node.style = VisualStyle {
+                cache_layer: style.cache_layer,
+                isolate_blending: style.isolate_blending,
+                corner_radius: style.corner_radius,
+                positioned: style.positioned,
+                z_index: style.z_index,
+                overflow: style.overflow,
+                transform: style.transform.clone(),
+                perspective: style.perspective,
+                transform_style: style.transform_style,
+                ..VisualStyle::default()
+            };
+            node.kind = RenderKind::Container;
+            node.text_layout = None;
+            node.text_edit = None;
+            node.scrollbars = None;
+        }
+        painted || !node.children.is_empty()
+    });
 }
 
 #[cfg(test)]
@@ -219,25 +282,23 @@ mod tests {
     }
 
     #[test]
-    fn covering_ui_hides_surface_and_removal_restores_it() {
+    fn covering_ui_is_painted_over_the_surface() {
         let viewport = RenderNode::container(LayoutBox::new(10.0, 10.0, 100.0, 100.0))
             .with_element_id("scene");
         let mut modal = RenderNode::container(LayoutBox::new(20.0, 20.0, 50.0, 50.0));
         modal.style.background = Some(Color::BLACK);
         let window = LayoutBox::new(0.0, 0.0, 200.0, 200.0);
-        assert!(
-            locate(&[viewport.clone(), modal], "scene", window, Color::WHITE)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            locate(&[viewport], "scene", window, Color::WHITE)
-                .unwrap()
-                .unwrap()
-                .bounds
-                .width,
-            100.0
-        );
+        let location = locate(&[viewport.clone(), modal], "scene", window, Color::WHITE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(location.bounds, viewport.layout);
+        assert_eq!(location.overlay.len(), 1);
+        assert_eq!(location.overlay[0].style.background, Some(Color::BLACK));
+        let uncovered = locate(&[viewport], "scene", window, Color::WHITE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(uncovered.bounds, location.bounds);
+        assert!(uncovered.overlay.is_empty());
     }
     #[test]
     fn partial_clipping_and_duplicate_ids_are_not_presented() {
