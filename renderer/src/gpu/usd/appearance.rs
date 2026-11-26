@@ -144,9 +144,6 @@ pub struct UsdShadowSettings {
     /// Grow the light-space fit from the casters at 0 to all visible USD
     /// meshes at 1. The range gives finer control close to the casters.
     pub coverage: f32,
-    /// Extra width and height in light space, in stage units. Split evenly
-    /// across opposite edges of the fitted rectangle.
-    pub coverage_expansion: f32,
     pub depth_bias: f32,
     pub slope_bias: f32,
     pub filter_radius: u32,
@@ -162,7 +159,6 @@ impl Default for UsdShadowSettings {
         Self {
             resolution: 1024,
             coverage: 0.0,
-            coverage_expansion: 0.0,
             depth_bias: 0.0004,
             slope_bias: 0.001,
             filter_radius: 1,
@@ -242,8 +238,6 @@ impl UsdStudioLighting {
             || self.shadows.is_some_and(|s| {
                 s.resolution == 0
                     || !(0.0..=1.0).contains(&s.coverage)
-                    || !s.coverage_expansion.is_finite()
-                    || s.coverage_expansion < 0.0
                     || !(0.0..=1.0).contains(&s.depth_bias)
                     || !(0.0..=1.0).contains(&s.slope_bias)
                     || s.filter_radius > 64
