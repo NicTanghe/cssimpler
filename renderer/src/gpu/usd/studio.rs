@@ -91,9 +91,14 @@ impl Studio {
         }
         let depth_key = |settings: Option<UsdStudioLighting>| {
             settings.and_then(|light| {
-                light
-                    .shadows
-                    .map(|shadow| (light.toward_key, shadow.resolution, shadow.coverage))
+                light.shadows.map(|shadow| {
+                    (
+                        light.toward_key,
+                        shadow.resolution,
+                        shadow.coverage,
+                        shadow.coverage_expansion,
+                    )
+                })
             })
         };
         self.depth_dirty |= depth_key(self.settings) != depth_key(settings);
@@ -174,6 +179,7 @@ impl Studio {
                     key,
                     self.up,
                     s.coverage,
+                    s.coverage_expansion,
                 );
                 params.light_projection = fit.matrix.to_cols_array_2d();
                 params.shadow_fit = fit.sampling;
@@ -384,6 +390,7 @@ fn shadow_projection(
     key: Vec3,
     up: Vec3,
     coverage: f32,
+    coverage_expansion: f32,
 ) -> ShadowProjection {
     let light_up = if key.dot(up).abs() > 0.99 {
         Vec3::X
@@ -400,8 +407,10 @@ fn shadow_projection(
     let mut minimum = caster_min.lerp(scene_min, weight);
     let mut maximum = caster_max.lerp(scene_max, weight);
     let padding = ((maximum - minimum) * 0.025).max(Vec3::splat(0.01));
-    minimum -= padding;
-    maximum += padding;
+    let half_expansion = coverage_expansion * 0.5;
+    let xy_padding = Vec3::new(half_expansion, half_expansion, 0.0);
+    minimum -= padding + xy_padding;
+    maximum += padding + xy_padding;
     let span = maximum - minimum;
     let caster_depth = caster_max.z - caster_min.z;
     let tight_depth_span = caster_depth + 2.0 * (caster_depth * 0.025).max(0.01);
@@ -463,7 +472,7 @@ mod tests {
         let casters = [Vec3::new(-0.55, 0.0, -0.25), Vec3::new(0.55, 1.8, 0.4)];
         let scene = [Vec3::new(-30.0, 0.0, -30.0), Vec3::new(30.0, 40.0, 30.0)];
         let key = Vec3::from_array(UsdStudioLighting::default().toward_key).normalize();
-        let fit = |coverage| shadow_projection(casters, scene, key, Vec3::Y, coverage);
+        let fit = |coverage| shadow_projection(casters, scene, key, Vec3::Y, coverage, 0.0);
         let tight = fit(0.0);
         let middle = fit(0.5);
         let full = fit(1.0);
@@ -498,9 +507,26 @@ mod tests {
     }
 
     #[test]
+    fn fixed_expansion_adds_stage_units_to_the_close_fit() {
+        let casters = [Vec3::new(-0.5, 0.0, -0.3), Vec3::new(0.5, 1.8, 0.3)];
+        let scene = [Vec3::splat(-100.0), Vec3::splat(100.0)];
+        let key = Vec3::from_array(UsdStudioLighting::default().toward_key).normalize();
+        let fit = |expansion| shadow_projection(casters, scene, key, Vec3::Y, 0.0, expansion);
+        let span = |projection: ShadowProjection| {
+            let axes = projection.matrix.transpose();
+            Vec3::new(
+                2.0 / axes.x_axis.truncate().length(),
+                2.0 / axes.y_axis.truncate().length(),
+                1.0 / axes.z_axis.truncate().length(),
+            )
+        };
+        assert!((span(fit(3.0)) - span(fit(0.0))).abs_diff_eq(Vec3::new(3.0, 3.0, 0.0), 1e-5));
+    }
+
+    #[test]
     fn shadow_projection_handles_degenerate_bounds_and_vertical_z_up_light() {
         let bounds = [Vec3::new(0.0, 0.0, 2.0); 2];
-        let fit = shadow_projection(bounds, bounds, Vec3::Z, Vec3::Z, 1.0);
+        let fit = shadow_projection(bounds, bounds, Vec3::Z, Vec3::Z, 1.0, 0.0);
         assert!(fit.matrix.is_finite());
         assert!(
             fit.matrix

@@ -213,7 +213,8 @@ Ok(Box::new(renderer))
   receiver. A mesh with `custom bool cssimpler:castsShadow = false` receives
   shadows and stays out of the caster pass. A `coverage` of `0` uses the close
   fit. Moving it toward `1` expands the fit to include all visible USD mesh
-  bounds without changing the texture resolution.
+  bounds without changing the texture resolution. `coverage_expansion` adds a
+  fixed width and height in stage units, leaving the light-depth range unchanged.
 - Bias parameters use normalized caster-only light depth. Increase `depth_bias` or
   `slope_bias` in small steps if a receiver shows self-shadow artifacts.
   `filter_radius` sets the disk filter radius in map texels. A nonzero
