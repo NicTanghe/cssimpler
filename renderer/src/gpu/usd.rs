@@ -659,6 +659,19 @@ impl UsdRenderer {
         self.set_studio_lighting(Some(settings))
     }
 
+    /// Override the filter radius in USD stage units. For an area key this
+    /// caps the penumbra in the plane perpendicular to the light. Zero uses
+    /// a hard comparison and `None` restores the filter measured in texels.
+    pub fn set_shadow_filter_radius_in_stage_units(&mut self, radius: Option<f32>) -> Result<()> {
+        if radius.is_some_and(|radius| !radius.is_finite() || radius < 0.0) {
+            return Err(error("invalid USD shadow filter radius"));
+        }
+        if self.studio.set_filter_radius_in_stage_units(radius) {
+            self.control.0.borrow().redraw.request_redraw();
+        }
+        Ok(())
+    }
+
     /// Whether the viewport's GPU supports a sampled key-light depth map.
     pub fn supports_shadow_mapping(&self) -> bool {
         self.studio.shadow_layout().is_some()

@@ -222,6 +222,11 @@ Ok(Box::new(renderer))
   between zero and one. Use `shadow_settings()` and `set_shadow_settings()`
   to adjust the current key at runtime. Sampling changes reuse the depth map.
   Coverage changes redraw it at the new fit.
+  Use `set_shadow_filter_radius_in_stage_units(Some(radius))` for a fixed
+  physical radius (the maximum penumbra radius with an area key). The renderer
+  converts it using the map's current fit and resolution. Coarse maps still
+  have less edge detail. The angular light radius controls how the penumbra
+  grows with separation from the blocker.
   Resolution is capped at the GPU's 2D texture limit. If the
   device cannot sample a depth attachment, the studio lights and floor still
   render. `supports_shadow_mapping()` reports this capability and

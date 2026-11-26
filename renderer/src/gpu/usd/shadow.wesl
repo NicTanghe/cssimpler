@@ -22,26 +22,31 @@ public fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -
         return 1.0;
     }
     let texel = 1.0 / vec2<f32>(textureDimensions(shadow_map));
-    let max_radius = studio.shadows.w;
-    let subtexel_bias = min(0.003, 0.5 * dot(abs(depth_gradient), texel));
+    let texels_per_depth = studio.shadow_fit.xy / texel;
+    let widest = max(texels_per_depth.x, texels_per_depth.y);
+    let world_filter = studio.shadow_filter_depth > 0.0;
+    let max_radius = select(studio.shadows.w, studio.shadow_filter_depth * widest, world_filter);
+    let slope_limit = 0.02 * studio.shadow_bias_scale;
+    let subtexel_bias = min(0.003 * studio.shadow_bias_scale, 0.5 * dot(abs(depth_gradient), texel));
     let bias = studio.shadows.y + studio.shadows.z * (1.0 - n_dot_l) + subtexel_bias;
     let receiver = light.z - bias;
+    if max_radius <= 1.0 {
+        return compare_shadow(uv, receiver);
+    }
     var radius = max_radius;
-    var aspect = vec2(1.0);
-    let area_key = studio.key_tint.w > 0.0 && max_radius > 0.0;
+    let area_key = studio.key_tint.w > 0.0;
+    let aspect = select(vec2(1.0), texels_per_depth / widest, area_key || world_filter);
     var wide_gradient = depth_gradient;
     if area_key {
         // Screen derivatives describe a single triangle. Extrapolating that
         // plane across a wide filter makes penumbras change at mesh edges.
         // Use the interpolated normal for the broad footprint instead.
-        wide_gradient = smooth_receiver_gradient(normal, n_dot_l);
-        let texels_per_depth = studio.shadow_fit.xy / texel;
-        let widest = max(texels_per_depth.x, texels_per_depth.y);
-        aspect = texels_per_depth / widest;
-        let separation = blocker_separation(uv, receiver, wide_gradient, texel * max_radius * aspect);
+        wide_gradient = smooth_receiver_gradient(normal, n_dot_l, world_filter);
+        let separation = blocker_separation(uv, receiver, wide_gradient, texel * max_radius * aspect, slope_limit);
         // Project the angular penumbra into the fitted rectangle in map texels.
         let projected = separation * studio.key_tint.w * widest;
-        radius = clamp(projected, min(1.25, max_radius), max_radius);
+        let min_radius = select(min(1.25, max_radius), 0.0, world_filter);
+        radius = clamp(projected, min_radius, max_radius);
     }
     if radius <= 1.0 {
         return compare_shadow(uv, receiver);
@@ -49,24 +54,31 @@ public fn key_visibility(position: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -
 
     // A disk breaks up the staircase produced by equally spaced square taps.
     // Keep the same sample pattern as the area-key radius changes.
-    let count = select(16u, 48u, area_key || radius > 6.0);
+    let count = select(16u, 48u, area_key || world_filter || radius > 6.0);
     var lit = 0.0;
     for (var i = 0u; i < count; i++) {
         let delta = disk_samples[i + select(0u, 16u, count == 48u)] * (radius * texel * aspect);
         // Retain precise geometric receiver depth for taps near contact.
         let local_weight = 1.0 - smoothstep(1.0, 5.0, length(delta / texel));
         let gradient = mix(wide_gradient, depth_gradient, local_weight);
-        let slope_offset = clamp(dot(gradient, delta), -0.02, 0.02);
+        let slope_offset = clamp(dot(gradient, delta), -slope_limit, slope_limit);
         lit += compare_shadow(uv + delta, receiver + slope_offset);
     }
     return lit / f32(count);
 }
 
-fn smooth_receiver_gradient(normal: vec3<f32>, n_dot_l: f32) -> vec2<f32> {
+fn smooth_receiver_gradient(normal: vec3<f32>, n_dot_l: f32, world_filter: bool) -> vec2<f32> {
     let projection = transpose(studio.light_projection);
     let x_axis = projection[0].xyz;
     let y_axis = projection[1].xyz;
     let z_axis = projection[2].xyz;
+    let taper = smoothstep(0.03, 0.20, n_dot_l);
+    if world_filter {
+        // Limit the correction at grazing angles in an orthonormal light
+        // basis so the projection's aspect ratio does not change that limit.
+        let n = vec3(dot(normal, normalize(x_axis)), dot(normal, normalize(y_axis)), dot(normal, normalize(z_axis)));
+        return vec2(1.0, -1.0) * n.xy / max(abs(n.z), length(n) * 0.05) * taper / studio.shadow_fit.xy;
+    }
     // The key projection is orthographic. These rows are orthogonal axes;
     // dividing by their squared lengths transforms the plane covector.
     let n = vec3(
@@ -76,7 +88,7 @@ fn smooth_receiver_gradient(normal: vec3<f32>, n_dot_l: f32) -> vec2<f32> {
     );
     // Taper the correction at grazing angles, where a plane is ill-conditioned.
     return vec2(2.0, -2.0) * n.xy / max(abs(n.z), length(n) * 0.05)
-        * smoothstep(0.03, 0.20, n_dot_l);
+        * taper;
 }
 
 fn compare_shadow(uv: vec2<f32>, depth: f32) -> f32 {
@@ -87,7 +99,7 @@ fn compare_shadow(uv: vec2<f32>, depth: f32) -> f32 {
     return textureSampleCompareLevel(shadow_map, shadow_sampler, uv, clamp(depth, 0.0, 1.0));
 }
 
-fn blocker_separation(uv: vec2<f32>, receiver: f32, gradient: vec2<f32>, extent: vec2<f32>) -> f32 {
+fn blocker_separation(uv: vec2<f32>, receiver: f32, gradient: vec2<f32>, extent: vec2<f32>, slope_limit: f32) -> f32 {
     // Search past the filter footprint so a wide penumbra can extend into
     // pixels whose centre and inner probes are still fully illuminated.
     let probes = array(
@@ -100,7 +112,7 @@ fn blocker_separation(uv: vec2<f32>, receiver: f32, gradient: vec2<f32>, extent:
     for (var i = 0u; i < 13u; i++) {
         let delta = probes[i] * extent;
         let sample_uv = uv + delta;
-        let surface_depth = receiver + clamp(dot(gradient, delta), -0.02, 0.02);
+        let surface_depth = receiver + clamp(dot(gradient, delta), -slope_limit, slope_limit);
         let occluded = 1.0 - compare_shadow(sample_uv, surface_depth);
         let weight = smoothstep(0.5, 0.95, occluded);
         if weight > 0.0 {
