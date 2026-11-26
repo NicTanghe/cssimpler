@@ -393,12 +393,14 @@ fn shadow_projection(
     let center = casters[0] + (casters[1] - casters[0]) * 0.5;
     let view = glam::camera::rh::view::look_to_mat4(center, -key, light_up);
     let [caster_min, caster_max] = light_bounds(view, casters);
-    let [scene_min, scene_max] = light_bounds(view, scene);
-    // The cove can be many times larger than the subject. Give small
-    // adjustments near the caster-only end more room on the control.
+    // Coverage grows toward the scene's footprint at floor level. The cove
+    // walls' height should not influence a shadow map fitted to the subject.
+    let floor = [scene[0], scene[1] - up * (scene[1] - scene[0]).dot(up)];
+    let [floor_min, floor_max] = light_bounds(view, floor);
+    // Give small adjustments near the caster-only end more room on the control.
     let weight = coverage.powi(3);
-    let mut minimum = caster_min.lerp(scene_min, weight);
-    let mut maximum = caster_max.lerp(scene_max, weight);
+    let mut minimum = caster_min.lerp(caster_min.min(floor_min), weight);
+    let mut maximum = caster_max.lerp(caster_max.max(floor_max), weight);
     let padding = ((maximum - minimum) * 0.025).max(Vec3::splat(0.01));
     minimum -= padding;
     maximum += padding;
@@ -459,9 +461,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coverage_expands_from_subject_to_cove_without_clipping_casters() {
+    fn coverage_expands_to_the_floor_without_clipping_casters() {
         let casters = [Vec3::new(-0.55, 0.0, -0.25), Vec3::new(0.55, 1.8, 0.4)];
         let scene = [Vec3::new(-30.0, 0.0, -30.0), Vec3::new(30.0, 40.0, 30.0)];
+        let floor = [scene[0], Vec3::new(30.0, 0.0, 30.0)];
         let key = Vec3::from_array(UsdStudioLighting::default().toward_key).normalize();
         let fit = |coverage| shadow_projection(casters, scene, key, Vec3::Y, coverage);
         let tight = fit(0.0);
@@ -474,9 +477,22 @@ mod tests {
 
         assert!(contains(tight.matrix, casters));
         assert!(contains(middle.matrix, casters));
-        assert!(contains(full.matrix, scene));
-        assert!(!contains(tight.matrix, scene));
-        assert!(!contains(middle.matrix, scene));
+        assert!(contains(full.matrix, casters));
+        assert!(contains(full.matrix, floor));
+        assert!(!contains(tight.matrix, floor));
+        assert!(!contains(middle.matrix, floor));
+        for coverage in [0.0, 0.32, 0.5, 1.0] {
+            assert_eq!(
+                fit(coverage).matrix,
+                shadow_projection(casters, floor, key, Vec3::Y, coverage).matrix,
+            );
+        }
+        let width = |matrix: Mat4| 2.0 / matrix.transpose().x_axis.truncate().length();
+        let near_subject_growth = width(fit(0.32).matrix) - width(tight.matrix);
+        assert!(
+            (2.5..3.0).contains(&near_subject_growth),
+            "{near_subject_growth} m"
+        );
 
         let ground_area = |matrix: Mat4| {
             let axes = matrix.transpose();

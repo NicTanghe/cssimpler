@@ -212,8 +212,8 @@ Ok(Box::new(renderer))
   neutral floor sits below the scene. Set `floor: false` to use an authored
   receiver. A mesh with `custom bool cssimpler:castsShadow = false` receives
   shadows and stays out of the caster pass. A `coverage` of `0` uses the close
-  fit. Moving it toward `1` expands the fit to include all visible USD mesh
-  bounds without changing the texture resolution.
+  fit. Moving it toward `1` expands the fit to include the scene's floor
+  footprint. Taller walls do not change the footprint or texture resolution.
 - Bias parameters use normalized caster-only light depth. Increase `depth_bias` or
   `slope_bias` in small steps if a receiver shows self-shadow artifacts.
   `filter_radius` sets the disk filter radius in map texels. A nonzero
@@ -318,9 +318,15 @@ An application that authors its own navigation camera can call
 that stage refresh the view without invalidating mesh buffers or the shadow map.
 
 Separate native surfaces currently require fully visible, rectangular, childless
-regions. A viewport hides when partially clipped, covered by later-painted UI,
-rounded, or affected by unsupported transforms. Its CPU background remains visible
-while hidden. Full CSS stacking and background effects sampling live 3D are pending.
+regions. Ordinary CPU UI painted over the viewport is rasterized to a transparent
+layer and composited over the live GPU image. The layer is reused until its paint
+changes. Painted pixels send pointer input to the UI, including translucent
+dimmers. Transparent pixels still allow 3D interaction. An overlay that covers
+the pointer releases viewport capture.
+
+A viewport hides when partially clipped, rounded, or affected by an unsupported
+transform. Backdrop effects that need to sample the live 3D image, such as
+backdrop blur and native glass, also use the hidden-surface fallback.
 
 ## macOS composition
 

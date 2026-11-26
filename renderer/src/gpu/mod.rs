@@ -5,6 +5,7 @@
 
 mod geometry;
 mod native;
+mod overlay;
 pub(crate) mod runtime;
 pub mod usd;
 
