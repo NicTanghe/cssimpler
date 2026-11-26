@@ -11,7 +11,9 @@ struct StudioUniform {
     key: [f32; 4],
     up: [f32; 4],
     lighting: [f32; 4],
-    occlusion_plane: [f32; 4],
+    occlusion_plane: [f32; 2],
+    shadow_filter_depth: f32,
+    shadow_bias_scale: f32,
     shadows: [f32; 4],
     shadow_fit: [f32; 4],
     key_tint: [f32; 4],
@@ -38,6 +40,7 @@ pub(super) struct Studio {
     pub settings: Option<UsdStudioLighting>,
     pub floor: Option<wgpu::Buffer>,
     shadow: Option<ShadowPass>,
+    filter_radius_in_stage_units: Option<f32>,
     caster_bounds: [Vec3; 2],
     scene_bounds: [Vec3; 2],
     caster_ranges: Vec<Range<u32>>,
@@ -66,6 +69,7 @@ impl Studio {
             settings: None,
             floor: None,
             shadow,
+            filter_radius_in_stage_units: None,
             caster_bounds: cache
                 .shadow_bounds
                 .unwrap_or([cache.minimum, cache.maximum]),
@@ -102,6 +106,15 @@ impl Studio {
         true
     }
 
+    pub fn set_filter_radius_in_stage_units(&mut self, radius: Option<f32>) -> bool {
+        if self.filter_radius_in_stage_units == radius {
+            return false;
+        }
+        self.filter_radius_in_stage_units = radius;
+        self.dirty = true;
+        true
+    }
+
     pub fn update_mesh(&mut self, cache: &MeshCache) {
         self.caster_ranges.clone_from(&cache.shadow_ranges);
         self.up = cache.up;
@@ -125,7 +138,9 @@ impl Studio {
             key: [0.0; 4],
             up: self.up.extend(0.0).to_array(),
             lighting: [0.0, 0.0, 1.0, 0.0],
-            occlusion_plane: [0.0; 4],
+            occlusion_plane: [0.0; 2],
+            shadow_filter_depth: 0.0,
+            shadow_bias_scale: 1.0,
             shadows: [0.0; 4],
             shadow_fit: [1.0, 1.0, 0.0, 1.0],
             key_tint: [1.0, 1.0, 1.0, 0.0],
@@ -165,7 +180,7 @@ impl Studio {
                 settings.exposure.exp2(),
                 settings.highlight_rolloff,
             ];
-            params.occlusion_plane = [height, radius.recip(), 0.0, 0.0];
+            params.occlusion_plane = [height, radius.recip()];
 
             if let Some(s) = shadow_settings.filter(|_| self.shadow.is_some()) {
                 let fit = shadow_projection(
@@ -181,8 +196,14 @@ impl Studio {
                     1.0,
                     s.depth_bias * fit.bias_scale,
                     s.slope_bias * fit.bias_scale,
-                    s.filter_radius as f32,
+                    0.0,
                 ];
+                if let Some(radius) = self.filter_radius_in_stage_units {
+                    params.shadow_filter_depth = fit.filter_depth(radius);
+                    params.shadow_bias_scale = fit.bias_scale;
+                } else {
+                    params.shadows[3] = s.filter_radius as f32;
+                }
                 params.key_tint[3] = s.light_radius.tan();
                 params.fill_tint[3] = s.strength;
             }
@@ -376,6 +397,13 @@ struct ShadowProjection {
     /// UV span per unit of normalized depth, then the caster depth interval.
     sampling: [f32; 4],
     bias_scale: f32,
+    depth_span: f32,
+}
+
+impl ShadowProjection {
+    fn filter_depth(&self, radius: f32) -> f32 {
+        radius / self.depth_span
+    }
 }
 
 fn shadow_projection(
@@ -418,6 +446,7 @@ fn shadow_projection(
             (maximum.z - caster_min.z) / span.z,
         ],
         bias_scale: tight_depth_span / span.z,
+        depth_span: span.z,
     }
 }
 
@@ -459,6 +488,38 @@ fn floor_vertices(center: Vec3, height: f32, radius: f32, up: Vec3) -> [Vertex; 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Vec2;
+
+    #[test]
+    fn stage_unit_penumbra_keeps_its_size_across_coverage_and_resolution() {
+        let casters = [Vec3::new(-0.55, 0.0, -0.25), Vec3::new(0.55, 1.8, 0.4)];
+        let scene = [Vec3::new(-30.0, 0.0, -30.0), Vec3::new(30.0, 40.0, 30.0)];
+        let key = Vec3::from_array(UsdStudioLighting::default().toward_key).normalize();
+        let cap = 0.04;
+        let angular_scale = 0.16_f32.tan();
+        for coverage in [0.0, 0.16, 0.32, 1.0] {
+            let fit = shadow_projection(casters, scene, key, Vec3::Y, coverage);
+            let axes = fit.matrix.transpose();
+            let stage_units_per_uv = Vec2::new(
+                2.0 / axes.x_axis.truncate().length(),
+                2.0 / axes.y_axis.truncate().length(),
+            );
+            for resolution in [512.0, 1024.0, 2048.0, 4096.0] {
+                // Mirror the shader's cap, angular penumbra and footprint aspect.
+                let texels_per_depth = Vec2::from_slice(&fit.sampling) * resolution;
+                let widest = texels_per_depth.max_element();
+                let max_radius = fit.filter_depth(cap) * widest;
+                let aspect = texels_per_depth / widest;
+                for separation in [0.03, 0.5] {
+                    let normalized_separation = separation / fit.depth_span;
+                    let radius = (normalized_separation * angular_scale * widest).min(max_radius);
+                    let stage_radius = radius * aspect / resolution * stage_units_per_uv;
+                    let expected = (separation * angular_scale).min(cap);
+                    assert!(stage_radius.abs_diff_eq(Vec2::splat(expected), 1e-6));
+                }
+            }
+        }
+    }
 
     #[test]
     fn coverage_expands_to_the_floor_without_clipping_casters() {
